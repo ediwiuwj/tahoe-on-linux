@@ -1,5 +1,6 @@
 // Sockets de macOS sobre los de Linux: traducción de sockaddr, opciones, banderas y mensajes con descriptores.
-// Solo AF_UNIX, AF_INET y AF_INET6; el resto de dominios (AF_SYSTEM, AF_ROUTE...) responde EAFNOSUPPORT.
+// AF_UNIX, AF_INET y AF_INET6 directos; PF_SYSTEM/SYSPROTO_EVENT (eventos del núcleo) con un socket de datagramas
+// propio; el resto de dominios (AF_ROUTE, SYSPROTO_CONTROL...) responde EAFNOSUPPORT.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
@@ -80,7 +81,79 @@ static int msg_flags(int f) {                         // MSG_* de Darwin -> Linu
 	return l;
 }
 
+// ---- PF_SYSTEM / SYSPROTO_EVENT: socket de eventos del núcleo (kern_event_msg: red, energía, sistema de archivos...).
+// configd, mDNSResponder y otros lo abren al arrancar y filtran con SIOCSKEVFILT. Es un extremo de un par de sockets de
+// datagramas: la otra punta queda abierta para publicar eventos (hoy ninguno), así que leer espera como en macOS cuando
+// nada cambia. Se reconoce por su número de inodo (el descriptor puede reutilizarse tras close).
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#define KEV_MAX_FD 4096
+static unsigned long kev_ino[KEV_MAX_FD];
+static int kev_peer[KEV_MAX_FD];
+static int is_kev(int fd) {
+	struct stat st;
+	return fd >= 0 && fd < KEV_MAX_FD && kev_ino[fd] && fstat(fd, &st) == 0 && st.st_ino == kev_ino[fd];
+}
+static long kev_socket(void) {
+	int sv[2];
+	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) return err();
+	if (sv[0] >= KEV_MAX_FD) { close(sv[0]); close(sv[1]); return -24; /* EMFILE */ }
+	fcntl(sv[1], F_SETFD, FD_CLOEXEC);
+	struct stat st; fstat(sv[0], &st);
+	if (kev_ino[sv[0]] && kev_peer[sv[0]] > 0) close(kev_peer[sv[0]]);   // un socket de eventos anterior ya cerrado
+	kev_ino[sv[0]] = st.st_ino; kev_peer[sv[0]] = sv[1];
+	return sv[0];
+}
+// Códigos de fabricante (SIOCGKEVVENDOR): "com.apple" es KEV_VENDOR_APPLE (1); los demás se numeran desde 1000.
+static uint32_t kev_vendor(const char* name) {
+	static char names[32][200]; static int n;
+	if (!strcmp(name, "com.apple")) return 1;
+	for (int i = 0; i < n; i++) if (!strcmp(names[i], name)) return 1000 + (uint32_t)i;
+	if (n < 32) { snprintf(names[n], sizeof names[n], "%s", name); return 1000 + (uint32_t)n++; }
+	return 0;
+}
+
+// ioctl de Darwin: las de FIO* genéricas y las de los sockets de eventos; el resto, ENOTTY (lo correcto para isatty()).
+static long net_ioctl(struct ctx* c) {
+	int fd = (int)c->a[0];
+	uint32_t req = (uint32_t)c->a[1];
+	uint64_t arg = c->a[2];
+	switch (req) {
+	case 0x8004667e: {                                        // FIONBIO
+		int on = 0; if (safe_read(arg, &on, 4) != 4) return -D_EFAULT;
+		int fl = fcntl(fd, F_GETFL); if (fl < 0) return err();
+		return fcntl(fd, F_SETFL, on ? fl | O_NONBLOCK : fl & ~O_NONBLOCK) < 0 ? err() : 0;
+	}
+	case 0x4004667f: {                                        // FIONREAD
+		int v = 0; if (ioctl(fd, FIONREAD, &v) < 0) return err();
+		return safe_write(arg, &v, 4) == 4 ? 0 : -D_EFAULT;
+	}
+	case 0x20006601: return fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ? err() : 0;   // FIOCLEX
+	case 0x20006602: return fcntl(fd, F_SETFD, 0) < 0 ? err() : 0;            // FIONCLEX
+	}
+	if (is_kev(fd)) {
+		switch (req) {
+		case 0x40046501: { uint32_t id = 0; return safe_write(arg, &id, 4) == 4 ? 0 : -D_EFAULT; }   // SIOCGKEVID: último id de evento
+		case 0x800c6502: return 0;                                                                  // SIOCSKEVFILT: filtro aceptado
+		case 0x400c6503: { uint32_t f[3] = { 0, 0, 0 }; return safe_write(arg, f, 12) == 12 ? 0 : -D_EFAULT; }   // SIOCGKEVFILT
+		case 0xc0cc6504: {                                                                          // SIOCGKEVVENDOR
+			char v[204] = { 0 };
+			if (safe_read(arg, v, sizeof v) != (ssize_t)sizeof v) return -D_EFAULT;
+			v[203] = 0;
+			uint32_t code = kev_vendor(v + 4);
+			if (!code) return -2;                                                                   // ENOENT
+			memcpy(v, &code, 4);
+			return safe_write(arg, v, 4) == 4 ? 0 : -D_EFAULT;
+		}
+		}
+	}
+	if (trace_all) logf_("    ioctl(fd=%d, 0x%x) sin traducir\n", fd, req);
+	return -25;
+}
+
 static long net_socket(struct ctx* c) {
+	if ((int)c->a[0] == 32 && (int)c->a[2] == 1) return kev_socket();   // PF_SYSTEM, SYSPROTO_EVENT
 	int dom = dom_to_linux((int)c->a[0]);
 	if (dom != AF_UNIX && dom != AF_INET && dom != AF_INET6) return -D_EAFNOSUPPORT;
 	int type = (int)c->a[1] & 0xff;
@@ -291,7 +364,7 @@ static long net_coalition(struct ctx* c) {
 }
 
 void emu_net_init(void) {
-	reg_bsd(97, net_socket); reg_bsd(98, net_connect); reg_bsd(409, net_connect);
+	reg_bsd(97, net_socket); reg_bsd(54, net_ioctl); reg_bsd(98, net_connect); reg_bsd(409, net_connect);
 	reg_bsd(104, net_bind); reg_bsd(106, net_listen); reg_bsd(30, net_accept); reg_bsd(404, net_accept);
 	reg_bsd(32, net_getsockname); reg_bsd(31, net_getpeername); reg_bsd(134, net_shutdown); reg_bsd(135, net_socketpair);
 	reg_bsd(105, net_setsockopt); reg_bsd(118, net_getsockopt);

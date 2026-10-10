@@ -949,7 +949,7 @@ static int emulate_sidt(ucontext_t* uc) {
 	if (mod == 1) { int8_t d = (int8_t)ip[len++]; addr += (int64_t)d; }
 	else if (mod == 2) { int32_t d; memcpy(&d, ip + len, 4); len += 4; addr += (int64_t)d; }
 	int cpu = sched_getcpu();
-	uint16_t limit = 0xfff;
+	uint16_t limit = (uint16_t)(0x1000 + (cpu < 0 ? 0 : cpu) % 4);   // como XNU: 0x1000 + número de CPU
 	uint64_t base = 0xffffff8000000000ULL | (uint64_t)((cpu < 0 ? 0 : cpu) % 4);
 	memcpy((void*)addr, &limit, 2);
 	memcpy((void*)(addr + 2), &base, 8);
@@ -976,6 +976,44 @@ static void install_dispatch(void) {
 	if (syscall(SYS_rt_sigaction, SIGSYS, &ks, NULL, 8) != 0) DIE("rt_sigaction: %s", strerror(errno));
 	if (prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON, (unsigned long)tahoe_restorer, 16, &selector) != 0)
 		DIE("PR_SET_SYSCALL_USER_DISPATCH: %s (hace falta Linux >= 5.11)", strerror(errno));
+}
+
+// Número de CPU: libsystem_pthread, libsystem_malloc y libdispatch lo leen con "sidt [rsp-0x10]" y se quedan con los
+// 12 bits bajos del límite de la IDT, porque XNU pone en cada CPU límite = 0x1000 + número de CPU (mp_desc.c). En Linux
+// el límite es 0xfff, así que salía la CPU 4095 y libdispatch indexaba su montón por CPU fuera de rango. Sin UMIP la
+// instrucción no se puede atrapar, de modo que en nuestra copia privada de la caché se cambia por una de igual tamaño,
+// "and dword [rsp-0x10], 0": límite & 0xfff = 0, la CPU 0, válida siempre (solo cambia el reparto por CPU).
+static void patch_cpu_number(void) {
+	const uint64_t cache = 0x7ff800000000UL;
+	uint32_t io = *(uint32_t*)(cache + 0x1c0), ic = *(uint32_t*)(cache + 0x1c4);
+	static const char* libs[] = { "/libdispatch.dylib", "/libsystem_malloc.dylib", "/libsystem_pthread.dylib" };
+	static const uint8_t sidt[5] = { 0x0f, 0x01, 0x4c, 0x24, 0xf0 }, repl[5] = { 0x83, 0x64, 0x24, 0xf0, 0x00 };
+	int patched = 0;
+	for (uint32_t i = 0; i < ic && i < 10000; i++) {
+		uint64_t mh = *(uint64_t*)(cache + io + i * 32ULL);
+		const char* path = (const char*)(cache + *(uint32_t*)(cache + io + i * 32ULL + 24));
+		size_t pl = strlen(path);
+		int want = 0;
+		for (size_t k = 0; k < sizeof libs / sizeof libs[0]; k++) { size_t ll = strlen(libs[k]); if (pl >= ll && !strcmp(path + pl - ll, libs[k])) want = 1; }
+		if (!want || *(uint32_t*)mh != 0xfeedfacf) continue;
+		uint64_t lc = mh + 32;
+		for (uint32_t c = 0; c < *(uint32_t*)(mh + 16); c++) {
+			struct seg64* sg = (struct seg64*)lc;
+			if (sg->cmd == 0x19 && !strcmp(sg->segname, "__TEXT")) {
+				uint8_t* a = (uint8_t*)sg->vmaddr; uint64_t n = sg->vmsize;
+				for (uint64_t off = 0; off + 5 <= n; off++) {
+					if (a[off] != 0x0f || memcmp(a + off, sidt, 5) != 0) continue;
+					uint64_t pg = ((uint64_t)a + off) & ~(uint64_t)(PAGE - 1);
+					if (mprotect((void*)pg, PAGE * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) continue;
+					memcpy(a + off, repl, 5);
+					mprotect((void*)pg, PAGE * 2, PROT_READ | PROT_EXEC);
+					patched++;
+				}
+			}
+			lc += ((struct lcmd*)lc)->cmdsize;
+		}
+	}
+	if (trace_all || getpid() == 1) logf_("    número de CPU: %d sidt sustituidas\n", patched);
 }
 
 // ---------------------------------------------------------------- main
@@ -1018,6 +1056,7 @@ int main(int argc, char** argv, char** envp) {
 	const char* argv0 = getenv("TAHOE_ARGV0");
 	if (argv0) { argv[3] = (char*)argv0; unsetenv("TAHOE_ARGV0"); }
 	map_cache(cache);
+	patch_cpu_number();
 	LOG("caché mapeada en 0x%lx\n", CACHE_BASE);
 	setup_commpage();
 	struct image di, ei;
