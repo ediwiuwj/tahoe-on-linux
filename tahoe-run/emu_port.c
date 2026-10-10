@@ -611,6 +611,31 @@ int port_assert_guard(uint32_t name, uint64_t guard) {
 	int r = !p ? 15 : (p->guarded && p->strict_guard && p->ctx == guard) ? 0 : 4;
 	unlock(); return r;
 }
+// mach_port_get_refs(name, right): como los nombres son globales, se responde según lo que este proceso tiene de ese puerto.
+// right: 0 SEND, 1 RECEIVE, 2 SEND_ONCE, 3 PORT_SET, 4 DEAD_NAME. Un nombre que fue puerto y ya no existe es un nombre
+// muerto (1 ref de DEAD_NAME, 0 del resto); uno que nunca existió, KERN_INVALID_NAME.
+int port_get_refs(uint32_t name, uint32_t right, uint32_t* refs) {
+	*refs = 0;
+	lock();
+	struct sport* p = find_locked(name);
+	int r = 0;
+	int32_t me = (int32_t)getpid();
+	if (!p) {
+		if (name && name < shm->next_name && (name & 0xff) == 0x03) { if (right == 4) *refs = 1; }
+		else r = KERN_INVALID_NAME_;
+	} else switch (right) {
+	case 0: *refs = p->is_set ? 0 : 1; break;
+	case 1: *refs = (!p->is_set && p->owner == me) ? 1 : 0; break;
+	case 2:
+		for (int i = 0; i < MAXSO; i++) if (shm->so[i].port == name && shm->so[i].holder == me) (*refs)++;
+		break;
+	case 3: *refs = (p->is_set && p->owner == me) ? 1 : 0; break;
+	case 4: *refs = 0; break;
+	default: r = 4;                                               // KERN_INVALID_VALUE (MACH_PORT_RIGHT desconocido)
+	}
+	unlock();
+	return r;
+}
 // mach_port_swap_guard: cambia la guarda de un puerto guardado (no estricto) si la vieja coincide
 int port_swap_guard(uint32_t name, uint64_t old, uint64_t nw) {
 	lock(); struct sport* p = find_locked(name);

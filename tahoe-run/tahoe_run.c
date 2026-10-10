@@ -849,6 +849,7 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 		if (num < MACH_NAMES_N && mach_table[num]) {
 			g[REG_RAX] = mach_table[num](&c);
 			if (trace_all || g_watch) log_call("mach", num, name, &c, "ok   ");
+			else if (diag_target() && diag_all()) { char v[24]; snprintf(v, sizeof v, "=%llx", (unsigned long long)g[REG_RAX]); log_call("mach", num, name, &c, v); }
 		} else {
 			log_call("mach", num, name, &c, "FALTA");
 			g[REG_RAX] = KERN_FAILURE_;
