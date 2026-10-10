@@ -326,6 +326,10 @@ static void io_init(void) {
 
 	int root = ent_add(-1, "Root", "IORegistryEntry", "", "", PL_SERVICE | PL_DT | PL_POWER, 0);
 	p_str(root, "IORegistryPlanes", "IOService");
+	p_num(root, "OSKernelCPUType", 0x01000007, 32);          // CPU_TYPE_X86_64 (OSKext lo publica como OSNumber desde la cabecera del núcleo)
+	p_num(root, "OSKernelCPUSubtype", 3, 32);                // CPU_SUBTYPE_X86_64_ALL
+	p_str(root, "IOKitBuildVersion", "Darwin Kernel Version 25.6.0: tahoe-run; root:xnu-12377.121.6~1/RELEASE_X86_64");
+	p_str(root, "OS Build Version", "25G83");
 	int plat = ent_add(root, "MacBookPro16,1", "IOPlatformExpertDevice", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(plat, "name", "/");
 	p_cstr(plat, "model", "MacBookPro16,1");

@@ -13,6 +13,7 @@
 #include <dirent.h>
 #include <stddef.h>
 #include "tahoe.h"
+__thread struct ctx* volatile t_cur;   // llamada en curso del hilo (la pone el manejador de SIGSYS)
 
 // bsdthread_register(thread_start, wqthread, pthread_size, ...): libpthread registra aquí las funciones con las
 // que el kernel arranca hilos nuevos. Se guardan y se devuelve la máscara de capacidades.
@@ -310,7 +311,7 @@ void diag_crash(ucontext_t* uc) {
 			int shown = 0;
 			for (int k = 0; k < (int)(got / 8) && shown < 24; k++) {
 				uint64_t a = sk[k];
-				if (a < 0x7ff800000000UL || a >= 0x7ff820000000UL) continue;
+				if (!((a >= 0x7ff800000000UL && a < 0x7ff820000000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;   // caché o ejecutable
 				uint8_t pre[6];
 				if (safe_read(a - 6, pre, 6) != 6) continue;
 				if (pre[1] == 0xe8 || pre[3] == 0xff || pre[4] == 0xff || pre[2] == 0xff) { logf_(" 0x%lx", a); shown++; }
@@ -322,7 +323,6 @@ void diag_crash(ucontext_t* uc) {
 // ---- Volcado de todos los hilos (diagnóstico de cuelgues): con /dev/shm/tahoe-stacks, cuando el proceso indicado cae,
 // cada hilo dice qué llamada al núcleo emulada tiene en curso (t_cur, puesto por el manejador de SIGSYS) o, si estaba
 // ejecutando código del invitado, dónde; y los retornos plausibles de su pila del invitado.
-__thread struct ctx* volatile t_cur;
 extern char tahoe_selector_get(void);
 extern void tahoe_selector_set(char v);
 static void plausible_returns(uint64_t rsp, int max) {
@@ -346,7 +346,14 @@ static void on_dump(int sig, siginfo_t* si, void* v) {
 	if (c && safe_read((uint64_t)&c->nr, &nr, 8) == 8 && safe_read((uint64_t)&c->uc, &uca, 8) == 8 && uca) {
 		safe_read(uca + offsetof(ucontext_t, uc_mcontext.gregs) + REG_RIP * 8, &rip, 8);
 		safe_read(uca + offsetof(ucontext_t, uc_mcontext.gregs) + REG_RSP * 8, &rsp, 8);
-		logf_("    HILO <%d:%ld> en llamada clase=%lu num=%lu rip=0x%lx:", (int)getpid(), (long)syscall(SYS_gettid), nr >> 24, nr & 0xffffff, rip);
+		logf_("    HILO <%d:%ld> en llamada clase=%lu num=%lu rip=0x%lx", (int)getpid(), (long)syscall(SYS_gettid), nr >> 24, nr & 0xffffff, rip);
+		uint64_t a[3] = { 0 }; safe_read((uint64_t)&c->a, a, sizeof a);
+		uint32_t num = (uint32_t)(nr & 0xffffff);
+		if ((nr >> 24) == 2 && (num == 5 || num == 398 || num == 463 || num == 464)) {   // open / openat: la ruta
+			char path[256] = ""; safe_read(num >= 463 ? a[1] : a[0], path, sizeof path - 1); path[255] = 0;
+			logf_(" \"%s\"", path);
+		} else logf_(" args=%lx,%lx,%lx", a[0], a[1], a[2]);
+		logf_(":");
 	} else {
 		ucontext_t* uc = v;
 		rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP]; rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
@@ -729,6 +736,7 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int
 		enter_guest_thread(wqthread_fn, self - 0x3000, self, kp, (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)(int64_t)nev);
 	}
 	wq_park_ok = 0;                                                  // volvió el hilo aparcado
+	t_cur = NULL;                                                    // salió de la llamada con siglongjmp
 	if (mach_trace()) logf_("    THR <%d:%ld> fin del trabajo\n", (int)getpid(), (long)syscall(SYS_gettid));
 }
 

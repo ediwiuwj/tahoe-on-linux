@@ -78,6 +78,11 @@ static struct entry table[] = {
 	{ "vm.darkwake_mode", { 201, 0x7218 }, K_INT, 0, NULL },
 	{ "net.inet6.send.opmode", { 201, 0x7219 }, K_INT, 0, NULL },
 	{ "kern.hostid", { CTL_KERN, 11 }, K_INT, 0, NULL },
+	{ "kern.safeboot", { CTL_KERN, 66 }, K_INT, 0, NULL },
+	{ "hw.target", { 201, 0x721a }, K_STR, 0, "J152fAP" },              // MobileGestalt (HWModelStr) lo usa: el del MacBookPro16,1
+	{ "hw.osenvironment", { 201, 0x721b }, K_STR, 0, "" },
+	{ "hw.use_kernelmanagerd", { 201, 0x721c }, K_INT, 1, NULL },
+	{ "hw.willshutdown", { 201, 0x721d }, K_INT, 0, NULL },
 	{ "kern.netboot", { CTL_KERN, 40 }, K_INT, 0, NULL },
 	{ "security.mac.lockdown_mode_state", { 200, 1 }, K_INT, 0, NULL },
 	{ "hw.machine", { CTL_HW, 1 }, K_STR, 0, "x86_64" },
