@@ -960,7 +960,7 @@ static void on_sigsegv(int sig, siginfo_t* si, void* v) {
 	(void)sig;
 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
 	if (si->si_code == 0x80 /*SI_KERNEL*/ && emulate_sidt(v)) { selector = SYSCALL_DISPATCH_FILTER_BLOCK; return; }
-	logf_("    SIGSEGV <%d> dirección=%p rip=0x%llx\n", getpid(), si->si_addr, (unsigned long long)((ucontext_t*)v)->uc_mcontext.gregs[REG_RIP]);
+	logf_("    SIGSEGV <%d> hilo %ld dirección=%p rip=0x%llx\n", getpid(), (long)syscall(SYS_gettid), si->si_addr, (unsigned long long)((ucontext_t*)v)->uc_mcontext.gregs[REG_RIP]);
 	diag_crash(v);
 	_exit(139);
 }

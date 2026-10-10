@@ -81,6 +81,8 @@ uint32_t tahoe_flags_path(const char* p);
 void port_move_receive(uint32_t name);
 int port_release_send_once(uint32_t name);
 int port_assert_guard(uint32_t name, uint64_t guard);
+int port_get_attributes(uint32_t name, int flavor, uint32_t* out, uint32_t* cnt);
+int port_set_attributes(uint32_t name, int flavor, const uint32_t* in, uint32_t cnt);
 int port_request_notification(uint32_t name, int variant, uint32_t notify, uint32_t* previous);
 long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total);
 uint32_t special_port_get(int which);

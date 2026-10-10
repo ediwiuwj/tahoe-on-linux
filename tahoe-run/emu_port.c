@@ -33,7 +33,7 @@
 #define MAXPORTS 2048
 #define MAXMSG   512
 #define MSGSZ    (64 * 1024)
-struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; };   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
+struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; };   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
 struct mslot { uint32_t next, size, total, spid, suid, sgid; uint8_t data[MSGSZ - 24]; };
 // Derechos que el núcleo tiene que vigilar para avisar cuando muere su dueño (ver "notificaciones" más abajo):
 //  sonce: un proceso tiene un derecho send-once (normalmente, la respuesta que debe a quien le pidió algo);
@@ -790,16 +790,48 @@ static long t_voucher_create(struct ctx* c) {
 // mach_port_guard_trap(task, nombre, guarda, estricto) / mach_port_unguard_trap(task, nombre, guarda)
 static long t_guard(struct ctx* c) { return port_guard((uint32_t)c->a[1], c->a[2], (int)c->a[3]); }
 static long t_unguard(struct ctx* c) { return port_unguard((uint32_t)c->a[1], c->a[2]); }
-// mach_port_get_attributes_trap(task, nombre, sabor, info*, cuenta*): solo MACH_PORT_RECEIVE_STATUS (2)
-static long t_get_attributes(struct ctx* c) {
-	if ((int)c->a[2] != 2) return KERN_INVALID_VALUE_;
-	uint32_t st[10] = { 0 };            // mach_port_status_t: pset, seqno, mscount, qlimit, msgcount, sorights, srights, pdrequest, nsrequest, flags
+// mach_port_get_attributes (como mach_port.c de XNU). Sabores: 1 LIMITS_INFO {qlimit}, 2 RECEIVE_STATUS
+// (mach_port_status_t), 3 DNREQUESTS_SIZE, 7 INFO_EXT (estado + boost + reservado), 8 GUARD_INFO {guarda u64}.
+// *cnt entra con la capacidad (en enteros de 32 bits) y sale con lo escrito; si no cabe, KERN_FAILURE (5).
+int port_get_attributes(uint32_t name, int flavor, uint32_t* out, uint32_t* cnt) {
+	static const uint32_t need[9] = { 0, 1, 10, 1, 0, 0, 0, 17, 2 };
+	if (flavor < 1 || flavor > 8 || !need[flavor]) return 4;                 // KERN_INVALID_ARGUMENT
+	if (*cnt < need[flavor]) return 5;
 	lock();
-	struct sport* p = find_locked((uint32_t)c->a[1]);
-	if (p) { st[3] = 5; st[4] = p->count; st[6] = 1; }
+	struct sport* p = find_locked(name);
+	if (!p) { unlock(); return KERN_INVALID_RIGHT_; }
+	memset(out, 0, need[flavor] * 4);
+	uint32_t ql = p->qlimit ? p->qlimit : 5;
+	if (flavor == 1) out[0] = ql;
+	else if (flavor == 3) out[0] = 0;
+	else if (flavor == 8) memcpy(out, &p->ctx, 8);
+	else {                                                                   // mach_port_status_t
+		uint32_t so = 0;
+		for (int i = 0; i < MAXSO; i++) if (shm->so[i].port == name) so++;
+		out[0] = p->set; out[1] = 0; out[2] = 0; out[3] = ql; out[4] = p->count; out[5] = so; out[6] = 1;
+		out[7] = p->pdreq != 0; out[8] = 0;
+		out[9] = (p->guarded ? 0x02 : 0) | (p->strict_guard ? 0x04 : 0);    // MACH_PORT_STATUS_FLAG_GUARDED / STRICT_GUARD
+	}
 	unlock();
-	if (!p) return KERN_INVALID_NAME_;
-	if (safe_write(c->a[3], st, sizeof st) != sizeof st) return KERN_INVALID_VALUE_;
+	*cnt = need[flavor];
+	return KERN_OK;
+}
+// mach_port_set_attributes: solo LIMITS_INFO (el límite de cola) tiene efecto que guardar.
+int port_set_attributes(uint32_t name, int flavor, const uint32_t* in, uint32_t cnt) {
+	lock();
+	struct sport* p = find_locked(name);
+	if (p && flavor == 1 && cnt >= 1) p->qlimit = in[0] > 2048 ? 2048 : in[0];
+	unlock();
+	return p ? KERN_OK : KERN_INVALID_RIGHT_;
+}
+// mach_port_get_attributes_trap(task, nombre, sabor, info*, cuenta*)
+static long t_get_attributes(struct ctx* c) {
+	uint32_t cnt = 0, out[17];
+	if (safe_read(c->a[4], &cnt, 4) != 4) return KERN_INVALID_VALUE_;
+	if (cnt > 17) cnt = 17;
+	int r = port_get_attributes((uint32_t)c->a[1], (int)c->a[2], out, &cnt);
+	if (r) return r;
+	if (safe_write(c->a[3], out, cnt * 4) != (ssize_t)(cnt * 4) || safe_write(c->a[4], &cnt, 4) != 4) return KERN_INVALID_VALUE_;
 	return KERN_OK;
 }
 // task_name_for_pid(host, pid, *puerto): puerto de nombre de tarea ficticio por proceso

@@ -499,7 +499,22 @@ static long mach_msg2(struct ctx* c) {
 		uint64_t pol = 0; memcpy(rep + n, &pol, 8); n += 8;       // sin filtrado de mensajes: política 0
 		break;
 	}
-	case 3420: case 3218: n = reply_begin(rep, &h, KERN_SUCCESS_); break;
+	case 3420: n = reply_begin(rep, &h, KERN_SUCCESS_); break;
+	case 3217: {                                                  // mach_port_get_attributes(task, name, flavor, cuenta) -> info[]
+		uint32_t nm, fl, cnt, out[17]; memcpy(&nm, req + 32, 4); memcpy(&fl, req + 36, 4); memcpy(&cnt, req + 40, 4);
+		if (cnt > 17) cnt = 17;
+		int kr = port_get_attributes(nm, (int)fl, out, &cnt);
+		n = reply_begin(rep, &h, kr);
+		if (!kr) { memcpy(rep + n, &cnt, 4); n += 4; memcpy(rep + n, out, cnt * 4); n += cnt * 4; }
+		break;
+	}
+	case 3218: {                                                  // mach_port_set_attributes(task, name, flavor, info[])
+		uint32_t nm, fl, cnt, in[17] = { 0 }; memcpy(&nm, req + 32, 4); memcpy(&fl, req + 36, 4); memcpy(&cnt, req + 40, 4);
+		if (cnt > 17) cnt = 17;
+		if (44 + cnt * 4 <= ssize) memcpy(in, req + 44, cnt * 4);
+		n = reply_begin(rep, &h, port_set_attributes(nm, (int)fl, in, cnt));
+		break;
+	}
 	case 3230: {                                                  // mach_port_get_context(task, name) -> context
 		uint32_t nm; memcpy(&nm, req + 32, 4);
 		n = reply_begin(rep, &h, port_exists(nm) ? KERN_SUCCESS_ : 15 /* KERN_INVALID_NAME */);
