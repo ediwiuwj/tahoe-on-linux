@@ -390,6 +390,26 @@ Estado actual: `launchd` arranca unos 40 procesos y ~20–24 servicios con nombr
 - **Diagnóstico**: los mensajes de aborto se leen de la sección `__crash_info` de todas las imágenes y del ejecutable; trazas
   dirigidas activables con archivos en `/dev/shm` (`tahoe-mach-trace`, `tahoe-stacks`, `tahoe-waittab`, `tahoe-watch-func`).
 
-**Pendiente**: `remoted` (respuesta XPC asíncrona entregada sin contexto), clientes de CarbonCore que no conectan con `coreservicesd`
-(MIG -300), `configd` (cola nula al cargar plugins), `powerd` (necesita el servicio HID de WindowServer), señales reales (`sigreturn`),
-`fileport_makeport`. Después: WindowServer (ya pasa `CA::Render::Server::start`), pantalla por DRM/KMS, entrada por evdev y Metal.
+### Más bases (10 de octubre de 2026, tarde)
+Ya arrancan sin caerse `remoted`, `configd`, `powerd`, `locationd`, `kernelmanagerd`, `airportd` y `containermanagerd`; quedan vivos
+~22–23 servicios con nombre. Cada arreglo sale de la semántica de XNU, no de parches:
+- **Guardas de puerto**: `mach_port_guard/unguard` (trampas y MIG) guardan la guarda en el contexto del puerto, que el receptor ve en el
+  trailer; libxpc guarda así sus puertos de respuesta con el objeto de la petición. `MPO_CONTEXT_AS_GUARD`/`MPO_STRICT`, `swap_guard`,
+  `assert_attributes`; mover un derecho de recepción borra contexto y guarda (`ipc_port_clear_receive`).
+- **Notificaciones Mach**: `MACH_NOTIFY_SEND_ONCE`, `DEAD_NAME` y `PORT_DESTROYED`, con seguimiento de derechos send-once; destrucción
+  de puertos como `ipc_port_destroy`; un recolector en el proceso raíz detecta los procesos muertos y destruye sus derechos (launchd
+  recupera los puertos de sus servicios con su guarda y los relanza).
+- **Números MIG verificados** con el preprocesador sobre los `.defs` (los de `mach_port` estaban desplazados): `get_context`,
+  `get/set_attributes` completos, `get_refs`, `semaphore_destroy`, `mach_task_is_self`. Las respuestas de error son `mig_reply_error_t`.
+- **Temporizadores**: `EVFILT_TIMER` con `NOTE_ABSOLUTE`, `NOTE_MACHTIME` y reloj de pared (libdispatch arma así todos los suyos).
+- **Colas de trabajo**: cada hilo arranca con la QoS de su petición (y OVERCOMMIT/COOPERATIVE), como `workq_setup_and_run`; las
+  peticiones de hilo de workloop siguen activas hasta que se entregan o libdispatch las retira.
+- **Número de CPU**: libdispatch y libmalloc lo leen con `sidt`; en una CPU sin UMIP no se puede atrapar, así que se sustituye en la
+  copia privada de la caché.
+- **Sistema**: socket de eventos del núcleo (`PF_SYSTEM`/`SYSPROTO_EVENT`), `ioctl` FIO*, más `sysctl` (`hw.target`,
+  `kern.bootsessionuuid`...), `OSKernelCPUType` en la raíz de IOKit, `boot-args` como cadena.
+- **Diagnóstico**: al caer el proceso indicado, cada hilo vuelca su llamada en curso y su pila; modo `all` (todas sus llamadas).
+
+**Pendiente**: `opendirectoryd` (se queda esperando al abrir `/Search`), clientes de CarbonCore (`FileIDTreeStorage` no registrado en
+`coreservicesd`), `displaypolicyd` (PF238), señales reales (`sigreturn`), `fileport_makeport`. Después: WindowServer, pantalla por
+DRM/KMS, entrada por evdev y Metal.
