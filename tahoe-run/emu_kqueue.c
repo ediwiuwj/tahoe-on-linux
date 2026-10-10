@@ -98,7 +98,7 @@ static int darwin_to_linux_sig_k(int d) {
 	}
 }
 struct kev { uint64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; uint64_t ext[4]; uint32_t qos; };
-struct knote { struct kev k; int kq, fd; int enabled, owns_fd, deferdel, fake_fd; struct knote* next; };   // deferdel/fake_fd: borrado diferido de XNU (KN_DEFERDELETE)   // owns_fd: el fd es solo de este knote
+struct knote { struct kev k; int kq, fd; int enabled, owns_fd, deferdel, fake_fd, tclock; struct knote* next; };   // deferdel/fake_fd: borrado diferido de XNU (KN_DEFERDELETE)   // owns_fd: el fd es solo de este knote
 static struct knote* notes;
 // Los hilos de las colas de trabajo llaman a kevent a la vez: sin este cerrojo, un hilo liberaba un knote (drop) mientras otro
 // acababa de recibirlo de epoll_wait y lo leía ya liberado (udata = 0 -> SIGSEGV en _dispatch_kevent_merge, que mataba a launchd
@@ -159,13 +159,31 @@ static int workq_kq_get(void) { return kq_for(-1); }
 
 static void kev_out(int layout, uint8_t* b, const struct kev* k);
 
+// EVFILT_TIMER como filt_timervalidate de XNU. Unidades: NOTE_SECONDS 1, NOTE_USECONDS 2, NOTE_NSECONDS 4, NOTE_MACHTIME
+// 0x100 (unidades de mach_absolute_time, que aquí son ns de CLOCK_MONOTONIC: así lo define el commpage), por omisión ms.
+// NOTE_ABSOLUTE 0x8: data es un instante, no un intervalo; en tiempo mach (con NOTE_MACHTIME, continuo o no) se mide en
+// CLOCK_MONOTONIC, y en s/us/ns en el reloj de pared (CLOCK_REALTIME). libdispatch arma TODOS sus temporizadores así
+// (NOTE_ABSOLUTE | NOTE_LEEWAY | reloj). Los relativos sin EV_ONESHOT se repiten con ese periodo.
+#define NOTE_ABSOLUTE_ 0x8u
+#define NOTE_MACHTIME_ 0x100u
+static int timer_clock(const struct kev* k) { return ((k->fflags & NOTE_ABSOLUTE_) && !(k->fflags & NOTE_MACHTIME_)) ? CLOCK_REALTIME : CLOCK_MONOTONIC; }
 static long timer_ns(const struct kev* k) {
 	uint32_t f = k->fflags;
 	long v = (long)k->data;
+	if (f & NOTE_MACHTIME_) return v;
 	if (f & 1) return v * 1000000000L;     // NOTE_SECONDS
 	if (f & 2) return v * 1000L;           // NOTE_USECONDS
 	if (f & 4) return v;                   // NOTE_NSECONDS
 	return v * 1000000L;                   // por omisión, milisegundos
+}
+static void timer_arm(int fd, const struct kev* k) {
+	uint64_t junk; while (read(fd, &junk, 8) == 8) {}                 // vencimientos viejos fuera
+	long ns = timer_ns(k);
+	if (ns <= 0) ns = 1;                                               // 0 desarmaría el timerfd: vencer ya
+	struct itimerspec it = { .it_value = { ns / 1000000000L, ns % 1000000000L } };
+	int abs_ = (k->fflags & NOTE_ABSOLUTE_) != 0;
+	if (!abs_ && !(k->flags & EV_ONESHOT)) it.it_interval = it.it_value;
+	timerfd_settime(fd, abs_ ? TFD_TIMER_ABSTIME : 0, &it, NULL);
 }
 
 // Un knote deshabilitado deja de contar en el registro de su descriptor (si no, un fd legible despertaría sin parar).
@@ -265,12 +283,9 @@ static int apply(int kq, const struct kev* c) {
 			break;
 		}
 		case EVFILT_TIMER: {
-			n->fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-			long ns = timer_ns(c);
-			struct itimerspec it = { .it_value = { ns / 1000000000L, ns % 1000000000L } };
-			if (it.it_value.tv_sec == 0 && it.it_value.tv_nsec == 0) it.it_value.tv_nsec = 1;
-			if (!(c->flags & EV_ONESHOT)) it.it_interval = it.it_value;
-			timerfd_settime(n->fd, 0, &it, NULL);
+			n->fd = timerfd_create(timer_clock(c), TFD_NONBLOCK | TFD_CLOEXEC);
+			n->tclock = timer_clock(c);
+			timer_arm(n->fd, c);
 			n->owns_fd = 1;
 			break;
 		}
@@ -332,12 +347,11 @@ static int apply(int kq, const struct kev* c) {
 			n->k.data = c->data; n->k.qos = c->qos; memcpy(n->k.ext, c->ext, sizeof n->k.ext);
 			n->k.flags = (uint16_t)((c->flags & ~(EV_ADD | EV_DELETE | EV_RECEIPT)) | keep);
 			if (c->filter == EVFILT_TIMER && n->fd >= 0) {
-				long ns = timer_ns(c);
-				struct itimerspec it = { .it_value = { ns / 1000000000L, ns % 1000000000L } };
-				if (it.it_value.tv_sec == 0 && it.it_value.tv_nsec == 0) it.it_value.tv_nsec = 1;
-				if (!(c->flags & EV_ONESHOT)) it.it_interval = it.it_value;
-				uint64_t junk; while (read(n->fd, &junk, 8) == 8) {}   // vencimientos viejos fuera
-				timerfd_settime(n->fd, 0, &it, NULL);
+				if (timer_clock(c) != n->tclock) {                  // otro reloj: un timerfd nuevo
+					int old = n->fd, nf = timerfd_create(timer_clock(c), TFD_NONBLOCK | TFD_CLOEXEC);
+					if (nf >= 0) { n->fd = nf; n->tclock = timer_clock(c); sync_fd(kq, old); close(old); }
+				}
+				timer_arm(n->fd, c);
 			}
 			if (!(c->flags & EV_DISABLE)) knote_set_enabled(n, 1);   // EV_ADD implica activar salvo EV_DISABLE
 		}
