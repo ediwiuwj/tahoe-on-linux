@@ -67,6 +67,7 @@ extern __thread int g_watch;
 int port_drain_idle(uint32_t name);
 int diag_target(void);
 int diag_all(void);
+void diag_dump_threads(void);
 int port_eventfd(uint32_t name);
 int port_send(uint32_t dest, const uint8_t* msg, uint32_t size);
 int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, uint32_t* sender, uint32_t limit, int large);

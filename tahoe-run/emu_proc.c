@@ -10,6 +10,8 @@
 #include <setjmp.h>
 #include <sys/mman.h>
 #include <stdlib.h>
+#include <dirent.h>
+#include <stddef.h>
 #include "tahoe.h"
 
 // bsdthread_register(thread_start, wqthread, pthread_size, ...): libpthread registra aquí las funciones con las
@@ -317,6 +319,61 @@ void diag_crash(ucontext_t* uc) {
 		}
 	}
 
+// ---- Volcado de todos los hilos (diagnóstico de cuelgues): con /dev/shm/tahoe-stacks, cuando el proceso indicado cae,
+// cada hilo dice qué llamada al núcleo emulada tiene en curso (t_cur, puesto por el manejador de SIGSYS) o, si estaba
+// ejecutando código del invitado, dónde; y los retornos plausibles de su pila del invitado.
+__thread struct ctx* volatile t_cur;
+extern char tahoe_selector_get(void);
+extern void tahoe_selector_set(char v);
+static void plausible_returns(uint64_t rsp, int max) {
+	static __thread uint64_t sk[1024];
+	ssize_t got = safe_read(rsp, sk, sizeof sk);
+	int shown = 0;
+	for (int k = 0; k < (int)(got / 8) && shown < max; k++) {
+		uint64_t a = sk[k];
+		if (!((a >= 0x7ff800000000UL && a < 0x7ff820000000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;
+		uint8_t pre[6];
+		if (safe_read(a - 6, pre, 6) != 6) continue;
+		if (pre[1] == 0xe8 || pre[3] == 0xff || pre[4] == 0xff || pre[2] == 0xff) { logf_(" 0x%lx", a); shown++; }
+	}
+}
+static void on_dump(int sig, siginfo_t* si, void* v) {
+	(void)sig; (void)si;
+	char sel = tahoe_selector_get();
+	tahoe_selector_set(0);                                      // SYSCALL_DISPATCH_FILTER_ALLOW: las syscalls del anfitrión van directas
+	struct ctx* c = t_cur;
+	uint64_t nr = 0, uca = 0, rip = 0, rsp = 0;
+	if (c && safe_read((uint64_t)&c->nr, &nr, 8) == 8 && safe_read((uint64_t)&c->uc, &uca, 8) == 8 && uca) {
+		safe_read(uca + offsetof(ucontext_t, uc_mcontext.gregs) + REG_RIP * 8, &rip, 8);
+		safe_read(uca + offsetof(ucontext_t, uc_mcontext.gregs) + REG_RSP * 8, &rsp, 8);
+		logf_("    HILO <%d:%ld> en llamada clase=%lu num=%lu rip=0x%lx:", (int)getpid(), (long)syscall(SYS_gettid), nr >> 24, nr & 0xffffff, rip);
+	} else {
+		ucontext_t* uc = v;
+		rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP]; rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
+		logf_("    HILO <%d:%ld> ejecutando rip=0x%lx:", (int)getpid(), (long)syscall(SYS_gettid), rip);
+	}
+	if (rsp) plausible_returns(rsp, 16);
+	logf_("\n");
+	tahoe_selector_set(sel);
+}
+void diag_dump_threads(void) {
+	static int done;
+	if (done || !diag_target()) return;
+	done = 1;
+	struct sigaction sa = { .sa_sigaction = on_dump, .sa_flags = SA_SIGINFO | SA_ONSTACK };
+	sigaction(SIGRTMIN + 4, &sa, NULL);
+	DIR* d = opendir("/proc/self/task");
+	if (!d) return;
+	long me = syscall(SYS_gettid);
+	struct dirent* e;
+	while ((e = readdir(d))) {
+		long t = atol(e->d_name);
+		if (t > 0 && t != me) syscall(SYS_tgkill, getpid(), t, SIGRTMIN + 4);
+	}
+	closedir(d);
+	struct timespec ts = { 0, 200 * 1000000L }; nanosleep(&ts, NULL);   // que escriban antes de salir
+}
+
 static long bsd_pthread_kill(struct ctx* c) {
 	int s = (int)c->a[1];
 	if (s == 0) return 0;
@@ -597,13 +654,26 @@ static long bsd_bsdthread_terminate(struct ctx* c) {
 static __thread uint64_t my_workloop;   // workloop que atiende este hilo
 #define WQ_DATA_SIZE 32768
 // npre/pre/pdata: eventos que el vigilante ya recogió del kqueue (y el búfer donde quedaron los mensajes Mach recibidos).
-struct wq_job { uint64_t kqid; int workloop, has_req, npre; uint8_t req[72]; uint8_t pre[16 * 72]; uint8_t* pdata; struct wq_job* next; };
+struct wq_job { uint64_t kqid; int workloop, has_req, npre; uint32_t prio; uint8_t req[72]; uint8_t pre[16 * 72]; uint8_t* pdata; struct wq_job* next; };
 struct wl_state { uint64_t kqid; int running, pending, watching, has_req; uint8_t req[72]; struct wl_state* next; };   // watching: ya tiene vigilante
 extern int kq_workloop_fd(uint64_t);
 extern long kq_drain(uint64_t, uint64_t, int, uint64_t, uint64_t);
 static void wl_arm(uint64_t kqid);
 // El kernel solo lanza el hilo si el estado de la cola sigue siendo el que esperaba libdispatch:
 // (*ext[ADDR] & ext[MASK]) == ext[VALUE]; si cambió, la petición está obsoleta y se descarta.
+// Banderas de prioridad del hilo (como workq_setup_and_run de XNU): la QoS de la petición (1..6) en los bits bajos y
+// OVERCOMMIT o COOPERATIVE. libdispatch elige con ellas qué cola raíz vacía (_dispatch_worker_thread2): si no coinciden con
+// la de la petición, lo encolado en esa cola no se vacía nunca. pp es un pthread_priority_t; sin QoS, LEGACY (4).
+#define WQ_OVERCOMMIT 0x00010000u
+#define WQ_COOPERATIVE 0x01000000u
+static uint32_t prio_from_pp(uint32_t pp, int coop) {
+	uint32_t qos = 4;                                                  // THREAD_QOS_LEGACY: los hilos de la cola por omisión
+	if (!(pp & (0x20000000u | 0x02000000u)) && (pp & 0x3f00u)) qos = (uint32_t)__builtin_ffs((int)((pp & 0x3f00u) >> 8));
+	if (coop) qos |= WQ_COOPERATIVE;
+	else if (pp & 0x80000000u) qos |= WQ_OVERCOMMIT;                   // _PTHREAD_PRIORITY_OVERCOMMIT_FLAG
+	return qos;
+}
+static uint32_t prio_from_kev(const uint8_t* kev72) { int32_t pp; memcpy(&pp, kev72 + 12, 4); return prio_from_pp((uint32_t)pp, 0); }
 static int req_still_valid(const uint8_t* req) {
 	uint64_t ext[4];
 	memcpy(ext, req + 40, 32);
@@ -634,7 +704,7 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int
 	uint64_t self = (uint64_t)base + WQ_STACK;
 	if (first) memset(base + WQ_STACK - 0x3000, 0, 0x3000 + psize);   // pthread_t limpio solo la primera vez
 	uint64_t kqid_slot = self - 0x2000, events = kqid_slot + 8;
-	uint64_t flags = WQ_NEWSPI | WQ_PRIO_QOS | 5 /* THREAD_QOS_DEFAULT */;
+	uint64_t flags = WQ_NEWSPI | WQ_PRIO_QOS | (jp->prio ? jp->prio : 4);
 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, self + tsd_offset); flags |= WQ_TSD_SET; }
 	if (!first) flags |= WQ_REUSE;
 	int nev = 0;
@@ -718,7 +788,8 @@ static void wq_spawn(uint64_t kqid, int workloop, const uint8_t* req) {
 	struct wq_job* j = calloc(1, sizeof *j);
 	if (!j) return;
 	j->kqid = kqid; j->workloop = workloop;
-	if (req) { j->has_req = 1; memcpy(j->req, req, 72); }
+	if (req) { j->has_req = 1; memcpy(j->req, req, 72); j->prio = prio_from_kev(req); }
+	if (kqid == ~0ULL) j->prio = (j->prio & 0xffu) | WQ_OVERCOMMIT;   // la kqueue de la cola: hilos de eventos overcommit (kqwq de XNU)
 	wq_spawn_job(j);
 }
 
@@ -728,11 +799,12 @@ void wq_request_workloop(uint64_t kqid, const void* req) {
 	struct wl_state* w = wl_states;
 	while (w && w->kqid != kqid) w = w->next;
 	if (!w) { w = calloc(1, sizeof *w); w->kqid = kqid; w->next = wl_states; wl_states = w; }
-	int valid = req_still_valid(req);
-	int start = !w->running && valid;
+	// El rebote (ESTALE) ya lo hizo kevent al registrarla: desde ahí la petición está activa, aunque el servidor actual
+	// cambie dq_state en paralelo (volver a mirarlo aquí la perdía).
+	int start = !w->running;
 	memcpy(w->req, req, 72); w->has_req = 1;
 	uint8_t copy[72]; memcpy(copy, req, 72);
-	if (start) w->running = 1; else if (valid) w->pending = 1;
+	if (start) w->running = 1; else w->pending = 1;
 	pthread_mutex_unlock(&wl_lock);
 	if (start) wq_spawn(kqid, 1, copy);
 }
@@ -796,6 +868,10 @@ static void* wl_watch(void* p) {
 		if (mach_trace()) logf_("    wl_watch <%d> kqid=0x%lx recogió %ld\n", (int)getpid(), (unsigned long)kqid, d);
 		if (d > 0) {
 			j->kqid = kqid; j->workloop = 1; j->npre = (int)d; j->pdata = data;
+			pthread_mutex_lock(&wl_lock);
+			j->prio = w->has_req ? prio_from_kev(w->req) : prio_from_kev(j->pre);
+			pthread_mutex_unlock(&wl_lock);
+			if (kqid == ~0ULL) j->prio = (j->prio & 0xffu) | WQ_OVERCOMMIT;
 			wq_spawn_job(j);
 			continue;
 		}
@@ -854,8 +930,14 @@ static long bsd_workq_kernreturn(struct ctx* c) {
 	switch (op) {
 	case 0x400: case 0x10: return 0;                                   // SETUP_DISPATCH, NEWSPISUPP
 	case 0x20: case 0x30: {                                            // REQTHREADS(n): hilos de trabajo normales
-		long n = op == 0x20 ? (long)(int)c->a[2] : 1;
-		for (long i = 0; i < n && i < 8; i++) wq_spawn(0, 0, NULL);
+		long n = (long)(int)c->a[2];                                  // arg2 = cuántos, arg3 = pthread_priority_t; 0x30 = cooperativos
+		uint32_t prio = prio_from_pp((uint32_t)c->a[3], op == 0x30);
+		for (long i = 0; i < n && i < 8; i++) {
+			struct wq_job* j = calloc(1, sizeof *j);
+			if (!j) break;
+			j->prio = prio;
+			wq_spawn_job(j);
+		}
 		return 0;
 	}
 	case 0x200: return 0;                                              // SHOULD_NARROW: no

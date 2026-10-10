@@ -827,6 +827,8 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 	greg_t* g = uc->uc_mcontext.gregs;
 	if (si->si_code != SYS_USER_DISPATCH) DIE("SIGSYS inesperado (si_code=%d) en rip=0x%llx", si->si_code, (unsigned long long)g[REG_RIP]);
 	struct ctx c = { .nr = g[REG_RAX], .a = { g[REG_RDI], g[REG_RSI], g[REG_RDX], g[REG_R10], g[REG_R8], g[REG_R9] }, .uc = uc };
+	extern __thread struct ctx* volatile t_cur;
+	t_cur = &c;                                                  // para el volcado de hilos (diag_dump_threads)
 	uint32_t cls = c.nr >> 24, num = c.nr & 0xffffff;
 	if (cls == 2) {                                              // syscall BSD
 		const char* name = num < BSD_NAMES_N ? bsd_names[num] : NULL;
@@ -864,6 +866,7 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 		log_call("clase", (uint32_t)c.nr, NULL, &c, "FALTA");
 		g[REG_RAX] = (uint64_t)-1;
 	}
+	t_cur = NULL;
 	selector = SYSCALL_DISPATCH_FILTER_BLOCK;
 }
 
@@ -897,6 +900,7 @@ void __attribute__((noreturn)) enter_guest_thread(uint64_t rip, uint64_t rsp, ui
 		if (sigaltstack(&ss, NULL) != 0) DIE("hilo: sigaltstack: %s", strerror(errno));
 	}
 	reenable_dispatch();
+	{ extern __thread struct ctx* volatile t_cur; t_cur = NULL; }   // hilo nuevo o reutilizado: sin llamada en curso
 	selector = SYSCALL_DISPATCH_FILTER_BLOCK;
 	register uint64_t r8 __asm__("r8") = a4, r9 __asm__("r9") = a5, r10 __asm__("r10") = rsp;
 	register uint64_t rax __asm__("rax") = rip;
@@ -914,6 +918,7 @@ static void on_sigill(int sig, siginfo_t* si, void* v) {
 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
 	logf_("    SIGILL <%d>\n", getpid());
 	diag_crash(v);
+	diag_dump_threads();
 	_exit(132);
 }
 
@@ -962,6 +967,7 @@ static void on_sigsegv(int sig, siginfo_t* si, void* v) {
 	if (si->si_code == 0x80 /*SI_KERNEL*/ && emulate_sidt(v)) { selector = SYSCALL_DISPATCH_FILTER_BLOCK; return; }
 	logf_("    SIGSEGV <%d> hilo %ld dirección=%p rip=0x%llx\n", getpid(), (long)syscall(SYS_gettid), si->si_addr, (unsigned long long)((ucontext_t*)v)->uc_mcontext.gregs[REG_RIP]);
 	diag_crash(v);
+	diag_dump_threads();
 	_exit(139);
 }
 
