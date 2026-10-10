@@ -60,10 +60,13 @@ static inline int mach_trace(void) { static int v = -1; if (v < 0) v = access("/
 int port_rpid(uint32_t name);
 int port_list_owned(uint32_t* names, uint32_t* types, int max);
 uint64_t port_get_context(uint32_t name);
-int port_set_context(uint32_t name, uint64_t v);
+int port_set_context(uint32_t name, uint64_t v);   // kern_return_t
+int port_guard(uint32_t name, uint64_t guard, int strict);
+int port_unguard(uint32_t name, uint64_t guard);
 extern __thread int g_watch;
 int port_drain_idle(uint32_t name);
 int diag_target(void);
+int diag_all(void);
 int port_eventfd(uint32_t name);
 int port_send(uint32_t dest, const uint8_t* msg, uint32_t size);
 int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, uint32_t* sender, uint32_t limit, int large);
@@ -75,6 +78,9 @@ uint32_t alloc_port(void);
 uint32_t tahoe_flags_fd(int fd);
 uint32_t tahoe_flags_path(const char* p);
 void port_move_receive(uint32_t name);
+int port_release_send_once(uint32_t name);
+int port_assert_guard(uint32_t name, uint64_t guard);
+int port_request_notification(uint32_t name, int variant, uint32_t notify, uint32_t* previous);
 long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total);
 uint32_t special_port_get(int which);
 void registered_ports_set(const uint32_t* p, int n);

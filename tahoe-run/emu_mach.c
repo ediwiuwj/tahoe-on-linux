@@ -351,6 +351,7 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	else if (safe_write(buf, m, size) != (ssize_t)size || safe_write(buf + size, tr, tsize) != (ssize_t)tsize) res = MACH_RCV_INVALID_DATA_;
 	else if (total) *total = size + tsize;
 	if (trace_all) logf_("    mach_msg: recibe en 0x%x id=%d (%u bytes) -> 0x%lx\n", rcv_name, h.id, size, res);
+	if (mach_trace()) { uint64_t cx; memcpy(&cx, tr + 52, 8); logf_("    MT pid=%d.%ld rx destino=0x%x id=%d trailer=%u ctx=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), local, h.id, tsize, tsize >= 60 ? cx : 0); }
 	free(m);
 	return res;
 }
@@ -429,7 +430,19 @@ static long mach_msg2(struct ctx* c) {
 	switch (h.id) {
 	case 217: case 3616: case 3617: n = reply_begin(rep, &h, KERN_SUCCESS_); break;
 	case 5403: n = reply_begin(rep, &h, 46 /* KERN_NOT_SUPPORTED */); break;   // mach_voucher_attr_command: sin vales de atributos
-	case 3207: case 3457: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // mach_port_deallocate (MIG): soltar un derecho de envío no destruye nada / task_set_mach_voucher
+	case 3207: {                                                  // mach_port_deallocate (MIG): soltar un send-once avisa; un derecho de envío no destruye nada
+		uint32_t nm; memcpy(&nm, req + 32, 4);
+		port_release_send_once(nm);
+		n = reply_begin(rep, &h, KERN_SUCCESS_);
+		break;
+	}
+	case 3457: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // task_set_mach_voucher
+	case 3242: {                                                  // mach_port_assert_attributes(task, name, flavor, info[])
+		uint32_t nm, fl, cnt; uint64_t g = 0; memcpy(&nm, req + 32, 4); memcpy(&fl, req + 36, 4); memcpy(&cnt, req + 40, 4);
+		if (cnt >= 2 && ssize >= 52) memcpy(&g, req + 44, 8);
+		n = reply_begin(rep, &h, fl == 8 ? port_assert_guard(nm, g) : 4 /* KERN_INVALID_ARGUMENT */);
+		break;
+	}
 	case 3419: n = reply_begin(rep, &h, 5 /* KERN_FAILURE */); break;       // task_swap_exception_ports: sin puertos de excepción
 	case 3200: {                                                  // mach_port_names(task) -> names[], types[] (dos OOL)
 		static uint32_t nm[2048], ty[2048];
@@ -485,13 +498,18 @@ static long mach_msg2(struct ctx* c) {
 	}
 	case 3235: {                                                  // mach_port_guard(task, name, guard, strict): la guarda es el contexto
 		uint32_t nm; uint64_t g; memcpy(&nm, req + 32, 4); memcpy(&g, req + 36, 8);
-		n = reply_begin(rep, &h, port_set_context(nm, g) ? KERN_SUCCESS_ : 15);
+		uint32_t strict = 0; memcpy(&strict, req + 44, 4);
+		n = reply_begin(rep, &h, port_guard(nm, g, strict));
 		break;
 	}
-	case 3236: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // mach_port_unguard
+	case 3236: {                                                  // mach_port_unguard(task, name, guard)
+		uint32_t nm; uint64_t g; memcpy(&nm, req + 32, 4); memcpy(&g, req + 36, 8);
+		n = reply_begin(rep, &h, port_unguard(nm, g));
+		break;
+	}
 	case 3231: {                                                  // mach_port_set_context(task, name, context)
 		uint32_t nm; uint64_t ctx; memcpy(&nm, req + 32, 4); memcpy(&ctx, req + 36, 8);
-		n = reply_begin(rep, &h, port_set_context(nm, ctx) ? KERN_SUCCESS_ : 15);
+		n = reply_begin(rep, &h, port_set_context(nm, ctx));
 		break;
 	}   // task_policy_set / mach_port_set_attributes: sin efecto
 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;

@@ -23,6 +23,7 @@ struct entry {
 
 #define CTL_KERN 1
 #define CTL_HW 6
+static char boot_session[40] = "B0070000-0000-4000-8000-000000000003";
 // Identificadores reales de Darwin cuando existen; el resto (nombres dinámicos) usan 0x7000 + n.
 static struct entry table[] = {
 	{ "kern.ostype", { CTL_KERN, 1 }, K_STR, 0, "Darwin" },
@@ -71,6 +72,13 @@ static struct entry table[] = {
 	{ "security.mac.amfi.allow_only_platform_code", { 201, 0x7213 }, K_INT, 0, NULL },
 	{ "vm.shared_region_pivot", { 201, 0x7214 }, K_INT, 0, NULL },
 	{ "hw.mempath", { 201, 0x7300 }, K_STR, 0, "" },
+	{ "kern.bootsessionuuid", { 201, 0x7215 }, K_STR, 0, boot_session },   // UUID de esta sesión de arranque (el boot_id de Linux)
+	{ "kern.hv_support", { 201, 0x7216 }, K_INT, 0, NULL },                  // sin Hypervisor.framework
+	{ "kern.hv_vmm_present", { 201, 0x7217 }, K_INT, 0, NULL },
+	{ "vm.darkwake_mode", { 201, 0x7218 }, K_INT, 0, NULL },
+	{ "net.inet6.send.opmode", { 201, 0x7219 }, K_INT, 0, NULL },
+	{ "kern.hostid", { CTL_KERN, 11 }, K_INT, 0, NULL },
+	{ "kern.netboot", { CTL_KERN, 40 }, K_INT, 0, NULL },
 	{ "security.mac.lockdown_mode_state", { 200, 1 }, K_INT, 0, NULL },
 	{ "hw.machine", { CTL_HW, 1 }, K_STR, 0, "x86_64" },
 	{ "hw.model", { CTL_HW, 2 }, K_STR, 0, "MacBookPro16,1" },
@@ -97,6 +105,12 @@ static struct entry table[] = {
 #define NENT (sizeof table / sizeof table[0])
 
 void emu_sysctl_init(void) {
+	FILE* bf = fopen("/proc/sys/kernel/random/boot_id", "r");
+	if (bf) {
+		char b[64] = "";
+		if (fgets(b, sizeof b, bf) && strlen(b) >= 36) { for (int i = 0; i < 36; i++) boot_session[i] = (b[i] >= 'a' && b[i] <= 'f') ? (char)(b[i] - 32) : b[i]; boot_session[36] = 0; }
+		fclose(bf);
+	}
 	long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
 	long long mem = (long long)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE);
 	for (size_t i = 0; i < NENT; i++) {

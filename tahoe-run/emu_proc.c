@@ -250,6 +250,8 @@ int diag_target(void) {
 	}
 	return want;
 }
+// Con /dev/shm/tahoe-stacks-all, el proceso indicado registra todas sus syscalls BSD (no solo las que fallan).
+int diag_all(void) { static int v = -1; if (v < 0) v = access("/dev/shm/tahoe-stacks-all", F_OK) == 0; return v; }
 // Lee los mensajes de aborto del ejecutable principal (cargado en 0x100000000) y de todas las imágenes de la caché
 // compartida (mapeada en 0x7ff800000000, sin slide).
 static void crash_messages(void) {

@@ -835,7 +835,10 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 		if (num < BSD_NAMES_N && bsd_table[num]) { r = bsd_table[num](&c); verdict = "ok   "; }
 		else { r = -DARWIN_ENOSYS; verdict = "FALTA"; }
 		if (trace_all || g_watch || verdict[0] == 'F') log_call("bsd", num, name, &c, verdict);
-		else if (r < 0 && r > -4096 && !c.raw_ret && diag_target()) { char v[16]; snprintf(v, sizeof v, "E%-4ld", -r); log_call("bsd", num, name, &c, v); }   // diagnóstico: errores del proceso indicado
+		else if (diag_target() && ((r < 0 && r > -4096 && !c.raw_ret) || diag_all())) {   // diagnóstico: errores (o todo) del proceso indicado
+			char v[24]; if (r < 0 && r > -4096 && !c.raw_ret) snprintf(v, sizeof v, "E%-4ld", -r); else snprintf(v, sizeof v, "=%lx", r);
+			log_call("bsd", num, name, &c, v);
+		}
 		if (c.raw_ret) { g[REG_RAX] = (uint64_t)r; g[REG_EFL] &= ~1UL; }
 		else if (r < 0 && r > -4096) { g[REG_RAX] = -r; g[REG_EFL] |= 1; }   // error: rax = errno, CF = 1
 		else { g[REG_RAX] = r; g[REG_EFL] &= ~1UL; if (c.has_ret2) g[REG_RDX] = c.ret2; }
