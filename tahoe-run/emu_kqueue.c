@@ -26,6 +26,7 @@
 #include "tahoe.h"
 
 extern void wq_request_workloop(uint64_t, const void* req72);
+extern void wq_cancel_workloop(uint64_t kqid);
 extern void wq_note_workloop(uint64_t);
 extern void wq_arm_workloop(uint64_t);
 
@@ -258,6 +259,16 @@ static int wl_sync_change(int kq, struct kev* c) {
 static int apply(int kq, const struct kev* c) {
 	if ((trace_all || mach_trace()) && c->filter == EVFILT_MACHPORT) logf_("    kevent: <%d> cambio MACHPORT 0x%lx flags=0x%x fflags=0x%x kq=%d\n", (int)getpid(), c->ident, c->flags, c->fflags, kq);
 	struct knote* n = find(kq, c->ident, c->filter, c->flags, c->udata);
+	if (c->filter == EVFILT_WORKLOOP && (c->fflags & NOTE_WL_THREAD_REQUEST) && (c->flags & EV_DELETE)) {
+		// libdispatch retira la petición de hilo (ASYNC_LEAVE / RETARGET) cuando la cola deja de estar encolada, con su
+		// propio rebote: si dq_state ya cambió, ESTALE y la petición sigue en pie. Si no, deja de estar pendiente.
+		struct kev cc = *c;
+		int de = wl_debounce(&cc);
+		if (de) { if (de == D_ESTALE && (c->fflags & NOTE_WL_IGNORE_ESTALE)) return 0; ((struct kev*)c)->ext[3] = cc.ext[3]; return de; }
+		wq_cancel_workloop(c->ident);
+		if (n) drop(n);
+		return 0;
+	}
 	if (c->flags & EV_DELETE) {
 		if (!n) return D_ENOENT;
 		// XNU: borrar sin EV_ENABLE un knote EV_DISPATCH2 desactivado queda diferido (EINPROGRESS) hasta que se reactive.

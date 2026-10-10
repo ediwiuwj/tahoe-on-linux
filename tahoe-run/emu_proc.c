@@ -737,13 +737,24 @@ void wq_request_workloop(uint64_t kqid, const void* req) {
 	if (start) wq_spawn(kqid, 1, copy);
 }
 
+// libdispatch retiró la petición de hilo de este workloop: ya no hay que lanzar otro servidor al terminar el actual.
+void wq_cancel_workloop(uint64_t kqid) {
+	pthread_mutex_lock(&wl_lock);
+	struct wl_state* w = wl_states;
+	while (w && w->kqid != kqid) w = w->next;
+	if (w) { w->pending = 0; w->has_req = 0; }
+	pthread_mutex_unlock(&wl_lock);
+}
+
 static pthread_cond_t wl_cv = PTHREAD_COND_INITIALIZER;     // avisa a los vigilantes de que su workloop quedó libre
 
 static void wl_finished(uint64_t kqid) {
 	pthread_mutex_lock(&wl_lock);
 	struct wl_state* w = wl_states;
 	while (w && w->kqid != kqid) w = w->next;
-	int again = w && w->pending && req_still_valid(w->req);
+	// Como en XNU: la petición que llegó con el workloop ocupado sigue activa hasta que se entrega o libdispatch la retira
+	// (EV_DELETE con NOTE_WL_THREAD_REQUEST, ver wq_cancel_workloop); el rebote solo se mira al registrarla y al retirarla.
+	int again = w && w->pending;
 	uint8_t copy[72];
 	if (w) { w->pending = 0; w->running = again; memcpy(copy, w->req, 72); }
 	pthread_cond_broadcast(&wl_cv);
