@@ -611,6 +611,13 @@ int port_assert_guard(uint32_t name, uint64_t guard) {
 	int r = !p ? 15 : (p->guarded && p->strict_guard && p->ctx == guard) ? 0 : 4;
 	unlock(); return r;
 }
+// mach_port_swap_guard: cambia la guarda de un puerto guardado (no estricto) si la vieja coincide
+int port_swap_guard(uint32_t name, uint64_t old, uint64_t nw) {
+	lock(); struct sport* p = find_locked(name);
+	int r = !p ? 15 : (!p->guarded || p->strict_guard || p->ctx != old) ? 4 : 0;
+	if (!r) p->ctx = nw;
+	unlock(); return r;
+}
 // Guardas de puerto como en XNU (mach_port_guard_locked / unguard_locked): la guarda se guarda en el contexto, que el
 // receptor ve en el trailer (msgh_context). libxpc guarda así sus puertos de respuesta con el objeto de la petición.
 int port_guard(uint32_t name, uint64_t guard, int strict) {

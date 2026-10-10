@@ -430,7 +430,7 @@ static long mach_msg2(struct ctx* c) {
 	switch (h.id) {
 	case 217: case 3616: case 3617: n = reply_begin(rep, &h, KERN_SUCCESS_); break;
 	case 5403: n = reply_begin(rep, &h, 46 /* KERN_NOT_SUPPORTED */); break;   // mach_voucher_attr_command: sin vales de atributos
-	case 3207: {                                                  // mach_port_deallocate (MIG): soltar un send-once avisa; un derecho de envío no destruye nada
+	case 3206: {                                                  // mach_port_deallocate (MIG): soltar un send-once avisa; un derecho de envío no destruye nada
 		uint32_t nm; memcpy(&nm, req + 32, 4);
 		port_release_send_once(nm);
 		n = reply_begin(rep, &h, KERN_SUCCESS_);
@@ -515,24 +515,40 @@ static long mach_msg2(struct ctx* c) {
 		n = reply_begin(rep, &h, port_set_attributes(nm, (int)fl, in, cnt));
 		break;
 	}
-	case 3230: {                                                  // mach_port_get_context(task, name) -> context
+	case 3228: {                                                  // mach_port_get_context(task, name) -> context
 		uint32_t nm; memcpy(&nm, req + 32, 4);
 		n = reply_begin(rep, &h, port_exists(nm) ? KERN_SUCCESS_ : 15 /* KERN_INVALID_NAME */);
 		uint64_t ctx = port_get_context(nm); memcpy(rep + n, &ctx, 8); n += 8;
 		break;
 	}
-	case 3235: {                                                  // mach_port_guard(task, name, guard, strict): la guarda es el contexto
+	case 3233: {                                                  // mach_port_guard(task, name, guard, strict): la guarda es el contexto
 		uint32_t nm; uint64_t g; memcpy(&nm, req + 32, 4); memcpy(&g, req + 36, 8);
 		uint32_t strict = 0; memcpy(&strict, req + 44, 4);
 		n = reply_begin(rep, &h, port_guard(nm, g, strict));
 		break;
 	}
-	case 3236: {                                                  // mach_port_unguard(task, name, guard)
+	case 3234: {                                                  // mach_port_unguard(task, name, guard)
 		uint32_t nm; uint64_t g; memcpy(&nm, req + 32, 4); memcpy(&g, req + 36, 8);
 		n = reply_begin(rep, &h, port_unguard(nm, g));
 		break;
 	}
-	case 3231: {                                                  // mach_port_set_context(task, name, context)
+	case 3207: {                                                  // mach_port_get_refs(task, name, right) -> refs
+		uint32_t nm; memcpy(&nm, req + 32, 4);
+		n = reply_begin(rep, &h, port_exists(nm) ? KERN_SUCCESS_ : 15);
+		uint32_t refs = port_exists(nm) ? 1 : 0; memcpy(rep + n, &refs, 4); n += 4;
+		break;
+	}
+	case 3237: {                                                  // mach_port_guard_with_flags(task, name, guard, flags): MPG_STRICT = 1
+		uint32_t nm; uint64_t g, fl; memcpy(&nm, req + 32, 4); memcpy(&g, req + 36, 8); memcpy(&fl, req + 44, 8);
+		n = reply_begin(rep, &h, port_guard(nm, g, (int)(fl & 1)));
+		break;
+	}
+	case 3238: {                                                  // mach_port_swap_guard(task, name, viejo, nuevo): solo sin guarda estricta
+		uint32_t nm; uint64_t o, nw; memcpy(&nm, req + 32, 4); memcpy(&o, req + 36, 8); memcpy(&nw, req + 44, 8);
+		n = reply_begin(rep, &h, port_swap_guard(nm, o, nw));
+		break;
+	}
+	case 3229: {                                                  // mach_port_set_context(task, name, context)
 		uint32_t nm; uint64_t ctx; memcpy(&nm, req + 32, 4); memcpy(&ctx, req + 36, 8);
 		n = reply_begin(rep, &h, port_set_context(nm, ctx));
 		break;

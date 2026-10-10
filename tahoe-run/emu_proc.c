@@ -655,10 +655,11 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int
 		wq_park_ok = 1;
 		static __thread uint32_t kp_cache; if (!kp_cache) kp_cache = alloc_port();
 		uint32_t kp = kp_cache;
-		if (mach_trace()) logf_("    THR <%d:%ld> hilo de cola puerto 0x%x\n", (int)getpid(), (long)syscall(SYS_gettid), kp);
+		if (mach_trace()) logf_("    THR <%d:%ld> hilo de cola puerto 0x%x %s kqid=0x%lx eventos=%d\n", (int)getpid(), (long)syscall(SYS_gettid), kp, j.workloop ? (j.kqid == ~0ULL ? "kq-cola" : "workloop") : "trabajador", j.kqid, nev);
 		enter_guest_thread(wqthread_fn, self - 0x3000, self, kp, (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)(int64_t)nev);
 	}
 	wq_park_ok = 0;                                                  // volvió el hilo aparcado
+	if (mach_trace()) logf_("    THR <%d:%ld> fin del trabajo\n", (int)getpid(), (long)syscall(SYS_gettid));
 }
 
 static void* wq_main(void* p) {
