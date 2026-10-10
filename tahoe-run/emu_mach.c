@@ -436,14 +436,24 @@ static long mach_msg2(struct ctx* c) {
 		n = reply_begin(rep, &h, KERN_SUCCESS_);
 		break;
 	}
-	case 3457: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // task_set_mach_voucher
+	case 3442: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // task_set_mach_voucher
+	case 3457: {                                                  // _kernelrpc_mach_task_is_self(task) -> boolean
+		n = reply_begin(rep, &h, KERN_SUCCESS_);
+		uint32_t yes = h.remote == 0x103; memcpy(rep + n, &yes, 4); n += 4;   // PORT_TASK_SELF
+		break;
+	}
 	case 3242: {                                                  // mach_port_assert_attributes(task, name, flavor, info[])
 		uint32_t nm, fl, cnt; uint64_t g = 0; memcpy(&nm, req + 32, 4); memcpy(&fl, req + 36, 4); memcpy(&cnt, req + 40, 4);
 		if (cnt >= 2 && ssize >= 52) memcpy(&g, req + 44, 8);
 		n = reply_begin(rep, &h, fl == 8 ? port_assert_guard(nm, g) : 4 /* KERN_INVALID_ARGUMENT */);
 		break;
 	}
-	case 3419: n = reply_begin(rep, &h, 5 /* KERN_FAILURE */); break;       // task_swap_exception_ports: sin puertos de excepción
+	case 3419: {                                                  // semaphore_destroy(task, semáforo): descriptor de puerto en el cuerpo
+		uint32_t nm = 0; if (ssize >= 40) memcpy(&nm, req + 28, 4);
+		n = reply_begin(rep, &h, machsem_destroy(nm));
+		break;
+	}
+	case 3415: n = reply_begin(rep, &h, 5 /* KERN_FAILURE */); break;       // task_swap_exception_ports: sin puertos de excepción
 	case 3200: {                                                  // mach_port_names(task) -> names[], types[] (dos OOL)
 		static uint32_t nm[2048], ty[2048];
 		int cnt = port_list_owned(nm, ty, 2048);

@@ -36,6 +36,20 @@ static struct sem* find(uint32_t name) {
 	return s;
 }
 
+// semaphore_destroy: el semáforo deja de existir (los que esperaban despiertan). La memoria se conserva por si un hilo
+// sigue dentro de wait_sem con el puntero; son pocos bytes por hilo terminado.
+int machsem_destroy(uint32_t name) {
+	pthread_mutex_lock(&table_lock);
+	struct sem** pp = &sems;
+	while (*pp && (*pp)->name != name) pp = &(*pp)->next;
+	struct sem* s = *pp;
+	if (s) *pp = s->next;
+	pthread_mutex_unlock(&table_lock);
+	if (!s) return KERN_BAD_ARG;
+	pthread_mutex_lock(&s->m); s->count += 1 << 20; pthread_cond_broadcast(&s->cv); pthread_mutex_unlock(&s->m);
+	return KERN_OK;
+}
+
 static void signal_one(struct sem* s) { pthread_mutex_lock(&s->m); s->count++; pthread_cond_signal(&s->cv); pthread_mutex_unlock(&s->m); }
 
 // Espera con plazo opcional (ns relativos; <0 = sin plazo). 0 = obtenido, 1 = plazo vencido.

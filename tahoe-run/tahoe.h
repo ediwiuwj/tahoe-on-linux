@@ -74,6 +74,7 @@ void emu_sem_init(void);
 void emu_psynch_init(void);
 void emu_cs_init(void);
 uint32_t sem_create(int value);
+int machsem_destroy(uint32_t name);
 uint32_t alloc_port(void);
 uint32_t tahoe_flags_fd(int fd);
 uint32_t tahoe_flags_path(const char* p);
