@@ -364,7 +364,7 @@ static void io_init(void) {
 
 	int opt = ent_add(plat, "options", "IODTNVRAM", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(opt, "name", "options");
-	p_data(opt, "boot-args", "", 1);
+	p_str(opt, "boot-args", "");                              // OSString, como IONVRAMCHRPHandler (las variables de texto son cadenas)
 	int chosen = ent_add(plat, "chosen", "IOService", "IORegistryEntry", "", PL_SERVICE | PL_DT, 0);
 	p_cstr(chosen, "name", "chosen");
 	p_data(chosen, "boot-uuid", "00000000-0000-1000-8000-000000000002", 37);
