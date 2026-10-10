@@ -13,3 +13,6 @@ __pycache__/
 # tahoe-run
 tahoe-run/tahoe-run
 tahoe-run/sysnames.h
+
+# Volcados de diagnóstico locales
+tahoe-run/ss.out
