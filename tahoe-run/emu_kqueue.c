@@ -258,6 +258,7 @@ static int wl_sync_change(int kq, struct kev* c) {
 // Aplica un cambio; devuelve 0 o un errno de Darwin.
 static int apply(int kq, const struct kev* c) {
 	if ((trace_all || mach_trace()) && c->filter == EVFILT_MACHPORT) logf_("    kevent: <%d> cambio MACHPORT 0x%lx flags=0x%x fflags=0x%x kq=%d\n", (int)getpid(), c->ident, c->flags, c->fflags, kq);
+	if ((trace_all || mach_trace()) && c->filter == EVFILT_TIMER) logf_("    kevent: <%d> cambio TIMER 0x%lx flags=0x%x fflags=0x%x data=%ld kq=%d\n", (int)getpid(), c->ident, c->flags, c->fflags, (long)c->data, kq);
 	struct knote* n = find(kq, c->ident, c->filter, c->flags, c->udata);
 	if (c->filter == EVFILT_WORKLOOP && (c->fflags & NOTE_WL_THREAD_REQUEST) && (c->flags & EV_DELETE)) {
 		// libdispatch retira la petición de hilo (ASYNC_LEAVE / RETARGET) cuando la cola deja de estar encolada, con su
