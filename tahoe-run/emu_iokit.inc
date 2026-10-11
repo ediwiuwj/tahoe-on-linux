@@ -990,14 +990,65 @@ static int32_t uc_watchdog(struct uc_call* c) {
 	*c->nsout = 0; *c->noutband = 0;
 	return 0;
 }
-// AppleGPUWranglerUserClient: de momento cada selector se anota con sus entradas (para conocer la interfaz que usa
-// GPUWrangler.framework) y se responde «no soportado».
+static int io_trace = -1;                                   // traza de IOKit (TAHOE_IOKIT o /dev/shm/tahoe-iokit-trace)
+// AppleGPUWranglerUserClient (interfaz deducida de GPUWrangler.framework, que es quien la usa):
+//   0xa0000001 saludo: entra y sale una estructura de 4 bytes con la versión ('GW' << 16 | 2).
+//   0xa0000002 lista de GPU: estructura de 0x23bc bytes (fuera de línea): u32 número de GPU, cabecera hasta 0x3c y 16
+//              entradas de 0x238. Entrada: +0 u16 id; +4 u32 banderas (0x1 expulsada, 0x2 extraíble, 0x10 integrada,
+//              0x20 discreta); +8 y +0x10 u64 ID de registro (índices 1 y 0 de GPUWranglerGPUGetRegistryEntryID);
+//              +0x18 u64 número de framebuffers; +0x20 u64[] sus ID de registro; +0x220/+0x228 otros ID (índices 2 y 1).
+//   0xa0000003 eventos: estructura de 0xa9 bytes, u32 número de eventos y el evento; sin eventos, 0.
+//   0xa0000004 entra un u64 (plazo); sin salida.
+// La GPU es la gráfica integrada emulada (IGPU en PCI0), con su framebuffer y su acelerador.
+static int ent_by_name_cls(const char* name, const char* cls) {
+	for (int i = 0; i < io_ne; i++) if (!strcmp(io_e[i].name, name) && !strcmp(io_e[i].cls, cls)) return i;
+	return -1;
+}
 static int32_t uc_gpuwrangler(struct uc_call* c) {
-	char a[200] = ""; int k = 0;
-	for (uint32_t i = 0; i < c->nsin && i < 8 && k < 180; i++) k += snprintf(a + k, sizeof a - (size_t)k, " 0x%lx", (unsigned long)c->sin[i]);
-	logf_("    iokit: <%d> GPUWrangler selector %u escalares=%u:%s entrada=%uB salida pedida=%u escalares/%uB\n", (int)getpid(), c->selector, c->nsin, a, c->ninband, *c->nsout, *c->noutband);
-	*c->nsout = 0; *c->noutband = 0;
-	return kIOReturnUnsupported;
+	if (trace_all || io_trace > 0) logf_("    iokit: <%d> GPUWrangler selector 0x%x entrada=%uB (+%luB fuera) salida=%uB (+%luB fuera)\n", (int)getpid(), c->selector, c->ninband, (unsigned long)c->ool_in_size, *c->noutband, (unsigned long)c->ool_out_size);
+	*c->nsout = 0;
+	switch (c->selector) {
+	case 0xa0000001: {
+		uint32_t v = 0x47570002;                                 // misma versión que pide GPUWrangler
+		if (*c->noutband < 4) return kIOReturnBadArgument;
+		memcpy(c->outband, &v, 4); *c->noutband = 4;
+		return 0;
+	}
+	case 0xa0000002: {
+		static uint8_t list[0x23bc];
+		memset(list, 0, sizeof list);
+		int gpu = ent_by_name_cls("IGPU", "IOPCIDevice"), fb = ent_by_name_cls("AppleIntelFramebuffer", "AppleIntelFramebuffer");
+		int acc = ent_by_name_cls("IOAccelerator", "IOAccelerator");
+		if (gpu >= 0) {
+			uint32_t n = 1; memcpy(list, &n, 4);
+			uint8_t* e = list + 0x3c;
+			uint16_t id = 1; memcpy(e, &id, 2);
+			uint32_t fl = 0x10; memcpy(e + 4, &fl, 4);              // integrada
+			uint64_t rg = io_e[gpu].id, ra = acc >= 0 ? io_e[acc].id : 0, nfb = fb >= 0, rfb = fb >= 0 ? io_e[fb].id : 0;
+			memcpy(e + 0x10, &rg, 8); memcpy(e + 8, ra ? &ra : &rg, 8);
+			memcpy(e + 0x18, &nfb, 8); memcpy(e + 0x20, &rfb, 8);
+		}
+		if (c->ool_out && c->ool_out_size >= sizeof list) {
+			if (safe_write(c->ool_out, list, sizeof list) != (ssize_t)sizeof list) return kIOReturnBadArgument;
+			*c->ool_out_len = sizeof list; *c->noutband = 0;
+			return 0;
+		}
+		if (*c->noutband >= sizeof list) { memcpy(c->outband, list, sizeof list); *c->noutband = sizeof list; return 0; }
+		return kIOReturnBadArgument;
+	}
+	case 0xa0000003: {
+		uint32_t n = *c->noutband < 0xa9 ? *c->noutband : 0xa9;
+		memset(c->outband, 0, n); *c->noutband = n;                // ningún evento pendiente
+		return 0;
+	}
+	case 0xa0000004:
+		*c->noutband = 0;
+		return 0;
+	default:
+		logf_("    iokit: <%d> GPUWrangler selector 0x%x sin implementar\n", (int)getpid(), c->selector);
+		*c->noutband = 0;
+		return kIOReturnUnsupported;
+	}
 }
 static uc_method_fn uc_hook_for(const char* cls) {
 	if (!strcmp(cls, "AppleGPUWrangler")) return uc_gpuwrangler;
@@ -1085,7 +1136,6 @@ static const struct { int id; const char* name; } io_names[] = {
 	{ 2889, "registry_entry_get_property_bin_buf" },
 	{ 2890, "service_wait_quiet_with_options" },
 };
-static int io_trace = -1;
 static const char* io_name_of(int id) { for (unsigned i = 0; i < sizeof io_names / sizeof *io_names; i++) if (io_names[i].id == id) return io_names[i].name; return "?"; }
 static void io_log_req(const struct hdr* h, const uint8_t* req) {
 	if (io_trace < 0) io_trace = getenv("TAHOE_IOKIT") != NULL || access("/dev/shm/tahoe-iokit-trace", F_OK) == 0;   // el archivo sirve porque launchd no propaga el entorno
