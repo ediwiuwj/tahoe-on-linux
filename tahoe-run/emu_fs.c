@@ -798,6 +798,7 @@ static long bsd_openat(struct ctx* c) {
 	if (dfd == -2) dfd = AT_FDCWD;
 	int flags = darwin_open_flags((int)c->a[2]);
 	long fd = -1;
+	if (!strcmp(path, "/dev/fsevents")) { int f = fsevents_open(); return f < 0 ? -2 : f; }
 	if (tahoe_root && path[0] == '/' && !tahoe_host_passthrough(path)) {
 		snprintf(full, sizeof full, "%s%s", tahoe_root, path);
 		fd = syscall(SYS_openat, dfd, full, flags, (int)c->a[3]);
@@ -867,7 +868,79 @@ void populate_data_volume(void) {
 	nftw(tmpl_root, tmpl_copy, 32, FTW_PHYS);
 }
 
-void emu_fs_xattr_init(void) {                                  // tras emu_fs2_init (sustituye su getxattr provisional)
+// ---- map_with_linking_np(regiones[], n, info, tamaño): como vm_dyld_pager de XNU. dyld pide al núcleo que proyecte las
+// regiones de datos de una imagen desde su archivo y que aplique al hacerlo los fixups encadenados (rebases con el
+// deslizamiento y binds con la tabla de punteros ya resueltos que manda en `info`). Sin esto, esas páginas quedaban con los
+// punteros codificados (p. ej. la rutina de personalidad de las excepciones de C++).
+struct mwl_region_ { int32_t fd; int32_t prot; uint64_t off, addr, size; };
+struct mwl_hdr_ { uint32_t version; uint16_t page_size, ptr_format; uint32_t binds_off, binds_count, chains_off, chains_size; uint64_t slide, image_address; };
+static int mwl_fixup_page(uint8_t* page, uint64_t pagesz, uint16_t start, int fmt, const uint64_t* binds, uint32_t nb, const struct mwl_hdr_* h) {
+	uint64_t off = start;
+	for (;;) {
+		if (off + 8 > pagesz) return -1;
+		uint64_t v; memcpy(&v, page + off, 8);
+		uint64_t next = (v >> 51) & 0xfff, nv;
+		if (v >> 63) {                                            // bind: ordinal (24) + addend (8)
+			uint32_t ord = (uint32_t)(v & 0xffffff); uint64_t add = (v >> 24) & 0xff;
+			if (ord >= nb) return -1;
+			nv = binds[ord] + add;
+		} else {                                                  // rebase: objetivo (36) + high8
+			uint64_t target = v & 0xfffffffffULL, high8 = (v >> 36) & 0xff;
+			nv = (fmt == 6 ? h->image_address + target : target + h->slide) | (high8 << 56);
+		}
+		memcpy(page + off, &nv, 8);
+		if (!next) return 0;
+		off += next * 4;
+	}
+}
+static long bsd_map_with_linking(struct ctx* c) {
+	if (access("/dev/shm/tahoe-mwl-off", F_OK) == 0) return -78;   // diagnóstico: que enlace dyld (comportamiento antiguo)
+	uint32_t nreg = (uint32_t)c->a[1], bsz = (uint32_t)c->a[3];
+	if (nreg == 0 || nreg > 5 || bsz < sizeof(struct mwl_hdr_) || bsz > (1u << 24)) return -D_EINVAL;
+	struct mwl_region_ r[5];
+	if (safe_read(c->a[0], r, nreg * sizeof r[0]) != (ssize_t)(nreg * sizeof r[0])) return -D_EFAULT;
+	uint8_t* blob = malloc(bsz);
+	if (safe_read(c->a[2], blob, bsz) != (ssize_t)bsz) { free(blob); return -D_EFAULT; }
+	struct mwl_hdr_ h; memcpy(&h, blob, sizeof h);
+	if (diag_target()) { logf_("    MWL <%d> v=%u pág=0x%x fmt=%u binds=%u@0x%x cadenas=0x%x@0x%x slide=0x%lx imagen=0x%lx regiones=%u\n", (int)getpid(), h.version, h.page_size, h.ptr_format, h.binds_count, h.binds_off, h.chains_size, h.chains_off, h.slide, h.image_address, nreg);
+		for (uint32_t i = 0; i < nreg; i++) logf_("      región fd=%d prot=%d off=0x%lx dir=0x%lx tam=0x%lx\n", r[i].fd, r[i].prot, r[i].off, r[i].addr, r[i].size); }
+	long rc = 0;
+	if (h.binds_off + (uint64_t)h.binds_count * 8 > bsz || h.chains_off + (uint64_t)h.chains_size > bsz || (h.ptr_format != 2 && h.ptr_format != 6)) { rc = -D_EINVAL; goto out; }
+	// Las regiones ya están en memoria con el contenido del archivo (las proyectó el cargador, con la cola de bss a cero, y
+	// dyld aún no las tocó): se enlazan en el sitio. Volver a proyectarlas desde el archivo metería en la última página los
+	// bytes que siguen al segmento en vez de ceros.
+	for (uint32_t i = 0; i < nreg; i++)
+		if (mprotect((void*)r[i].addr, r[i].size, PROT_READ | PROT_WRITE) != 0) { rc = err(); goto out; }
+	{
+		const uint64_t* binds = (const uint64_t*)(blob + h.binds_off);
+		const uint8_t* ch = blob + h.chains_off;
+		uint32_t segc; memcpy(&segc, ch, 4);
+		for (uint32_t sgi = 0; sgi < segc; sgi++) {
+			uint32_t so; memcpy(&so, ch + 4 + sgi * 4, 4);
+			if (!so || so + 22 > h.chains_size) continue;
+			const uint8_t* sg = ch + so;
+			uint16_t psz, fmt, pcount; uint64_t segoff;
+			memcpy(&psz, sg + 4, 2); memcpy(&fmt, sg + 6, 2); memcpy(&segoff, sg + 8, 8); memcpy(&pcount, sg + 20, 2);
+			for (uint16_t pi = 0; pi < pcount; pi++) {
+				uint16_t st; memcpy(&st, sg + 22 + pi * 2, 2);
+				if (st == 0xffff) continue;
+				uint64_t pa = h.image_address + segoff + (uint64_t)pi * psz;
+				int inside = 0;
+				for (uint32_t i = 0; i < nreg; i++) if (pa >= r[i].addr && pa + psz <= r[i].addr + r[i].size) inside = 1;
+				if (!inside) continue;                           // páginas de otras regiones: ya las enlazó dyld
+				if (mwl_fixup_page((uint8_t*)pa, psz, st, fmt, binds, h.binds_count, &h) != 0) { rc = -D_EINVAL; goto out; }
+			}
+		}
+	}
+	for (uint32_t i = 0; i < nreg; i++) mprotect((void*)r[i].addr, r[i].size, r[i].prot & 7);
+out:
+	free(blob);
+	if (rc) logf_("    map_with_linking_np: fallo %ld\n", rc);
+	return rc;
+}
+
+void emu_fs_xattr_init(void) {
+	reg_bsd(550, bsd_map_with_linking);                                  // tras emu_fs2_init (sustituye su getxattr provisional)
 	reg_bsd(234, bsd_getxattr); reg_bsd(235, bsd_fgetxattr); reg_bsd(236, bsd_setxattr); reg_bsd(237, bsd_fsetxattr);
 	reg_bsd(238, bsd_removexattr); reg_bsd(239, bsd_fremovexattr); reg_bsd(240, bsd_listxattr); reg_bsd(241, bsd_flistxattr);
 	reg_bsd(341, bsd_stat64_ext); reg_bsd(342, bsd_lstat64_ext); reg_bsd(343, bsd_fstat64_ext);

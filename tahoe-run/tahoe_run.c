@@ -529,6 +529,7 @@ static long bsd_open(struct ctx* c) {
 	char path[4096], full[4200];
 	if (safe_string(c->a[0], path, sizeof path) != 0) return -14;          // EFAULT
 	if (!strcmp(path, "/dev/console")) strcpy(path, "/dev/null");        // sin consola real dentro del entorno
+	if (!strcmp(path, "/dev/fsevents")) { int f = fsevents_open(); return f < 0 ? -2 : f; }   // dispositivo de FSEvents emulado
 	int flags = darwin_open_flags((int)c->a[1]);
 	long fd = -1;
 	if (tahoe_root && path[0] == '/' && !tahoe_host_passthrough(path)) {

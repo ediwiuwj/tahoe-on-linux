@@ -290,7 +290,10 @@ static long net_iflist(struct ctx* c, int af, int v2, int only) {
 			uint8_t tmp[32]; size_t l;
 			if ((l = put_sa(tmp, a->ifa_netmask))) { tmp[1] = 0; if (a->ifa_netmask->sa_family == AF_INET) tmp[1] = 2; else tmp[1] = 30; memcpy(b + k, tmp, l); k += SA_RLEN(l); aa |= 0x4; }
 			if ((l = put_sa(b + k, a->ifa_addr))) { k += SA_RLEN(l); aa |= 0x20; }
-			if ((a->ifa_flags & IFF_BROADCAST) && fam == AF_INET && a->ifa_broadaddr && (l = put_sa(b + k, a->ifa_broadaddr))) { k += SA_RLEN(l); aa |= 0x80; }
+			if (fam == AF_INET) {                              // RTA_BRD siempre en IPv4: broadcast/destino, o la propia dirección (lo0)
+				const struct sockaddr* bd = ((a->ifa_flags & (IFF_BROADCAST | IFF_POINTOPOINT)) && a->ifa_broadaddr) ? a->ifa_broadaddr : a->ifa_addr;
+				if ((l = put_sa(b + k, bd))) { k += SA_RLEN(l); aa |= 0x80; }
+			}
 			memcpy(am + 4, &aa, 4); memcpy(am + 8, &fl, 4); memcpy(am + 12, &idx, 2);
 			uint16_t al2 = (uint16_t)(k - as); memcpy(am, &al2, 2);
 		}

@@ -181,6 +181,33 @@ static long tty_ioctl(int fd, uint32_t req, uint64_t arg, int* handled) {
 	return 0;
 }
 
+// ---- /dev/fsevents: el dispositivo de eventos del sistema de archivos. Se abre un descriptor marcado; FSEVENTS_CLONE
+// devuelve el extremo de lectura de una tubería (no llegan eventos: la lectura espera, como en un sistema quieto). Las demás
+// ioctl del grupo 's' (filtro de dispositivos, eventos compactos/extendidos, id actual) se aceptan.
+#define FSEV_MAX_FD 4096
+static uint8_t fsev_fd[FSEV_MAX_FD];
+static int fsev_keep[FSEV_MAX_FD];                       // extremo de escritura de cada clon (para que la lectura no vea EOF)
+int fsevents_open(void) {
+	int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	if (fd >= 0 && fd < FSEV_MAX_FD) fsev_fd[fd] = 1;
+	return fd;
+}
+static long fsev_ioctl(int fd, uint32_t req, uint64_t arg, int* handled) {
+	*handled = 0;
+	if (fd < 0 || fd >= FSEV_MAX_FD || !fsev_fd[fd] || ((req >> 8) & 0xff) != 's') return 0;
+	*handled = 1;
+	if ((req & 0xff) == 1) {                                  // FSEVENTS_CLONE(event_list*, num_events, queue_depth, int* fd)
+		uint64_t a[3]; if (safe_read(arg, a, 24) != 24) return -D_EFAULT;
+		int p[2]; if (pipe(p) < 0) return err();
+		if (p[0] < FSEV_MAX_FD) { fsev_fd[p[0]] = 2; fsev_keep[p[0]] = p[1]; }
+		fcntl(p[1], F_SETFD, FD_CLOEXEC);
+		int32_t nfd = p[0];
+		return safe_write(a[2], &nfd, 4) == 4 ? 0 : -D_EFAULT;
+	}
+	if ((req & 0xff) == 103) { uint64_t z = 0; return safe_write(arg, &z, 8) == 8 ? 0 : -D_EFAULT; }   // FSEVENTS_GET_CURRENT_ID
+	return 0;
+}
+
 // ioctl de Darwin: las de FIO* genéricas y las de los sockets de eventos; el resto, ENOTTY (lo correcto para isatty()).
 static long net_ioctl(struct ctx* c) {
 	int fd = (int)c->a[0];
@@ -199,6 +226,7 @@ static long net_ioctl(struct ctx* c) {
 	case 0x20006601: return fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ? err() : 0;   // FIOCLEX
 	case 0x20006602: return fcntl(fd, F_SETFD, 0) < 0 ? err() : 0;            // FIONCLEX
 	}
+	{ int handled; long r = fsev_ioctl(fd, req, arg, &handled); if (handled) return r; }
 	{ int handled; long r = tty_ioctl(fd, req, arg, &handled); if (handled) return r; }
 	if (is_kev(fd)) {
 		switch (req) {

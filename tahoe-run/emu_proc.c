@@ -400,6 +400,15 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
 			      (int)getpid(), (long)syscall(SYS_gettid), at, (unsigned long long)g[REG_RAX], (unsigned long long)g[REG_RBX],
 			      (unsigned long long)g[REG_RCX], (unsigned long long)g[REG_RDX], (unsigned long long)g[REG_RSI], (unsigned long long)g[REG_RDI],
 			      (unsigned long long)g[REG_R8], (unsigned long long)g[REG_R12], (unsigned long long)g[REG_R13], (unsigned long long)g[REG_R14], (unsigned long long)g[REG_R15]);
+			FILE* dr = fopen("/dev/shm/tahoe-dumpreg", "r");      // volcar regiones de memoria a archivos
+			if (dr) { uint64_t a, sz; while (fscanf(dr, "%lx %lx", &a, &sz) == 2) { char fn[128]; snprintf(fn, sizeof fn, "/tmp/tahoe-dump-%d-%lx.bin", (int)getpid(), a); FILE* o = fopen(fn, "w"); if (o) { uint8_t* bb = malloc(sz); if (safe_read(a, bb, sz) == (ssize_t)sz) fwrite(bb, 1, sz, o); free(bb); fclose(o); } } fclose(dr); }
+			FILE* pk = fopen("/dev/shm/tahoe-peek", "r");       // además: valor de 8 bytes en esas direcciones
+			if (pk) { char ln[64]; while (fgets(ln, sizeof ln, pk)) {
+				uint64_t a, v = 0;
+				static const struct { const char* n; int r; } rn[] = { {"rax",REG_RAX},{"rsi",REG_RSI},{"rdi",REG_RDI},{"rbx",REG_RBX},{"rsp",REG_RSP},{"rbp",REG_RBP},{"r12",REG_R12},{"r13",REG_R13},{"r14",REG_R14},{"r15",REG_R15} };
+				a = 0; for (size_t q = 0; q < sizeof rn / sizeof rn[0]; q++) if (!strncmp(ln, rn[q].n, 3)) a = (uint64_t)g[rn[q].r] + (ln[3] == '+' ? strtoull(ln + 4, NULL, 16) : 0);
+				if (!a) a = strtoull(ln, NULL, 16);
+				if (a && safe_read(a, &v, 8) == 8) logf_("    PEEK %.*s[0x%lx] = 0x%lx\n", (int)strcspn(ln, "\n"), ln, a, v); } fclose(pk); }
 			brk_poke(at, brk_orig[i]);
 			g[REG_RIP] = (greg_t)at;
 			g[REG_EFL] |= 0x100L;                                // TF: una instrucción y vuelve aquí
