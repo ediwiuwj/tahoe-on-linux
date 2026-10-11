@@ -26,6 +26,7 @@
 #include <sys/prctl.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <pwd.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -496,8 +497,15 @@ static long bsd_issetugid(struct ctx* c) { (void)c; return 0; }
 static long bsd_write(struct ctx* c) {
 	// TAHOE_FD2LOG: lo que el programa escribe en stdout/stderr (p. ej. os_log con OS_ACTIVITY_DT_MODE) va al registro.
 	static int fd2log = -1;
+	// Solo si ese descriptor es /dev/null (lo que launchd da a sus servicios): si es una tubería o un archivo, la salida es de
+	// quien lo lee (diskarbitrationd recoge así lo que imprime apfs.util -p; antes se iba al registro).
 	if (fd2log < 0) fd2log = getenv("TAHOE_FD2LOG") != NULL;
-	long r = syscall(SYS_write, (fd2log && (c->a[0] == 1 || c->a[0] == 2)) ? (unsigned long)logfd : c->a[0], c->a[1], c->a[2]);
+	unsigned long fd = c->a[0];
+	if (fd2log && (fd == 1 || fd == 2)) {
+		struct stat st;
+		if (fstat((int)fd, &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == makedev(1, 3)) fd = (unsigned long)logfd;
+	}
+	long r = syscall(SYS_write, fd, c->a[1], c->a[2]);
 	return r < 0 ? -darwin_errno(errno) : r;
 }
 static long bsd_read(struct ctx* c) {
