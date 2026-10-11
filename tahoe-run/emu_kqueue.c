@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <poll.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -99,7 +100,7 @@ static int darwin_to_linux_sig_k(int d) {
 	}
 }
 struct kev { uint64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; uint64_t ext[4]; uint32_t qos; };
-struct knote { struct kev k; int kq, fd; int enabled, owns_fd, deferdel, fake_fd, tclock; struct knote* next; };   // deferdel/fake_fd: borrado diferido de XNU (KN_DEFERDELETE)   // owns_fd: el fd es solo de este knote
+struct knote { struct kev k; int kq, fd; int enabled, owns_fd, deferdel, fake_fd, tclock; int xfd; uint32_t xport; struct knote* next; };   // xfd/xport: EVFILT_PROC con NOTE_EXEC (pidfd y puerto del aviso, dentro del epoll fd)   // deferdel/fake_fd: borrado diferido de XNU (KN_DEFERDELETE)   // owns_fd: el fd es solo de este knote
 static struct knote* notes;
 // Los hilos de las colas de trabajo llaman a kevent a la vez: sin este cerrojo, un hilo liberaba un knote (drop) mientras otro
 // acababa de recibirlo de epoll_wait y lo leía ya liberado (udata = 0 -> SIGSEGV en _dispatch_kevent_merge, que mataba a launchd
@@ -137,10 +138,23 @@ static void sync_fd(int kq, int fd) {
 	struct epoll_event e = { .events = ev | (all_clear ? EPOLLET : 0), .data.u64 = (uint64_t)(uint32_t)fd };
 	if (epoll_ctl(kq, EPOLL_CTL_MOD, fd, &e) != 0 && errno == ENOENT) epoll_ctl(kq, EPOLL_CTL_ADD, fd, &e);
 }
+#define NOTE_EXEC 0x20000000u
+// EVFILT_PROC con NOTE_EXEC: ¿llegó un aviso de exec? (se consume) / ¿terminó el proceso? (el pidfd es legible)
+static int proc_exec_pending(struct knote* n) {
+	uint8_t* m = NULL; uint32_t sz = 0, snd[3];
+	if (port_receive(n->xport, 0, &m, &sz, snd, 0, 0) != 0) return 0;
+	free(m);
+	return 1;
+}
+static int proc_exited(struct knote* n) {
+	struct pollfd pf = { n->xfd, POLLIN, 0 };
+	return poll(&pf, 1, 0) == 1;
+}
 static void drop(struct knote* dead) {
 	for (struct knote** p = &notes; *p; p = &(*p)->next)
 		if (*p == dead) { *p = dead->next; break; }
 	if (dead->fake_fd > 0) { epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fake_fd, NULL); close(dead->fake_fd); }
+	if (dead->xport) { execwatch_del(dead->xport); if (dead->xfd > 0) close(dead->xfd); }
 	if (dead->fd >= 0) {
 		if (dead->owns_fd) {
 			epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fd, NULL);
@@ -311,6 +325,18 @@ static int apply(int kq, const struct kev* c) {
 			int pfd = (int)syscall(SYS_pidfd_open, (pid_t)c->ident, 0);
 			if (pfd < 0) { int e = darwin_errno(errno); drop(n); return e == D_ENOENT ? 3 /* ESRCH */ : e; }
 			n->fd = pfd; n->owns_fd = 1;
+			if (c->fflags & NOTE_EXEC) {
+				// NOTE_EXEC (launchd lo pide a cada proceso que lanza, para saber cuándo xpcproxy ya ejecutó el programa del
+				// servicio): un epoll con el pidfd y el aviso del puerto de exec (execwatch_add, emu_port.c)
+				uint32_t xp = execwatch_add((int32_t)c->ident);
+				int sock = xp ? port_eventfd(xp) : -1;
+				int ep = sock >= 0 ? epoll_create1(EPOLL_CLOEXEC) : -1;
+				if (ep >= 0) {
+					struct epoll_event e1 = { .events = EPOLLIN, .data.u32 = 0 }, e2 = { .events = EPOLLIN, .data.u32 = 1 };
+					epoll_ctl(ep, EPOLL_CTL_ADD, pfd, &e1); epoll_ctl(ep, EPOLL_CTL_ADD, sock, &e2);
+					n->xfd = pfd; n->fd = ep; n->xport = xp;
+				} else if (xp) execwatch_del(xp);
+			}
 			break;
 		}
 		case EVFILT_SIGNAL: {
@@ -492,7 +518,11 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 				}
 				else { k.fflags = 0; k.ext[0] = k.ext[1] = k.ext[2] = k.ext[3] = 0; }   // sin recepción directa: solo "hay mensaje"
 			}
+			else if (n->k.filter == EVFILT_PROC && n->xport && proc_exec_pending(n)) {
+				k.fflags = NOTE_EXEC; k.data = 0;                                 // el proceso hizo exec: sigue vivo, el knote sigue
+			}
 			else if (n->k.filter == EVFILT_PROC) {
+				if (n->xport && !proc_exited(n)) continue;                        // solo había un aviso de exec ya consumido
 				siginfo_t si = { 0 };
 				int st = 0;
 				if (waitid(P_PID, (id_t)n->k.ident, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid) {

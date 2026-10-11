@@ -528,7 +528,15 @@ int darwin_open_flags(int f) {
 static long bsd_open(struct ctx* c) {
 	char path[4096], full[4200];
 	if (safe_string(c->a[0], path, sizeof path) != 0) return -14;          // EFAULT
-	if (!strcmp(path, "/dev/console")) strcpy(path, "/dev/null");        // sin consola real dentro del entorno
+	if (!strcmp(path, "/dev/console")) {                                  // sin consola real dentro del entorno
+		// diagnóstico: si existe /dev/shm/tahoe-console, la consola es ese archivo (lo que launchd y otros escriben ahí)
+		if (access("/dev/shm/tahoe-console", W_OK) == 0) {
+			long f = syscall(SYS_open, "/dev/shm/tahoe-console", O_WRONLY | O_APPEND | O_CLOEXEC);
+			if (f >= 0 && !(c->a[1] & 0x1000000)) fcntl((int)f, F_SETFD, 0);
+			return f < 0 ? -darwin_errno(errno) : f;
+		}
+		strcpy(path, "/dev/null");
+	}
 	if (!strcmp(path, "/dev/fsevents")) { int f = fsevents_open(); return f < 0 ? -2 : f; }   // dispositivo de FSEvents emulado
 	int flags = darwin_open_flags((int)c->a[1]);
 	long fd = -1;
@@ -606,12 +614,27 @@ static void show_payload(const char* what, uint64_t ns, uint64_t code, uint64_t 
 	}
 	logf_("\n  === %s: espacio=%lu codigo=%lu\n  === motivo: \"%s\"\n  === carga: \"%s\"\n", what, ns, code, msg, pl);
 }
+// pid y marcos de la pila de macOS (direcciones de retorno, con tools/diag/sym.py) de quien aborta
+static void show_frames(struct ctx* c) {
+	logf_("  === pid %d, marcos (rbp):", (int)getpid());
+	uint64_t fp = c->uc ? (uint64_t)c->uc->uc_mcontext.gregs[REG_RBP] : 0;
+	for (int k = 0; k < 24 && fp; k++) {
+		uint64_t fr[2];
+		if (safe_read(fp, fr, 16) != 16 || !fr[1]) break;
+		logf_(" 0x%lx", fr[1]);
+		if (fr[0] <= fp) break;
+		fp = fr[0];
+	}
+	logf_("\n");
+}
 static long bsd_abort_with_payload(struct ctx* c) {
 	show_payload("abort_with_payload", c->a[0], c->a[1], c->a[2], c->a[3], c->a[4]);
+	show_frames(c);
 	_exit(134);
 }
 static long bsd_terminate_with_payload(struct ctx* c) {
 	show_payload("terminate_with_payload", c->a[1], c->a[2], c->a[3], c->a[4], c->a[5]);
+	show_frames(c);
 	_exit(134);
 }
 // csrctl: consulta de SIP. op 0 = CSR_SYSCALL_CHECK; 0 significa "permitido" (como con SIP desactivado).
@@ -708,6 +731,20 @@ static long bsd_proc_info(struct ctx* c) {
 		if (c->a[5] < size) return -DARWIN_EINVAL;
 		if (safe_write(c->a[4], src, size) != (ssize_t)size) return -D_EFAULT;
 		return (long)size;
+	}
+	if ((int)c->a[0] == 2 && (int)c->a[2] == 11) {                         // PIDPATHINFO (proc_pidpath): ruta del ejecutable en macOS
+		char hp[4096];
+		if (exe_host_path((int)c->a[1], hp, sizeof hp) != 0) return -3;   // ESRCH
+		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+		const char* g = (rl && !strncmp(hp, tahoe_root, rl) && hp[rl] == '/') ? hp + rl : hp;
+		size_t len = strlen(g) + 1;
+		if (c->a[5] < 1024 /* PROC_PIDPATHINFO_SIZE */ || c->a[5] < len) return -DARWIN_EINVAL;
+		return safe_write(c->a[4], g, len) == (ssize_t)len ? (long)len : -D_EFAULT;
+	}
+	if ((int)c->a[0] == 2 && (int)c->a[2] == 20) {                         // PIDCOALITIONINFO: una coalición por tipo (la 1)
+		uint64_t b[5] = { 1, 1, 0, 0, 0 };                                  // coalition_id[RESOURCE, JETSAM], reservados
+		if (c->a[5] < sizeof b) return -DARWIN_EINVAL;
+		return safe_write(c->a[4], b, sizeof b) == (ssize_t)sizeof b ? (long)sizeof b : -D_EFAULT;
 	}
 	return -DARWIN_EINVAL;
 }

@@ -9,6 +9,7 @@
 #   ALL=1             con STACKS: todas sus syscalls y trampas Mach
 #   MACH=1            traza de mensajes Mach, workloops e hilos de las colas (MT, WL, THR)
 #   IOK=1             traza de IOKit
+#   CONSOLA=1         lo que se escribe en /dev/console (launchd anota ahí sus errores) se imprime al final
 #   BRK='dir dir...'  int3 en esas direcciones (hex) del proceso de STACKS: registra los registros al pasar (BRK)
 #   PEEK='expr...'    con BRK: lee 8 bytes en cada dirección o registro+desplazamiento (p. ej. rdi+0x50)
 #   TAHOE_RUN=<bin>   otro binario de tahoe-run (comparar versiones)
@@ -16,14 +17,16 @@
 #                     recoveryosd no reinicia si falla, para poder seguir mirando)
 DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
-rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stacks /dev/shm/tahoe-stacks-all /dev/shm/tahoe-mach-trace /dev/shm/tahoe-iokit-trace
+rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stacks /dev/shm/tahoe-stacks-all /dev/shm/tahoe-mach-trace /dev/shm/tahoe-iokit-trace /dev/shm/tahoe-console
 [ -n "$STACKS" ] && echo "$STACKS" > /dev/shm/tahoe-stacks
 [ -n "$ALL" ] && touch /dev/shm/tahoe-stacks-all
 [ -n "$MACH" ] && touch /dev/shm/tahoe-mach-trace
 [ -n "$IOK" ] && touch /dev/shm/tahoe-iokit-trace
+[ -n "$CONSOLA" ] && : > /dev/shm/tahoe-console
 [ -n "$BRK" ] && printf "%s\n" $BRK > /dev/shm/tahoe-break
 [ -n "$PEEK" ] && printf "%s\n" $PEEK > /dev/shm/tahoe-peek
 TAHOE_RUN="${TAHOE_RUN:-}" TAHOE_LOGFILE="$D/msh.log" TAHOE_BOOT_WAIT="${2:-12}" timeout -s TERM -k 5 "${3:-60}" nice -n 10 \
 	"$DIAG/../macos-shell.sh" --launchd $([ "${TAHOE_DEPURAR:-1}" = 0 ] || echo --depurar) -c "$1" < /dev/null 2>&1
 echo "[salida=$?]"
+[ -n "$CONSOLA" ] && { echo "--- consola ---"; cat /dev/shm/tahoe-console; cp /dev/shm/tahoe-console "$D/consola.log"; rm -f /dev/shm/tahoe-console; }
 "$DIAG/clean.sh"

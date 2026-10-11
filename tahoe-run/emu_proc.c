@@ -627,6 +627,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 		int pe = posix_spawn(pidout, g_self_exe, NULL, NULL, nargv, nenv);
 		return pe ? -darwin_errno(pe) : 0;
 	}
+	execwatch_notify();                                              // NOTE_EXEC para quien vigila este proceso (kqueue)
 	execve(g_self_exe, nargv, nenv);
 	return -darwin_errno(errno);
 }

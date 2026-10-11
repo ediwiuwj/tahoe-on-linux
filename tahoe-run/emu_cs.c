@@ -6,6 +6,7 @@
 // (0xfade7172). Muchos servicios consultan los derechos de quien les habla (csops_audittoken sobre el pid del cliente).
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,14 +16,26 @@
 
 #include "tahoe.h"
 
-// Ruta del ejecutable de macOS de un proceso: tahoe-run <caché> <dyld> <ejecutable> [args...]
-static int exe_host_path(int pid, char* out, size_t cap) {
+// Ruta (en el anfitrión) del ejecutable de macOS de un proceso: tahoe-run <caché> <dyld> <ejecutable> [args...]. Si el hilo
+// principal ya terminó, /proc/<pid>/cmdline está vacío: se lee el de otro hilo.
+int exe_host_path(int pid, char* out, size_t cap) {
 	char p[64], buf[8192];
-	snprintf(p, sizeof p, "/proc/%d/cmdline", pid ? pid : (int)getpid());
+	if (pid <= 0) pid = (int)getpid();
+	snprintf(p, sizeof p, "/proc/%d/cmdline", pid);
+	ssize_t n = -1;
 	int fd = open(p, O_RDONLY | O_CLOEXEC);
-	if (fd < 0) return -1;
-	ssize_t n = read(fd, buf, sizeof buf - 1);
-	close(fd);
+	if (fd >= 0) { n = read(fd, buf, sizeof buf - 1); close(fd); }
+	if (n <= 0) {
+		snprintf(p, sizeof p, "/proc/%d/task", pid);
+		DIR* d = opendir(p); struct dirent* de;
+		while (d && n <= 0 && (de = readdir(d))) {
+			if (de->d_name[0] == '.') continue;
+			char tp[96]; snprintf(tp, sizeof tp, "%s/%s/cmdline", p, de->d_name);
+			int tf = open(tp, O_RDONLY | O_CLOEXEC);
+			if (tf >= 0) { n = read(tf, buf, sizeof buf - 1); close(tf); }
+		}
+		if (d) closedir(d);
+	}
 	if (n <= 0) return -1;
 	buf[n] = 0;
 	const char* a = buf; int i = 0;
@@ -35,6 +48,16 @@ static int exe_host_path(int pid, char* out, size_t cap) {
 static uint32_t rd32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static uint32_t be32(const uint8_t* p) { return ntohl(rd32(p)); }
 
+// Desplazamiento de la rebanada x86_64 dentro del archivo (0 si no es universal). -1 si no se puede leer.
+static int64_t slice_offset(int fd) {
+	uint8_t h[4096];
+	if (pread(fd, h, sizeof h, 0) < 32) return -1;
+	if (be32(h) != 0xcafebabe) return 0;
+	uint32_t nf = be32(h + 4);
+	for (uint32_t i = 0; i < nf && 8 + (i + 1) * 20 <= sizeof h; i++)
+		if (be32(h + 8 + i * 20) == 0x01000007) return be32(h + 8 + i * 20 + 8);
+	return -1;
+}
 // Busca en la firma del ejecutable el blob de la ranura indicada. Devuelve malloc() con el blob (cabecera incluida).
 static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
 	char path[4096];
@@ -86,6 +109,79 @@ static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
 	return out;
 }
 
+// SHA-1 y SHA-256 (FIPS 180-4), para el cdhash: el hash del CodeDirectory de la firma, truncado a 20 bytes.
+#define ROTL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+#define ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+static void hash_pad(const uint8_t* m, size_t len, void (*blk)(uint32_t*, const uint8_t*), uint32_t* st) {
+	size_t i = 0;
+	for (; i + 64 <= len; i += 64) blk(st, m + i);
+	uint8_t t[128] = { 0 };
+	size_t r = len - i;
+	memcpy(t, m + i, r); t[r] = 0x80;
+	size_t tl = r + 9 <= 64 ? 64 : 128;
+	uint64_t bits = (uint64_t)len * 8;
+	for (int k = 0; k < 8; k++) t[tl - 1 - k] = (uint8_t)(bits >> (8 * k));
+	blk(st, t); if (tl == 128) blk(st, t + 64);
+}
+static void sha1_blk(uint32_t* h, const uint8_t* p) {
+	uint32_t w[80], a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+	for (int i = 0; i < 16; i++) w[i] = be32(p + 4 * i);
+	for (int i = 16; i < 80; i++) w[i] = ROTL(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+	for (int i = 0; i < 80; i++) {
+		uint32_t f, k;
+		if (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }
+		else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }
+		else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
+		else { f = b ^ c ^ d; k = 0xca62c1d6; }
+		uint32_t t = ROTL(a, 5) + f + e + k + w[i];
+		e = d; d = c; c = ROTL(b, 30); b = a; a = t;
+	}
+	h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+}
+static const uint32_t K256[64] = {
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
+	0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+	0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+	0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08,
+	0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+	0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2 };
+static void sha256_blk(uint32_t* h, const uint8_t* p) {
+	uint32_t w[64], v[8];
+	for (int i = 0; i < 16; i++) w[i] = be32(p + 4 * i);
+	for (int i = 16; i < 64; i++) {
+		uint32_t s0 = ROTR(w[i - 15], 7) ^ ROTR(w[i - 15], 18) ^ (w[i - 15] >> 3);
+		uint32_t s1 = ROTR(w[i - 2], 17) ^ ROTR(w[i - 2], 19) ^ (w[i - 2] >> 10);
+		w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+	}
+	memcpy(v, h, 32);
+	for (int i = 0; i < 64; i++) {
+		uint32_t S1 = ROTR(v[4], 6) ^ ROTR(v[4], 11) ^ ROTR(v[4], 25), ch = (v[4] & v[5]) ^ (~v[4] & v[6]);
+		uint32_t t1 = v[7] + S1 + ch + K256[i] + w[i];
+		uint32_t S0 = ROTR(v[0], 2) ^ ROTR(v[0], 13) ^ ROTR(v[0], 22), mj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+		uint32_t t2 = S0 + mj;
+		v[7] = v[6]; v[6] = v[5]; v[5] = v[4]; v[4] = v[3] + t1; v[3] = v[2]; v[2] = v[1]; v[1] = v[0]; v[0] = t1 + t2;
+	}
+	for (int i = 0; i < 8; i++) h[i] += v[i];
+}
+// cdhash: 20 primeros bytes del hash (del tipo que dice el propio CodeDirectory) del blob del CodeDirectory
+static void cd_hash20(const uint8_t* cd, uint32_t len, uint8_t out[20]) {
+	uint32_t st[8];
+	uint8_t full[32];
+	if (cd[37] == 1) {                                           // CS_HASHTYPE_SHA1
+		uint32_t i1[5] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0 };
+		memcpy(st, i1, sizeof i1);
+		hash_pad(cd, len, sha1_blk, st);
+		for (int i = 0; i < 5; i++) { uint32_t b = htonl(st[i]); memcpy(full + 4 * i, &b, 4); }
+	} else {                                                     // SHA256 (y SHA256 truncado): lo habitual
+		uint32_t i2[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
+		memcpy(st, i2, sizeof i2);
+		hash_pad(cd, len, sha256_blk, st);
+		for (int i = 0; i < 8; i++) { uint32_t b = htonl(st[i]); memcpy(full + 4 * i, &b, 4); }
+	}
+	memcpy(out, full, 20);
+}
+
 // Como csops_copy_token de XNU: si no cabe, solo la cabecera con la longitud necesaria y ERANGE.
 static long copy_token(const uint8_t* blob, uint32_t len, uint64_t uaddr, uint64_t usize) {
 	if (usize < 8) return -34;                                   // ERANGE
@@ -131,6 +227,35 @@ static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
 		}
 		free(cd);
 		return r;
+	}
+	case 5: {                                                    // CDHASH: del CodeDirectory de mejor hash (SHA-256 si lo hay)
+		if (usize < 20) return -D_EINVAL;
+		uint32_t len = 0, best_len = 0;
+		uint8_t* best = cs_blob(pid, 0, &best_len);              // el principal (ranura 0) y los alternativos (0x1000...)
+		for (uint32_t slot = 0x1000; slot < 0x1005; slot++) {
+			uint8_t* alt = cs_blob(pid, slot, &len);
+			if (!alt) continue;
+			int rank_alt = len > 37 ? (alt[37] == 1 ? 1 : alt[37] == 3 ? 2 : alt[37] == 2 ? 3 : alt[37] == 4 ? 4 : 0) : 0;
+			int rank_best = best && best_len > 37 ? (best[37] == 1 ? 1 : best[37] == 3 ? 2 : best[37] == 2 ? 3 : best[37] == 4 ? 4 : 0) : 0;
+			if (rank_alt > rank_best) { free(best); best = alt; best_len = len; } else free(alt);
+		}
+		if (!best || best_len < 44 || be32(best) != 0xfade0c02) { free(best); return -D_EINVAL; }   // sin firma
+		uint8_t h[20];
+		cd_hash20(best, best_len, h);
+		free(best);
+		return safe_write(uaddr, h, 20) == 20 ? 0 : -D_EFAULT;
+	}
+	case 6: {                                                    // PIDOFFSET: dónde empieza en el archivo la rebanada que se ejecuta
+		char path[4096];
+		if (usize < 8) return -D_EINVAL;
+		if (exe_host_path(pid, path, sizeof path) != 0) return -3;  // ESRCH
+		int fd = open(path, O_RDONLY | O_CLOEXEC);
+		if (fd < 0) return -3;
+		int64_t off = slice_offset(fd);
+		close(fd);
+		if (off < 0) return -D_EINVAL;
+		uint64_t v = (uint64_t)off;
+		return safe_write(uaddr, &v, 8) == 8 ? 0 : -D_EFAULT;
 	}
 	default:
 		logf_("    csops: operación %d sin implementar\n", op);
