@@ -335,6 +335,51 @@ static long net_rtdump(struct ctx* c, int af) {
 	long r = sc_out(c, b, k); free(b); return r;
 }
 
+// ---- Identificadores especiales {0, x, oid...} de XNU (kern_newsysctl.c), que usa la orden sysctl(8):
+//   {0,1,oid} nombre del oid; {0,2,oid} el oid siguiente en orden (para recorrer el árbol con sysctl -a);
+//   {0,4,oid} formato: uint32 kind (CTLTYPE_* | CTLFLAG_*) seguido de la cadena de formato ("I", "Q", "A", "S,timeval").
+// Solo se conocen los oid hoja de la tabla (dos niveles); un prefijo cuenta como nodo para "siguiente".
+#define CTLTYPE_INT 2
+#define CTLTYPE_STRING 3
+#define CTLTYPE_QUAD 4
+#define CTLTYPE_STRUCT 5
+#define CTLFLAG_RD 0x80000000u
+static int mib_cmp(const int* a, const int* b) { return a[0] != b[0] ? (a[0] < b[0] ? -1 : 1) : a[1] != b[1] ? (a[1] < b[1] ? -1 : 1) : 0; }
+static const struct entry* entry_by_mib(const int* m) {
+	for (size_t i = 0; i < NENT; i++) if (!mib_cmp(table[i].mib, m)) return &table[i];
+	return NULL;
+}
+static long sysctl_meta(struct ctx* c, int op, const int* oid, uint32_t len) {
+	if (op == 2) {                                       // siguiente: el menor oid de la tabla mayor que el dado
+		int from[2] = { len >= 1 ? oid[0] : -1, len >= 2 ? oid[1] : -1 };
+		if (len == 1) from[1] = -1;                      // un nodo: su primer hijo es el siguiente
+		const struct entry* best = NULL;
+		for (size_t i = 0; i < NENT; i++) {
+			if (len && mib_cmp(table[i].mib, from) <= 0) continue;
+			if (!best || mib_cmp(table[i].mib, best->mib) < 0) best = &table[i];
+		}
+		if (!best) return -D_ENOENT;
+		return sc_out(c, best->mib, sizeof best->mib);
+	}
+	if (len != 2) return -D_ENOENT;
+	const struct entry* e = entry_by_mib(oid);
+	if (!e) return -D_ENOENT;
+	if (op == 1) return sc_out(c, e->name, strlen(e->name) + 1);
+	uint8_t b[32] = { 0 };                              // op 4: formato
+	uint32_t kind = CTLFLAG_RD;
+	const char* fmt;
+	switch (e->kind) {
+	case K_INT:  kind |= CTLTYPE_INT; fmt = "I"; break;
+	case K_QUAD: kind |= CTLTYPE_QUAD; fmt = "Q"; break;
+	case K_STR:  kind |= CTLTYPE_STRING; fmt = "A"; break;
+	default:     kind |= CTLTYPE_STRUCT; fmt = "S,timeval"; break;
+	}
+	memcpy(b, &kind, 4);
+	size_t fl = strlen(fmt) + 1;
+	memcpy(b + 4, fmt, fl);
+	return sc_out(c, b, 4 + fl);
+}
+
 long bsd_sysctl(struct ctx* c) {
 	int mib[16];
 	uint32_t n = (uint32_t)c->a[1];
@@ -396,6 +441,7 @@ long bsd_sysctl(struct ctx* c) {
 		free(b);
 		return r;
 	}
+	if (n >= 2 && mib[0] == 0 && (mib[1] == 1 || mib[1] == 2 || mib[1] == 4)) return sysctl_meta(c, mib[1], mib + 2, n - 2);
 	if (n == 2 && mib[0] == 0 && mib[1] == 3) {          // name2oid: nombre en newp -> identificador
 		char name[256];
 		size_t len = c->a[5] < sizeof name - 1 ? c->a[5] : sizeof name - 1;
