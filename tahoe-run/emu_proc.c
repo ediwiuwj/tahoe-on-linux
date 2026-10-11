@@ -705,6 +705,21 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 			snprintf(gpath, sizeof gpath, "%s", interp);
 			continue;
 		}
+		// Como XNU: un Mach-O sin parte x86_64 no se ejecuta y la llamada falla con EBADARCH (86) sin crear el proceso. El
+		// macOS completo es universal pero trae programas solo de Apple Silicon (p. ej. seputil, la tarea de arranque
+		// data-protection), y launchd en un Mac Intel cuenta con ese error para saltarlos.
+		if (hn >= 8) {
+			uint32_t m; memcpy(&m, head, 4);
+			int fat = m == 0xbebafecaU || m == 0xbfbafecaU, ok = 1;     // FAT_MAGIC / FAT_MAGIC_64 (big endian)
+			if (m == 0xfeedfacfU) ok = *(uint32_t*)(head + 4) == 0x01000007;
+			else if (fat) {
+				uint32_t n = __builtin_bswap32(*(uint32_t*)(head + 4)), esz = m == 0xbebafecaU ? 20 : 32;
+				ok = 0;
+				for (uint32_t i = 0; i < n && 8 + (i + 1) * esz <= (uint32_t)hn; i++)
+					if (__builtin_bswap32(*(uint32_t*)(head + 8 + i * esz)) == 0x01000007) ok = 1;
+			}
+			if (!ok) { logf_("    exec \"%s\": sin parte x86_64 -> EBADARCH\n", gpath); return -86; }
+		}
 		break;
 	}
 	// Programas que se sustituyen por un proceso que sale con éxito: rutas separadas por comas en TAHOE_STUB_EXEC (para
@@ -804,6 +819,31 @@ static long bsd_posix_spawn(struct ctx* c) {
 	long r = exec_common(c->a[1], c->a[3], c->a[4], 1, &pid);
 	if (r == 0 && c->a[0]) { uint32_t p = (uint32_t)pid; safe_write(c->a[0], &p, 4); }
 	return r;
+}
+
+// setpriority(which, who, prio) / getpriority(which, who): PRIO_PROCESS/PGRP/USER (0-2) son el nice de POSIX y van al de Linux
+// (los pid son los del espacio de PID del arranque). Bajar el nice exige CAP_SYS_NICE en el anfitrión: siendo root en macOS
+// se acepta igual, como en XNU. Las clases propias de Darwin (PRIO_DARWIN_THREAD 3, _PROCESS 4, _GPU 5, _ROLE 6, _GAME_MODE
+// 7...: modo de fondo, rol de la app) solo cambian la planificación de XNU: se aceptan sin efecto y getpriority da 0.
+static long bsd_setpriority(struct ctx* c) {
+	int which = (int)c->a[0], prio = (int)c->a[2];
+	if (which > 2) return 0;
+	if (which < 0) return -D_EINVAL;
+	if (prio < -20) prio = -20;
+	if (prio > 20) prio = 20;
+	if (setpriority(which, (id_t)c->a[1], prio) == 0) return 0;
+	if ((errno == EACCES || errno == EPERM) && cred_euid() == 0) return 0;
+	return -darwin_errno(errno);
+}
+static long bsd_getpriority(struct ctx* c) {
+	int which = (int)c->a[0];
+	if (which > 2) return 0;
+	if (which < 0) return -D_EINVAL;
+	errno = 0;
+	int v = getpriority(which, (id_t)c->a[1]);
+	if (v == -1 && errno) return -darwin_errno(errno);
+	c->raw_ret = 1;                                                  // el nice puede ser negativo: sin CF
+	return v;
 }
 
 // bsdthread_ctl(comando, arg1, arg2, arg3): QoS, sobrescrituras de prioridad y permisos de las colas de trabajo.
@@ -1321,6 +1361,7 @@ static long bsd_ulock_wake(struct ctx* c) {
 void emu_proc_init(void) {
 	reg_bsd(515, bsd_ulock_wait); reg_bsd(516, bsd_ulock_wake); reg_bsd(544, bsd_ulock_wait2);
 	reg_bsd(550, bsd_map_with_linking);
+	reg_bsd(96, bsd_setpriority); reg_bsd(100, bsd_getpriority);
 	reg_bsd(322, bsd_proc_rlimit_control);   // iopolicysys: sin efecto
 	reg_bsd(331, bsd_proc_rlimit_control);   // __disable_threadsignal: sin efecto
 	reg_bsd(111, bsd_sigsuspend); reg_bsd(410, bsd_sigsuspend);

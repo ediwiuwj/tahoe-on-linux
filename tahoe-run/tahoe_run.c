@@ -895,6 +895,9 @@ static mach_fn mach_table[MACH_NAMES_N] = {
 	[10] = mach_vm_allocate_trap, [12] = mach_vm_deallocate_trap, [15] = mach_vm_map_trap,
 	[18] = mach_nop_success, [88] = mach_not_supported, [19] = mach_nop_success, [21] = mach_nop_success, [24] = mach_nop_success, [25] = mach_nop_success,
 	[89] = mach_timebase_info_trap,
+	// macx_triggers(alto, bajo, flags, puerto): launchd activa al arrancar la compactación del compresor de memoria y el
+	// intercambio (SWAP_COMPACT_ENABLE 0x20) y comprueba el resultado. La memoria la gestiona Linux: éxito sin efecto.
+	[51] = mach_nop_success,
 	[14] = mach_vm_protect_trap, [11] = mach_vm_purgable_trap,
 	[26] = mach_reply_port_trap, [27] = mach_thread_self_trap, [28] = mach_task_self_trap, [29] = mach_host_self_trap,
 };
@@ -940,7 +943,7 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 			char v[24]; if (r < 0 && r > -4096 && !c.raw_ret) snprintf(v, sizeof v, "E%-4ld", -r); else snprintf(v, sizeof v, "=%lx", r);
 			log_call("bsd", num, name, &c, v);
 			int pa = -1;                                         // argumento con ruta: open, access, readlink, stat, lstat, getattrlist...
-			if (num == 5 || num == 398 || num == 33 || num == 58 || num == 338 || num == 340 || num == 220 || num == 136 || num == 10 || num == 128) pa = 0;
+			if (num == 5 || num == 398 || num == 33 || num == 58 || num == 338 || num == 340 || num == 220 || num == 136 || num == 10 || num == 128 || num == 345) pa = 0;
 			else if (num == 463 || num == 464 || num == 469 || num == 470 || num == 466) pa = 1;
 			if (pa >= 0) { char path[200] = ""; if (safe_read(c.a[pa], path, sizeof path - 1) > 0) { path[199] = 0; logf_("        ruta: \"%s\"\n", path); } }
 		}
@@ -1170,9 +1173,7 @@ int main(int argc, char** argv, char** envp) {
 	static char self[4096];
 	ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
 	g_self_exe = sl > 0 ? (self[sl] = 0, self) : argv[0];
-	// execve relanza tahoe-run: TAHOE_ARGV0 permite que argv[0] del programa no sea su ruta
-	const char* argv0 = getenv("TAHOE_ARGV0");
-	if (argv0) { argv[3] = (char*)argv0; unsetenv("TAHOE_ARGV0"); }
+	if (getpid() == 1) sys_volumes_mount();                      // launchd: antes de que macOS mire sus volúmenes
 	map_cache(cache);
 	patch_cpu_number();
 	LOG("caché mapeada en 0x%lx\n", CACHE_BASE);
@@ -1182,6 +1183,10 @@ int main(int argc, char** argv, char** envp) {
 	load_macho(exe, 0, &ei);
 	diag_breakpoints();                                          // /dev/shm/tahoe-break en el proceso de /dev/shm/tahoe-stacks
 	if (di.filetype != 7) DIE("%s no es un MH_DYLINKER", dyld);
+	// execve relanza tahoe-run: TAHOE_ARGV0 permite que argv[0] del programa no sea su ruta. Se aplica después de mapear la
+	// caché: si allí hay que relanzarse sin ASLR (g_argv), el programa a cargar tiene que seguir en argv[3].
+	const char* argv0 = getenv("TAHOE_ARGV0");
+	if (argv0) { argv[3] = (char*)argv0; unsetenv("TAHOE_ARGV0"); }
 	char real[4096];
 	if (!realpath(exe, real)) snprintf(real, sizeof real, "%s", exe);
 	// el programa debe ver su ruta como macOS (/bin/ls), no la del host

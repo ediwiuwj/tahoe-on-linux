@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
@@ -45,7 +46,7 @@ const char* tahoe_dev_alias(const char* p, char* buf, size_t cap) {
 // Discos emulados: los nodos /dev/diskN[sM] (bloque) y /dev/rdiskN[sM] (caracteres) de los medios que anuncia IOKit
 // (emu_iokit.inc, io_disks: BSD Major 1, Minor = posición en esta lista). /dev viene del anfitrión y no los tiene; aquí se
 // presentan en stat/lstat y al listar /dev. No hay datos detrás (el volumen es una carpeta de Linux): abrirlos falla.
-static const char* const emu_disks[] = { "disk0", "disk0s1", "disk1", "disk1s1" };
+static const char* const emu_disks[] = { "disk0", "disk0s1", "disk1", "disk1s1", "disk1s2", "disk1s3" };
 #define EMU_DISK_MAJOR 1
 static int emu_disk_node(const char* p, int* raw) {
 	if (strncmp(p, "/dev/", 5)) return -1;
@@ -70,10 +71,70 @@ static void emu_disk_stat(int minor_, int raw, struct stat* s) {
 // anfitrión) es del volumen /dev/disk1s1, como en un Mac (stat("/").st_dev = dev_t de disk1s1). Así se traduce una ruta a
 // su disco (diskutil info /, devname). El resto (/dev, terminales...) conserva su dispositivo.
 #define ROOT_VOLUME_MINOR 3                                           // disk1s1 en emu_disks
-static uint32_t guest_dev(dev_t d) {
+// Volúmenes de un macOS completo: en un Mac, /System/Volumes/Data (los datos, a los que llevan los firmlinks /Library,
+// /Users, /private...) y /System/Volumes/Preboot (donde está el cryptex del sistema con la caché de dyld) son otros volúmenes
+// APFS del contenedor, con su propio dispositivo. Aquí son carpetas del mismo disco de Linux, montadas sobre sí mismas (bind)
+// en el espacio de montajes del arranque (sys_volumes_mount): mismo st_dev, pero otro id de montaje. Tras cada stat de algo
+// del disco de la raíz se mira el id de montaje (statx) y, si es el de uno de estos volúmenes, st_dev pasa a su marca, que
+// guest_dev traduce a su disco. En la Recovery no los hay (allí /System/Volumes/Data es un tmpfs).
+#ifndef STATX_MNT_ID
+#define STATX_MNT_ID 0x1000U
+#endif
+struct sys_volume { const char* on; const char* need; int minor; dev_t mark; };
+static const struct sys_volume sys_volumes[] = {
+	{ "/System/Volumes/Data",    "/private",   4, (dev_t)0xfffffffffffffffeULL },   // disk1s2 en emu_disks (marca: ningún st_dev real)
+	{ "/System/Volumes/Preboot", "/Cryptexes", 5, (dev_t)0xfffffffffffffffdULL },   // disk1s3
+};
+#define NSYSVOL (sizeof sys_volumes / sizeof sys_volumes[0])
+static dev_t root_dev(void) {
 	static dev_t root; static int known;
 	if (!known) { struct stat rs; known = 1; root = (tahoe_root && stat(tahoe_root, &rs) == 0) ? rs.st_dev : (dev_t)-1; }
-	if (tahoe_root && d == root) return darwin_dev(EMU_DISK_MAJOR, ROOT_VOLUME_MINOR);
+	return root;
+}
+static uint64_t mnt_id_of(int dfd, const char* p, int fl) {
+	struct statx x;
+	if (statx(dfd, p, fl | AT_NO_AUTOMOUNT, STATX_MNT_ID, &x) != 0 || !(x.stx_mask & STATX_MNT_ID)) return 0;
+	return x.stx_mnt_id;
+}
+static uint64_t sysvol_mnt(size_t i) {                                  // id de montaje del volumen i, o 0 si no está montado
+	static uint64_t id[NSYSVOL]; static int known;
+	if (!known && tahoe_root) {
+		known = 1;
+		uint64_t r = mnt_id_of(AT_FDCWD, tahoe_root, 0);
+		for (size_t k = 0; k < NSYSVOL; k++) {
+			char h[4200]; struct statfs sf;
+			snprintf(h, sizeof h, "%s%s", tahoe_root, sys_volumes[k].on);
+			uint64_t d = mnt_id_of(AT_FDCWD, h, 0);
+			if (d && r && d != r && statfs(h, &sf) == 0 && sf.f_type != 0x01021994 /* tmpfs */) id[k] = d;
+		}
+	}
+	return id[i];
+}
+void sys_volumes_mount(void) {                                         // en el PID 1 del arranque, antes que nada de macOS
+	if (!tahoe_root) return;
+	uint64_t r = mnt_id_of(AT_FDCWD, tahoe_root, 0);
+	for (size_t k = 0; k < NSYSVOL; k++) {
+		char h[4200], need[4300]; struct stat st;
+		snprintf(h, sizeof h, "%s%s", tahoe_root, sys_volumes[k].on);
+		snprintf(need, sizeof need, "%s%s", h, sys_volumes[k].need);
+		if (lstat(need, &st) != 0 || !S_ISDIR(st.st_mode)) continue;      // no está en el disco (Recovery)
+		if (mnt_id_of(AT_FDCWD, h, 0) != r) continue;                     // ya montado
+		if (syscall(SYS_mount, h, h, NULL, 4096UL /* MS_BIND */, NULL) != 0) logf_("    volumen %s: mount --bind falló: %s\n", sys_volumes[k].on, strerror(errno));
+	}
+}
+// Marca el st_dev de lo que esté en uno de esos volúmenes (mismos argumentos que fstatat/statx).
+static void vol_fix(struct stat* s, int dfd, const char* p, int fl) {
+	if (s->st_dev != root_dev() || !tahoe_root) return;
+	uint64_t m = 0;
+	for (size_t k = 0; k < NSYSVOL; k++) {
+		if (!sysvol_mnt(k)) continue;
+		if (!m && !(m = mnt_id_of(dfd, p, fl))) return;
+		if (m == sysvol_mnt(k)) { s->st_dev = sys_volumes[k].mark; return; }
+	}
+}
+static uint32_t guest_dev(dev_t d) {
+	for (size_t k = 0; k < NSYSVOL; k++) if (d == sys_volumes[k].mark) return darwin_dev(EMU_DISK_MAJOR, sys_volumes[k].minor);
+	if (tahoe_root && d == root_dev()) return darwin_dev(EMU_DISK_MAJOR, ROOT_VOLUME_MINOR);
 	return darwin_dev(major(d), minor(d));
 }
 
@@ -191,6 +252,7 @@ static long do_stat(struct ctx* c, int follow) {
 		if (trace_all) logf_("    stat(\"%s\") -> %s\n", p, strerror(errno));
 		return err();
 	}
+	vol_fix(&s, AT_FDCWD, path, follow ? 0 : AT_SYMLINK_NOFOLLOW);
 	put_stat(c->a[1], &s, follow ? tahoe_flags_path(path) : tahoe_flags_path(path));
 	return 0;
 }
@@ -273,6 +335,7 @@ static long bsd_listxattr(struct ctx* c) { return xlist(c, 0); }   static long b
 static long bsd_fstat64(struct ctx* c) {
 	struct stat s;
 	if (fstat((int)c->a[0], &s) != 0) return err();
+	vol_fix(&s, (int)c->a[0], "", AT_EMPTY_PATH);
 	put_stat(c->a[1], &s, tahoe_flags_fd((int)c->a[0]));
 	return 0;
 }
@@ -308,6 +371,7 @@ static long bsd_fstatat64(struct ctx* c) {
 		if (trace_all) logf_("    fstatat(%d, \"%s\") -> %s\n", (int)c->a[0], p, strerror(errno));
 		return err();
 	}
+	vol_fix(&s, dfd, path, flags);
 	uint32_t fl = 0;
 	if (dfd == AT_FDCWD || p[0] == '/') fl = tahoe_flags_path(path);
 	else if (p[0] == '\0') fl = tahoe_flags_fd(dfd);
@@ -390,7 +454,6 @@ static long bsd_fcntl(struct ctx* c) {
 //   0 f_bsize  4 f_iosize  8 f_blocks  16 f_bfree  24 f_bavail  32 f_files  40 f_ffree  48 f_fsid[2]  56 f_owner
 //   60 f_type  64 f_flags  68 f_fssubtype  72 f_fstypename[16]  88 f_mntonname[1024]  1112 f_mntfromname[1024]
 //   2136 f_flags_ext  2140 f_reserved[7]
-#include <sys/statfs.h>
 // Banderas de montaje de XNU (sys/mount.h). MNT_UPDATE (0x10000) es una orden para mount(2), no un estado del volumen.
 #define MNT_RDONLY      0x00000001
 #define MNT_LOCAL       0x00001000
@@ -466,6 +529,12 @@ static int tmpfs_mounts(struct dmount* v, int max) {
 	fclose(f);
 	return n;
 }
+// Los volúmenes de sys_volumes como los lista mount en un Mac: «/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled,
+// nobrowse)», igual Preboot.
+static const struct gmount sysvol_gmounts[NSYSVOL] = {
+	{ "/System/Volumes/Data",    "/dev/disk1s2", "apfs", 0x18, MNT_LOCAL | MNT_DOVOLFS | MNT_JOURNALED | MNT_DONTBROWSE | MNT_MULTILABEL, 1048576 },
+	{ "/System/Volumes/Preboot", "/dev/disk1s3", "apfs", 0x18, MNT_LOCAL | MNT_DOVOLFS | MNT_JOURNALED | MNT_DONTBROWSE | MNT_MULTILABEL, 1048576 },
+};
 // Montaje de macOS al que pertenece un archivo (por su statfs y su dev_t): los tmpfs de la lista, /dev o la raíz
 static const struct gmount* gmount_of_dev(const struct statfs* s, dev_t dev) {
 	if (s->f_type == LINUX_TMPFS_MAGIC) {
@@ -473,12 +542,18 @@ static const struct gmount* gmount_of_dev(const struct statfs* s, dev_t dev) {
 		int n = tmpfs_mounts(dm, 16);
 		for (int i = 0; i < n; i++) { struct stat st; if (stat(dm[i].host, &st) == 0 && st.st_dev == dev) return &dm[i].m; }
 	}
+	for (size_t k = 0; k < NSYSVOL; k++) if (dev == sys_volumes[k].mark) return &sysvol_gmounts[k];
 	return is_devfs_host(s) ? &gmounts[1] : &gmounts[0];
 }
 // getfsstat64(buf, bufsize, flags): sin búfer devuelve el número de montajes; si no, copia los que quepan.
 static long getfsstat_common(uint64_t buf, uint64_t bufsize) {
 	static __thread struct dmount dm[16];
 	int nd = tmpfs_mounts(dm, 16);
+	for (size_t k = 0; k < NSYSVOL && nd < 16; k++) {                   // Data y Preboot, tras la raíz y /dev
+		if (!sysvol_mnt(k)) continue;
+		snprintf(dm[nd].host, sizeof dm[nd].host, "%s%s", tahoe_root, sys_volumes[k].on);
+		dm[nd].m = sysvol_gmounts[k]; nd++;
+	}
 	if (!buf) return (long)NGMOUNT + nd;
 	long n = 0;
 	for (size_t i = 0; i < NGMOUNT + (size_t)nd && (n + 1) * 2168 <= (long)bufsize; i++) {
@@ -500,12 +575,14 @@ static long bsd_statfs64(struct ctx* c) {
 	if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT;
 	const char* hp = resolve(p, b, sizeof b); struct stat st;
 	if (statfs(hp, &s) != 0 || stat(hp, &st) != 0) return err();
+	vol_fix(&st, AT_FDCWD, hp, 0);
 	put_statfs(c->a[1], &s, gmount_of_dev(&s, st.st_dev));
 	return 0;
 }
 static long bsd_fstatfs64(struct ctx* c) {
 	struct statfs s; struct stat st;
 	if (fstatfs((int)c->a[0], &s) != 0 || fstat((int)c->a[0], &st) != 0) return err();
+	vol_fix(&st, (int)c->a[0], "", AT_EMPTY_PATH);
 	put_statfs(c->a[1], &s, gmount_of_dev(&s, st.st_dev));
 	return 0;
 }
@@ -599,6 +676,7 @@ static long bsd_getattrlist(struct ctx* c) {
 		struct stat st;
 		const char* rpth = resolve(p, b, sizeof b);
 		if ((nofollow ? lstat(rpth, &st) : stat(rpth, &st)) != 0) return err();
+		vol_fix(&st, AT_FDCWD, rpth, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
 		char real[4096], gp2[4096];
 		const char* rp = realpath(rpth, real) ? real : p;
 		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
@@ -621,6 +699,7 @@ static long bsd_getattrlist(struct ctx* c) {
 	}
 	const char* rpv = resolve(p, b, sizeof b);
 	if (stat(rpv, &s) != 0) return err();
+	vol_fix(&s, AT_FDCWD, rpv, 0);
 	struct statfs sf; if (statfs(rpv, &sf) != 0) memset(&sf, 0, sizeof sf);
 	uint8_t out[1024];
 	size_t n = 4;                                         // el primer campo es la longitud total
@@ -996,6 +1075,7 @@ static long bsd_getattrlistbulk(struct ctx* c) {
 			if (!strcmp(name, ".") || !strcmp(name, "..")) { prev = off; pos += reclen; continue; }   // el kernel no las devuelve
 			struct stat s;
 			if (fstatat(fd, name, &s, AT_SYMLINK_NOFOLLOW) != 0) { prev = off; pos += reclen; continue; }
+			vol_fix(&s, fd, name, AT_SYMLINK_NOFOLLOW);
 			uint8_t e[2048];
 			size_t en = pack_bulk_entry(e, common, file, name, &s);
 			if (used + en > gsize) { lseek(fd, prev, SEEK_SET); full = 1; break; }
