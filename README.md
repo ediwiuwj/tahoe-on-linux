@@ -60,9 +60,11 @@ Diagnóstico con `tools/diag/` (registro y salidas en `$TAHOE_DIAG_DIR`, por omi
    - `bless --info` necesita un volumen Preboot, que el contenedor de la Recovery no tiene (como en un Mac sin él).
    - El disco sale como «disk image», igual que el sistema base de una Recovery real (con «PCI-Express» apfs_boot_util
      exige el volumen VM y launchd entra en pánico).
-2. **Caídas de servicios**: `locationd` (`getpwuid(205)` devuelve NULL dentro de launchd), `opendirectoryd` (espera al abrir
-   `/Search`), CarbonCore (`FileIDTreeStorage` no registrado en `coreservicesd`), `displaypolicyd` (PF238), `apsd` (a veces:
-   excepción de `SecurityServer` al firmar su CSR con securityd).
+2. **Caídas de servicios**: el arranque ya hace lo de una Recovery real (rc.cdrom monta `/System/Volumes/Data` y `/Volumes`
+   en tmpfs y copia la plantilla), así que `/var` empieza vacío y locationd ya no entra en bucle de caídas. Queda una carrera
+   en los workloops («BUG IN LIBDISPATCH: Invalid wlh state», ~1 de cada 6 arranques, en locationd o mobileassetd; se
+   estudia con `msh.sh WL=1`), y caídas sueltas de `coreservicesd`. Antes anotadas: `opendirectoryd` (espera al abrir
+   `/Search`), CarbonCore (`FileIDTreeStorage` no registrado en `coreservicesd`), `displaypolicyd` (PF238), `apsd`.
 3. **Señales reales** (`sigreturn`). (`fileport_makeport` ya está.)
 4. **Interfaz gráfica**: servicio HID, pantalla por DRM/KMS, entrada por evdev y Metal sobre Vulkan para WindowServer.
 

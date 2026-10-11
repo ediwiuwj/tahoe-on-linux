@@ -56,11 +56,18 @@ static long bsd_truncate(struct ctx* c) { PATH1(p, 0); RET(truncate(p, (off_t)c-
 static long bsd_mkfifo(struct ctx* c) { PATH1(p, 0); RET(mkfifo(p, (mode_t)c->a[1])); }
 static long bsd_rename(struct ctx* c) { PATH1(a, 0); PATH1(b, 1); RET(rename(a, b)); }
 static long bsd_link(struct ctx* c)   { PATH1(a, 0); PATH1(b, 1); RET(link(a, b)); }
-static long bsd_symlink(struct ctx* c) {      // el destino del enlace se guarda tal cual; solo la ruta del enlace va a la raíz
-	char tgt[4096];
+// Destino de un enlace simbólico nuevo: el kernel de Linux lo sigue por su cuenta, así que un destino absoluto de macOS
+// (/tmp, /usr/lib/...) se guarda dentro de la raíz; readlink lo devuelve sin ese prefijo (emu_fs.c, guest_link_target).
+static void host_link_target(const char* t, char* out, size_t cap) {
+	if (tahoe_root && t[0] == '/' && !tahoe_host_passthrough(t)) snprintf(out, cap, "%s%s", tahoe_root, t);
+	else snprintf(out, cap, "%s", t);
+}
+static long bsd_symlink(struct ctx* c) {
+	char tgt[4096], ht[4400];
 	if (safe_string(c->a[0], tgt, sizeof tgt) != 0) return -D_EFAULT;
 	PATH1(l, 1);
-	RET(symlink(tgt, l));
+	host_link_target(tgt, ht, sizeof ht);
+	RET(symlink(ht, l));
 }
 static long bsd_fchmod(struct ctx* c) { RET(fchmod((int)c->a[0], (mode_t)c->a[1])); }
 static long bsd_fchown(struct ctx* c) { return chown_result(fchown((int)c->a[0], (uid_t)c->a[1], (gid_t)c->a[2])); }
@@ -131,6 +138,67 @@ static long bsd_select(struct ctx* c) {
 
 // ---- variantes *at: el descriptor de directorio AT_FDCWD de Darwin es -2
 static int dfd(uint64_t v) { return (int)v == -2 ? AT_FDCWD : (int)v; }
+static long apath(uint64_t addr, char* out, size_t cap);
+
+// setattrlist(ruta, attrlist*, búfer, tamaño, opciones) / fsetattrlist(fd, ...) / setattrlistat(dirfd, ruta, ..., opciones):
+// atributos comunes que se pueden cambiar (ditto los usa al copiar). El búfer va sin longitud, en orden de bit, alineado a 4.
+// Fechas: modificación y acceso con utimensat; creación, cambio, copia y alta no existen en Linux (se aceptan sin efecto).
+// FinderInfo como el atributo extendido com.apple.FinderInfo; banderas como chflags; propietario como chown (sin efecto si el
+// uid no existe aquí); permisos como chmod. Volumen, directorio, archivo y fork no se pueden cambiar: EINVAL, como XNU.
+static long setattr_common(const char* hp, int nofollow, uint64_t alp, uint64_t buf, uint64_t size) {
+	uint32_t al[6];
+	if (safe_read(alp, al, sizeof al) != (ssize_t)sizeof al) return -D_EFAULT;
+	uint32_t common = al[1];
+	const uint32_t known = 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x10000 | 0x20000 | 0x40000 | 0x10000000;
+	if (al[2] || al[3] || al[4] || al[5] || (common & ~known)) {
+		logf_("    setattrlist: atributos no modificables common=0x%x vol=0x%x dir=0x%x file=0x%x fork=0x%x\n", common, al[2], al[3], al[4], al[5]);
+		return -D_EINVAL;
+	}
+	uint8_t b[512]; size_t n = size < sizeof b ? (size_t)size : sizeof b, o = 0;
+	if (n && safe_read(buf, b, n) != (ssize_t)n) return -D_EFAULT;
+	struct timespec ts[2] = { { 0, UTIME_OMIT }, { 0, UTIME_OMIT } };
+	uint32_t uid = (uint32_t)-1, gid = (uint32_t)-1, mode = 0, flags = 0; const uint8_t* fi = NULL;
+#define NEED(k) do { if (o + (k) > n) return -D_EINVAL; } while (0)
+#define TS(t) do { int64_t s_, ns_; memcpy(&s_, b + o, 8); memcpy(&ns_, b + o + 8, 8); (t).tv_sec = s_; (t).tv_nsec = ns_; } while (0)
+	if (common & 0x100) { NEED(4); o += 4; }                            // SCRIPT
+	if (common & 0x200) { NEED(16); o += 16; }                          // CRTIME
+	if (common & 0x400) { NEED(16); TS(ts[1]); o += 16; }               // MODTIME
+	if (common & 0x800) { NEED(16); o += 16; }                          // CHGTIME
+	if (common & 0x1000) { NEED(16); TS(ts[0]); o += 16; }              // ACCTIME
+	if (common & 0x2000) { NEED(16); o += 16; }                         // BKUPTIME
+	if (common & 0x4000) { NEED(32); fi = b + o; o += 32; }             // FNDRINFO
+	if (common & 0x8000) { NEED(4); memcpy(&uid, b + o, 4); o += 4; }   // OWNERID
+	if (common & 0x10000) { NEED(4); memcpy(&gid, b + o, 4); o += 4; }  // GRPID
+	if (common & 0x20000) { NEED(4); memcpy(&mode, b + o, 4); o += 4; } // ACCESSMASK
+	if (common & 0x40000) { NEED(4); memcpy(&flags, b + o, 4); o += 4; }// FLAGS
+	if (common & 0x10000000) { NEED(16); o += 16; }                     // ADDEDTIME
+#undef NEED
+#undef TS
+	struct stat st;
+	if ((nofollow ? lstat(hp, &st) : stat(hp, &st)) != 0) return err();
+	int link = S_ISLNK(st.st_mode);
+	if (common & (0x8000 | 0x10000)) { long r = chown_result(nofollow ? lchown(hp, uid, gid) : chown(hp, uid, gid)); if (r) return r; }
+	if ((common & 0x20000) && !link && chmod(hp, mode & 07777) != 0) return err();
+	if (common & 0x40000) lsetxattr(hp, "user.tahoe.flags", &flags, 4, 0);
+	if (fi) {
+		static const uint8_t zero[32];
+		if (memcmp(fi, zero, 32)) lsetxattr(hp, "user.com.apple.FinderInfo", fi, 32, 0);
+		else lremovexattr(hp, "user.com.apple.FinderInfo");             // FinderInfo a cero: XNU borra el atributo
+	}
+	if ((common & (0x400 | 0x1000)) && utimensat(AT_FDCWD, hp, ts, nofollow ? AT_SYMLINK_NOFOLLOW : 0) != 0) return err();
+	return 0;
+}
+static long bsd_setattrlist(struct ctx* c) { PATH1(p, 0); return setattr_common(p, (c->a[4] & (1 | 0x800)) != 0, c->a[1], c->a[2], c->a[3]); }
+static long bsd_fsetattrlist(struct ctx* c) {
+	char p[64]; snprintf(p, sizeof p, "/proc/self/fd/%d", (int)c->a[0]);
+	return setattr_common(p, 0, c->a[1], c->a[2], c->a[3]);
+}
+static long bsd_setattrlistat(struct ctx* c) {
+	char g[4400], p[4500]; long e = apath(c->a[1], g, sizeof g); if (e) return e;
+	int d = dfd(c->a[0]);
+	if (g[0] != '/' && d != AT_FDCWD) snprintf(p, sizeof p, "/proc/self/fd/%d/%s", d, g); else snprintf(p, sizeof p, "%s", g);
+	return setattr_common(p, (c->a[5] & (1 | 0x800)) != 0, c->a[2], c->a[3], c->a[4]);
+}
 // Ruta relativa al dirfd o absoluta -> bajo la raíz si es absoluta
 static long apath(uint64_t addr, char* out, size_t cap) {
 	char g[4096];
@@ -150,13 +218,14 @@ static long bsd_renameatx(struct ctx* c) {      // flags de Darwin: RENAME_SWAP 
 static long bsd_unlinkat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(unlinkat(dfd(c->a[0]), p, (c->a[2] & 0x180) ? AT_REMOVEDIR : 0)); }   // AT_REMOVEDIR = 0x80, AT_REMOVEDIR_DATALESS = 0x100 (rm -r)
 static long bsd_mkdirat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(mkdirat(dfd(c->a[0]), p, (mode_t)c->a[2])); }
 static long bsd_symlinkat(struct ctx* c) {
-	char tgt[4096], l[4400];
+	char tgt[4096], ht[4400], l[4400];
 	if (safe_string(c->a[0], tgt, sizeof tgt) != 0) return -D_EFAULT;
 	long e = apath(c->a[2], l, sizeof l); if (e) return e;
-	RET(symlinkat(tgt, dfd(c->a[1]), l));
+	host_link_target(tgt, ht, sizeof ht);
+	RET(symlinkat(ht, dfd(c->a[1]), l));
 }
 static long bsd_fchmodat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(fchmodat(dfd(c->a[0]), p, (mode_t)c->a[2], 0)); }
-static long bsd_fchownat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; return chown_result(fchownat(dfd(c->a[0]), p, (uid_t)c->a[2], (gid_t)c->a[3], (c->a[4] & 0x20) ? AT_SYMLINK_NOFOLLOW : 0)); }
+static long bsd_fchownat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; return chown_result(fchownat(dfd(c->a[0]), p, (uid_t)c->a[2], (gid_t)c->a[3], (c->a[4] & (0x20 | 0x800)) ? AT_SYMLINK_NOFOLLOW : 0)); }
 static long bsd_linkat(struct ctx* c) { char a[4400], b[4400]; long e; if ((e = apath(c->a[1], a, sizeof a)) || (e = apath(c->a[3], b, sizeof b))) return e; RET(linkat(dfd(c->a[0]), a, dfd(c->a[2]), b, 0)); }
 
 // poll(fds, n, ms): struct pollfd igual que en Linux; cambian POLLWRNORM (Darwin 0x4 = POLLOUT, Linux 0x100) y POLLWRBAND
@@ -185,6 +254,7 @@ static long bsd_poll(struct ctx* c) {
 void emu_fs2_init(void) {
 	reg_bsd(230, bsd_poll); reg_bsd(417, bsd_poll);   // poll / poll_nocancel
 	reg_bsd(465, bsd_renameat); reg_bsd(488, bsd_renameatx); reg_bsd(472, bsd_unlinkat); reg_bsd(475, bsd_mkdirat);
+	reg_bsd(221, bsd_setattrlist); reg_bsd(228, bsd_fsetattrlist); reg_bsd(524, bsd_setattrlistat);
 	reg_bsd(474, bsd_symlinkat); reg_bsd(467, bsd_fchmodat); reg_bsd(468, bsd_fchownat); reg_bsd(471, bsd_linkat);
 	reg_bsd(136, bsd_mkdir); reg_bsd(137, bsd_rmdir); reg_bsd(10, bsd_unlink); reg_bsd(15, bsd_chmod);
 	reg_bsd(364, bsd_lchown); reg_bsd(34, bsd_chflags); reg_bsd(35, bsd_fchflags); reg_bsd(351, bsd_ret0);   // lchown; chflags/fchflags/auditon sin efecto

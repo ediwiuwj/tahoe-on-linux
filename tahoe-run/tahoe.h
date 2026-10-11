@@ -26,6 +26,7 @@ void reg_mach(unsigned num, emu_fn fn);
 void logf_(const char* fmt, ...);
 int darwin_errno(int linux_errno);
 int darwin_open_flags(int darwin_flags);
+long open_symlink(int dfd, const char* p, int dflags, int lflags, long fd);   // O_SYMLINK de Darwin
 ssize_t safe_read(uint64_t addr, void* buf, size_t len);
 ssize_t safe_write(uint64_t addr, const void* buf, size_t len);
 int safe_string(uint64_t addr, char* out, size_t max);
@@ -41,6 +42,7 @@ extern int trace_all;
 void emu_sysctl_init(void);
 void emu_fileport_init(void);
 int exe_host_path(int pid, char* out, size_t cap);
+void data_log_storage(const char* data_root);   // almacén de logd en un volumen de datos (emu_fs.c)
 int proc_dir(int pid, char* out, size_t cap);
 int exe_uuid(int pid, uint8_t out[16]);          // LC_UUID del ejecutable de macOS del proceso   // /proc/<pid>, o el de un hilo vivo si el líder es zombi
 int darwin_sig_to_linux(int s);                         // número de señal de Darwin -> Linux (0 si no hay)   // ruta en el anfitrión del ejecutable de macOS de un proceso
@@ -62,6 +64,9 @@ uint32_t port_create(int is_set);
 #define MACH_RCV_PORT_DIED_      0x10004009
 int port_exists(uint32_t name);
 static inline int mach_trace(void) { static int v = -1; if (v < 0) v = access("/dev/shm/tahoe-mach-trace", F_OK) == 0; return v; }
+// solo los workloops (peticiones de hilo, entregas, EVFILT_WORKLOOP): mucho menos que la traza Mach, para carreras que esta
+// tapa al cambiar los tiempos (msh.sh WL=1). La traza Mach completa la incluye.
+static inline int wl_trace_on(void) { static int v = -1; if (v < 0) v = mach_trace() || access("/dev/shm/tahoe-wl-trace", F_OK) == 0; return v; }
 int port_rpid(uint32_t name);
 int port_list_owned(uint32_t* names, uint32_t* types, int max);
 uint64_t port_get_context(uint32_t name);

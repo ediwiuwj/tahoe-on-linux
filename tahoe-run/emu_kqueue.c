@@ -447,7 +447,7 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 		if (safe_read(chg + i * kev_size[layout], raw, kev_size[layout]) != (ssize_t)kev_size[layout]) return -D_EFAULT;
 		kev_in(layout, raw, &k);
 		int e;
-		if (k.filter == EVFILT_WORKLOOP && mach_trace()) { uint64_t cur = 0; if (k.ext[1]) safe_read(k.ext[1], &cur, 8); logf_("    WL <%d:%ld> kq=%d ident=0x%lx flags=0x%x fflags=0x%x máscara=0x%lx valor=0x%lx actual=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), kq, k.ident, k.flags, k.fflags, k.ext[2], k.ext[3], cur); }
+		if (k.filter == EVFILT_WORKLOOP && wl_trace_on()) { uint64_t cur = 0; if (k.ext[1]) safe_read(k.ext[1], &cur, 8); logf_("    WL <%d:%ld> kq=%d ident=0x%lx flags=0x%x fflags=0x%x máscara=0x%lx valor=0x%lx actual=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), kq, k.ident, k.flags, k.fflags, k.ext[2], k.ext[3], cur); }
 		if (k.filter == EVFILT_WORKLOOP && (k.fflags & (NOTE_WL_SYNC_WAIT | NOTE_WL_SYNC_WAKE))) e = wl_sync_change(kq, &k);   // puede bloquear: sin kq_lock
 		else {
 			pthread_mutex_lock(&kq_lock);

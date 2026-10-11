@@ -116,12 +116,39 @@ static long bsd_access(struct ctx* c) {
 	int raw; if (emu_disk_node(p, &raw) >= 0) return ((int)c->a[1] & 1) ? -13 /* EACCES */ : 0;   // discos emulados: rw para root, no x
 	RET(access(resolve(p, b, sizeof b), (int)c->a[1] & 7));          // R_OK/W_OK/X_OK/F_OK coinciden
 }
+// Destino de un enlace tal como lo ve macOS: los absolutos se guardan dentro de la raíz (el kernel de Linux los sigue), así
+// que se les quita ese prefijo. Devuelve los bytes que caben en cap (readlink no termina en NUL).
+static ssize_t guest_link_target(const char* host, char* out, size_t cap) {
+	char t[4400];
+	ssize_t n = readlink(host, t, sizeof t - 1);
+	if (n < 0) return -1;
+	t[n] = 0;
+	const char* g = t;
+	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+	if (rl && !strncmp(t, tahoe_root, rl) && t[rl] == '/') g = t + rl;
+	size_t gl = strlen(g); if (gl > cap) gl = cap;
+	memcpy(out, g, gl);
+	return (ssize_t)gl;
+}
 static long bsd_readlink(struct ctx* c) {
 	char p[4096], b[4200], out[4096];
 	if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT;
-	ssize_t n = readlink(resolve(p, b, sizeof b), out, c->a[2] < sizeof out ? c->a[2] : sizeof out);
+	ssize_t n = guest_link_target(resolve(p, b, sizeof b), out, c->a[2] < sizeof out ? c->a[2] : sizeof out);
 	if (n < 0) return err();
 	return safe_write(c->a[1], out, n) == n ? n : -D_EFAULT;
+}
+// readlinkat(dirfd, ruta, búfer, tamaño)
+static long bsd_readlinkat(struct ctx* c) {
+	char p[4096], b[4200], out[4096], h[4400];
+	if (safe_string(c->a[1], p, sizeof p) != 0) return -D_EFAULT;
+	const char* host;
+	int dfd = (int)c->a[0] == -2 ? AT_FDCWD : (int)c->a[0];
+	if (p[0] == '/' || dfd == AT_FDCWD) host = resolve(p, b, sizeof b);
+	else { char lp[64]; snprintf(lp, sizeof lp, "/proc/self/fd/%d", dfd); char d[4096]; ssize_t dl = readlink(lp, d, sizeof d - 1);
+		if (dl < 0) return err(); d[dl] = 0; snprintf(h, sizeof h, "%s/%s", d, p); host = h; }
+	ssize_t n = guest_link_target(host, out, c->a[3] < sizeof out ? c->a[3] : sizeof out);
+	if (n < 0) return err();
+	return safe_write(c->a[2], out, n) == n ? n : -D_EFAULT;
 }
 
 // Banderas BSD (st_flags: SF_RESTRICTED, UF_HIDDEN...): Linux no las tiene; se guardan como atributo extendido del archivo.
@@ -254,14 +281,15 @@ static long bsd_fstat64(struct ctx* c) {
 static long bsd_dup(struct ctx* c)  { RET(dup((int)c->a[0])); }
 static long bsd_dup2(struct ctx* c) { RET(dup2((int)c->a[0], (int)c->a[1])); }
 
-// fstatat64(fd, ruta, búfer, flags): AT_FDCWD = -2 y AT_SYMLINK_NOFOLLOW = 0x20 en Darwin
+// fstatat64(fd, ruta, búfer, flags): AT_FDCWD = -2 y AT_SYMLINK_NOFOLLOW = 0x20 en Darwin. AT_SYMLINK_NOFOLLOW_ANY (0x800,
+// macOS 14) tampoco sigue los enlaces intermedios; aquí cuenta como el primero (el último componente no se sigue).
 static long bsd_fstatat64(struct ctx* c) {
 	char p[4096], b[4200];
 	struct stat s;
 	if (safe_string(c->a[1], p, sizeof p) != 0) return -D_EFAULT;
 	int dfd = (int)c->a[0];
 	if (dfd == -2) dfd = AT_FDCWD;
-	int flags = ((int)c->a[3] & 0x20) ? AT_SYMLINK_NOFOLLOW : 0;
+	int flags = ((int)c->a[3] & (0x20 | 0x800)) ? AT_SYMLINK_NOFOLLOW : 0;
 	if (p[0] == '\0') flags |= AT_EMPTY_PATH;
 	{                                                                // discos emulados: por ruta absoluta o relativa a /dev
 		char full[4200]; int raw, dm = -1;
@@ -405,16 +433,60 @@ static void put_statfs(uint64_t out, const struct statfs* s, const struct gmount
 #undef W
 	safe_write(out, d, sizeof d);
 }
-static const struct gmount* gmount_of(const struct statfs* s) { return is_devfs_host(s) ? &gmounts[1] : &gmounts[0]; }
+// tmpfs montados por macOS (mount_tmpfs: la Recovery pone uno en /System/Volumes/Data, su /private, que empieza vacío en cada
+// arranque). Son tmpfs de Linux de verdad en el espacio de montajes del arranque (unshare --mount), así que todos sus procesos
+// los ven; se leen de /proc/self/mountinfo (los que estén dentro de la raíz). Número de vfs: el que XNU asigna al cargar
+// tmpfs.kext no es fijo; se usa el siguiente libre tras los del núcleo.
+#define LINUX_TMPFS_MAGIC 0x01021994
+#define MNT_NOSUID 0x00000008
+#define MNT_NODEV  0x00000010
+struct dmount { char on[1024], host[1100]; struct gmount m; };
+static int tmpfs_mounts(struct dmount* v, int max) {
+	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+	if (!rl) return 0;
+	FILE* f = fopen("/proc/self/mountinfo", "r");
+	if (!f) return 0;
+	char ln[4096]; int n = 0;
+	while (n < max && fgets(ln, sizeof ln, f)) {
+		char mp[2048], fs[64]; const char* sep = strstr(ln, " - ");
+		if (!sep || sscanf(sep + 3, "%63s", fs) != 1 || strcmp(fs, "tmpfs")) continue;
+		if (sscanf(ln, "%*s %*s %*s %*s %2047s", mp) != 1) continue;
+		char h[1100]; size_t k = 0;                                      // \040 y demás escapes octales de mountinfo
+		for (const char* q = mp; *q && k < sizeof h - 1; q++) {
+			if (q[0] == '\\' && q[1] >= '0' && q[1] <= '7' && q[2] && q[3]) { h[k++] = (char)((q[1] - '0') * 64 + (q[2] - '0') * 8 + (q[3] - '0')); q += 3; }
+			else h[k++] = *q;
+		}
+		h[k] = 0;
+		if (strncmp(h, tahoe_root, rl) || h[rl] != '/') continue;
+		snprintf(v[n].host, sizeof v[n].host, "%s", h);
+		snprintf(v[n].on, sizeof v[n].on, "%s", h + rl);
+		v[n].m = (struct gmount){ v[n].on, "tmpfs", "tmpfs", 0x1d, MNT_LOCAL | MNT_NOSUID | MNT_NODEV, 4096 };
+		n++;
+	}
+	fclose(f);
+	return n;
+}
+// Montaje de macOS al que pertenece un archivo (por su statfs y su dev_t): los tmpfs de la lista, /dev o la raíz
+static const struct gmount* gmount_of_dev(const struct statfs* s, dev_t dev) {
+	if (s->f_type == LINUX_TMPFS_MAGIC) {
+		static __thread struct dmount dm[16];
+		int n = tmpfs_mounts(dm, 16);
+		for (int i = 0; i < n; i++) { struct stat st; if (stat(dm[i].host, &st) == 0 && st.st_dev == dev) return &dm[i].m; }
+	}
+	return is_devfs_host(s) ? &gmounts[1] : &gmounts[0];
+}
 // getfsstat64(buf, bufsize, flags): sin búfer devuelve el número de montajes; si no, copia los que quepan.
 static long getfsstat_common(uint64_t buf, uint64_t bufsize) {
-	if (!buf) return NGMOUNT;
+	static __thread struct dmount dm[16];
+	int nd = tmpfs_mounts(dm, 16);
+	if (!buf) return (long)NGMOUNT + nd;
 	long n = 0;
-	for (size_t i = 0; i < NGMOUNT && (n + 1) * 2168 <= (long)bufsize; i++) {
+	for (size_t i = 0; i < NGMOUNT + (size_t)nd && (n + 1) * 2168 <= (long)bufsize; i++) {
 		struct statfs s;
-		const char* hp = !strcmp(gmounts[i].on, "/") ? (tahoe_root ? tahoe_root : "/") : gmounts[i].on;
+		const struct gmount* m = i < NGMOUNT ? &gmounts[i] : &dm[i - NGMOUNT].m;
+		const char* hp = i >= NGMOUNT ? dm[i - NGMOUNT].host : !strcmp(m->on, "/") ? (tahoe_root ? tahoe_root : "/") : m->on;
 		if (statfs(hp, &s) != 0) memset(&s, 0, sizeof s);
-		put_statfs(buf + (uint64_t)n * 2168, &s, &gmounts[i]);
+		put_statfs(buf + (uint64_t)n * 2168, &s, m);
 		n++;
 	}
 	return n;
@@ -426,14 +498,15 @@ static long bsd_statfs64(struct ctx* c) {
 	char p[4096], b[4200];
 	struct statfs s;
 	if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT;
-	if (statfs(resolve(p, b, sizeof b), &s) != 0) return err();
-	put_statfs(c->a[1], &s, gmount_of(&s));
+	const char* hp = resolve(p, b, sizeof b); struct stat st;
+	if (statfs(hp, &s) != 0 || stat(hp, &st) != 0) return err();
+	put_statfs(c->a[1], &s, gmount_of_dev(&s, st.st_dev));
 	return 0;
 }
 static long bsd_fstatfs64(struct ctx* c) {
-	struct statfs s;
-	if (fstatfs((int)c->a[0], &s) != 0) return err();
-	put_statfs(c->a[1], &s, gmount_of(&s));
+	struct statfs s; struct stat st;
+	if (fstatfs((int)c->a[0], &s) != 0 || fstat((int)c->a[0], &st) != 0) return err();
+	put_statfs(c->a[1], &s, gmount_of_dev(&s, st.st_dev));
 	return 0;
 }
 
@@ -450,6 +523,14 @@ static const struct gmount* gmount_at(const char* p) {
 static long do_mount(const char* type, const char* path, uint32_t flags) {
 	logf_("    mount(\"%s\", \"%s\", 0x%x)\n", type, path, flags);
 	const struct gmount* m = gmount_at(path);
+	if (!strcmp(type, "tmpfs") && !(flags & MNT_UPDATE)) {   // tmpfs de verdad en el espacio de montajes del arranque
+		char b[4200]; const char* hp = resolve(path, b, sizeof b);
+		unsigned long lf = ((flags & MNT_RDONLY) ? 1 : 0) | ((flags & MNT_NOSUID) ? 2 : 0) | ((flags & MNT_NODEV) ? 4 : 0);
+		if (syscall(SYS_mount, "tmpfs", hp, "tmpfs", lf, "mode=0755") != 0) return err();
+		if (!strcmp(path, "/System/Volumes/Data")) data_log_storage(hp);   // el /private nuevo, con el almacén de registros
+		vfs_event_signal(0x8);                          // VQ_MOUNT
+		return 0;
+	}
 	if (flags & MNT_UPDATE) {
 		if (!m) return -D_EINVAL;
 		vfs_event_signal(0x100);                        // VQ_UPDATE, como vfs_event_signal tras una actualización en XNU
@@ -476,6 +557,12 @@ static long bsd_unmount(struct ctx* c) {
 	char p[4096];
 	if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT;
 	logf_("    unmount(\"%s\", 0x%lx)\n", p, c->a[1]);
+	struct dmount dm[16]; int nd = tmpfs_mounts(dm, 16);
+	for (int i = 0; i < nd; i++) if (!strcmp(dm[i].on, p)) {
+		if (syscall(SYS_umount2, dm[i].host, (c->a[1] & 0x80000) ? 1 /* MNT_FORCE de Linux */ : 0) != 0) return err();
+		vfs_event_signal(0x10);                         // VQ_UNMOUNT
+		return 0;
+	}
 	return gmount_at(p) ? -16 : -D_EINVAL;
 }
 static long bsd_funmount(struct ctx* c) { (void)c; return -16; }
@@ -508,7 +595,7 @@ static long bsd_getattrlist(struct ctx* c) {
 	uint32_t common = al[1], vol = al[2];
 	if (trace_all || (diag_target() && diag_all())) logf_("    getattrlist(\"%s\") common=0x%x vol=0x%x dir=0x%x file=0x%x opts=0x%lx\n", p, common, vol, al[3], al[4], (long)c->a[4]);
 	if (!vol) {                                           // atributos del objeto: empaquetado general
-		int nofollow = (c->a[4] & 1) != 0;
+		int nofollow = (c->a[4] & (1 | 0x800)) != 0;          // FSOPT_NOFOLLOW / FSOPT_NOFOLLOW_ANY
 		struct stat st;
 		const char* rpth = resolve(p, b, sizeof b);
 		if ((nofollow ? lstat(rpth, &st) : stat(rpth, &st)) != 0) return err();
@@ -946,9 +1033,9 @@ static long bsd_openat(struct ctx* c) {
 	if (!strcmp(path, "/dev/fsevents")) { int f = fsevents_open(); return f < 0 ? -2 : f; }
 	if (tahoe_root && path[0] == '/' && !tahoe_host_passthrough(path)) {
 		snprintf(full, sizeof full, "%s%s", tahoe_root, path);
-		fd = syscall(SYS_openat, dfd, full, flags, (int)c->a[3]);
+		fd = open_symlink(dfd, full, (int)c->a[2], flags, syscall(SYS_openat, dfd, full, flags, (int)c->a[3]));
 	}
-	if (fd < 0 && (!tahoe_root || path[0] != '/' || tahoe_host_passthrough(path))) { char al[64]; fd = syscall(SYS_openat, dfd, tahoe_dev_alias(path, al, sizeof al), flags, (int)c->a[3]); }
+	if (fd < 0 && (!tahoe_root || path[0] != '/' || tahoe_host_passthrough(path))) { char al[64]; const char* q = tahoe_dev_alias(path, al, sizeof al); fd = open_symlink(dfd, q, (int)c->a[2], flags, syscall(SYS_openat, dfd, q, flags, (int)c->a[3])); }
 	if (trace_all || fd < 0) logf_("    openat(%d, \"%s\") -> %ld%s%s\n", (int)c->a[0], path, fd, fd < 0 ? " " : "", fd < 0 ? strerror(errno) : "");
 	return fd < 0 ? err() : fd;
 }
@@ -1026,18 +1113,25 @@ void populate_data_volume(void) {
 	struct stat st;
 	if (stat(tmpl_root, &st) != 0) return;
 	nftw(tmpl_root, tmpl_copy, 32, FTW_PHYS);
-	// Almacén de registros de logd. En un BaseSystem, libsystem_trace (_os_trace_basesystem_storage_available) solo da por
+	data_log_storage(tahoe_root);
+}
+// Almacén de registros de logd. En un BaseSystem, libsystem_trace (_os_trace_basesystem_storage_available) solo da por
 	// disponible el almacenamiento si /private/var/db/diagnostics es un enlace simbólico (el arranque lo apunta a un volumen
 	// escribible) o si los boot-args lo indican; si no, launchd decide que no hay registro completo (HasFullLogging = NO) y
 	// no carga logd. Aquí la raíz es una carpeta escribible de Linux: se presenta como lo haría un arranque con almacenamiento.
-	char p[4400], q[4400];
-	snprintf(p, sizeof p, "%s/private/var/db/diagnostics", tahoe_root);
+// Se hace sobre el volumen de datos: al arrancar launchd (populate_data_volume) y otra vez cuando la Recovery monta su
+// tmpfs en /System/Volumes/Data (do_mount), que tapa lo anterior; si no, logd queda cargado sin almacén y `log` no conecta.
+void data_log_storage(const char* data_root) {
+	char p[4400], q[4400]; struct stat st;
+	snprintf(p, sizeof p, "%s/private/var/db", data_root);
+	if (stat(p, &st) != 0) { char a[4400]; snprintf(a, sizeof a, "%s/private", data_root); mkdir(a, 0755); snprintf(a, sizeof a, "%s/private/var", data_root); mkdir(a, 0755); mkdir(p, 0755); }
+	snprintf(p, sizeof p, "%s/private/var/db/diagnostics", data_root);
 	if (lstat(p, &st) != 0) {
-		snprintf(q, sizeof q, "%s/private/var/db/diagnostics.storage", tahoe_root);
+		snprintf(q, sizeof q, "%s/private/var/db/diagnostics.storage", data_root);
 		mkdir(q, 0755);
 		if (symlink("diagnostics.storage", p) != 0) {}
 	}
-	snprintf(p, sizeof p, "%s/private/var/db/uuidtext", tahoe_root);
+	snprintf(p, sizeof p, "%s/private/var/db/uuidtext", data_root);
 	if (lstat(p, &st) != 0) mkdir(p, 0755);
 }
 
@@ -1121,7 +1215,7 @@ void emu_fs_xattr_init(void) {
 void emu_fs_init(void) {
 	reg_bsd(73, bsd_munmap);   reg_bsd(74, bsd_mprotect); reg_bsd(75, bsd_madvise); reg_bsd(197, bsd_mmap);
 	reg_bsd(199, bsd_lseek);   reg_bsd(153, bsd_pread);   reg_bsd(154, bsd_pwrite);
-	reg_bsd(33, bsd_access);   reg_bsd(58, bsd_readlink); reg_bsd(92, bsd_fcntl);
+	reg_bsd(33, bsd_access);   reg_bsd(58, bsd_readlink); reg_bsd(473, bsd_readlinkat); reg_bsd(92, bsd_fcntl);
 	reg_bsd(338, bsd_stat64);  reg_bsd(339, bsd_fstat64); reg_bsd(340, bsd_lstat64);
 	reg_bsd(24, bsd_getuid);   reg_bsd(25, bsd_geteuid);  reg_bsd(47, bsd_getgid); reg_bsd(43, bsd_getegid);
 	reg_bsd(381, bsd_mac_syscall);
