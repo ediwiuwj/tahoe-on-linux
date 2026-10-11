@@ -1139,6 +1139,20 @@ void execwatch_del(uint32_t port) {
 	unlock();
 	flush_notes();
 }
+// EVFILT_FS: quien vigila los eventos de VFS (KernelEventAgent) anota un puerto con destino -2; vfs_event_signal manda a cada
+// uno un mensaje cuyo id son los bits VQ_* (VQ_MOUNT 0x8, VQ_UNMOUNT 0x10, VQ_UPDATE 0x100), como vfs_event_signal de XNU.
+#define VFSWATCH_TARGET (-2)
+uint32_t vfswatch_add(void) { return execwatch_add(VFSWATCH_TARGET); }
+void vfs_event_signal(uint32_t vq) {
+	uint32_t ports[MAXEXECW]; int n = 0;
+	lock();
+	for (int i = 0; i < MAXEXECW; i++) if (shm->execw[i].port && shm->execw[i].target == VFSWATCH_TARGET) ports[n++] = shm->execw[i].port;
+	unlock();
+	for (int i = 0; i < n; i++) {
+		uint32_t m[6] = { 0x13 /* MACH_MSG_TYPE_COPY_SEND */, 24, ports[i], 0, 0, vq };
+		port_send_k(ports[i], (const uint8_t*)m, 24, 1);
+	}
+}
 void execwatch_notify(void) {
 	uint32_t ports[MAXEXECW]; int n = 0;
 	lock();

@@ -31,7 +31,7 @@ extern void wq_cancel_workloop(uint64_t kqid);
 extern void wq_note_workloop(uint64_t);
 extern void wq_arm_workloop(uint64_t);
 
-enum { EVFILT_READ = -1, EVFILT_WRITE = -2, EVFILT_SIGNAL = -6, EVFILT_TIMER = -7, EVFILT_MACHPORT = -8, EVFILT_USER = -10, EVFILT_WORKLOOP = -17, EVFILT_PROC = -5 };
+enum { EVFILT_READ = -1, EVFILT_WRITE = -2, EVFILT_SIGNAL = -6, EVFILT_TIMER = -7, EVFILT_MACHPORT = -8, EVFILT_USER = -10, EVFILT_WORKLOOP = -17, EVFILT_PROC = -5, EVFILT_FS = -9 };
 static __thread uint64_t g_dout, g_davail;   // búfer de datos del kevent_qos en curso (mensajes Mach recibidos directamente)
 enum { EV_ADD = 1, EV_DELETE = 2, EV_ENABLE = 4, EV_DISABLE = 8, EV_ONESHOT = 0x10, EV_CLEAR = 0x20, EV_RECEIPT = 0x40, EV_ERROR = 0x4000 };
 #define NOTE_TRIGGER 0x01000000u
@@ -339,6 +339,14 @@ static int apply(int kq, const struct kev* c) {
 			}
 			break;
 		}
+		case EVFILT_FS: {
+			// eventos de VFS de todo el sistema (vfs_event_signal, emu_port.c): un puerto propio anotado como vigilante
+			uint32_t xp = vfswatch_add();
+			int sock = xp ? port_eventfd(xp) : -1;
+			if (sock < 0) { if (xp) execwatch_del(xp); drop(n); return D_ENOMEM; }
+			n->fd = sock; n->xport = xp; n->xfd = -1;
+			break;
+		}
 		case EVFILT_SIGNAL: {
 			// Señales de Darwin como eventos: un manejador del anfitrión suma al eventfd de esa señal, y el knote lo lee.
 			int ls = darwin_to_linux_sig_k((int)c->ident);
@@ -517,6 +525,13 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 					}
 				}
 				else { k.fflags = 0; k.ext[0] = k.ext[1] = k.ext[2] = k.ext[3] = 0; }   // sin recepción directa: solo "hay mensaje"
+			}
+			else if (n->k.filter == EVFILT_FS) {
+				uint8_t* m = NULL; uint32_t sz = 0, snd[3];
+				if (port_receive(n->xport, 0, &m, &sz, snd, 0, 0) != 0) continue;   // aviso sin mensaje
+				uint32_t vq = 0; if (sz >= 24) memcpy(&vq, m + 20, 4);
+				free(m);
+				k.fflags = vq; k.data = 0;
 			}
 			else if (n->k.filter == EVFILT_PROC && n->xport && proc_exec_pending(n)) {
 				k.fflags = NOTE_EXEC; k.data = 0;                                 // el proceso hizo exec: sigue vivo, el knote sigue

@@ -111,7 +111,9 @@ void kobj_free(uint32_t name);
 int kobj_lookup(uint32_t name, int* type, int32_t* pid);
 uint32_t execwatch_add(int32_t target);   // NOTE_EXEC: puerto que recibe un mensaje cuando target hace exec
 void execwatch_del(uint32_t port);
-void execwatch_notify(void);             // antes de exec: avisar a quien vigila este proceso
+void execwatch_notify(void);
+uint32_t vfswatch_add(void);                  // EVFILT_FS: puerto que recibe los eventos de VFS
+void vfs_event_signal(uint32_t vq);         // VQ_MOUNT/VQ_UNMOUNT/VQ_UPDATE a quien vigila             // antes de exec: avisar a quien vigila este proceso
 uint64_t rmap_add(int32_t pid, const char* path, uint64_t off, uint64_t len, int prot, uint64_t align);
 int rmap_fault(uint64_t addr);
 int port_get_attributes(uint32_t name, int flavor, uint32_t* out, uint32_t* cnt);
