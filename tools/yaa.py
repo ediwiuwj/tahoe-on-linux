@@ -8,6 +8,7 @@
 #   - atributos extendidos de macOS como user.<nombre>;
 #   - propietario distinto de root en user.tahoe.owner ("uid:gid"), porque sin ser root no se puede aplicar.
 #   tools/yaa.py <paquete.zip> <raíz destino> [miembro...]     # por omisión, AssetData/payloadv2/payload.NNN en orden
+#   tools/yaa.py --enlaces <paquete.zip> <raíz destino>        # solo los enlaces duros de links.txt
 # Formato: cada miembro es un flujo pbzx (bloques xz) con entradas: "YAA1"/"AA01", u16 tamaño de cabecera y campos
 # CLAVE(3)+subtipo(1): 1/2/4/8 enteros, P ruta (u16+bytes), T fecha (s+ns, 12 bytes), S fecha (8), A/B/C tamaño de un
 # bloque de datos (u16/u32/u64) que va detrás de la cabecera, F/G/H/I sumas (20/32/48/64 bytes).
@@ -121,7 +122,27 @@ def parse(buf, pos, ex):
         pos += total
     return pos
 
+def hardlinks(z, root):
+    """links.txt: el paquete guarda cada archivo una sola vez; «=ruta» es el original y cada «+ruta» siguiente, un enlace
+    duro a él."""
+    try: txt = z.read("AssetData/payloadv2/links.txt").decode("utf-8", "surrogateescape")
+    except KeyError: return
+    src = None; n = falta = 0
+    for line in txt.splitlines():
+        if not line: continue
+        op, rel = line[0], line[1:]
+        hp = os.path.join(root, rel)
+        if op == "=": src = hp
+        elif op == "+" and src:
+            if not os.path.lexists(src): falta += 1; continue
+            os.makedirs(os.path.dirname(hp), exist_ok=True)
+            if os.path.lexists(hp): os.unlink(hp)
+            os.link(src, hp, follow_symlinks=False); n += 1
+    print(f"enlaces duros: {n} (sin original: {falta})")
+
 def main():
+    if sys.argv[1] == "--enlaces":                     # solo links.txt, sobre una extracción ya hecha
+        hardlinks(zipfile.ZipFile(sys.argv[2]), os.path.abspath(sys.argv[3])); return
     zpath, root = sys.argv[1], sys.argv[2]
     z = zipfile.ZipFile(zpath)
     members = sys.argv[3:] or sorted(n for n in z.namelist() if n.startswith("AssetData/payloadv2/payload.") and n.rsplit(".", 1)[1].isdigit())
@@ -136,6 +157,7 @@ def main():
         print(f"{m}: hecho ({ex.n} entradas)", flush=True)
     ex.finish()
     print(f"total {ex.n} entradas; sin crear (tipo: cuántas): {ex.skipped}")
+    if not sys.argv[3:]: hardlinks(z, ex.root)
 
 if __name__ == "__main__":
     main()
