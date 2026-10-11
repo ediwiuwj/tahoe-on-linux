@@ -144,6 +144,73 @@ done:;
 	return n + 8;
 }
 
+// mach_vm_remap (id 4813): cabecera, 1 descriptor de puerto (tarea origen), NDR, target_address, size, mask, flags,
+// src_address, copy, inheritance -> target_address, cur_protection, max_protection. Mapea en esta tarea las páginas de otra
+// zona suya (libobjc lo usa para sus trampolines de bloques: copia junto a una página de datos la página de código de la
+// caché). Con copy=FALSE XNU comparte las páginas: en Linux solo se puede con mapeos compartidos (mremap con tamaño 0); en
+// los privados (la caché, memoria anónima) se copia el contenido, que para código de solo lectura es lo mismo.
+// La nueva zona lleva la protección del origen; flags: VM_FLAGS_ANYWHERE (1), VM_FLAGS_OVERWRITE (0x4000).
+static int prot_of(uint64_t a) {
+	FILE* f = fopen("/proc/self/maps", "r");
+	if (!f) return -1;
+	char ln[512]; int prot = -1;
+	while (fgets(ln, sizeof ln, f)) {
+		unsigned long lo, hi; char pr[5];
+		if (sscanf(ln, "%lx-%lx %4s", &lo, &hi, pr) != 3 || a < lo || a >= hi) continue;
+		prot = (pr[0] == 'r' ? 1 : 0) | (pr[1] == 'w' ? 2 : 0) | (pr[2] == 'x' ? 4 : 0);
+		break;
+	}
+	fclose(f);
+	return prot;
+}
+static size_t mig_mach_vm_remap(const struct hdr* req, const uint8_t* m, uint8_t* r) {
+	if (req->size < 92) return reply_begin(r, req, KERN_INVALID_ARG);
+	uint32_t srctask; uint64_t addr, size, mask, src; int32_t flags, copy;
+	memcpy(&srctask, m + 28, 4); memcpy(&addr, m + 48, 8); memcpy(&size, m + 56, 8); memcpy(&mask, m + 64, 8);
+	memcpy(&flags, m + 72, 4); memcpy(&src, m + 76, 8); memcpy(&copy, m + 84, 4);
+	int ttype; int32_t tpid;
+	if ((kobj_lookup(req->remote, &ttype, &tpid) && ttype == KO_TASK && tpid != (int32_t)getpid()) ||
+	    (kobj_lookup(srctask, &ttype, &tpid) && ttype == KO_TASK && tpid != (int32_t)getpid())) {
+		logf_("    mach_vm_remap entre tareas distintas: sin implementar\n");
+		return reply_begin(r, req, KERN_INVALID_ARG);
+	}
+	uint64_t s0 = src & ~(uint64_t)(PAGE - 1), len = round_up(src + size) - s0;
+	int prot = prot_of(s0);
+	if (!size || prot < 0) return reply_begin(r, req, 1);       // KERN_INVALID_ADDRESS
+	int32_t kr = KERN_SUCCESS_;
+	void* p = MAP_FAILED;
+	uint64_t want = (flags & 1) ? 0 : (addr & ~(uint64_t)(PAGE - 1));
+	if (!copy) {
+		p = want ? mremap((void*)s0, 0, len, MREMAP_MAYMOVE | MREMAP_FIXED, (void*)want) : mremap((void*)s0, 0, len, MREMAP_MAYMOVE);
+	}
+	if (p == MAP_FAILED) {
+		uint64_t align = mask + 1 > PAGE ? mask + 1 : PAGE;
+		if (want) p = mmap((void*)want, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | ((flags & 0x4000) ? MAP_FIXED : MAP_FIXED_NOREPLACE), -1, 0);
+		else {
+			uint8_t* q = mmap(NULL, len + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (q != MAP_FAILED) {
+				uint64_t a = ((uint64_t)q + align - 1) & ~(align - 1);
+				if (a > (uint64_t)q) munmap(q, a - (uint64_t)q);
+				if ((uint64_t)q + len + align > a + len) munmap((void*)(a + len), (uint64_t)q + len + align - (a + len));
+				p = (void*)a;
+			}
+		}
+		if (p == MAP_FAILED) kr = KERN_NO_SPACE_;
+		else {
+			if (!(prot & 1)) mprotect((void*)s0, len, prot | PROT_READ);      // origen ilegible: leerlo para copiarlo
+			memcpy(p, (void*)s0, len);
+			if (!(prot & 1)) mprotect((void*)s0, len, prot);
+			mprotect(p, len, prot);
+		}
+	}
+	uint64_t out = p == MAP_FAILED ? 0 : (uint64_t)p + (src - s0);
+	if (mach_trace()) logf_("    MT pid=%d vm_remap 0x%lx (0x%lx) copy=%d flags=0x%x -> 0x%lx kr=%d\n", (int)getpid(), src, size, copy, flags, out, kr);
+	size_t n = reply_begin(r, req, kr);
+	int32_t cur = prot, max = 7;
+	memcpy(r + n, &out, 8); memcpy(r + n + 8, &cur, 4); memcpy(r + n + 12, &max, 4);
+	return n + 16;
+}
+
 // host_info (id 200): NDR, flavor, capacidad. Solo HOST_BASIC_INFO (1): 12 enteros.
 static size_t mig_host_info(const struct hdr* req, const uint8_t* m, uint8_t* r) {
 	int32_t flavor, cap;
@@ -702,6 +769,7 @@ static long mach_msg2(struct ctx* c) {
 	}   // task_policy_set / mach_port_set_attributes: sin efecto
 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;
 	case 4817: n = mig_make_memory_entry(&h, req, rep); break;
+	case 4813: n = mig_mach_vm_remap(&h, req, rep); break;
 	case 4807: {                                                  // mach_vm_copy(task, src, size, dst): el destino ya está asignado
 		uint64_t src, size, dst; memcpy(&src, req + 32, 8); memcpy(&size, req + 40, 8); memcpy(&dst, req + 48, 8);
 		memmove((void*)dst, (void*)src, size);

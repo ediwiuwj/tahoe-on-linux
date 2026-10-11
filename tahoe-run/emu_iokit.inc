@@ -490,6 +490,15 @@ static void io_init(void) {
 	p_str(di2, "IOProviderClass", "IOResources");
 	p_str(di2, "IOResourceMatch", "IOKit");
 	p_str(di2, "IOUserClientClass", "DIDeviceCreatorUserClient");
+	// Vigilante del sistema (Watchdog.kext, com.apple.driver.watchdog): watchdogd lo abre al arrancar y le avisa periódicamente
+	// de que userspace sigue vivo; si no lo encuentra y no está en una máquina virtual, aborta. Sin núcleo de macOS no hay a
+	// quién reiniciar: el servicio está y sus métodos se aceptan sin efecto (uc_watchdog).
+	int wd = ent_add(res, "IOWatchdog", "IOWatchdog", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	p_str(wd, "IOClass", "IOWatchdog");
+	p_str(wd, "CFBundleIdentifier", "com.apple.driver.watchdog");
+	p_str(wd, "IOMatchCategory", "IOWatchdog");
+	p_str(wd, "IOProviderClass", "IOResources");
+	p_str(wd, "IOUserClientClass", "IOWatchdogUserClient");
 
 	int opt = ent_add(plat, "options", "IODTNVRAM", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(opt, "name", "options");
@@ -926,7 +935,19 @@ static int32_t uc_lifs(struct uc_call* c) {
 	*c->nsout = 0; *c->noutband = 0;
 	return 0;
 }
+// IOWatchdogUserClient: watchdogd pregunta si el vigilante está activo y se registra; todo se acepta sin datos de salida (el
+// vigilante queda inactivo, como si nunca fuera a disparar). Se anota cada selector la primera vez.
+static int32_t uc_watchdog(struct uc_call* c) {
+	static uint64_t seen;
+	if (c->selector < 64 && !(seen & (1ull << c->selector))) {
+		seen |= 1ull << c->selector;
+		logf_("    iokit: <%d> watchdog selector %u (%u escalares, %u bytes): aceptado sin efecto\n", (int)getpid(), c->selector, c->nsin, c->ninband);
+	}
+	*c->nsout = 0; *c->noutband = 0;
+	return 0;
+}
 static uc_method_fn uc_hook_for(const char* cls) {
+	if (!strcmp(cls, "IOWatchdog")) return uc_watchdog;
 	if (!strcmp(cls, "AppleSMC")) return uc_smc;
 	if (!strcmp(cls, "com_apple_filesystems_lifs")) return uc_lifs;
 	if (!strcmp(cls, "IOHIDSystem")) return uc_hid;

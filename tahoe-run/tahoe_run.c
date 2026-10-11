@@ -1099,16 +1099,21 @@ static void install_dispatch(void) {
 		DIE("PR_SET_SYSCALL_USER_DISPATCH: %s (hace falta Linux >= 5.11)", strerror(errno));
 }
 
-// Número de CPU: libsystem_pthread, libsystem_malloc y libdispatch lo leen con "sidt [rsp-0x10]" y se quedan con los
+// Número de CPU: libsystem_pthread, libsystem_malloc y libdispatch lo leen con "sidt [rsp-0x10]" (o, según cómo se compiló la
+// caché, "sidt [rbp-0x10]", p. ej. en la del macOS completo) y se quedan con los
 // 12 bits bajos del límite de la IDT, porque XNU pone en cada CPU límite = 0x1000 + número de CPU (mp_desc.c). En Linux
 // el límite es 0xfff, así que salía la CPU 4095 y libdispatch indexaba su montón por CPU fuera de rango. Sin UMIP la
 // instrucción no se puede atrapar, de modo que en nuestra copia privada de la caché se cambia por una de igual tamaño,
-// "and dword [rsp-0x10], 0": límite & 0xfff = 0, la CPU 0, válida siempre (solo cambia el reparto por CPU).
+// "and dword [rsp-0x10], 0" / "and dword [rbp-0x10], 0": límite & 0xfff = 0, la CPU 0, válida siempre (solo cambia el
+// reparto por CPU).
 static void patch_cpu_number(void) {
 	const uint64_t cache = 0x7ff800000000UL;
 	uint32_t io = *(uint32_t*)(cache + 0x1c0), ic = *(uint32_t*)(cache + 0x1c4);
 	static const char* libs[] = { "/libdispatch.dylib", "/libsystem_malloc.dylib", "/libsystem_pthread.dylib" };
-	static const uint8_t sidt[5] = { 0x0f, 0x01, 0x4c, 0x24, 0xf0 }, repl[5] = { 0x83, 0x64, 0x24, 0xf0, 0x00 };
+	static const struct { uint8_t len, sidt[5], repl[5]; } pat[] = {
+		{ 5, { 0x0f, 0x01, 0x4c, 0x24, 0xf0 }, { 0x83, 0x64, 0x24, 0xf0, 0x00 } },   // sidt [rsp-0x10]
+		{ 4, { 0x0f, 0x01, 0x4d, 0xf0 },       { 0x83, 0x65, 0xf0, 0x00 } },         // sidt [rbp-0x10]
+	};
 	int patched = 0;
 	for (uint32_t i = 0; i < ic && i < 10000; i++) {
 		uint64_t mh = *(uint64_t*)(cache + io + i * 32ULL);
@@ -1123,10 +1128,13 @@ static void patch_cpu_number(void) {
 			if (sg->cmd == 0x19 && !strcmp(sg->segname, "__TEXT")) {
 				uint8_t* a = (uint8_t*)sg->vmaddr; uint64_t n = sg->vmsize;
 				for (uint64_t off = 0; off + 5 <= n; off++) {
-					if (a[off] != 0x0f || memcmp(a + off, sidt, 5) != 0) continue;
+					if (a[off] != 0x0f || a[off + 1] != 0x01) continue;
+					int k = -1;
+					for (int j = 0; j < (int)(sizeof pat / sizeof pat[0]); j++) if (!memcmp(a + off, pat[j].sidt, pat[j].len)) k = j;
+					if (k < 0) continue;
 					uint64_t pg = ((uint64_t)a + off) & ~(uint64_t)(PAGE - 1);
 					if (mprotect((void*)pg, PAGE * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) continue;
-					memcpy(a + off, repl, 5);
+					memcpy(a + off, pat[k].repl, pat[k].len);
 					mprotect((void*)pg, PAGE * 2, PROT_READ | PROT_EXEC);
 					patched++;
 				}
