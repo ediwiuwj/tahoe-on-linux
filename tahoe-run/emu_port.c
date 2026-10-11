@@ -34,7 +34,7 @@
 #define MAXPORTS 2048
 #define MAXMSG   512
 #define MSGSZ    (64 * 1024)
-struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; };   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
+struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; };   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
 struct mslot { uint32_t next, size, total, spid, suid, sgid; uint8_t data[MSGSZ - 24]; };
 // Derechos que el núcleo tiene que vigilar para avisar cuando muere su dueño (ver "notificaciones" más abajo):
 //  sonce: un proceso tiene un derecho send-once (normalmente, la respuesta que debe a quien le pidió algo);
@@ -46,6 +46,9 @@ struct mslot { uint32_t next, size, total, spid, suid, sgid; uint8_t data[MSGSZ 
 struct sonce { uint32_t port; int32_t holder; };
 struct dnreq { uint32_t port, notify; int32_t pid; };
 struct sproc { int32_t pid; uint64_t start; };
+// shold: un proceso que no es el dueño tiene un derecho de envío a un puerto (para MACH_NOTIFY_NO_SENDERS, ver más abajo).
+#define MAXSH 8192
+struct shold { uint32_t port; int32_t holder; };
 // Objetos del núcleo con nombre de puerto (tareas de otros procesos, tokens de identidad...): el nombre lleva a su tipo y pid.
 #define MAXKOBJ 1024
 struct skobj { uint32_t name; uint16_t type; int32_t pid; };
@@ -63,9 +66,11 @@ struct shm {
 	struct sonce so[MAXSO];
 	struct dnreq dn[MAXDN];
 	struct sproc procs[MAXPROC];
+	struct shold sh[MAXSH];
 	struct skobj kobjs[MAXKOBJ];
 	struct srmap rmaps[MAXRMAP];
 	uint64_t rmap_next;
+	uint64_t osvariant_status;            // kern.osvariant_status: lo fija launchd (PID 1) una vez y lo leen todos
 };
 static struct shm* shm;
 static char shm_path[128], tag[32];
@@ -179,7 +184,37 @@ uint32_t port_create(int is_set) {
 	lock();
 	struct sport* p = NULL;
 	for (int i = 0; i < MAXPORTS; i++) if (!shm->ports[i].used) { p = &shm->ports[i]; break; }
-	if (!p) { unlock(); logf_("    puertos: tabla llena\n"); return 0; }
+	if (!p) {
+		// Diagnóstico (una vez por proceso): quién tiene los puertos. rpid = dueño del derecho de recepción.
+		static int dumped;
+		if (!dumped) {
+			dumped = 1;
+			int pid[64] = { 0 }, cnt[64] = { 0 }, np = 0;
+			for (int i = 0; i < MAXPORTS; i++) {
+				int r = shm->ports[i].rpid, k;
+				for (k = 0; k < np && pid[k] != r; k++) {}
+				if (k == np && np < 64) { pid[np] = r; np++; }
+				if (k < 64) cnt[k]++;
+			}
+			unlock();
+			logf_("    puertos: tabla llena; por dueño:");
+			for (int k = 0; k < np; k++) if (cnt[k] >= 20) logf_(" %d:%d%s", pid[k], cnt[k], kill(pid[k], 0) == 0 ? "" : "(muerto)");
+			logf_("\n");
+			int top = 0; for (int k = 1; k < np; k++) if (cnt[k] > cnt[top]) top = k;
+			int ns = 0, held = 0, sets = 0, queued = 0, pd = 0, insets = 0;
+			lock();
+			for (int i = 0; i < MAXPORTS; i++) {
+				struct sport* q = &shm->ports[i];
+				if (!q->used || q->rpid != pid[top]) continue;
+				ns += q->nsreq != 0; sets += q->is_set; queued += q->count > 0; pd += q->pdreq != 0; insets += q->set != 0;
+				for (int j = 0; j < MAXSH; j++) if (shm->sh[j].port == q->name) { held++; break; }
+			}
+			unlock();
+			logf_("    puertos de %d: no-senders pedido=%d con usuarios anotados=%d conjuntos=%d en conjunto=%d con mensajes=%d port-destroyed=%d\n", pid[top], ns, held, sets, insets, queued, pd);
+		} else unlock();
+		logf_("    puertos: tabla llena\n");
+		return 0;
+	}
 	{ pthread_cond_t keep = p->cv; memset(p, 0, sizeof *p); p->cv = keep; }   // la variable de condición se inicializó al crear la región
 	p->used = 1; p->is_set = (uint8_t)is_set; p->name = name; p->owner = (int32_t)getpid(); p->rpid = (int32_t)getpid();
 	local_sock[port_index(p)] = make_wake_socket(name, p->rpid);
@@ -217,6 +252,11 @@ int port_eventfd(uint32_t name) {
 //    mensaje con el derecho de respuesta se descartó). El cliente MIG lo traduce a MIG_SERVER_DIED y XPC a un error,
 //    en vez de esperar para siempre.
 //  - MACH_NOTIFY_DEAD_NAME (72): muere el puerto al que se tenía un derecho de envío y se pidió el aviso.
+//  - MACH_NOTIFY_NO_SENDERS (70): ya nadie tiene derechos de envío al puerto. libxpc lo usa en los servidores para cerrar la
+//    conexión de un cliente y destruir su puerto; sin el aviso, cada cliente que termina deja un puerto huérfano en el servidor
+//    (logd, launchd...) hasta llenar la tabla. Aquí se anota qué procesos (distintos del dueño) recibieron un derecho de envío
+//    a cada puerto, y el aviso sale cuando muere el último de ellos. Es conservador: si un cliente suelta su derecho sin
+//    terminar, el aviso llega cuando termine, nunca antes de tiempo.
 //  - MACH_NOTIFY_PORT_DESTROYED (69): se iba a destruir un derecho de recepción con esa petición; en vez de eso el derecho
 //    viaja (con sus mensajes) al que la pidió. launchd lo usa para recuperar los puertos de los servicios que mueren.
 // Los avisos se acumulan con el cerrojo tomado y se envían después (enviar toma el cerrojo).
@@ -234,7 +274,7 @@ static void flush_notes(void) {
 		struct note n = notes[--nnotes];
 		uint8_t m[40] = { 0 };
 		uint32_t bits = 18, size = 24;                       // remoto: MOVE_SEND_ONCE (el aviso usa el send-once de la petición)
-		if (n.id == 72) { size = 36; m[24 + 4] = 1; memcpy(m + 32, &n.arg, 4); }      // NDR (little endian) + nombre muerto
+		if (n.id == 72 || n.id == 70) { size = 36; m[24 + 4] = 1; memcpy(m + 32, &n.arg, 4); }      // NDR (little endian) + nombre muerto
 		else if (n.id == 69) {                               // complejo: un descriptor de puerto con el derecho de recepción
 			bits |= 0x80000000u; size = 40;
 			uint32_t one = 1; memcpy(m + 24, &one, 4); memcpy(m + 28, &n.arg, 4); m[38] = 16; m[39] = 0;
@@ -245,6 +285,17 @@ static void flush_notes(void) {
 	}
 }
 
+static void sh_put_locked(uint32_t port, int32_t holder) {
+	int fr = -1;
+	for (int i = 0; i < MAXSH; i++) { if (shm->sh[i].port == port && shm->sh[i].holder == holder) return; if (fr < 0 && !shm->sh[i].port) fr = i; }
+	if (fr >= 0) shm->sh[fr] = (struct shold){ port, holder };
+	else logf_("    no-senders: tabla llena\n");
+}
+static void sh_add_locked(uint32_t port, int32_t holder) {
+	struct sport* p = find_locked(port);
+	if (!p || p->rpid == holder) return;                      // solo derechos a puertos de otro proceso
+	sh_put_locked(port, holder);
+}
 static void so_add_locked(uint32_t port, int32_t holder) {
 	for (int i = 0; i < MAXSO; i++) if (!shm->so[i].port) { shm->so[i] = (struct sonce){ port, holder }; return; }
 	logf_("    send-once: tabla llena\n");
@@ -272,6 +323,7 @@ static void msg_rights_locked(const uint8_t* m, uint32_t size, int mode, uint32_
 		else if (mode == RIGHTS_RECV) so_add_locked(local, me);
 		else if (mode == RIGHTS_DESTROY) note_locked(local, 71, 0);
 	}
+	if (mode == RIGHTS_RECV && local && (ld == 17 || ld == 19 || ld == 20)) sh_add_locked(local, me);   // MOVE/COPY/MAKE_SEND
 	if (size < 28 || !(bits & 0x80000000u)) return;
 	uint32_t cnt, off = 28; memcpy(&cnt, m + 24, 4);
 	for (uint32_t i = 0; i < cnt && off + 12 <= size; i++) {
@@ -284,9 +336,17 @@ static void msg_rights_locked(const uint8_t* m, uint32_t size, int mode, uint32_
 				if (mode == RIGHTS_SEND && disp == 18) so_take_locked(nm, me);
 				else if (mode == RIGHTS_RECV) so_add_locked(nm, me);
 				else if (mode == RIGHTS_DESTROY) note_locked(nm, 71, 0);
+			} else if (mode == RIGHTS_RECV && (disp == 17 || disp == 19 || disp == 20)) {
+				sh_add_locked(nm, me);
 			} else if (disp == 16) {                                       // MOVE_RECEIVE
 				struct sport* q = find_locked(nm);
-				if (q && mode == RIGHTS_SEND) { q->owner = 0; q->ctx = 0; q->guarded = q->strict_guard = 0; }   // en tránsito (ipc_port_clear_receive)
+				if (q && mode == RIGHTS_SEND) {
+					q->owner = 0; q->ctx = 0; q->guarded = q->strict_guard = 0;   // en tránsito (ipc_port_clear_receive)
+					// Quien traspasa el derecho de recepción suele quedarse con derechos de envío hechos por él (así crea
+					// libxpc las conexiones: el cliente hace el puerto y entrega la recepción al servidor). Se anota como
+					// usuario; si no los tenía, el aviso NO_SENDERS solo llega más tarde (al terminar), nunca antes.
+					sh_put_locked(nm, me);
+				}
 				else if (q && mode == RIGHTS_DESTROY) destroy_locked(q);      // nadie lo recibirá
 			}
 		}
@@ -298,6 +358,7 @@ static void msg_rights_locked(const uint8_t* m, uint32_t size, int mode, uint32_
 // si no, se descartan los mensajes y se avisa a quien pidió DEAD_NAME.
 static void destroy_locked(struct sport* p) {
 	uint32_t name = p->name;
+	for (int i = 0; i < MAXSH; i++) if (shm->sh[i].port == name) shm->sh[i].port = 0;   // ya no hay a quién avisar
 	if (p->pdreq && !p->is_set) {
 		uint32_t to = p->pdreq; p->pdreq = 0;
 		p->owner = 0;                                         // en tránsito hacia quien pidió el aviso
@@ -381,6 +442,14 @@ static void* reaper_thread(void* arg) {
 			int nso = 0, nrecv = 0;
 			for (int i = 0; i < MAXSO; i++) if (shm->so[i].port && shm->so[i].holder == pid) { note_locked(shm->so[i].port, 71, 0); shm->so[i].port = 0; nso++; }
 			for (int i = 0; i < MAXDN; i++) if (shm->dn[i].port && shm->dn[i].pid == pid) shm->dn[i].port = 0;
+			for (int i = 0; i < MAXSH; i++) {                     // sus derechos de envío desaparecen: ¿queda alguien más?
+				if (!shm->sh[i].port || shm->sh[i].holder != pid) continue;
+				uint32_t port = shm->sh[i].port; shm->sh[i].port = 0;
+				int others = 0;
+				for (int j = 0; j < MAXSH && !others; j++) if (shm->sh[j].port == port) others = 1;
+				struct sport* q = others ? NULL : find_locked(port);
+				if (q && q->nsreq) { note_locked(q->nsreq, 70, q->nsmscount); q->nsreq = 0; }   // el aviso consume la petición
+			}
 			if (mach_trace()) for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used && shm->ports[i].owner == pid) logf_("    recolector: 0x%x era de %d (rpid %d)\n", shm->ports[i].name, (int)pid, (int)shm->ports[i].rpid);
 			for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used && shm->ports[i].owner == pid) { destroy_locked(&shm->ports[i]); nrecv++; }
 			logf_("    recolector: pid %d murió (%d derechos de recepción, %d respuestas pendientes)\n", (int)pid, nrecv, nso);
@@ -568,8 +637,45 @@ static void sp_init(void) {
 }
 // mach_ports_register(ports[3]): se guardan en la región compartida; los hijos los heredan (en XNU, task_create copia
 // itk_registered) y, mientras no tengan puerto bootstrap propio, usan el primero: así encuentran a launchd.
-void registered_ports_set(const uint32_t* p, int n) { lock(); for (int i = 0; i < 3; i++) shm->special[i] = i < n ? p[i] : 0; unlock(); }
-static uint32_t registered_port(int i) { lock(); uint32_t v = shm->special[i]; unlock(); return v; }
+// kern.osvariant_status (kern_sysctl.c de XNU): un valor por arranque, compartido por todos los procesos. Solo el PID 1 lo
+// fija, y una sola vez; si no, EPERM (devuelve 0 si se fijó).
+uint64_t osvariant_status_get(void) { lock(); uint64_t v = shm->osvariant_status; unlock(); return v; }
+int osvariant_status_set(uint64_t v) {
+	if (getpid() != 1) return -1;
+	lock(); int ok = shm->osvariant_status == 0; if (ok) shm->osvariant_status = v; unlock();
+	return ok ? 0 : -1;
+}
+// Puertos registrados (mach_ports_register): como en XNU son de cada tarea y los hereda el hijo (task_create copia
+// itk_registered); aquí viajan en TAHOE_REG al hacer exec/posix_spawn. Solo los de launchd (PID 1) se guardan además en la
+// región compartida: son el respaldo de un proceso que no desciende de launchd (la shell que se une con nsenter). Antes
+// eran globales: el último proceso que registraba (p. ej. al crear una sesión) cambiaba el bootstrap de todos los demás.
+static uint32_t reg_local[3]; static int reg_known;
+static pthread_once_t reg_once = PTHREAD_ONCE_INIT;
+static void reg_init(void) {
+	const char* v = getenv("TAHOE_REG");
+	if (v && sscanf(v, "%u,%u,%u", &reg_local[0], &reg_local[1], &reg_local[2]) == 3) reg_known = 1;
+}
+void registered_ports_set(const uint32_t* p, int n) {
+	pthread_once(&reg_once, reg_init);
+	for (int i = 0; i < 3; i++) reg_local[i] = i < n ? p[i] : 0;
+	reg_known = 1;
+	if (getpid() == 1) { lock(); for (int i = 0; i < 3; i++) shm->special[i] = reg_local[i]; unlock(); }
+}
+static uint32_t registered_port(int i) {
+	pthread_once(&reg_once, reg_init);
+	if (reg_known) return reg_local[i];
+	lock(); uint32_t v = shm->special[i]; unlock(); return v;
+}
+// Entorno que hereda un hijo en exec/posix_spawn: sus puertos especiales (el bootstrap, sobre todo) y los registrados, como
+// task_create de XNU. Las acciones de puerto de posix_spawn van antes en el entorno y tienen prioridad (getenv da la primera).
+int ports_inherit_env(char out[][40], int max) {
+	pthread_once(&sp_once, sp_init);
+	pthread_once(&reg_once, reg_init);
+	int k = 0;
+	for (int i = 0; i < 8 && k < max; i++) if (special[i]) snprintf(out[k++], 40, "TAHOE_SP%d=%u", i, special[i]);
+	if (reg_known && k < max) snprintf(out[k++], 40, "TAHOE_REG=%u,%u,%u", reg_local[0], reg_local[1], reg_local[2]);
+	return k;
+}
 uint32_t special_port_get(int which) {
 	pthread_once(&sp_once, sp_init);
 	if (which < 0 || which >= 8) return 0;
@@ -933,6 +1039,20 @@ uint32_t kobj_make(int type, int32_t pid) {
 	unlock();
 	return r;
 }
+// Objeto del núcleo con nombre propio cada vez (p. ej. un fileport por cada fileport_makeport). 0 si la tabla está llena.
+uint32_t kobj_new(int type, int32_t pid) {
+	lock();
+	uint32_t r = 0;
+	for (int i = 0; i < MAXKOBJ; i++) if (!shm->kobjs[i].name) { r = shm->next_name; shm->next_name += 0x100; shm->kobjs[i] = (struct skobj){ r, (uint16_t)type, pid }; break; }
+	unlock();
+	if (!r) logf_("    kobj: tabla llena\n");
+	return r;
+}
+void kobj_free(uint32_t name) {
+	lock();
+	for (int i = 0; i < MAXKOBJ; i++) if (shm->kobjs[i].name == name) { shm->kobjs[i].name = 0; break; }
+	unlock();
+}
 int kobj_lookup(uint32_t name, int* type, int32_t* pid) {
 	if (name == 0x103) { *type = KO_TASK; *pid = (int32_t)getpid(); return 1; }   // mach_task_self
 	lock();
@@ -957,8 +1077,9 @@ static long t_pid_for_task(struct ctx* c) {
 
 // mach_port_request_notification_trap(task, nombre, variante, sync, aviso, polí, *anterior)
 // Se guardan PORT_DESTROYED (69, sobre un derecho de recepción) y DEAD_NAME (72, sobre un derecho de envío). Si el puerto
-// ya murió, DEAD_NAME avisa en el acto (como un nombre muerto en XNU). NO_SENDERS y SEND_POSSIBLE se aceptan sin avisos.
-int port_request_notification(uint32_t name, int variant, uint32_t notify, uint32_t* previous) {
+// ya murió, DEAD_NAME avisa en el acto (como un nombre muerto en XNU). NO_SENDERS (70) se guarda en el puerto y avisa al
+// morir el último proceso con derecho de envío (ver «notificaciones»). SEND_POSSIBLE se acepta sin avisos.
+int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_t notify, uint32_t* previous) {
 	*previous = 0;
 	int r = KERN_OK;
 	lock();
@@ -966,6 +1087,9 @@ int port_request_notification(uint32_t name, int variant, uint32_t notify, uint3
 	if (variant == 69) {
 		if (!p) r = KERN_INVALID_RIGHT_;
 		else { *previous = p->pdreq; p->pdreq = notify; }
+	} else if (variant == 70) {                                // NO_SENDERS: sobre un derecho de recepción; sync = make-send count
+		if (!p) r = KERN_INVALID_RIGHT_;
+		else { *previous = p->nsreq; p->nsreq = notify; p->nsmscount = sync; }
 	} else if (variant == 72) {
 		int32_t me = (int32_t)getpid();
 		for (int i = 0; i < MAXDN; i++) if (shm->dn[i].port == name && shm->dn[i].pid == me) { *previous = shm->dn[i].notify; shm->dn[i].port = 0; break; }
@@ -984,7 +1108,7 @@ int port_request_notification(uint32_t name, int variant, uint32_t notify, uint3
 }
 static long t_request_notification(struct ctx* c) {
 	uint32_t prev = 0;
-	long r = port_request_notification((uint32_t)c->a[1], (int)c->a[2], (uint32_t)c->a[4], &prev);
+	long r = port_request_notification((uint32_t)c->a[1], (int)c->a[2], (uint32_t)c->a[3], (uint32_t)c->a[4], &prev);
 	uint64_t pa = ctx_arg(c, 6);
 	if (pa) safe_write(pa, &prev, 4);
 	return r;

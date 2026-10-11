@@ -1106,6 +1106,7 @@ int main(int argc, char** argv, char** envp) {
 	uint64_t sp = build_stack(ei.mh, argc - 3, argv + 3, envp, guest);
 	memfd_init();
 	emu_sysctl_init();
+	emu_fileport_init();
 	emu_fs_init();
 	emu_mach_init();
 	emu_proc_init();

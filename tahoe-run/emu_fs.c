@@ -927,13 +927,41 @@ static int tmpl_copy(const char* src, const struct stat* st, int type, struct FT
 	}
 	return 0;
 }
+// /private/var/run es por arranque (sockets, .pid, marcas como systemkeychaincheck.done o WindowServer.didRunThisBoot): en un
+// Mac empieza vacío. Aquí la raíz persiste entre arranques, así que lo vacía el arranque (launchd como PID 1); la shell
+// suelta no es un arranque y no lo toca.
+static int run_rm(const char* p, const struct stat* st, int type, struct FTW* fw) {
+	(void)st;
+	if (fw->level == 0) return 0;                                 // el propio /private/var/run se conserva
+	if (type == FTW_DP) rmdir(p); else unlink(p);
+	return 0;
+}
+static void clear_var_run(void) {
+	char p[4400];
+	snprintf(p, sizeof p, "%s/private/var/run", tahoe_root);
+	nftw(p, run_rm, 32, FTW_PHYS | FTW_DEPTH);
+}
 void populate_data_volume(void) {
 	if (!tahoe_root) return;
+	if (getpid() == 1) clear_var_run();
 	snprintf(tmpl_root, sizeof tmpl_root, "%s/System/Library/Templates/Data", tahoe_root);
 	tmpl_len = strlen(tmpl_root);
 	struct stat st;
 	if (stat(tmpl_root, &st) != 0) return;
 	nftw(tmpl_root, tmpl_copy, 32, FTW_PHYS);
+	// Almacén de registros de logd. En un BaseSystem, libsystem_trace (_os_trace_basesystem_storage_available) solo da por
+	// disponible el almacenamiento si /private/var/db/diagnostics es un enlace simbólico (el arranque lo apunta a un volumen
+	// escribible) o si los boot-args lo indican; si no, launchd decide que no hay registro completo (HasFullLogging = NO) y
+	// no carga logd. Aquí la raíz es una carpeta escribible de Linux: se presenta como lo haría un arranque con almacenamiento.
+	char p[4400], q[4400];
+	snprintf(p, sizeof p, "%s/private/var/db/diagnostics", tahoe_root);
+	if (lstat(p, &st) != 0) {
+		snprintf(q, sizeof q, "%s/private/var/db/diagnostics.storage", tahoe_root);
+		mkdir(q, 0755);
+		if (symlink("diagnostics.storage", p) != 0) {}
+	}
+	snprintf(p, sizeof p, "%s/private/var/db/uuidtext", tahoe_root);
+	if (lstat(p, &st) != 0) mkdir(p, 0755);
 }
 
 // ---- map_with_linking_np(regiones[], n, info, tamaño): como vm_dyld_pager de XNU. dyld pide al núcleo que proyecte las
