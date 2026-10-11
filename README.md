@@ -410,6 +410,22 @@ Ya arrancan sin caerse `remoted`, `configd`, `powerd`, `locationd`, `kernelmanag
   `kern.bootsessionuuid`...), `OSKernelCPUType` en la raíz de IOKit, `boot-args` como cadena.
 - **Diagnóstico**: al caer el proceso indicado, cada hilo vuelca su llamada en curso y su pila; modo `all` (todas sus llamadas).
 
+### Shell de macOS (11 de octubre de 2026)
+`tools/macos-shell.sh` abre el `/bin/bash` del sistema base de macOS 26 en la terminal de Linux, con un entorno de macOS
+(PATH de macOS, `HOME=/var/root`, usuario root). Funcionan, entre otras, `ls`, `cd`, `cat`, `grep`, `find`, `sed`, `awk`,
+`cp`/`mv`/`rm -r`, `tar`, `ps`, `uname`, `sw_vers`, `id`, `date`, `df`, `plutil`, `csrutil`, `perl`, `vim` y `less`, con
+tuberías, redirecciones y edición de línea. Aún no: lo que necesita servicios de launchd (`defaults`, `diskutil`,
+`launchctl`) y la red (`ifconfig`).
+
+```
+tools/macos-shell.sh                  # sesión interactiva
+tools/macos-shell.sh -c 'sw_vers'     # una orden
+```
+Bases que hicieron falta: `fork` reabre `/proc/self/mem` en el hijo y no hereda la marca de creador de la región de puertos;
+rutas confinadas a la raíz de macOS (solo `/dev` viene de Linux, con las pts como `/dev/ttysNNN`); `exec` conserva el
+directorio actual; termios de Darwin; `poll`; `sysctl KERN_PROC`/`KERN_PROCARGS2` con los procesos de macOS; atributos
+extendidos; uid/gid emulados.
+
 **Pendiente**: `opendirectoryd` (se queda esperando al abrir `/Search`), clientes de CarbonCore (`FileIDTreeStorage` no registrado en
 `coreservicesd`), `displaypolicyd` (PF238), señales reales (`sigreturn`), `fileport_makeport`. Después: WindowServer, pantalla por
 DRM/KMS, entrada por evdev y Metal.

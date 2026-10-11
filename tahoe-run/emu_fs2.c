@@ -159,7 +159,31 @@ static long bsd_fchmodat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], 
 static long bsd_fchownat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; return chown_result(fchownat(dfd(c->a[0]), p, (uid_t)c->a[2], (gid_t)c->a[3], (c->a[4] & 0x20) ? AT_SYMLINK_NOFOLLOW : 0)); }
 static long bsd_linkat(struct ctx* c) { char a[4400], b[4400]; long e; if ((e = apath(c->a[1], a, sizeof a)) || (e = apath(c->a[3], b, sizeof b))) return e; RET(linkat(dfd(c->a[0]), a, dfd(c->a[2]), b, 0)); }
 
+// poll(fds, n, ms): struct pollfd igual que en Linux; cambian POLLWRNORM (Darwin 0x4 = POLLOUT, Linux 0x100) y POLLWRBAND
+// (Darwin 0x100, Linux 0x200). Los bits de Darwin sin equivalente (EXTEND, ATTRIB...) no se piden.
+#include <poll.h>
+static short ev_to_linux(short d) { short l = d & (POLLIN | POLLPRI | POLLOUT | POLLRDNORM | POLLRDBAND); if (d & 0x100) l |= POLLWRBAND; return l; }
+static short ev_to_darwin(short l) {
+	short d = l & (POLLIN | POLLPRI | POLLOUT | POLLERR | POLLHUP | POLLNVAL | POLLRDNORM | POLLRDBAND);
+	if (l & POLLWRNORM) d |= 0x4; if (l & POLLWRBAND) d |= 0x100;
+	return d;
+}
+static long bsd_poll(struct ctx* c) {
+	uint32_t n = (uint32_t)c->a[1];
+	if (n > 4096) return -D_EINVAL;
+	struct pollfd* p = calloc(n ? n : 1, sizeof *p);
+	if (n && safe_read(c->a[0], p, n * sizeof *p) != (ssize_t)(n * sizeof *p)) { free(p); return -D_EFAULT; }
+	for (uint32_t i = 0; i < n; i++) p[i].events = ev_to_linux(p[i].events);
+	int r = poll(p, n, (int)c->a[2]);
+	if (r < 0) { int e = errno; free(p); return -darwin_errno(e); }
+	for (uint32_t i = 0; i < n; i++) p[i].revents = ev_to_darwin(p[i].revents);
+	long rc = (n && safe_write(c->a[0], p, n * sizeof *p) != (ssize_t)(n * sizeof *p)) ? -D_EFAULT : r;
+	free(p);
+	return rc;
+}
+
 void emu_fs2_init(void) {
+	reg_bsd(230, bsd_poll); reg_bsd(417, bsd_poll);   // poll / poll_nocancel
 	reg_bsd(465, bsd_renameat); reg_bsd(488, bsd_renameatx); reg_bsd(472, bsd_unlinkat); reg_bsd(475, bsd_mkdirat);
 	reg_bsd(474, bsd_symlinkat); reg_bsd(467, bsd_fchmodat); reg_bsd(468, bsd_fchownat); reg_bsd(471, bsd_linkat);
 	reg_bsd(136, bsd_mkdir); reg_bsd(137, bsd_rmdir); reg_bsd(10, bsd_unlink); reg_bsd(15, bsd_chmod);
