@@ -15,7 +15,8 @@ para una GPU Intel Haswell). [Darling](https://github.com/darlinghq/darling) se 
 | Metal | Un kernel de Metal (AIR) traducido a SPIR-V con `metal2vulkan` se ejecuta en la GPU (Intel HD 4400) por Vulkan (`test/run_add_arrays.c`). Aún no está conectado a `tahoe-run`. |
 
 Qué funciona en la shell (con `--launchd`): `ls`, `cp`/`mv`/`rm`, `find`, `grep`, `sed`, `awk`, `sort`, `tar`, `vim`, `less`, `perl`, `curl`,
-`ssh -V`, `ps`, `df`, `mount`, `stat`, `xattr`, `chmod`/`chown`, `sysctl`, `sw_vers`, `uname`, `id`, `date`, `ifconfig`, `netstat`, `ping`,
+`ssh -V`, `ps aux` (estado, CPU, memoria, hora de inicio), `log show`, `df`, `mount`, `stat`, `xattr`, `chmod`/`chown`, `sysctl`,
+`sw_vers`, `uname`, `id`, `date`, `ifconfig`, `netstat`, `ping`,
 `scutil`, `launchctl list`/`print`, `defaults read`/`write`, `plutil`, `pmset`, `ioreg`, `nvram`, `csrutil`, `dscl`, `codesign`, `spctl`,
 `caffeinate`, `installer`, `resetpassword`, `security list-keychains`, `diskutil list`, `diskutil info disk0`/`disk1s1`/`/`, `diskutil apfs list`,
 `hdiutil info`, `bless --getBoot`, `ls -l /dev/disk*`, `launchctl kill`/`kickstart -k`.
@@ -54,13 +55,11 @@ Diagnóstico con `tools/diag/` (registro y salidas en `$TAHOE_DIAG_DIR`, por omi
 
 ## Hoja de ruta, por orden
 
-1. **Terminar la shell** (lo que falla en el inventario):
-   - `log show`: logd ya corre y entrega su almacén a `log` por fileports, pero no responde a la petición siguiente.
-   - Discos: `diskutil list`/`info` (también `info /`), `hdiutil info` y `bless --getBoot` funcionan, y el volumen se llama
-     «macOS Base System». El disco sale como «disk image», igual que el sistema base de una Recovery real (con «PCI-Express»
-     apfs_boot_util exige el volumen VM y launchd entra en pánico). Falta un volumen Preboot para `bless --info`.
-   - `ps` no ve los procesos cuyo hilo principal terminó (`ps ax` cuenta 35 frente a 50 servicios en ejecución).
-   - `bash` muestra en sus mensajes de error la ruta de Linux del ejecutable en vez de `/bin/bash`.
+1. **Terminar la shell**: lo que falla en el inventario ya da lo mismo que en un Mac. Quedan detalles:
+   - `log show` a veces responde «Could not open local log store» (1 de cada 3 inventarios); repetirlo funciona.
+   - `bless --info` necesita un volumen Preboot, que el contenedor de la Recovery no tiene (como en un Mac sin él).
+   - El disco sale como «disk image», igual que el sistema base de una Recovery real (con «PCI-Express» apfs_boot_util
+     exige el volumen VM y launchd entra en pánico).
 2. **Caídas de servicios**: `locationd` (`getpwuid(205)` devuelve NULL dentro de launchd), `opendirectoryd` (espera al abrir
    `/Search`), CarbonCore (`FileIDTreeStorage` no registrado en `coreservicesd`), `displaypolicyd` (PF238), `apsd` (a veces:
    excepción de `SecurityServer` al firmar su CSR con securityd).

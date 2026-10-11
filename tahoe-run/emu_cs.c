@@ -16,26 +16,43 @@
 
 #include "tahoe.h"
 
-// Ruta (en el anfitrión) del ejecutable de macOS de un proceso: tahoe-run <caché> <dyld> <ejecutable> [args...]. Si el hilo
-// principal ya terminó, /proc/<pid>/cmdline está vacío: se lee el de otro hilo.
-int exe_host_path(int pid, char* out, size_t cap) {
-	char p[64], buf[8192];
+// Directorio de /proc con los datos de un proceso. Si su hilo principal ya terminó (dispatch_main, pthread_exit) y quedan
+// otros, el líder es un zombi con exe, cmdline y environ vacíos: se usa el de un hilo vivo (/proc/<pid>/task/<tid>), que
+// comparte memoria y ejecutable con el proceso. Devuelve 0, o -1 si el proceso no existe o ya no le queda ningún hilo.
+static char proc_state(const char* dir) {
+	char p[128], b[512]; snprintf(p, sizeof p, "%s/stat", dir);
+	int fd = open(p, O_RDONLY | O_CLOEXEC); if (fd < 0) return 0;
+	ssize_t n = read(fd, b, sizeof b - 1); close(fd);
+	if (n <= 0) return 0;
+	b[n] = 0;
+	char* e = strrchr(b, ')');
+	return e && e[1] == ' ' ? e[2] : 0;
+}
+int proc_dir(int pid, char* out, size_t cap) {
 	if (pid <= 0) pid = (int)getpid();
-	snprintf(p, sizeof p, "/proc/%d/cmdline", pid);
+	snprintf(out, cap, "/proc/%d", pid);
+	char st = proc_state(out);
+	if (!st) return -1;
+	if (st != 'Z' && st != 'X') return 0;
+	char tdir[64]; snprintf(tdir, sizeof tdir, "/proc/%d/task", pid);
+	DIR* d = opendir(tdir); struct dirent* de; int found = -1;
+	while (d && found < 0 && (de = readdir(d))) {
+		if (de->d_name[0] == '.' || atoi(de->d_name) == pid) continue;
+		char td[128]; snprintf(td, sizeof td, "%s/%s", tdir, de->d_name);
+		char ts = proc_state(td);
+		if (ts && ts != 'Z' && ts != 'X') { snprintf(out, cap, "%s", td); found = 0; }
+	}
+	if (d) closedir(d);
+	return found;
+}
+// Ruta (en el anfitrión) del ejecutable de macOS de un proceso: tahoe-run <caché> <dyld> <ejecutable> [args...].
+int exe_host_path(int pid, char* out, size_t cap) {
+	char dir[128], p[160], buf[8192];
+	if (proc_dir(pid, dir, sizeof dir) != 0) return -1;
+	snprintf(p, sizeof p, "%s/cmdline", dir);
 	ssize_t n = -1;
 	int fd = open(p, O_RDONLY | O_CLOEXEC);
 	if (fd >= 0) { n = read(fd, buf, sizeof buf - 1); close(fd); }
-	if (n <= 0) {
-		snprintf(p, sizeof p, "/proc/%d/task", pid);
-		DIR* d = opendir(p); struct dirent* de;
-		while (d && n <= 0 && (de = readdir(d))) {
-			if (de->d_name[0] == '.') continue;
-			char tp[96]; snprintf(tp, sizeof tp, "%s/%s/cmdline", p, de->d_name);
-			int tf = open(tp, O_RDONLY | O_CLOEXEC);
-			if (tf >= 0) { n = read(tf, buf, sizeof buf - 1); close(tf); }
-		}
-		if (d) closedir(d);
-	}
 	if (n <= 0) return -1;
 	buf[n] = 0;
 	const char* a = buf; int i = 0;
@@ -107,6 +124,32 @@ static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
 	}
 	close(fd);
 	return out;
+}
+
+// LC_UUID del ejecutable de macOS de un proceso (p_uuid de proc_pidinfo): logd lo anota en cada mensaje para encontrar después
+// el texto de formato del programa. 0 si se encontró.
+int exe_uuid(int pid, uint8_t out[16]) {
+	char path[4096];
+	if (exe_host_path(pid, path, sizeof path) != 0) return -1;
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return -1;
+	int64_t base = slice_offset(fd);
+	uint8_t h[32]; int r = -1;
+	if (base >= 0 && pread(fd, h, 32, (off_t)base) == 32 && rd32(h) == 0xfeedfacf) {
+		uint32_t ncmds = rd32(h + 16), sizeofcmds = rd32(h + 20);
+		uint8_t* lc = sizeofcmds < (1u << 20) ? malloc(sizeofcmds) : NULL;
+		if (lc && pread(fd, lc, sizeofcmds, (off_t)base + 32) == (ssize_t)sizeofcmds) {
+			for (uint32_t i = 0, off = 0; i < ncmds && off + 8 <= sizeofcmds; i++) {
+				uint32_t cmd = rd32(lc + off), cs = rd32(lc + off + 4);
+				if (cs < 8) break;
+				if (cmd == 0x1b && cs >= 24 && off + 24 <= sizeofcmds) { memcpy(out, lc + off + 8, 16); r = 0; break; }   // LC_UUID
+				off += cs;
+			}
+		}
+		free(lc);
+	}
+	close(fd);
+	return r;
 }
 
 // SHA-1 y SHA-256 (FIPS 180-4), para el cdhash: el hash del CodeDirectory de la firma, truncado a 20 bytes.

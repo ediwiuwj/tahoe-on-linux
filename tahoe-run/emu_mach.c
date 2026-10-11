@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include <time.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include "tahoe.h"
 
@@ -243,6 +244,29 @@ static size_t mig_task_set_special_port(const struct hdr* req, const uint8_t* m,
 }
 
 // task_info (id 3405): NDR, sabor, capacidad (en enteros). Sabores soportados: 15 (TASK_AUDIT_TOKEN).
+// Campos de /proc/<pid>/stat (o de un hilo: /proc/<tid>/stat) a partir del estado: f[0] = estado, f[11] utime, f[12] stime,
+// f[15] prioridad, f[16] nice, f[17] hilos, f[20] vsize, f[21] rss (páginas). Devuelve el número de campos leídos.
+static int stat_fields(const char* path, long long f[24], char* state) {
+	char b[1024]; int fd = open(path, O_RDONLY | O_CLOEXEC); if (fd < 0) return 0;
+	ssize_t n = read(fd, b, sizeof b - 1); close(fd);
+	if (n <= 0) return 0;
+	b[n] = 0;
+	char* e = strrchr(b, ')'); if (!e || e[1] != ' ') return 0;
+	*state = e[2];
+	int k = 1; char* q = e + 3;
+	while (k < 24 && *q) { while (*q == ' ') q++; if (!*q) break; f[k++] = strtoll(q, &q, 10); }
+	return k;
+}
+// tiempo en ticks de reloj -> time_value_t {segundos, microsegundos}
+static void ticks_tv(long long t, int32_t tv[2]) {
+	long hz = sysconf(_SC_CLK_TCK); if (hz <= 0) hz = 100;
+	tv[0] = (int32_t)(t / hz); tv[1] = (int32_t)((t % hz) * (1000000 / hz));
+}
+// prioridad de Mach a partir del nice de Linux: BASEPRI_DEFAULT (31) menos el nice, como hace XNU con setpriority
+static int32_t mach_pri(long long nice) { long long p = 31 - nice; return (int32_t)(p < 0 ? 0 : p > 63 ? 63 : p); }
+// estado de un hilo de Linux -> TH_STATE_* de Mach (RUNNING 1, STOPPED 2, WAITING 3, UNINTERRUPTIBLE 4, HALTED 5)
+static int32_t mach_run_state(char st) { return st == 'R' ? 1 : st == 'T' || st == 't' ? 2 : st == 'D' ? 4 : st == 'Z' || st == 'X' ? 5 : 3; }
+
 static size_t mig_task_info(const struct hdr* req, const uint8_t* m, uint8_t* r) {
 	int32_t flavor, cap;
 	memcpy(&flavor, m + 32, 4);
@@ -253,9 +277,9 @@ static size_t mig_task_info(const struct hdr* req, const uint8_t* m, uint8_t* r)
 		if (kobj_lookup(req->remote, &ktype, &kpid) && (ktype == KO_TASK || ktype == KO_TASK_NAME) && kpid != (int32_t)getpid()) {
 			// la tarea de otro proceso (task_name_for_pid...): su token, no el de quien pregunta. launchd lo usa como destino de
 			// las señales que pide launchctl (proc_signal_delegate); con el propio se mandaba la señal a sí mismo.
-			char p[48], ln[128]; unsigned ru = 0, eu = 0, rg = 0, eg = 0;
-			snprintf(p, sizeof p, "/proc/%d/status", (int)kpid);
-			FILE* f = fopen(p, "r");
+			char d[128], p[160], ln[128]; unsigned ru = 0, eu = 0, rg = 0, eg = 0;
+			FILE* f = NULL;
+			if (proc_dir((int)kpid, d, sizeof d) == 0) { snprintf(p, sizeof p, "%s/status", d); f = fopen(p, "r"); }
 			if (!f) return reply_begin(r, req, 5 /* KERN_FAILURE: la tarea ya no existe */);
 			while (fgets(ln, sizeof ln, f)) {
 				if (!strncmp(ln, "Uid:", 4)) sscanf(ln + 4, "%u %u", &ru, &eu);
@@ -270,6 +294,42 @@ static size_t mig_task_info(const struct hdr* req, const uint8_t* m, uint8_t* r)
 		memcpy(r + n, &cnt, 4);
 		memcpy(r + n + 4, tok, sizeof tok);
 		return n + 4 + sizeof tok;
+	}
+	// Consumo de la tarea (la propia o la de otro proceso, p. ej. de task_read_for_pid para ps), desde /proc
+	int ktype; int32_t kpid = (int32_t)getpid();
+	if (req->remote != 0x103 && !(kobj_lookup(req->remote, &ktype, &kpid) && (ktype == KO_TASK || ktype == KO_TASK_NAME)))
+		kpid = (int32_t)getpid();
+	int need = flavor == 5 ? 10 : flavor == 20 ? 12 : flavor == 3 ? 4 : flavor == 10 ? 5 : flavor == 2 ? 8 : -1;
+	if (need > 0) {
+		if (cap < need) return reply_begin(r, req, KERN_INVALID_ARG);
+		char d[128], p[160]; long long f[24] = { 0 }; char st = 0;
+		if (proc_dir((int)kpid, d, sizeof d) != 0) return reply_begin(r, req, 5 /* KERN_FAILURE */);
+		snprintf(p, sizeof p, "/proc/%d/stat", (int)kpid);       // del proceso entero (todos sus hilos), aunque el líder sea zombi
+		if (stat_fields(p, f, &st) < 22) return reply_begin(r, req, 5);
+		long pg = sysconf(_SC_PAGESIZE);
+		long long g[24] = { 0 }; char gs = 0;                   // la memoria, de un hilo vivo (la del líder zombi es 0)
+		snprintf(p, sizeof p, "%s/stat", d);
+		if (stat_fields(p, g, &gs) < 22) memcpy(g, f, sizeof g);
+		uint64_t vsz = (uint64_t)g[20], rss = (uint64_t)g[21] * (uint64_t)pg;
+		int32_t ut[2], stm[2]; ticks_tv(f[11], ut); ticks_tv(f[12], stm);
+		uint8_t o[64] = { 0 };
+		if (flavor == 5) {                                        // TASK_BASIC_INFO_64 (empaquetado a 4)
+			memcpy(o + 4, &vsz, 8); memcpy(o + 12, &rss, 8); memcpy(o + 20, ut, 8); memcpy(o + 28, stm, 8);
+			int32_t pol = 1; memcpy(o + 36, &pol, 4);             // POLICY_TIMESHARE
+		} else if (flavor == 20) {                                // MACH_TASK_BASIC_INFO
+			memcpy(o, &vsz, 8); memcpy(o + 8, &rss, 8); memcpy(o + 16, &rss, 8); memcpy(o + 24, ut, 8); memcpy(o + 32, stm, 8);
+			int32_t pol = 1; memcpy(o + 40, &pol, 4);
+		} else if (flavor == 3) {                                 // TASK_THREAD_TIMES_INFO: de los hilos vivos
+			memcpy(o, ut, 8); memcpy(o + 8, stm, 8);
+		} else if (flavor == 10) {                                // TASK_SCHED_TIMESHARE_INFO: max, base, cur, depressed, depress
+			int32_t pr = mach_pri(f[16]); int32_t v[5] = { 63, pr, pr, 0, 0 }; memcpy(o, v, 20);
+		} else if (flavor == 2) {                                 // TASK_EVENTS_INFO: fallos de página; el resto sin contar
+			int32_t v[8] = { (int32_t)(f[7] + f[9]), (int32_t)f[9], 0, 0, 0, 0, 0, 0 }; memcpy(o, v, 32);
+		}
+		size_t n = reply_begin(r, req, KERN_SUCCESS_);
+		memcpy(r + n, &need, 4);
+		memcpy(r + n + 4, o, (size_t)need * 4);
+		return n + 4 + (size_t)need * 4;
 	}
 	logf_("    task_info: sabor %d (capacidad %d) sin implementar\n", flavor, cap);
 	return reply_begin(r, req, KERN_INVALID_ARG);
@@ -523,7 +583,19 @@ static long mach_msg2(struct ctx* c) {
 		extern __thread uint32_t g_thread_port;
 		extern uint64_t dispatch_queue_offset;
 		int self = h.remote == g_thread_port;
-		if (flavor == 3) {                                        // THREAD_BASIC_INFO: tiempos 0, ejecutándose (run_state 1)
+		int kt; int32_t tid = 0;
+		int other = !self && kobj_lookup(h.remote, &kt, &tid) && kt == KO_THREAD;   // un hilo de otro proceso (task_threads)
+		if (other && (flavor == 3 || flavor == 10)) {
+			char p[48]; long long f[24] = { 0 }; char st = 0;
+			snprintf(p, sizeof p, "/proc/%d/stat", (int)tid);
+			if (stat_fields(p, f, &st) < 17) { n = reply_begin(rep, &h, 5 /* KERN_FAILURE: el hilo terminó */); break; }
+			if (flavor == 3) {                                    // THREAD_BASIC_INFO
+				int32_t tv[2]; ticks_tv(f[11], tv); memcpy(info, tv, 8); ticks_tv(f[12], tv); memcpy(info + 2, tv, 8);
+				info[5] = 1; info[6] = (uint32_t)mach_run_state(st); outc = 10;   // POLICY_TIMESHARE, estado
+			} else {                                              // THREAD_SCHED_TIMESHARE_INFO
+				int32_t pr = mach_pri(f[16]); info[0] = 63; info[1] = (uint32_t)pr; info[2] = (uint32_t)pr; outc = 5;
+			}
+		} else if (flavor == 3) {                                 // THREAD_BASIC_INFO: tiempos 0, ejecutándose (run_state 1)
 			info[6] = 1; outc = 10;
 		} else if (flavor == 4) {                                 // THREAD_IDENTIFIER_INFO: thread_id, thread_handle (TSD), dispatch_qaddr
 			uint64_t tid = self ? (uint64_t)syscall(SYS_gettid) : h.remote, gs = 0;
@@ -538,6 +610,37 @@ static long mach_msg2(struct ctx* c) {
 		memcpy(rep + n, info, outc * 4); n += outc * 4;
 		break;
 	}   // host_request_notification / thread_policy(_set): sin efecto
+	case 3402: {                                                  // task_threads(tarea) -> puertos de sus hilos (un OOL de puertos)
+		// Solo para otros procesos (ps, top): un puerto por hilo de Linux vivo, que thread_info entiende. Para la propia tarea
+		// no se ofrece: los puertos de hilo propios tienen otro esquema y nadie lo ha necesitado.
+		int kt; int32_t kpid;
+		if (h.remote == 0x103 || !kobj_lookup(h.remote, &kt, &kpid) || kt != KO_TASK || kpid == (int32_t)getpid()) {
+			n = reply_begin(rep, &h, 46 /* KERN_NOT_SUPPORTED */); break;
+		}
+		static uint32_t th[1024]; int cnt = 0;
+		char tp[48]; snprintf(tp, sizeof tp, "/proc/%d/task", (int)kpid);
+		DIR* dd = opendir(tp); struct dirent* de;
+		while (dd && cnt < 1024 && (de = readdir(dd))) {
+			int tid = atoi(de->d_name); if (tid <= 0) continue;
+			char sp[96]; long long f[24]; char st = 0; snprintf(sp, sizeof sp, "%s/%d/stat", tp, tid);
+			if (stat_fields(sp, f, &st) && st != 'Z' && st != 'X') th[cnt++] = kobj_make(KO_THREAD, tid);
+		}
+		if (dd) closedir(dd);
+		if (!cnt) { n = reply_begin(rep, &h, 5 /* KERN_FAILURE: la tarea terminó */); break; }
+		struct hdr nh = { .bits = 0x80000000u, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = h.id + 100 };
+		memcpy(rep, &nh, sizeof nh);
+		uint32_t one = 1; memcpy(rep + 24, &one, 4);
+		uint64_t addr = 0; size_t len = (size_t)cnt * 4;
+		void* mm = mmap(NULL, (len + 4095) & ~4095ul, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (mm == MAP_FAILED) { n = reply_begin(rep, &h, 6 /* KERN_RESOURCE_SHORTAGE */); break; }
+		memcpy(mm, th, len); addr = (uint64_t)mm;
+		uint8_t dsc[16] = { 0 }; memcpy(dsc, &addr, 8); dsc[8] = 1; dsc[10] = 17; dsc[11] = 2;   // dealloc, PORT_SEND, OOL_PORTS
+		uint32_t c32 = (uint32_t)cnt; memcpy(dsc + 12, &c32, 4);
+		memcpy(rep + 28, dsc, 16);
+		memcpy(rep + 44, NDR_LE, 8); memcpy(rep + 52, &c32, 4);
+		n = 56;
+		break;
+	}
 	case 3240: {                                                  // mach_port_is_connection_for_service(conexión, servicio) -> id de política de filtro
 		n = reply_begin(rep, &h, KERN_SUCCESS_);
 		uint64_t pol = 0; memcpy(rep + n, &pol, 8); n += 8;       // sin filtrado de mensajes: política 0

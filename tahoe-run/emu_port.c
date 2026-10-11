@@ -1079,6 +1079,18 @@ int rmap_fault(uint64_t addr) {
 	return p != MAP_FAILED;
 }
 // Nombre (estable por tipo y pid) de un objeto del núcleo; se reutiliza si ya existe.
+// Con la tabla llena se reciclan los puertos de tareas e hilos que ya terminaron (el pid o tid ya no existe); los nombres no
+// se reutilizan nunca (next_name solo crece), así que un nombre viejo no puede acabar señalando a otro objeto.
+static int kobj_reclaim_locked(void) {
+	int freed = 0;
+	for (int i = 0; i < MAXKOBJ; i++) {
+		struct skobj* k = &shm->kobjs[i];
+		if (!k->name || (k->type != KO_TASK && k->type != KO_TASK_NAME && k->type != KO_THREAD)) continue;
+		char p[48]; snprintf(p, sizeof p, "/proc/%d", (int)k->pid);
+		if (access(p, F_OK) != 0) { k->name = 0; freed++; }
+	}
+	return freed;
+}
 uint32_t kobj_make(int type, int32_t pid) {
 	lock();
 	uint32_t r = 0;
@@ -1086,7 +1098,10 @@ uint32_t kobj_make(int type, int32_t pid) {
 	if (!r) {
 		r = shm->next_name; shm->next_name += 0x100;
 		int put = 0;
-		for (int i = 0; i < MAXKOBJ; i++) if (!shm->kobjs[i].name) { shm->kobjs[i] = (struct skobj){ r, (uint16_t)type, pid }; put = 1; break; }
+		for (int pass = 0; pass < 2 && !put; pass++) {
+			if (pass == 1 && !kobj_reclaim_locked()) break;
+			for (int i = 0; i < MAXKOBJ; i++) if (!shm->kobjs[i].name) { shm->kobjs[i] = (struct skobj){ r, (uint16_t)type, pid }; put = 1; break; }
+		}
 		if (!put) logf_("    kobj: tabla llena\n");
 	}
 	unlock();
@@ -1171,6 +1186,22 @@ static long t_task_name_for_pid(struct ctx* c) {
 	uint32_t n = pid == (int32_t)getpid() ? 0x103 : kobj_make(KO_TASK_NAME, pid);
 	return safe_write(c->a[2], &n, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }
+// task_for_pid (trampa 45) y task_read_for_pid (syscall 539) (tarea, pid, *puerto): el puerto de la tarea de otro proceso.
+// Como en XNU, solo root o el mismo usuario; el propio proceso recibe mach_task_self.
+static int task_port_for_pid(int32_t pid, uint64_t out) {
+	if (pid <= 0 || kill(pid, 0) != 0) return 5 /* KERN_FAILURE */;
+	if (geteuid() != 0) {
+		char d[128], p[160], ln[128]; unsigned ru = 0, eu = (unsigned)-1;
+		FILE* f = NULL;
+		if (proc_dir(pid, d, sizeof d) == 0) { snprintf(p, sizeof p, "%s/status", d); f = fopen(p, "r"); }
+		if (f) { while (fgets(ln, sizeof ln, f)) if (!strncmp(ln, "Uid:", 4)) sscanf(ln + 4, "%u %u", &ru, &eu); fclose(f); }
+		if (eu != geteuid()) return 5;
+	}
+	uint32_t n = pid == (int32_t)getpid() ? 0x103 : kobj_make(KO_TASK, pid);
+	return safe_write(out, &n, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
+}
+static long t_task_for_pid(struct ctx* c) { return task_port_for_pid((int32_t)c->a[1], c->a[2]); }
+static long bsd_task_read_for_pid(struct ctx* c) { return task_port_for_pid((int32_t)c->a[1], c->a[2]); }
 // pid_for_task(tarea, *pid)
 static long t_pid_for_task(struct ctx* c) {
 	int type; int32_t pid;
@@ -1219,7 +1250,8 @@ static long t_request_notification(struct ctx* c) {
 
 void emu_port_init(void) {
 	reg_mach(42, t_unguard); reg_mach(77, t_request_notification);
-	reg_mach(41, t_guard); reg_mach(40, t_get_attributes); reg_mach(44, t_task_name_for_pid); reg_mach(46, t_pid_for_task);
+	reg_mach(41, t_guard); reg_mach(40, t_get_attributes); reg_mach(44, t_task_name_for_pid); reg_mach(45, t_task_for_pid); reg_mach(46, t_pid_for_task);
+	reg_bsd(539, bsd_task_read_for_pid);
 	reg_mach(70, t_voucher_create);
 	reg_mach(91, t_mk_create); reg_mach(92, t_mk_destroy); reg_mach(93, t_mk_arm); reg_mach(94, t_mk_cancel); reg_mach(95, t_mk_arm_leeway);
 	reg_mach(43, t_activity_id);

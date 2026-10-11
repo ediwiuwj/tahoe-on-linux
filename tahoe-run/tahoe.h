@@ -41,6 +41,8 @@ extern int trace_all;
 void emu_sysctl_init(void);
 void emu_fileport_init(void);
 int exe_host_path(int pid, char* out, size_t cap);
+int proc_dir(int pid, char* out, size_t cap);
+int exe_uuid(int pid, uint8_t out[16]);          // LC_UUID del ejecutable de macOS del proceso   // /proc/<pid>, o el de un hilo vivo si el líder es zombi
 int darwin_sig_to_linux(int s);                         // número de señal de Darwin -> Linux (0 si no hay)   // ruta en el anfitrión del ejecutable de macOS de un proceso
 void emu_fs_init(void);
 void emu_mach_init(void);
@@ -104,7 +106,7 @@ int port_release_send_once(uint32_t name);
 int port_assert_guard(uint32_t name, uint64_t guard);
 int port_swap_guard(uint32_t name, uint64_t old, uint64_t nw);
 int port_get_refs(uint32_t name, uint32_t right, uint32_t* refs);
-enum { KO_TASK = 1, KO_TASK_NAME = 2, KO_IDENTITY_TOKEN = 3, KO_FILEPORT = 4 };
+enum { KO_TASK = 1, KO_TASK_NAME = 2, KO_IDENTITY_TOKEN = 3, KO_FILEPORT = 4, KO_THREAD = 5 };   // KO_THREAD: pid = tid de Linux
 uint32_t kobj_make(int type, int32_t pid);
 uint32_t kobj_new(int type, int32_t pid);
 void kobj_free(uint32_t name);

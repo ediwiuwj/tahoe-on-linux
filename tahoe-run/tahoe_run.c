@@ -653,8 +653,9 @@ struct pinfo { int pid, ppid, pgid, status, uid, gid, ruid, rgid, svuid, svgid, 
 static int proc_snapshot(int pid, struct pinfo* o) {
 	memset(o, 0, sizeof *o);
 	if (pid <= 0) pid = getpid();
-	char p[64], b[4096];
-	snprintf(p, sizeof p, "/proc/%d/stat", pid);
+	char dir[128], p[160], b[4096];
+	if (proc_dir(pid, dir, sizeof dir) != 0) return -1;      // un hilo vivo si el hilo principal ya terminó
+	snprintf(p, sizeof p, "%s/stat", dir);
 	int fd = open(p, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) return -1;
 	ssize_t n = read(fd, b, sizeof b - 1); close(fd);
@@ -671,7 +672,7 @@ static int proc_snapshot(int pid, struct pinfo* o) {
 	struct timespec now, up; clock_gettime(CLOCK_REALTIME, &now); clock_gettime(CLOCK_BOOTTIME, &up);
 	double boot = (double)now.tv_sec + now.tv_nsec / 1e9 - (up.tv_sec + up.tv_nsec / 1e9), s = boot + (double)start / (double)hz;
 	o->start_sec = (uint64_t)s; o->start_usec = (uint64_t)((s - (double)(uint64_t)s) * 1e6);
-	snprintf(p, sizeof p, "/proc/%d/status", pid);
+	snprintf(p, sizeof p, "%s/status", dir);
 	FILE* f = fopen(p, "r");
 	if (f) {
 		char ln[256];
@@ -681,7 +682,7 @@ static int proc_snapshot(int pid, struct pinfo* o) {
 		}
 		fclose(f);
 	}
-	snprintf(p, sizeof p, "/proc/%d/cmdline", pid);
+	snprintf(p, sizeof p, "%s/cmdline", dir);
 	fd = open(p, O_RDONLY | O_CLOEXEC);
 	if (fd >= 0) {
 		n = read(fd, b, sizeof b - 1); close(fd);
@@ -698,6 +699,8 @@ static int proc_snapshot(int pid, struct pinfo* o) {
 static void put_bsdinfo(uint8_t* b, const struct pinfo* pi) {
 	memset(b, 0, 136);
 #define W32(off, v) do { uint32_t t_ = (uint32_t)(v); memcpy(b + (off), &t_, 4); } while (0)
+	// pbi_flags: PROC_FLAG_LP64 (todos los procesos son de 64 bits; log lo usa para el tamaño de %ld) y SLEADER si lo es
+	W32(0, 0x10 | (getsid(pi->pid) == pi->pid ? 0x20 : 0));
 	W32(4, pi->status); W32(12, pi->pid); W32(16, pi->ppid); W32(20, pi->uid); W32(24, pi->gid); W32(28, pi->ruid); W32(32, pi->rgid);
 	W32(36, pi->svuid); W32(40, pi->svgid); memcpy(b + 48, pi->comm, 16); memcpy(b + 64, pi->name, 32); W32(100, pi->pgid); W32(112, pi->pgid);
 	memcpy(b + 120, &pi->start_sec, 8); memcpy(b + 128, &pi->start_usec, 8);
@@ -756,6 +759,7 @@ static long bsd_proc_info(struct ctx* c) {
 		put_bsdinfo(b, &pi);
 		uint64_t uniq = (uint64_t)pi.pid;
 		size_t off = (int)c->a[2] == 18 ? 136 : 0, size = off + 56;
+		exe_uuid(pi.pid, b + 136);                          // p_uuid: el LC_UUID del ejecutable
 		memcpy(b + 136 + 16, &uniq, 8);                     // p_uniqueid
 		if ((int)c->a[2] == 17) memcpy(b + 16, &uniq, 8);   // (en este sabor la estructura empieza en p_uuid)
 		const uint8_t* src = (int)c->a[2] == 18 ? b : b + 136;
@@ -1166,6 +1170,9 @@ int main(int argc, char** argv, char** envp) {
 	const char* guest = real;
 	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
 	if (rl && !strncmp(real, tahoe_root, rl) && real[rl] == '/') guest = real + rl;
+	// Arranque directo (la shell, launchd): argv[0] es la ruta del host; el programa la ve como en macOS (bash la usa en sus
+	// mensajes y en $0). Tras un execve de macOS, TAHOE_ARGV0 ya trae el argv[0] que eligió quien lo lanzó.
+	if (!argv0 && rl && !strncmp(argv[3], tahoe_root, rl) && argv[3][rl] == '/') argv[3] += rl;
 	if (tahoe_root) {                                            // cwd inicial = "/" de macOS, salvo que ya estemos dentro (exec hereda el cwd)
 		char cwd[4300]; size_t rl = strlen(tahoe_root);
 		int inside = getcwd(cwd, sizeof cwd) && !strncmp(cwd, tahoe_root, rl) && (cwd[rl] == '/' || cwd[rl] == 0);
