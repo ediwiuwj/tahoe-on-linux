@@ -415,7 +415,15 @@ static void io_init(void) {
 	p_str(pm, "IOClass", "IOPMrootDomain");
 	int res = ent_add(root, "IOResources", "IOResources", "IORegistryEntry IOService", "", PL_SERVICE, 0);
 	p_str(res, "IOClass", "IOResources");
-	for (int i = 0; i < 0; i++) {}
+	// LiveFS (lifs.kext): el puente del núcleo para los sistemas de archivos de FSKit. fskitd lo busca al arrancar y, si no
+	// está, sale con error; sin fskitd, diskarbitrationd no termina de sondear los discos sin sistema de archivos (pregunta a
+	// FSKit por sus módulos) y nunca anuncia la lista completa: diskutil se queda esperando.
+	int lifs = ent_add(res, "com_apple_filesystems_lifs", "com_apple_filesystems_lifs", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	p_str(lifs, "IOClass", "com_apple_filesystems_lifs");
+	p_str(lifs, "CFBundleIdentifier", "com.apple.filesystems.lifs");
+	p_str(lifs, "IOMatchCategory", "com_apple_filesystems_lifs");
+	p_str(lifs, "IOProviderClass", "IOResources");
+	p_str(lifs, "IOUserClientClass", "AppleLIFSUserClient");
 
 	int opt = ent_add(plat, "options", "IODTNVRAM", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(opt, "name", "options");
@@ -674,8 +682,14 @@ static void rq_init(struct rq* r, const struct hdr* h, const uint8_t* req) {
 static void rq_ndr(struct rq* r) { r->p += 8; }
 static uint32_t rq_u32(struct rq* r) { uint32_t v = 0; if (r->p + 4 <= r->len) memcpy(&v, r->b + r->p, 4); r->p += 4; return v; }
 static uint64_t rq_u64(struct rq* r) { uint64_t v = 0; if (r->p + 8 <= r->len) memcpy(&v, r->b + r->p, 8); r->p += 8; return v; }
-static const char* rq_str(struct rq* r) {                                // c_string[*:N]: desplazamiento, cuenta y bytes
-	static __thread char tmp[4100];
+// c_string[*:N]: desplazamiento, cuenta y bytes. Varios búferes en anillo: un mensaje trae a veces dos cadenas que se usan a la
+// vez (tipo y diccionario de add_notification; plano y clave). Con uno solo, la segunda pisaba a la primera y el tipo
+// "IOServiceTerminate" se leía como el diccionario: la notificación de terminación devolvía todos los discos y
+// diskarbitrationd los daba por retirados nada más crearlos.
+static const char* rq_str(struct rq* r) {
+	static __thread char ring[4][4100];
+	static __thread unsigned next;
+	char* tmp = ring[next++ & 3];
 	rq_u32(r); uint32_t n = rq_u32(r);
 	if (n > 4096 || r->p + n > r->len) { tmp[0] = 0; r->p = r->len; return tmp; }
 	memcpy(tmp, r->b + r->p, n); tmp[n] = 0;
@@ -827,8 +841,21 @@ static int32_t uc_hid(struct uc_call* c) {
 		return kIOReturnUnsupported;
 	}
 }
+// LiveFS (AppleLIFSUserClient): fskitd registra con él sus puertos al arrancar. El kext no está (su código va en la colección
+// del núcleo), así que no se conocen sus métodos: se aceptan sin datos de salida y se anota cada selector la primera vez. Los
+// montajes de FSKit no funcionan; basta para que fskitd arranque y conteste qué módulos hay (ninguno de usuario).
+static int32_t uc_lifs(struct uc_call* c) {
+	static uint64_t seen;
+	if (c->selector < 64 && !(seen & (1ull << c->selector))) {
+		seen |= 1ull << c->selector;
+		logf_("    iokit: <%d> lifs selector %u (%u escalares, %u bytes): aceptado sin efecto\n", (int)getpid(), c->selector, c->nsin, c->ninband);
+	}
+	*c->nsout = 0; *c->noutband = 0;
+	return 0;
+}
 static uc_method_fn uc_hook_for(const char* cls) {
 	if (!strcmp(cls, "AppleSMC")) return uc_smc;
+	if (!strcmp(cls, "com_apple_filesystems_lifs")) return uc_lifs;
 	if (!strcmp(cls, "IOHIDSystem")) return uc_hid;
 	return NULL;
 }

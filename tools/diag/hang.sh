@@ -2,7 +2,8 @@
 # hang.sh '<orden de macOS>' <proceso> [segundos]: lanza la orden con msh.sh y, pasados los segundos (20) tras el arranque,
 # vuelca cada hilo del proceso de macOS llamado <proceso> (estado, llamada de Linux en curso, wchan y la instrucción,
 # simbolizada con sym.py si está en la caché de macOS o con addr2line si es código de tahoe-run). Siempre limpia.
-# Admite las variables de diagnóstico de msh.sh (el registro queda en msh.log).
+# Admite las variables de diagnóstico de msh.sh (el registro queda en msh.log). Con STACKS=<proceso> (el mismo), además
+# las pilas de macOS de cada hilo, simbolizadas.
 DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
 RUN="${TAHOE_RUN:-$DIAG/../../tahoe-run/tahoe-run}"
@@ -21,6 +22,18 @@ for P in $(pgrep -x tahoe-run); do
 			0x*) where=$(addr2line -f -s -e "$RUN" "$pc" 2>/dev/null | paste -sd' ');; *) where=;; esac
 		echo "   $(basename $t) $st nr=$nr wchan=$w pc=$pc $where"
 	done
+	# Pilas de macOS de cada hilo: si el proceso es el de STACKS, SIGRTMIN+5 hace que cada hilo escriba en el registro sus
+	# marcos (rbp) y la llamada en curso (on_dump_all, emu_proc.c); se simbolizan con sym.py.
+	if [ -n "$STACKS" ]; then
+		N=$(awk '/^NSpid/{print $NF}' /proc/$P/status)
+		kill -s RTMIN+5 "$P" 2>/dev/null; sleep 1
+		LC_ALL=C grep -a "HILO <$N:" "$D/msh.log" | sort -s -t: -k2,2n | tail -n 120 | while read -r l; do
+			case "$l" in
+				*"marcos (rbp):"*) python3 "$DIAG/sym.py" ${l#*marcos (rbp):} 2>/dev/null | sed 's/^/        /';;
+				*) echo "   ${l:0:200}";;
+			esac
+		done
+	fi
 done
 sleep 2; while pgrep -f "diag/msh.sh" > /dev/null; do sleep 1; done
 echo "--- salida de la orden:"; tail -8 "$D/hang.out"

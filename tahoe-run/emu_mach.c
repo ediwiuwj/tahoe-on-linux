@@ -249,6 +249,22 @@ static size_t mig_task_info(const struct hdr* req, const uint8_t* m, uint8_t* r)
 	memcpy(&cap, m + 36, 4);
 	if (flavor == 15 && cap >= 8) {                             // audit_token_t: 8 enteros
 		uint32_t tok[8] = { (uint32_t)-1, geteuid(), getegid(), getuid(), getgid(), (uint32_t)getpid(), 0, 1 };
+		int ktype; int32_t kpid;
+		if (kobj_lookup(req->remote, &ktype, &kpid) && (ktype == KO_TASK || ktype == KO_TASK_NAME) && kpid != (int32_t)getpid()) {
+			// la tarea de otro proceso (task_name_for_pid...): su token, no el de quien pregunta. launchd lo usa como destino de
+			// las señales que pide launchctl (proc_signal_delegate); con el propio se mandaba la señal a sí mismo.
+			char p[48], ln[128]; unsigned ru = 0, eu = 0, rg = 0, eg = 0;
+			snprintf(p, sizeof p, "/proc/%d/status", (int)kpid);
+			FILE* f = fopen(p, "r");
+			if (!f) return reply_begin(r, req, 5 /* KERN_FAILURE: la tarea ya no existe */);
+			while (fgets(ln, sizeof ln, f)) {
+				if (!strncmp(ln, "Uid:", 4)) sscanf(ln + 4, "%u %u", &ru, &eu);
+				else if (!strncmp(ln, "Gid:", 4)) sscanf(ln + 4, "%u %u", &rg, &eg);
+			}
+			fclose(f);
+			uint32_t o[8] = { (uint32_t)-1, eu, eg, ru, rg, (uint32_t)kpid, 0, 1 };
+			memcpy(tok, o, sizeof tok);
+		}
 		size_t n = reply_begin(r, req, KERN_SUCCESS_);
 		int32_t cnt = 8;
 		memcpy(r + n, &cnt, 4);

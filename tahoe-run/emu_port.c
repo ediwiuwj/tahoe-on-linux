@@ -185,6 +185,18 @@ static void poke(uint32_t name, int32_t rpid) {
 // Vacía todos los avisos pendientes del socket: el aviso es un nivel ("hay mensajes"), no un contador; la cola de datagramas
 // de Unix es corta y puede perder avisos, así que tras recibir se vuelve a avisar si aún quedan mensajes.
 static void drain_all(int fd) { char b[64]; if (fd < 0) return; while (recv(fd, b, sizeof b, MSG_DONTWAIT) > 0) {} }
+// Vacía el socket de aviso de un puerto y vuelve a mirar su cola con el cerrojo: si entre tanto llegó un mensaje, su aviso
+// pudo irse con el vaciado (el emisor avisa después de soltar el cerrojo) y el kqueue no despertaría nunca por él (se vio en
+// configd: un mensaje a su propio puerto quedó en cola sin aviso y con él se colgaron powerd y storagekitd). Se avisa de nuevo.
+static void drain_recheck(uint32_t name, int fd) {
+	if (fd < 0) return;
+	drain_all(fd);
+	lock();
+	struct sport* p = find_locked(name);
+	uint32_t cnt = p ? p->count : 0; int32_t rp = p ? p->rpid : 0;
+	unlock();
+	if (cnt) poke(name, rp);
+}
 
 static int make_wake_socket(uint32_t name, int32_t rpid) {
 	int s = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -313,7 +325,16 @@ static void sh_add_locked(uint32_t port, int32_t holder) {
 	if (!p || p->rpid == holder) return;                      // solo derechos a puertos de otro proceso
 	sh_put_locked(port, holder);
 }
+// Derechos send-once ya gastados hace poco (puerto, quien lo tenía): un segundo envío con el mismo derecho es una respuesta
+// duplicada, que en XNU no puede ocurrir (el derecho se consume al enviar).
+static struct sonce so_used[256];
+static unsigned so_used_next;
+static int so_was_used_locked(uint32_t port, int32_t holder) {
+	for (int i = 0; i < 256; i++) if (so_used[i].port == port && so_used[i].holder == holder) return 1;
+	return 0;
+}
 static void so_add_locked(uint32_t port, int32_t holder) {
+	for (int i = 0; i < 256; i++) if (so_used[i].port == port && so_used[i].holder == holder) so_used[i].port = 0;
 	for (int i = 0; i < MAXSO; i++) if (!shm->so[i].port) { shm->so[i] = (struct sonce){ port, holder }; return; }
 	logf_("    send-once: tabla llena\n");
 }
@@ -334,7 +355,13 @@ static void msg_rights_locked(const uint8_t* m, uint32_t size, int mode, uint32_
 	uint32_t bits, remote, local; memcpy(&bits, m, 4); memcpy(&remote, m + 8, 4); memcpy(&local, m + 12, 4);
 	uint32_t rd = bits & 0x1f, ld = (bits >> 8) & 0x1f;
 	int32_t me = (int32_t)getpid();
-	if (mode == RIGHTS_SEND && rd == 18) so_take_locked(dest, me);           // responde con su send-once
+	if (mode == RIGHTS_SEND && rd == 18) {                                  // responde con su send-once
+		if (so_take_locked(dest, me)) so_used[so_used_next++ & 255] = (struct sonce){ dest, me };
+		else if (so_was_used_locked(dest, me)) {
+			uint32_t id; memcpy(&id, m + 20, 4);
+			logf_("    send-once: pid %d responde otra vez por 0x%x (id=%u): derecho ya gastado\n", (int)me, dest, id);
+		}
+	}
 	if ((ld == 18 || ld == 21) && local) {                                  // derecho de respuesta send-once
 		if (mode == RIGHTS_SEND && ld == 18) so_take_locked(local, me);
 		else if (mode == RIGHTS_RECV) so_add_locked(local, me);
@@ -580,13 +607,11 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			q->next = shm->free_head; shm->free_head = idx;
 			int si = port_index(src);
 			int fd1 = local_sock[si], fd2 = -1;
-			uint32_t rem1 = src->count, rname1 = src->name, rname2 = 0, rem2 = 0;
-			int32_t rp1 = src->rpid, rp2 = 0;
-			if (src->set) { struct sport* s = find_locked(src->set); if (s) { fd2 = local_sock[port_index(s)]; rem2 = s->count; rname2 = s->name; rp2 = s->rpid; } }
+			uint32_t rname1 = src->name, rname2 = 0;
+			if (src->set) { struct sport* s = find_locked(src->set); if (s) { fd2 = local_sock[port_index(s)]; rname2 = s->name; } }
 			unlock();
-			drain_all(fd1); drain_all(fd2);
-			if (rem1) poke(rname1, rp1);                        // aún quedan mensajes: renovar el aviso
-			if (rem2) poke(rname2, rp2);
+			drain_recheck(rname1, fd1);                         // si aún quedan mensajes (o llegó uno), se renueva el aviso
+			if (rname2) drain_recheck(rname2, fd2);
 			// materializar los descriptores OOL en memoria nueva de este proceso
 			uint32_t ooff[32], olen[32];
 			int nool = ool_scan(m, sz, ooff, olen, 32);
@@ -707,6 +732,7 @@ void special_port_set(int which, uint32_t name) { pthread_once(&sp_once, sp_init
 static long t_allocate(struct ctx* c) {
 	if (c->a[1] != 1 && c->a[1] != 3) return KERN_INVALID_VALUE_;
 	uint32_t n = port_create(c->a[1] == 3);
+	if (!n) return 6;                                // KERN_RESOURCE_SHORTAGE: tabla llena (no un nombre 0 con éxito)
 	return safe_write(c->a[2], &n, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }
 // mach_port_construct_trap(task, options*, context, *name)
@@ -714,7 +740,8 @@ static long t_construct(struct ctx* c) {
 	uint32_t flags = 0;
 	if (c->a[1]) safe_read(c->a[1], &flags, 4);
 	uint32_t n = port_create(0);                     // construct nunca crea conjuntos (el bit 8 es MPO_IMPORTANCE_RECEIVER)
-	if (n != (uint32_t)-1) {                         // el contexto, o la guarda con MPO_CONTEXT_AS_GUARD (0x1; MPO_STRICT 0x20)
+	if (!n) return 6;                                // KERN_RESOURCE_SHORTAGE: tabla llena (libxpc aborta si recibe éxito con nombre 0)
+	{                         // el contexto, o la guarda con MPO_CONTEXT_AS_GUARD (0x1; MPO_STRICT 0x20)
 		if (flags & 0x1) port_guard(n, c->a[2], (flags & 0x20) != 0);
 		else port_set_context(n, c->a[2]);
 		if (flags & 0x400) { lock(); struct sport* p = find_locked(n); if (p) { p->svc = 1; p->svc_ctx = (flags & 0x1) ? c->a[2] : 0; } unlock(); }   // MPO_SERVICE_PORT
@@ -731,7 +758,7 @@ int port_drain_idle(uint32_t name) {
 	lock(); struct sport* p = find_locked(name);
 	int gone = p == NULL, fd = p ? local_sock[port_index(p)] : -1, cnt = p ? p->count : 0;
 	unlock();
-	if (!cnt) drain_all(fd);
+	if (!cnt) drain_recheck(name, fd);
 	return gone;
 }
 uint64_t port_get_context(uint32_t name) { lock(); struct sport* p = find_locked(name); uint64_t r = p ? p->ctx : 0; unlock(); return r; }

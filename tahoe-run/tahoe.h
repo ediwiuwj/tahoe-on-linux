@@ -40,7 +40,8 @@ extern int trace_all;
 // Módulos
 void emu_sysctl_init(void);
 void emu_fileport_init(void);
-int exe_host_path(int pid, char* out, size_t cap);   // ruta en el anfitrión del ejecutable de macOS de un proceso
+int exe_host_path(int pid, char* out, size_t cap);
+int darwin_sig_to_linux(int s);                         // número de señal de Darwin -> Linux (0 si no hay)   // ruta en el anfitrión del ejecutable de macOS de un proceso
 void emu_fs_init(void);
 void emu_mach_init(void);
 void emu_proc_init(void);

@@ -42,6 +42,30 @@ const char* tahoe_dev_alias(const char* p, char* buf, size_t cap) {
 	if (sscanf(p, "/dev/ttys%u%c", &n, &extra) == 1) { snprintf(buf, cap, "/dev/pts/%u", n); return buf; }
 	return p;
 }
+// Discos emulados: los nodos /dev/diskN[sM] (bloque) y /dev/rdiskN[sM] (caracteres) de los medios que anuncia IOKit
+// (emu_iokit.inc, io_disks: BSD Major 1, Minor = posición en esta lista). /dev viene del anfitrión y no los tiene; aquí se
+// presentan en stat/lstat y al listar /dev. No hay datos detrás (el volumen es una carpeta de Linux): abrirlos falla.
+static const char* const emu_disks[] = { "disk0", "disk0s1", "disk1", "disk1s1" };
+#define EMU_DISK_MAJOR 1
+static int emu_disk_node(const char* p, int* raw) {
+	if (strncmp(p, "/dev/", 5)) return -1;
+	const char* n = p + 5;
+	*raw = n[0] == 'r';
+	if (*raw) n++;
+	for (int i = 0; i < (int)(sizeof emu_disks / sizeof emu_disks[0]); i++) if (!strcmp(n, emu_disks[i])) return i;
+	return -1;
+}
+static void emu_disk_stat(int minor_, int raw, struct stat* s) {
+	struct stat d;
+	memset(s, 0, sizeof *s);
+	if (stat("/dev", &d) == 0) { s->st_dev = d.st_dev; s->st_atim = s->st_mtim = s->st_ctim = d.st_ctim; }
+	s->st_mode = (raw ? S_IFCHR : S_IFBLK) | 0640;                // root:operator, como en macOS
+	s->st_nlink = 1; s->st_uid = 0; s->st_gid = 5;
+	s->st_rdev = makedev(EMU_DISK_MAJOR, minor_);
+	s->st_ino = 0x7ffe0000 + minor_ * 2 + raw;
+	s->st_blksize = 4096;
+}
+
 // Resuelve una ruta absoluta del programa bajo TAHOE_ROOT (salvo /dev, del anfitrión).
 static const char* resolve(const char* guest, char* buf, size_t cap) {
 	if (tahoe_root && guest[0] == '/' && !tahoe_host_passthrough(guest)) { snprintf(buf, cap, "%s%s", tahoe_root, guest); return buf; }
@@ -78,6 +102,7 @@ static long bsd_pwrite(struct ctx* c) { RET(syscall(SYS_pwrite64, c->a[0], c->a[
 static long bsd_access(struct ctx* c) {
 	char p[4096], b[4200];
 	if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT;
+	int raw; if (emu_disk_node(p, &raw) >= 0) return ((int)c->a[1] & 1) ? -13 /* EACCES */ : 0;   // discos emulados: rw para root, no x
 	RET(access(resolve(p, b, sizeof b), (int)c->a[1] & 7));          // R_OK/W_OK/X_OK/F_OK coinciden
 }
 static long bsd_readlink(struct ctx* c) {
@@ -121,6 +146,8 @@ static long do_stat(struct ctx* c, int follow) {
 	char p[4096], b[4200];
 	struct stat s;
 	if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT;
+	int raw, dm = emu_disk_node(p, &raw);
+	if (dm >= 0) { emu_disk_stat(dm, raw, &s); put_stat(c->a[1], &s, 0); return 0; }
 	const char* path = resolve(p, b, sizeof b);
 	if ((follow ? stat(path, &s) : lstat(path, &s)) != 0) {
 		if (trace_all) logf_("    stat(\"%s\") -> %s\n", p, strerror(errno));
@@ -225,6 +252,18 @@ static long bsd_fstatat64(struct ctx* c) {
 	if (dfd == -2) dfd = AT_FDCWD;
 	int flags = ((int)c->a[3] & 0x20) ? AT_SYMLINK_NOFOLLOW : 0;
 	if (p[0] == '\0') flags |= AT_EMPTY_PATH;
+	{                                                                // discos emulados: por ruta absoluta o relativa a /dev
+		char full[4200]; int raw, dm = -1;
+		if (p[0] == '/') dm = emu_disk_node(p, &raw);
+		else if (p[0] && !strchr(p, '/')) {
+			struct stat ds, dd;
+			int in_dev = dfd == AT_FDCWD ? (getcwd(full, sizeof full) && !strcmp(full, "/dev"))
+				: (fstat(dfd, &ds) == 0 && stat("/dev", &dd) == 0 && ds.st_ino == dd.st_ino && ds.st_dev == dd.st_dev);
+			snprintf(full, sizeof full, "/dev/%s", p);
+			if (in_dev) dm = emu_disk_node(full, &raw);
+		}
+		if (dm >= 0) { emu_disk_stat(dm, raw, &s); put_stat(c->a[2], &s, 0); return 0; }
+	}
 	const char* path = (dfd == AT_FDCWD || p[0] == '/') ? resolve(p, b, sizeof b) : p;
 	if (fstatat(dfd, path, &s, flags) != 0) {
 		if (trace_all) logf_("    fstatat(%d, \"%s\") -> %s\n", (int)c->a[0], p, strerror(errno));
@@ -594,6 +633,14 @@ static long bsd_getdirentries64(struct ctx* c) {
 			k += rl;
 		}
 		if (pd) closedir(pd);
+		for (int i = 0; i < (int)(sizeof emu_disks / sizeof emu_disks[0]) * 2 && k + 64 < (long)sizeof lin; i++) {   // y los discos
+			char nm[16]; snprintf(nm, sizeof nm, "%s%s", (i & 1) ? "r" : "", emu_disks[i / 2]);
+			uint8_t* r = lin + k; size_t nl = strlen(nm); uint16_t rl = (uint16_t)((19 + nl + 1 + 7) & ~7UL);
+			memset(r, 0, rl);
+			*(uint64_t*)r = 0x7ffe0000 + i; *(int64_t*)(r + 8) = (int64_t)(0x7ffe0000 + i); *(uint16_t*)(r + 16) = rl; r[18] = (i & 1) ? DT_CHR : DT_BLK;
+			memcpy(r + 19, nm, nl + 1);
+			k += rl;
+		}
 		n = k;
 	}
 	uint8_t* out = malloc(gsize);

@@ -700,8 +700,31 @@ static void put_bsdshortinfo(uint8_t* b, const struct pinfo* pi) {
 	W32(36, pi->uid); W32(40, pi->gid); W32(44, pi->ruid); W32(48, pi->rgid); W32(52, pi->svuid); W32(56, pi->svgid);
 #undef W32
 }
+// Señales por token de auditoría (proc_signal_with_audittoken, proc_signal_delegate, proc_terminate...): así manda launchd las
+// señales a sus servicios (launchctl kill, kickstart -k, bootout). El pid va en val[5] del token del destino; en las llamadas
+// delegadas el búfer lleva dos tokens, primero el de quien lo pide y luego el del destino.
+static long proc_signal_call(struct ctx* c) {
+	int call = (int)c->a[0];
+	int pid = (int)c->a[1];
+	if (call != 7) {                                                       // 7 = TERMINATE: el pid va en la llamada
+		uint32_t tok[16] = { 0 };
+		size_t sz = c->a[5] > sizeof tok ? sizeof tok : c->a[5];
+		if (sz < 32 || safe_read(c->a[4], tok, sz) != (ssize_t)sz) return -DARWIN_EINVAL;
+		pid = (int)((call >= 0x13 && sz >= 64) ? tok[8 + 5] : tok[5]);
+	}
+	int terminate = call == 7 || call == 0x12 || call == 0x14;
+	int sig = terminate ? 15 /* SIGTERM */ : (int)c->a[2];
+	if (pid <= 0) return -3;                                               // ESRCH
+	int ls = sig ? darwin_sig_to_linux(sig) : 0;
+	if (sig && ls <= 0) return -DARWIN_EINVAL;
+	int r = kill(pid, ls);
+	logf_("    proc_info 0x%x: señal %d -> pid %d%s\n", call, sig, pid, r ? " (falló)" : "");
+	if (r != 0) return -darwin_errno(errno);
+	return terminate ? sig : 0;                                            // proc_terminate devuelve la señal enviada
+}
 static long bsd_proc_info(struct ctx* c) {
 	if ((int)c->a[0] == 15) return 0;
+	if ((int)c->a[0] == 7 || ((int)c->a[0] >= 0x11 && (int)c->a[0] <= 0x14)) return proc_signal_call(c);
 	if ((int)c->a[0] == 5 || (int)c->a[0] == 8) return 0;                 // SETCONTROL / DIRTYCONTROL: sin efecto
 	if ((int)c->a[0] == 9) {                                              // PIDRUSAGE: contadores a cero
 		uint8_t z[512] = { 0 };
