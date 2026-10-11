@@ -234,6 +234,9 @@ anterior.
 | `tools/narrow_int64.py` | Quita `Int64` de un SPIR-V cuando solo se usa para indexar (conservador) |
 | `test/add_arrays.vulkan1.2.spv` | SPIR-V generado por `metal2vulkan` (aún con `Int64`) |
 | `test/run_add_arrays.c` | Programa mínimo de Vulkan que ejecuta el kernel y comprueba `c = a + b` |
+| `tools/macos-shell.sh` | Shell de macOS sobre `tahoe-run`; con `--launchd`, unida a launchd |
+| `tools/shell_survey.sh` | Inventario: ~85 órdenes típicas de macOS clasificadas en OK, ERR, COLGADA o SEÑAL |
+| `tools/diag/` | Diagnóstico: `msh.sh`, `hang.sh`, `ab.sh`, `clean.sh`, `sym.py`, `dis.py` (ver más abajo) |
 
 ### Estado de los parches
 
@@ -429,3 +432,26 @@ extendidos; uid/gid emulados.
 **Pendiente**: `opendirectoryd` (se queda esperando al abrir `/Search`), clientes de CarbonCore (`FileIDTreeStorage` no registrado en
 `coreservicesd`), `displaypolicyd` (PF238), señales reales (`sigreturn`), `fileport_makeport`. Después: WindowServer, pantalla por
 DRM/KMS, entrada por evdev y Metal.
+
+### Shell unida a launchd y herramientas de diagnóstico (11 de octubre de 2026)
+`tools/macos-shell.sh --launchd` arranca launchd en su propio espacio de PID (o se une a uno que ya corre) y mete la shell con
+`nsenter`, compartiendo la región de puertos Mach: sin puerto bootstrap propio usa el que launchd registró, como un proceso de
+macOS. Así funcionan `launchctl list`/`print`, `defaults read/write` (cfprefsd), `scutil`, `pmset`, `ioreg`, `nvram`, `dscl`.
+Además, desde esta fecha: `sysctl` (identificadores especiales `{0,1}`, `{0,2}`, `{0,4}`), `mount`/`umount` y `df` con la raíz
+y `devfs` (llamadas de montaje como XNU), y `caffeinate`: el hilo gestor de eventos de libdispatch se lanza con
+`WQ_FLAG_THREAD_EVENT_MANAGER`, sin lo cual ningún temporizador de la cola principal o de las globales (`dispatch_after`) se
+disparaba en ningún proceso.
+
+Herramientas de `tools/diag/` (registro y salidas en `$TAHOE_DIAG_DIR`, por omisión `~/.cache/tahoe-diag`):
+
+| Herramienta | Uso |
+|---|---|
+| `msh.sh '<órdenes>' [espera] [límite]` | Órdenes en la shell unida a launchd; siempre limpia. Variables: `STACKS=<proceso>`, `ALL=1`, `MACH=1`, `IOK=1`, `BRK='dir…'`, `PEEK='expr…'`, `TAHOE_RUN=<binario>` |
+| `hang.sh '<orden>' <proceso> [s]` | Vuelca cada hilo de un proceso colgado, simbolizado |
+| `ab.sh <N> [binario]` | N arranques con recuento de procesos y caídas: comparar dos versiones antes de dar por bueno un cambio |
+| `clean.sh` | Termina todo `tahoe-run` y limpia `/dev/shm` |
+| `sym.py <dir>…` / `dis.py <dir> [bytes]` | Símbolo (con `ipsw`) o desensamblado de direcciones de la caché de dyld |
+
+**Pendiente** (inventario `tools/shell_survey.sh`): `log show` (no hay logd), `security list-keychains` (se cuelga), discos
+(`diskutil`, `hdiutil`, `bless`: el registro IOKit aún no tiene la jerarquía `IOBlockStorageDevice` → `IOMedia` →
+`AppleAPFSVolume`; por eso las fases de montaje del arranque, `mount -P`, siguen sustituidas), caída de `locationd`.
