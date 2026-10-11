@@ -415,6 +415,55 @@ static void io_nvram_boot(int opt) {
 	p_str(opt, "efi-boot-device", xml);
 }
 
+// ------------------------------------------------------------------ pantalla emulada
+// Un único modo: 1280×800 a 60 Hz, 32 bits por píxel (IO32BitDirectPixels: en memoria B, G, R, X). La memoria de vídeo es un
+// archivo de /dev/shm que ven a la vez WindowServer (la proyecta con IOConnectMapMemory) y el visor de Linux (tools/tahoe-view).
+#define FB_W      1280
+#define FB_H      800
+#define FB_BPR    (FB_W * 4)
+#define FB_VRAM   (16u << 20)                           // 16 MiB: IOFBMemorySize
+#define FB_MODE   1                                     // IODisplayModeID del único modo
+// EDID 1.4 de un panel interno de 13,3" (286×179 mm) con el modo nativo como temporización detallada (CVT con borrado reducido:
+// 71 MHz, 1280+160 × 800+23). Fabricante "TAH" (no es un panel real).
+static void edid_make(uint8_t e[128]) {
+	static const uint8_t head[] = { 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+		0x50, 0x28, 0x80, 0x12, 0, 0, 0, 0, 1, 35, 1, 4,       // "TAH", producto 0x1280, semana 1 de 2025, EDID 1.4
+		0xa5, 29, 18, 120, 0x02,                              // digital 8 bits; 29×18 cm; gamma 2,2; temporización preferida nativa
+		0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54,   // cromaticidad sRGB
+		0, 0, 0 };
+	memset(e, 0, 128);
+	memcpy(e, head, sizeof head);
+	for (int i = 38; i < 54; i++) e[i] = 0x01;               // sin temporizaciones estándar
+	static const uint8_t dtd[18] = { 0xbc, 0x1b, 0x00, 0xa0, 0x50, 0x20, 0x17, 0x30, 0x30, 0x20, 0x36, 0x00,
+		0x1e, 0xb3, 0x10, 0, 0, 0x1a };
+	memcpy(e + 54, dtd, 18);
+	static const uint8_t name[18] = { 0, 0, 0, 0xfc, 0, 'T', 'a', 'h', 'o', 'e', ' ', 'L', 'C', 'D', '\n', ' ', ' ', ' ' };
+	memcpy(e + 72, name, 18);
+	static const uint8_t dummy[18] = { 0, 0, 0, 0x10, 0 };
+	memcpy(e + 90, dummy, 18); memcpy(e + 108, dummy, 18);
+	uint8_t sum = 0; for (int i = 0; i < 127; i++) sum += e[i];
+	e[127] = (uint8_t)-sum;
+}
+static void fb_props(int fb) {
+	p_num(fb, "IOFBMemorySize", FB_VRAM, 32);
+	p_num(fb, "IOFBCurrentPixelCount", (uint64_t)(FB_W + 160) * (FB_H + 23), 64);
+	p_num(fb, "IOFBCurrentPixelClock", 71000000, 64);
+	p_num(fb, "IOFramebufferOpenGLIndex", 0, 32);
+	p_num(fb, "IOFBGammaWidth", 8, 32); p_num(fb, "IOFBGammaCount", 256, 32); p_num(fb, "IOFBGammaHeaderSize", 0, 32);
+	p_bool(fb, "IOFBNeedsRefresh", 0);
+	p_num(fb, "IOFBWaitCursorFrames", 0, 32);
+	p_num(fb, "IOFBWaitCursorPeriod", 33333333, 32);
+}
+static void display_props(int d) {
+	uint8_t e[128]; edid_make(e);
+	p_data(d, "IODisplayEDID", e, sizeof e);
+	p_num(d, "DisplayVendorID", 0x5028, 32);
+	p_num(d, "DisplayProductID", 0x1280, 32);
+	p_num(d, "DisplaySerialNumber", 0, 32);
+	p_str(d, "IODisplayPrefsKey", "IOService:/AppleACPIPlatformExpert/PCI0/IGPU@20000/AppleIntelFramebuffer@0/display0/AppleDisplay-5028-1280");
+	p_num(d, "IODisplayConnectFlags", 0, 32);
+}
+
 static void io_init(void) {
 	if (io_inited) return;
 	io_inited = 1;
@@ -550,14 +599,26 @@ static void io_init(void) {
 	p_str(gpu, "IOPCIMatch", compat);
 	p_bool(gpu, "IOPCIExpressLinkStatus", 1);
 	p_str(gpu, "IOProviderClass", "IOPCIDevice");
+	// Identidad PCI completa (como la publica IOPCIFamily en 00:02.0): CoreDisplay la usa para nombrar la GPU (vid.did, b:d:f).
+	p_u32(gpu, "revision-id", 0x09); p_u32(gpu, "subsystem-vendor-id", vendor); p_u32(gpu, "subsystem-id", device);
+	{ uint32_t reg[5] = { 0x00001000, 0, 0, 0, 0 }; p_data(gpu, "reg", reg, sizeof reg); }   // bus 0, dispositivo 2, función 0
+	p_str(gpu, "pcidebug", "0:2:0");
+	p_cstr(gpu, "AAPL,slot-name", "Internal@0,2,0");
+	p_u32(gpu, "AAPL,ig-platform-id", 0x0a260006);                // Haswell móvil (HD 4400), como en las guías de Dortania
+	p_num(gpu, "IOPCIExpressCapabilities", 2, 32);
+	p_bool(gpu, "built-in", 1);
 	int accel = ent_add(gpu, "AppleIntelFramebuffer", "AppleIntelFramebuffer", "IORegistryEntry IOService IOFramebuffer", "0", PL_SERVICE, 1);
 	p_str(accel, "IOClass", "AppleIntelFramebuffer");
 	p_str(accel, "IOProviderClass", "IOPCIDevice");
+	fb_props(accel);
 	int accl = ent_add(gpu, "IOAccelerator", "IOAccelerator", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(accl, "IOClass", "IOAccelerator");
 	p_str(accl, "IOVARendererID", "0x00000000");
-	int disp = ent_add(accel, "AppleDisplay", "IODisplay", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	int dcon = ent_add(accel, "display0", "IODisplayConnect", "IORegistryEntry IOService", "", PL_SERVICE, 0);
+	p_str(dcon, "IOClass", "IODisplayConnect");
+	int disp = ent_add(dcon, "AppleDisplay", "IODisplay", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(disp, "IOClass", "AppleDisplay");
+	display_props(disp);
 	int wr = ent_add(plat, "IODisplayWrangler", "IODisplayWrangler", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(wr, "IOClass", "IODisplayWrangler");
 
@@ -943,7 +1004,7 @@ static uint8_t* hid_map(void) {
 		v = 1; memcpy(g + G_ENUM, &v, 4);
 		for (int i = 0; i < LLEQSIZE_; i++) { int32_t nx = i + 1 == LLEQSIZE_ ? 0 : i + 1; memcpy(g + G_LLEQ + i * EQELEM_SIZE, &nx, 4); }
 		v = 1; memcpy(g + G_LLEHEAD, &v, 4); memcpy(g + G_LLETAIL, &v, 4); v = 0; memcpy(g + G_LLELAST, &v, 4);
-		int16_t wb[4] = { 0, 1920, 0, 1080 }; memcpy(g + G_WORKBOUNDS, wb, 8);
+		int16_t wb[4] = { 0, FB_W, 0, FB_H }; memcpy(g + G_WORKBOUNDS, wb, 8);
 	}
 	hid_shm = m;
 	return m;
@@ -1050,8 +1111,153 @@ static int32_t uc_gpuwrangler(struct uc_call* c) {
 		return kIOReturnUnsupported;
 	}
 }
+// IOFramebufferUserClient (IOGraphics-600, IOFramebufferUserClient.cpp: selectores 0-20). Sin acelerador: WindowServer dibuja
+// en la memoria de vídeo (tipo kIOFBVRAMMemory 110, o la apertura del sistema 0) y el cursor va por software en la memoria
+// compartida StdFBShmem_t (tipo kIOFBCursorMemory 100) que crea createSharedCursor.
+// Cabecera para el visor tras la memoria de vídeo (en FB_VRAM): "TFB1", ancho, alto, bytes por fila, formato (0 = BGRX).
+struct fb_hdr { char magic[4]; uint32_t w, h, bpr, fmt, seq; };
+static uint8_t* fb_vram;
+static uint8_t* fb_cursor; static size_t fb_cursor_size;
+static void fb_path(char* b, size_t n, const char* what) { snprintf(b, n, "/dev/shm/tahoe-%s-%s", what, getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x"); }
+static uint8_t* shm_file(const char* what, size_t size, int reset) {
+	char p[128]; fb_path(p, sizeof p, what);
+	int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+	if (fd < 0) return NULL;
+	struct stat st; fstat(fd, &st);
+	if ((reset || (size_t)st.st_size != size) && ftruncate(fd, 0) == 0 && ftruncate(fd, size) != 0) { close(fd); return NULL; }
+	uint8_t* m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	return m == MAP_FAILED ? NULL : m;
+}
+static uint8_t* fb_map(void) {
+	if (fb_vram) return fb_vram;
+	uint8_t* m = shm_file("fb", FB_VRAM + 4096, 0);
+	if (!m) return NULL;
+	struct fb_hdr h = { { 'T', 'F', 'B', '1' }, FB_W, FB_H, FB_BPR, 0, 0 };
+	memcpy(m + FB_VRAM, &h, sizeof h);
+	return fb_vram = m;
+}
+// StdFBShmem_t con IOFB_ARBITRARY_SIZE_CURSOR e IOFB_ARBITRARY_FRAMES_CURSOR (lo que usan el núcleo y WindowServer).
+struct fb_shmem {
+	int32_t cursorSema, frame;
+	char cursorShow, cursorObscured, shieldFlag, shielded;
+	int16_t saveRect[4], shieldRect[4], cursorLoc[2], cursorRect[4], oldCursorRect[4], screenBounds[4];
+	int32_t version, structSize;
+	uint32_t vblTime[2], vblDelta[2];
+	uint64_t vblCount, vblDrift, vblDeltaMeasured;
+	uint32_t vblDeltaReal[2];
+	uint32_t reservedC[22];
+	uint8_t hardwareCursorCapable, hardwareCursorActive, hardwareCursorShields, reservedB[1];
+	int16_t cursorSize[4][2], hotSpot[4][2];
+};
+_Static_assert(offsetof(struct fb_shmem, version) == 56 && offsetof(struct fb_shmem, vblCount) == 80 &&
+               offsetof(struct fb_shmem, hardwareCursorCapable) == 200 && offsetof(struct fb_shmem, hotSpot) == 220 &&
+               sizeof(struct fb_shmem) == 240, "StdFBShmem_t");
+struct fb_pixinfo {                                      // IOPixelInformation
+	uint32_t bytesPerRow, bytesPerPlane, bitsPerPixel, pixelType, componentCount, bitsPerComponent, componentMasks[16];
+	char pixelFormat[64];
+	uint32_t flags, activeWidth, activeHeight, reserved[2];
+};
+_Static_assert(sizeof(struct fb_pixinfo) == 172, "IOPixelInformation");
+struct fb_modeinfo { uint32_t nominalWidth, nominalHeight, refreshRate, maxDepthIndex, flags; uint16_t imageWidth, imageHeight; uint32_t reserved[3]; };
+struct fb_timing_v2 {                                    // IODetailedTimingInformationV2
+	uint32_t reservedA[3], hScaledInset, vScaledInset, scalerFlags, hScaled, vScaled, signalConfig, signalLevels;
+	uint64_t pixelClock, minPixelClock, maxPixelClock;
+	uint32_t hActive, hBlanking, hSyncOffset, hSyncPulseWidth, vActive, vBlanking, vSyncOffset, vSyncPulseWidth;
+	uint32_t hBorderLeft, hBorderRight, vBorderTop, vBorderBottom, hSyncConfig, hSyncLevel, vSyncConfig, vSyncLevel, numLinks;
+	uint32_t vBlankingExtension;
+	uint16_t pixelEncoding, bitsPerColorComponent, colorimetry, dynamicRange, dscBpp, dscSliceHeight, dscSliceWidth, vMaxStretch, vMaxShrink, reservedB[3];
+};
+struct fb_timing { uint32_t appleTimingID, flags; union { uint8_t v1[52]; struct fb_timing_v2 v2; } d; };
+#pragma pack(push, 4)
+struct fb_modedesc { struct fb_modeinfo info; struct fb_timing timing; };   // IOFBDisplayModeDescription
+#pragma pack(pop)
+_Static_assert(sizeof(struct fb_modeinfo) == 36 && offsetof(struct fb_timing_v2, pixelClock) == 40 &&
+               offsetof(struct fb_modedesc, timing) == 36 && offsetof(struct fb_modedesc, timing.d) == 44, "IOFBDisplayModeDescription");
+static int32_t uc_fb(struct uc_call* c) {
+	uint32_t want = *c->noutband;
+	*c->noutband = 0; *c->nsout = 0;
+	switch (c->selector) {
+	case 0: {                                                          // createSharedCursor(versión, ancho máx., ancho de espera)
+		if (c->nsin < 3) return kIOReturnBadArgument;
+		uint32_t ver = (uint32_t)c->sin[0], mw = (uint32_t)c->sin[1], mww = (uint32_t)c->sin[2], frames;
+		if (mw > 256 || mww > 256) return kIOReturnNoMemory;
+		if (!mw || !mww) return kIOReturnBadArgument;
+		if ((ver & 0xff) == 3) { frames = (ver >> 16) & 0xff; if (frames > 32) return kIOReturnNoMemory; if (!frames) return kIOReturnBadArgument; }
+		else if ((ver & 0xff) == 2) frames = 4;
+		else return kIOReturnUnsupported;
+		size_t img = (size_t)mw * mw * 4, wimg = (size_t)mww * mww * 4;
+		size_t size = sizeof(struct fb_shmem) + img + (img > wimg ? img : wimg) + (frames - 1) * wimg;
+		if (fb_cursor) munmap(fb_cursor, fb_cursor_size);
+		fb_cursor = shm_file("fbcursor", size, 1); fb_cursor_size = size;
+		if (!fb_cursor) return kIOReturnNoMemory;
+		struct fb_shmem* sh = (struct fb_shmem*)fb_cursor;
+		sh->version = (int32_t)(ver & 0xff); sh->structSize = (int32_t)size; sh->cursorShow = 1;
+		sh->screenBounds[0] = 0; sh->screenBounds[1] = FB_W; sh->screenBounds[2] = 0; sh->screenBounds[3] = FB_H;
+		sh->cursorLoc[0] = FB_W / 2; sh->cursorLoc[1] = FB_H / 2;
+		p_num(c->ent, "IOFBWaitCursorFrames", frames - 1, 32);
+		return 0;
+	}
+	case 1: {                                                          // getPixelInformation(modo, profundidad, apertura)
+		if (c->nsin < 3 || c->sin[0] != FB_MODE || c->sin[1] != 0 || c->sin[2] != 0) return kIOReturnBadArgument;
+		struct fb_pixinfo pi = { .bytesPerRow = FB_BPR, .bitsPerPixel = 32, .pixelType = 2 /* kIORGBDirectPixels */,
+			.componentCount = 3, .bitsPerComponent = 8, .componentMasks = { 0xff0000, 0xff00, 0xff },
+			.pixelFormat = "--------RRRRRRRRGGGGGGGGBBBBBBBB", .activeWidth = FB_W, .activeHeight = FB_H };
+		uint32_t n = want < sizeof pi ? want : sizeof pi;
+		memcpy(c->outband, &pi, n); *c->noutband = n;
+		return 0;
+	}
+	case 2: c->sout[0] = FB_MODE; c->sout[1] = 0; *c->nsout = 2; return 0;   // getCurrentDisplayMode -> (modo, profundidad)
+	case 5: {                                                          // getInformationForDisplayMode(modo)
+		if (c->nsin < 1 || c->sin[0] != FB_MODE || want < sizeof(struct fb_modeinfo)) return kIOReturnBadArgument;
+		struct fb_modedesc d = { 0 };
+		d.info = (struct fb_modeinfo){ FB_W, FB_H, 60u << 16, 0, 0x7 | 0x400 /* seguro, válido, por defecto; integrado */, 286, 179, { 0 } };
+		d.timing.flags = want >= sizeof d ? 0x80000000u : 0;          // kIODetailedTimingValid
+		struct fb_timing_v2* t = &d.timing.d.v2;
+		t->pixelClock = t->minPixelClock = t->maxPixelClock = 71000000;
+		t->hActive = FB_W; t->hBlanking = 160; t->hSyncOffset = 48; t->hSyncPulseWidth = 32;
+		t->vActive = FB_H; t->vBlanking = 23; t->vSyncOffset = 3; t->vSyncPulseWidth = 6;
+		t->hScaled = FB_W; t->vScaled = FB_H; t->numLinks = 1; t->bitsPerColorComponent = 8;
+		uint32_t n = want < sizeof d ? want : sizeof d;
+		memcpy(c->outband, &d, n); *c->noutband = n;
+		return 0;
+	}
+	case 6: c->sout[0] = 1; *c->nsout = 1; return 0;                 // getDisplayModeCount
+	case 7: {                                                          // getDisplayModes
+		if (want < 4) return kIOReturnBadArgument;
+		uint32_t m = FB_MODE; memcpy(c->outband, &m, 4); *c->noutband = 4;
+		return 0;
+	}
+	case 8: c->sout[0] = 0; *c->nsout = 1; return 0;                 // getVRAMMapOffset: la imagen empieza al principio
+	case 13:                                                           // setCursorPosition(dispositivo, x, y)
+		if (fb_cursor && c->nsin >= 3) { struct fb_shmem* sh = (struct fb_shmem*)fb_cursor; sh->cursorLoc[0] = (int16_t)c->sin[1]; sh->cursorLoc[1] = (int16_t)c->sin[2]; }
+		return 0;
+	case 3: case 4: case 9: case 10: case 11: case 12: case 14: case 15: case 16: case 19: case 20:
+		return 0;                                                      // cambios de modo, cursor, gamma, CLUT, atributos: aceptados
+	case 18: {                                                         // getAttribute(atributo)
+		uint32_t a = c->nsin ? (uint32_t)c->sin[0] : 0;
+		c->sout[0] = 0; *c->nsout = 1;
+		switch (a) {
+		case 0x77737570: case 0x77736368: case 0x77736564:            // 'wsup' 'wsch' 'wsed': inicio de WindowServer, cambios de conexión
+		case 0x6d726466:                                               // 'mrdf' kIOMirrorDefaultAttribute: sin espejo
+			return 0;
+		case 0x706f7772:                                               // 'powr' encendido: máximo
+			c->sout[0] = 2; return 0;
+		}
+		static uint32_t seen[32]; static int nseen;
+		int known = 0; for (int i = 0; i < nseen; i++) known |= seen[i] == a;
+		if (!known && nseen < 32) { seen[nseen++] = a; logf_("    iokit: <%d> framebuffer getAttribute '%c%c%c%c' sin implementar\n", (int)getpid(), a >> 24, a >> 16 & 0xff, a >> 8 & 0xff, a & 0xff); }
+		*c->nsout = 0;
+		return kIOReturnUnsupported;
+	}
+	default:
+		logf_("    iokit: <%d> framebuffer selector %u sin implementar\n", (int)getpid(), c->selector);
+		return kIOReturnUnsupported;
+	}
+}
 static uc_method_fn uc_hook_for(const char* cls) {
 	if (!strcmp(cls, "AppleGPUWrangler")) return uc_gpuwrangler;
+	if (!strcmp(cls, "AppleIntelFramebuffer")) return uc_fb;
 	if (!strcmp(cls, "IOWatchdog")) return uc_watchdog;
 	if (!strcmp(cls, "AppleSMC")) return uc_smc;
 	if (!strcmp(cls, "com_apple_filesystems_lifs")) return uc_lifs;
@@ -1458,6 +1664,14 @@ static size_t mig_iokit(const struct hdr* h, const uint8_t* req, uint8_t* rep, i
 			uint8_t* m = hid_map(); if (!m) return rp_err(rep, h, kIOReturnNoMemory);
 			size_t n = reply_begin(rep, h, KERN_SUCCESS_);
 			uint64_t a = (uint64_t)m, sz = HID_SHM_SIZE; (void)size;
+			memcpy(rep + n, &a, 8); memcpy(rep + n + 8, &sz, 8);
+			return n + 16;
+		}
+		if (!strcmp(io_e[self->ent].cls, "AppleIntelFramebuffer") && (mtype == 100 || mtype == 110 || mtype == 0)) {
+			uint8_t* m = mtype == 100 ? fb_cursor : fb_map();                   // 100 cursor compartido; 110/0 memoria de vídeo
+			if (!m) return rp_err(rep, h, mtype == 100 ? kIOReturnBadArgument : kIOReturnNoMemory);
+			size_t n = reply_begin(rep, h, KERN_SUCCESS_);
+			uint64_t a = (uint64_t)m, sz = mtype == 100 ? fb_cursor_size : FB_VRAM;
 			memcpy(rep + n, &a, 8); memcpy(rep + n + 8, &sz, 8);
 			return n + 16;
 		}

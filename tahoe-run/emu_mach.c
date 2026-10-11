@@ -19,6 +19,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include "tahoe.h"
 
 #define MACH_MSG_SUCCESS     0

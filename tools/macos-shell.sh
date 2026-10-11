@@ -6,6 +6,7 @@
 #   tools/macos-shell.sh --launchd                # shell unida a launchd (launchctl, defaults... hablan con sus servicios)
 #   tools/macos-shell.sh --launchd -c 'launchctl list'
 #   tools/macos-shell.sh --launchd --depurar      # modo depuración (ver abajo)
+#   tools/macos-shell.sh --launchd --pantalla     # además abre el visor de la pantalla de macOS (tools/tahoe-view)
 #
 # TAHOE_RUN: binario de tahoe-run a usar (por omisión, el del repo).
 # TAHOE_ROOT: carpeta con el sistema base de macOS extraído (por omisión ~/macos26/base/macOS Base System).
@@ -20,6 +21,9 @@
 # --depurar: modo depuración. Pone en la NVRAM emulada ROS_SLEEP_ON_FAILURE, el ajuste de recoveryosd para que, si algo le
 # obliga a reiniciar (hoy: el llavero de root), se quede dormido en vez de ejecutar /sbin/reboot y apagar todo el arranque.
 # Sin la opción, el arranque es el normal, como en un Mac.
+#
+# --pantalla: abre tools/tahoe-view/tahoe-view (compílalo con su build.sh; necesita SDL3), que muestra en una ventana la
+# memoria de vídeo emulada en la que dibuja WindowServer (/dev/shm/tahoe-fb-<id>). Implica --launchd.
 ROOT="${TAHOE_ROOT:-$HOME/macos26/base/macOS Base System}"
 TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 RUN="${TAHOE_RUN:-$(cd "$TOOLS/../tahoe-run" && pwd)/tahoe-run}"   # TAHOE_RUN: otro binario (comparar versiones)
@@ -37,8 +41,9 @@ CACHE="${TAHOE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tahoe-run}"   # el sli
 LOG="${TAHOE_LOGFILE:-/tmp/tahoe-shell-$USER.log}"
 
 WITH_LAUNCHD= DEBUG_ENV=()
-while [ "$1" = --launchd ] || [ "$1" = --depurar ]; do
+while [ "$1" = --launchd ] || [ "$1" = --depurar ] || [ "$1" = --pantalla ]; do
 	[ "$1" = --launchd ] && WITH_LAUNCHD=1
+	[ "$1" = --pantalla ] && WITH_LAUNCHD=1 WITH_VIEW=1
 	[ "$1" = --depurar ] && DEBUG_ENV=(TAHOE_DEBUG_NOREBOOT=1)
 	shift
 done
@@ -73,6 +78,8 @@ STARTED=
 stop_launchd() {
 	[ -n "$STARTED" ] || return
 	kill -9 "$L" $(pgrep -P "$U" 2>/dev/null) 2>/dev/null   # al morir el PID 1 del espacio, el núcleo termina a todos sus procesos
+	[ -n "$VIEW" ] && kill "$VIEW" 2>/dev/null
+	[ -n "$REGION" ] && rm -f "/dev/shm/tahoe-fb-${REGION#/dev/shm/tahoe-ports-}" "/dev/shm/tahoe-fbcursor-${REGION#/dev/shm/tahoe-ports-}"
 	touch /dev/shm/tahoe-guard-stop; wait "$GUARD" 2>/dev/null
 	rm -f /dev/shm/tahoe-guard-stop
 }
@@ -93,6 +100,14 @@ if [ -z "$L" ]; then
 fi
 REGION=$(find_region "$L")
 if [ -z "$REGION" ]; then echo "no encuentro la región de puertos de launchd (pid $L)" >&2; exit 1; fi
+
+if [ -n "$WITH_VIEW" ]; then
+	if [ -x "$TOOLS/tahoe-view/tahoe-view" ]; then
+		"$TOOLS/tahoe-view/tahoe-view" "/dev/shm/tahoe-fb-${REGION#/dev/shm/tahoe-ports-}" < /dev/null > /dev/null 2>&1 & VIEW=$!
+	else
+		echo "falta el visor: compila con tools/tahoe-view/build.sh" >&2
+	fi
+fi
 
 T=$(ls /proc/$L/task | grep -vx "$L" | head -1)       # un hilo vivo: con el principal terminado, /proc/<pid>/ns no se abre
 nsenter --target "${T:-$L}" --user --mount --pid --preserve-credentials -- \
