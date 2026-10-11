@@ -216,8 +216,40 @@ static long net_ioctl(struct ctx* c) {
 		}
 		}
 	}
+	if (((req >> 8) & 0xff) == 'i') {                         // ioctl de interfaces de red sobre un socket (struct ifreq / in6_ifreq)
+		struct stat st;
+		if (fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode)) {
+			unsigned nr = req & 0xff, len = (req >> 16) & 0x1fff;
+			if ((nr == 73 || nr == 76 || nr == 81) && len > 16 && len <= 512) {   // SIOCGIFAFLAG_IN6 / SIOCGIFINFO_IN6 / SIOCGIFALIFETIME_IN6: vacíos
+				uint8_t z[512] = { 0 };
+				return safe_write(arg + 16, z, len - 16) == (ssize_t)(len - 16) ? 0 : -D_EFAULT;
+			}
+			return -2;                                        // ENOENT: sin esa configuración (CLAT46, NAT64...)
+		}
+	}
 	if (trace_all) logf_("    ioctl(fd=%d, 0x%x) sin traducir\n", fd, req);
 	return -25;
+}
+
+// ---- ICMP sin privilegios (ping): en Linux SOCK_RAW exige CAP_NET_RAW; se usa el socket "ping" (SOCK_DGRAM,
+// IPPROTO_ICMP). Diferencias que se ocultan: macOS entrega la cabecera IP delante del ICMP recibido, y Linux reescribe el
+// identificador del eco con su puerto. Al recibir se restaura el identificador enviado y se antepone una cabecera IPv4.
+#define ICMP_MAX_FD 4096
+static int icmp_emul[ICMP_MAX_FD];
+static uint16_t icmp_id[ICMP_MAX_FD];
+static int is_icmp(int fd) { return fd >= 0 && fd < ICMP_MAX_FD && icmp_emul[fd]; }
+static uint16_t csum(const uint8_t* p, size_t n) { uint32_t s = 0; for (size_t i = 0; i + 1 < n; i += 2) s += (uint32_t)(p[i] << 8 | p[i + 1]); if (n & 1) s += (uint32_t)p[n - 1] << 8; while (s >> 16) s = (s & 0xffff) + (s >> 16); return (uint16_t)~s; }
+static void icmp_note_send(int fd, const uint8_t* buf, size_t len) { if (is_icmp(fd) && len >= 8) memcpy(&icmp_id[fd], buf + 4, 2); }
+// paquete ICMP recibido (in, n) de src -> cabecera IPv4 + ICMP con el id original; devuelve la longitud
+static size_t icmp_fix(int fd, const uint8_t* in, size_t n, const struct sockaddr_in* src, uint8_t* out) {
+	uint8_t* ip = out; memset(ip, 0, 20);
+	ip[0] = 0x45; uint16_t tl = (uint16_t)(20 + n); ip[2] = tl >> 8; ip[3] = tl & 0xff; ip[8] = 64; ip[9] = 1;
+	if (src) memcpy(ip + 12, &src->sin_addr, 4);
+	uint16_t hc = csum(ip, 20); ip[10] = hc >> 8; ip[11] = hc & 0xff;
+	memcpy(out + 20, in, n);
+	uint8_t* ic = out + 20;
+	if (n >= 8) { memcpy(ic + 4, &icmp_id[fd], 2); ic[2] = ic[3] = 0; uint16_t cc = csum(ic, n); ic[2] = cc >> 8; ic[3] = cc & 0xff; }
+	return 20 + n;
 }
 
 static long net_socket(struct ctx* c) {
@@ -226,6 +258,10 @@ static long net_socket(struct ctx* c) {
 	if (dom != AF_UNIX && dom != AF_INET && dom != AF_INET6) return -D_EAFNOSUPPORT;
 	int type = (int)c->a[1] & 0xff;
 	long r = syscall(SYS_socket, dom, type | SOCK_CLOEXEC * 0, (int)c->a[2]);
+	if (r < 0 && errno == EPERM && dom == AF_INET && type == SOCK_RAW && (int)c->a[2] == IPPROTO_ICMP) {
+		r = syscall(SYS_socket, AF_INET, SOCK_DGRAM, IPPROTO_ICMP);   // ping sin privilegios
+		if (r >= 0 && r < ICMP_MAX_FD) { icmp_emul[r] = 1; icmp_id[r] = 0; }
+	} else if (r >= 0 && r < ICMP_MAX_FD) icmp_emul[r] = 0;
 	return r < 0 ? err() : r;
 }
 static long net_socketpair(struct ctx* c) {
@@ -339,11 +375,22 @@ static long net_sendto(struct ctx* c) {              // (fd, buf, len, flags, to
 		if (e) return e;
 		tp = ls;
 	}
+	icmp_note_send((int)c->a[0], (const uint8_t*)c->a[1], c->a[2]);
 	long r = sendto((int)c->a[0], (const void*)c->a[1], c->a[2], msg_flags((int)c->a[3]), tp, ll);
 	return r < 0 ? err() : r;
 }
 static long net_recvfrom(struct ctx* c) {            // (fd, buf, len, flags, from*, fromlen*)
 	uint8_t l[128]; socklen_t ll = sizeof l;
+	if (is_icmp((int)c->a[0])) {
+		uint8_t in[65536], out[65536 + 20];
+		long r = recvfrom((int)c->a[0], in, sizeof in, msg_flags((int)c->a[3]) & ~MSG_NOSIGNAL, (struct sockaddr*)l, &ll);
+		if (r < 0) return err();
+		size_t n = icmp_fix((int)c->a[0], in, (size_t)r, (struct sockaddr_in*)l, out);
+		if (n > c->a[2]) n = c->a[2];
+		if (safe_write(c->a[1], out, n) != (ssize_t)n) return -D_EFAULT;
+		if (c->a[4]) write_name(c->a[4], c->a[5], l, ll);
+		return (long)n;
+	}
 	long r = recvfrom((int)c->a[0], (void*)c->a[1], c->a[2], msg_flags((int)c->a[3]) & ~MSG_NOSIGNAL, c->a[4] ? (struct sockaddr*)l : NULL, c->a[4] ? &ll : NULL);
 	if (r < 0) return err();
 	if (c->a[4]) write_name(c->a[4], c->a[5], l, ll);
@@ -379,6 +426,7 @@ static long net_sendmsg(struct ctx* c) {
 			m.msg_control = cbuf; m.msg_controllen = CMSG_SPACE(dl);
 		}
 	}
+	if (is_icmp((int)c->a[0]) && d.iovlen >= 1) { uint64_t io[2]; if (safe_read(d.iov, io, 16) == 16) { uint8_t h[8]; if (io[1] >= 8 && safe_read(io[0], h, 8) == 8) icmp_note_send((int)c->a[0], h, 8); } }
 	long r = sendmsg((int)c->a[0], &m, msg_flags((int)c->a[2]));
 	return r < 0 ? err() : r;
 }
@@ -390,8 +438,22 @@ static long net_recvmsg(struct ctx* c) {
 	m.msg_name = d.name ? l : NULL; m.msg_namelen = d.name ? sizeof l : 0;
 	m.msg_iov = (struct iovec*)d.iov; m.msg_iovlen = (size_t)d.iovlen;
 	m.msg_control = d.control ? cbuf : NULL; m.msg_controllen = d.control ? sizeof cbuf : 0;
+	static __thread uint8_t icin[65536], icout[65536 + 20];
+	struct iovec iv1 = { icin, sizeof icin };
+	int icmp = is_icmp((int)c->a[0]);
+	if (icmp) { m.msg_iov = &iv1; m.msg_iovlen = 1; }
 	long r = recvmsg((int)c->a[0], &m, msg_flags((int)c->a[2]) & ~MSG_NOSIGNAL);
 	if (r < 0) return err();
+	if (icmp) {                                                  // cabecera IP delante y el id original; se reparte en los iov del programa
+		size_t n = icmp_fix((int)c->a[0], icin, (size_t)r, (struct sockaddr_in*)l, icout), done = 0;
+		for (int i = 0; i < d.iovlen && done < n; i++) {
+			uint64_t io[2]; if (safe_read(d.iov + (uint64_t)i * 16, io, 16) != 16) break;
+			size_t k = n - done < io[1] ? n - done : io[1];
+			if (safe_write(io[0], icout + done, k) != (ssize_t)k) break;
+			done += k;
+		}
+		r = (long)done;
+	}
 	if (d.name) { uint8_t dd[128]; uint32_t dl = sa_out(l, m.msg_namelen, dd); if (dl) safe_write(d.name, dd, dl < d.namelen ? dl : d.namelen); d.namelen = dl; }
 	uint32_t used = 0;
 	if (d.control) {

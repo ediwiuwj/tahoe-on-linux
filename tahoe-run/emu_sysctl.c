@@ -224,6 +224,114 @@ static int fill_kinfo(int pid, uint8_t* o) {
 	return 0;
 }
 
+// ---- Interfaces de red (getifaddrs de macOS): sysctl {CTL_NET, PF_ROUTE, 0, af, NET_RT_IFLIST(2), 0} devuelve mensajes
+// de rutas: un if_msghdr(2) + sockaddr_dl por interfaz y un ifa_msghdr + sockaddrs por dirección. Se generan del getifaddrs
+// de Linux. Nombres al estilo de macOS: lo -> lo0, las demás en0, en1... (en orden de índice).
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <netpacket/packet.h>
+#define SA_RLEN(l) (((l) + 3) & ~3)
+struct nif { char lname[IFNAMSIZ], dname[16]; unsigned idx; unsigned flags; uint8_t mac[6]; int has_mac; };
+static int nif_list(struct nif* v, int max) {
+	struct ifaddrs* ifa; if (getifaddrs(&ifa) != 0) return 0;
+	int n = 0;
+	for (struct ifaddrs* a = ifa; a; a = a->ifa_next) {
+		int k; for (k = 0; k < n && strcmp(v[k].lname, a->ifa_name); k++) {}
+		if (k == n) { if (n == max) continue; memset(&v[n], 0, sizeof v[n]); snprintf(v[n].lname, IFNAMSIZ, "%s", a->ifa_name); v[n].idx = if_nametoindex(a->ifa_name); v[n].flags = a->ifa_flags; n++; }
+		if (a->ifa_addr && a->ifa_addr->sa_family == AF_PACKET) { struct sockaddr_ll* l = (void*)a->ifa_addr; if (l->sll_halen == 6) { memcpy(v[k].mac, l->sll_addr, 6); v[k].has_mac = 1; } }
+	}
+	freeifaddrs(ifa);
+	for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) if (v[j].idx < v[i].idx) { struct nif t = v[i]; v[i] = v[j]; v[j] = t; }
+	int en = 0;
+	for (int i = 0; i < n; i++) { if (v[i].flags & IFF_LOOPBACK) snprintf(v[i].dname, 16, "lo0"); else snprintf(v[i].dname, 16, "en%d", en++); }
+	return n;
+}
+// nombre de macOS -> de Linux (para las ioctl por nombre)
+int net_name_to_linux(const char* d, char* out, size_t cap) {
+	struct nif v[32]; int n = nif_list(v, 32);
+	for (int i = 0; i < n; i++) if (!strcmp(v[i].dname, d)) { snprintf(out, cap, "%s", v[i].lname); return 0; }
+	return -1;
+}
+static uint32_t dflags(unsigned l) { uint32_t d = l & 0x3ff; if (l & IFF_MULTICAST) d |= 0x8000; d |= 0x800; /* SIMPLEX */ return d; }
+static size_t put_sa(uint8_t* o, const struct sockaddr* sa) {
+	if (!sa) return 0;
+	if (sa->sa_family == AF_INET) { const struct sockaddr_in* s4 = (const void*)sa; o[0] = 16; o[1] = 2; memcpy(o + 2, &s4->sin_port, 2); memcpy(o + 4, &s4->sin_addr, 4); return 16; }
+	if (sa->sa_family == AF_INET6) { const struct sockaddr_in6* s6 = (const void*)sa; o[0] = 28; o[1] = 30; memcpy(o + 2, &s6->sin6_port, 2); memcpy(o + 4, &s6->sin6_flowinfo, 4); memcpy(o + 8, &s6->sin6_addr, 16); memcpy(o + 24, &s6->sin6_scope_id, 4); return 28; }
+	return 0;
+}
+static long net_iflist(struct ctx* c, int af, int v2, int only) {
+	struct nif v[32]; int n = nif_list(v, 32);
+	struct ifaddrs* ifa; if (getifaddrs(&ifa) != 0) return -D_ENOENT;
+	size_t cap = 65536, k = 0; uint8_t* b = calloc(1, cap);
+	for (int i = 0; i < n; i++) {
+		if (only && (int)v[i].idx != only) continue;
+		size_t h = v2 ? 160 : 112, start = k;          // if_msghdr2 (con if_data64) / if_msghdr (con if_data)
+		uint8_t* m = b + k; memset(m, 0, h);
+		m[2] = 5; m[3] = v2 ? 0x12 : 0xe;              // RTM_VERSION, RTM_IFINFO2 / RTM_IFINFO
+		int32_t addrs = 0x10, fl = (int32_t)dflags(v[i].flags); uint16_t idx = (uint16_t)v[i].idx;
+		memcpy(m + 4, &addrs, 4); memcpy(m + 8, &fl, 4); memcpy(m + 12, &idx, 2);
+		uint8_t* d = m + (v2 ? 32 : 16);               // if_data: tipo, longitud de dirección, MTU
+		d[0] = (v[i].flags & IFF_LOOPBACK) ? 24 : 6; d[3] = v[i].has_mac ? 6 : 0; uint32_t mtu = (v[i].flags & IFF_LOOPBACK) ? 16384 : 1500; memcpy(d + 8, &mtu, 4);
+		k += h;
+		uint8_t* dl = b + k; size_t nl = strlen(v[i].dname), al = v[i].has_mac ? 6 : 0, dlen = 8 + nl + al; if (dlen < 20) dlen = 20;
+		dl[0] = (uint8_t)dlen; dl[1] = 18; memcpy(dl + 2, &idx, 2); dl[4] = d[0]; dl[5] = (uint8_t)nl; dl[6] = (uint8_t)al;
+		memcpy(dl + 8, v[i].dname, nl); if (al) memcpy(dl + 8 + nl, v[i].mac, 6);
+		k += SA_RLEN(dlen);
+		uint16_t ml = (uint16_t)(k - start); memcpy(b + start, &ml, 2);
+		for (struct ifaddrs* a = ifa; a; a = a->ifa_next) {
+			if (strcmp(a->ifa_name, v[i].lname) || !a->ifa_addr) continue;
+			int fam = a->ifa_addr->sa_family;
+			if (fam != AF_INET && fam != AF_INET6) continue;
+			if (af && !((af == 2 && fam == AF_INET) || (af == 30 && fam == AF_INET6))) continue;
+			size_t as = k; uint8_t* am = b + k; memset(am, 0, 20);
+			am[2] = 5; am[3] = 0xc;                    // RTM_NEWADDR
+			int32_t aa = 0; k += 20;
+			uint8_t tmp[32]; size_t l;
+			if ((l = put_sa(tmp, a->ifa_netmask))) { tmp[1] = 0; if (a->ifa_netmask->sa_family == AF_INET) tmp[1] = 2; else tmp[1] = 30; memcpy(b + k, tmp, l); k += SA_RLEN(l); aa |= 0x4; }
+			if ((l = put_sa(b + k, a->ifa_addr))) { k += SA_RLEN(l); aa |= 0x20; }
+			if ((a->ifa_flags & IFF_BROADCAST) && fam == AF_INET && a->ifa_broadaddr && (l = put_sa(b + k, a->ifa_broadaddr))) { k += SA_RLEN(l); aa |= 0x80; }
+			memcpy(am + 4, &aa, 4); memcpy(am + 8, &fl, 4); memcpy(am + 12, &idx, 2);
+			uint16_t al2 = (uint16_t)(k - as); memcpy(am, &al2, 2);
+		}
+	}
+	freeifaddrs(ifa);
+	long r = sc_out(c, b, k); free(b); return r;
+}
+
+// Tabla de rutas (NET_RT_DUMP): un rt_msghdr (92 bytes) + destino, puerta de enlace y máscara por ruta IPv4 de
+// /proc/net/route. Las rutas directas llevan como puerta de enlace un sockaddr_dl de la interfaz, como en macOS.
+static size_t sin_put(uint8_t* o, uint32_t a) { memset(o, 0, 16); o[0] = 16; o[1] = 2; memcpy(o + 4, &a, 4); return 16; }
+static long net_rtdump(struct ctx* c, int af) {
+	if (af && af != 2) return sc_out(c, "", 0);
+	FILE* f = fopen("/proc/net/route", "r"); if (!f) return -D_ENOENT;
+	struct nif v[32]; int nn = nif_list(v, 32);
+	size_t cap = 65536, k = 0; uint8_t* b = calloc(1, cap);
+	char line[512]; if (!fgets(line, sizeof line, f)) line[0] = 0;
+	while (fgets(line, sizeof line, f) && k + 256 < cap) {
+		char ifn[32]; unsigned dst, gw, fl, refc, use, met, mask, mtu, win, irtt;
+		if (sscanf(line, "%31s %x %x %x %u %u %u %x %u %u %u", ifn, &dst, &gw, &fl, &refc, &use, &met, &mask, &mtu, &win, &irtt) < 8) continue;
+		uint16_t idx = (uint16_t)if_nametoindex(ifn);
+		const char* dn = ifn; for (int i = 0; i < nn; i++) if (!strcmp(v[i].lname, ifn)) dn = v[i].dname;
+		uint8_t* m = b + k; size_t st = k; memset(m, 0, 92);
+		m[2] = 5; m[3] = 4;                                        // RTM_VERSION, RTM_GET
+		memcpy(m + 4, &idx, 2);
+		int32_t rf = (int32_t)(fl & 0x7) | 0x800 /* RTF_STATIC */, addrs = 0x1 | 0x2 | 0x4;
+		if (mask == 0xffffffffu) rf |= 0x4;
+		memcpy(m + 8, &rf, 4); memcpy(m + 12, &addrs, 4);
+		k += 92;
+		k += sin_put(b + k, dst);
+		if (fl & 2) k += sin_put(b + k, gw);
+		else {                                                     // puerta de enlace = la interfaz (AF_LINK)
+			uint8_t* dl = b + k; size_t nl = strlen(dn); memset(dl, 0, 20); dl[0] = 20; dl[1] = 18; memcpy(dl + 2, &idx, 2); dl[5] = (uint8_t)nl; memcpy(dl + 8, dn, nl < 12 ? nl : 12); k += 20;
+		}
+		k += sin_put(b + k, mask);
+		uint16_t ml = (uint16_t)(k - st); memcpy(b + st, &ml, 2);
+	}
+	fclose(f);
+	long r = sc_out(c, b, k); free(b); return r;
+}
+
 long bsd_sysctl(struct ctx* c) {
 	int mib[16];
 	uint32_t n = (uint32_t)c->a[1];
@@ -259,6 +367,8 @@ long bsd_sysctl(struct ctx* c) {
 			return r;
 		}
 	}
+	if (n == 6 && mib[0] == 4 && mib[1] == 17 && (mib[4] == 1 || mib[4] == 7)) return net_rtdump(c, mib[3]);   // NET_RT_DUMP(2)
+	if (n == 6 && mib[0] == 4 && mib[1] == 17 && (mib[4] == 3 || mib[4] == 6)) return net_iflist(c, mib[3], mib[4] == 6, mib[5]);   // NET_RT_IFLIST(2)
 	if (n == 3 && mib[0] == 1 && mib[1] == 49) {         // KERN_PROCARGS2: argc, ruta del ejecutable, argv y entorno
 		int pid = mib[2];
 		if (!is_tahoe_proc(pid)) return -D_EINVAL;
