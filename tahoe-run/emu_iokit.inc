@@ -555,6 +555,38 @@ static void io_init(void) {
 
 	int hid = ent_add(res, "IOHIDSystem", "IOHIDSystem", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(hid, "IOClass", "IOHIDSystem");
+	{
+		// Parámetros de entrada que publica IOHIDSystem (los de fábrica de macOS). IOHIDGetParameter (NXClickTime...) los lee
+		// del registro con la conexión de IOHIDSystem, y solo si faltan pregunta al sistema de eventos HID (com.apple.
+		// iohideventsystem). WindowServer lo hace al crear la sesión, ANTES de montar su propio servidor de eventos: sin esta
+		// propiedad se preguntaba a sí mismo y se quedaba esperando para siempre.
+		struct val* hp = v_new(V_DICT);
+		static const struct { const char* k; uint64_t v; int bits; } hpv[] = {
+			{ "HIDClickTime", 500000000, 64 },            // doble clic: 0,5 s (en ns)
+			{ "HIDKeyRepeat", 83333333, 64 },             // repetición de teclas
+			{ "HIDInitialKeyRepeat", 500000000, 64 },
+			{ "HIDPointerAcceleration", 45056, 32 },
+			{ "HIDMouseAcceleration", 45056, 32 },
+			{ "HIDTrackpadAcceleration", 45056, 32 },
+			{ "HIDScrollAcceleration", 20480, 32 },
+			{ "HIDF12EjectDelay", 250000000, 64 },
+			{ "HIDSlowKeysDelay", 0, 32 },
+			{ "HIDStickyKeysDisabled", 0, 32 },
+			{ "HIDStickyKeysOn", 0, 32 },
+			{ "HIDStickyKeysShiftToggles", 0, 32 },
+			{ "HIDMouseKeysOptionToggles", 0, 32 },
+			{ "HIDWaitCursorFrameInterval", 16666667, 32 },
+			{ "HIDPointerButtonMode", 2, 32 },
+			{ "HIDScrollZoomModifierMask", 0, 32 },
+			{ "HIDDefaultParameters", 1, 32 },
+		};
+		for (size_t k = 0; k < sizeof hpv / sizeof hpv[0]; k++) v_add(hp, hpv[k].k, v_num(hpv[k].v, hpv[k].bits));
+		struct val* cs = v_new(V_DICT);                  // HIDClickSpace: margen del doble clic en píxeles
+		v_add(cs, "x", v_num(4, 32)); v_add(cs, "y", v_num(4, 32));
+		v_add(hp, "HIDClickSpace", cs);
+		v_add(hp, "HIDKeyboardModifierMappingPairs", v_new(V_ARRAY));
+		v_set(io_e[hid].props, "HIDParameters", hp);
+	}
 	int kbd = ent_add(acpi, "AppleACPIPS2Keyboard", "IOHIDDevice", "IORegistryEntry IOService", "", PL_SERVICE, 0);
 	p_num(kbd, "PrimaryUsagePage", 1, 32); p_num(kbd, "PrimaryUsage", 6, 32); p_num(kbd, "DeviceUsagePage", 1, 32); p_num(kbd, "DeviceUsage", 6, 32);
 	p_str(kbd, "Product", "Apple Internal Keyboard / Trackpad");
