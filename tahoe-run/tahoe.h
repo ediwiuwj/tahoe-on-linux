@@ -111,7 +111,7 @@ uint64_t rmap_add(int32_t pid, const char* path, uint64_t off, uint64_t len, int
 int rmap_fault(uint64_t addr);
 int port_get_attributes(uint32_t name, int flavor, uint32_t* out, uint32_t* cnt);
 int port_set_attributes(uint32_t name, int flavor, const uint32_t* in, uint32_t cnt);
-int port_request_notification(uint32_t name, int variant, uint32_t notify, uint32_t* previous);
+int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_t notify, uint32_t* previous);
 long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total);
 uint32_t special_port_get(int which);
 void registered_ports_set(const uint32_t* p, int n);
