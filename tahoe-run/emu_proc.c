@@ -571,16 +571,19 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 		}
 		break;
 	}
-	// Programas que dependen de hardware/IOKit de verdad (montaje de volúmenes, fsck...) se sustituyen por un
-	// proceso que sale con éxito. Lista configurable en TAHOE_STUB_EXEC (rutas separadas por comas).
+	// Programas que se sustituyen por un proceso que sale con éxito: rutas separadas por comas en TAHOE_STUB_EXEC (para
+	// diagnóstico), y las fases de montaje del arranque (`mount -P <fase>`, tareas mount-phase-N de launchd): ejecutan
+	// apfs_boot_util, que busca en IOKit el volumen APFS del UUID de arranque, y el registro aún no tiene la jerarquía de
+	// discos (IOBlockStorageDevice -> IOMedia -> AppleAPFSVolume). El `mount` normal sí se ejecuta (llamadas de emu_fs.c).
 	{
 		const char* stubs = getenv("TAHOE_STUB_EXEC");
-		if (!stubs) stubs = "/sbin/mount";
+		if (!stubs) stubs = "";
+		int boot_phase = !strcmp(gpath, "/sbin/mount") && ac >= 2 && !strncmp(av[1], "-P", 2);
 		size_t gl = strlen(gpath);
-		for (const char* p = stubs; *p;) {
+		for (const char* p = boot_phase ? gpath : stubs; *p;) {
 			const char* q = strchr(p, ',');
 			size_t l = q ? (size_t)(q - p) : strlen(p);
-			if (l == gl && !strncmp(p, gpath, l)) {
+			if (boot_phase || (l == gl && !strncmp(p, gpath, l))) {
 				logf_("    exec \"%s\" sustituido por un proceso que sale con 0\n", gpath);
 				char* targv[] = { (char*)"true", NULL };
 				if (spawn) { int pe = posix_spawnp(pidout, "true", NULL, NULL, targv, environ); return pe ? -darwin_errno(pe) : 0; }

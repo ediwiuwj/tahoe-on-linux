@@ -308,14 +308,35 @@ static long bsd_fcntl(struct ctx* c) {
 
 
 
-// struct statfs de Darwin (64 bits de inodo): 2168 bytes
+// struct statfs de Darwin (64 bits de inodo, <sys/mount.h>): 2168 bytes
+//   0 f_bsize  4 f_iosize  8 f_blocks  16 f_bfree  24 f_bavail  32 f_files  40 f_ffree  48 f_fsid[2]  56 f_owner
+//   60 f_type  64 f_flags  68 f_fssubtype  72 f_fstypename[16]  88 f_mntonname[1024]  1112 f_mntfromname[1024]
+//   2136 f_flags_ext  2140 f_reserved[7]
 #include <sys/statfs.h>
-static void put_statfs(uint64_t out, const struct statfs* s, const char* mnt) {
+// Banderas de montaje de XNU (sys/mount.h). MNT_UPDATE (0x10000) es una orden para mount(2), no un estado del volumen.
+#define MNT_RDONLY      0x00000001
+#define MNT_LOCAL       0x00001000
+#define MNT_ROOTFS      0x00004000
+#define MNT_DOVOLFS     0x00008000
+#define MNT_UPDATE      0x00010000
+#define MNT_DONTBROWSE  0x00100000
+#define MNT_JOURNALED   0x00800000
+#define MNT_MULTILABEL  0x04000000
+// Sistemas de archivos que ve macOS: la raíz (APFS, el volumen del sistema) y devfs en /dev, como en un Mac. /dev es el
+// del anfitrión (devtmpfs/devpts), así que lo que esté ahí se presenta como devfs.
+struct gmount { const char* on; const char* from; const char* type; uint32_t ftype, flags, iosize; };
+static const struct gmount gmounts[] = {
+	{ "/",    "/dev/disk1s1", "apfs",  0x18, MNT_LOCAL | MNT_ROOTFS | MNT_DOVOLFS | MNT_JOURNALED | MNT_MULTILABEL, 1048576 },
+	{ "/dev", "devfs",        "devfs", 0x13, MNT_LOCAL | MNT_DONTBROWSE | MNT_MULTILABEL, 512 },
+};
+#define NGMOUNT (sizeof gmounts / sizeof gmounts[0])
+static int is_devfs_host(const struct statfs* s) { return s->f_type == 0x1373 /* devtmpfs */ || s->f_type == 0x1cd1 /* devpts */; }
+static void put_statfs(uint64_t out, const struct statfs* s, const struct gmount* m) {
 	uint8_t d[2168];
 	memset(d, 0, sizeof d);
 #define W(type, off, v) do { type t_ = (type)(v); memcpy(d + (off), &t_, sizeof t_); } while (0)
 	W(uint32_t, 0, s->f_bsize);
-	W(int32_t, 4, s->f_bsize);
+	W(int32_t, 4, m->iosize);
 	W(uint64_t, 8, s->f_blocks);
 	W(uint64_t, 16, s->f_bfree);
 	W(uint64_t, 24, s->f_bavail);
@@ -323,37 +344,84 @@ static void put_statfs(uint64_t out, const struct statfs* s, const char* mnt) {
 	W(uint64_t, 40, s->f_ffree);
 	W(uint32_t, 48, s->f_fsid.__val[0]);
 	W(uint32_t, 52, s->f_fsid.__val[1]);
-	W(uint32_t, 60, 0x18);                              // f_type: APFS
-	W(uint32_t, 64, 0x14000 | 0x1000);                  // f_flags: MNT_ROOTFS | MNT_LOCAL | MNT_JOURNALED...
-	memcpy(d + 72, "apfs", 5);
-	strncpy((char*)d + 88, mnt, 1023);
-	strncpy((char*)d + 1112, "/dev/disk1s1", 1023);
+	W(uint32_t, 60, m->ftype);
+	W(uint32_t, 64, m->flags);
+	strncpy((char*)d + 72, m->type, 15);
+	strncpy((char*)d + 88, m->on, 1023);
+	strncpy((char*)d + 1112, m->from, 1023);
 #undef W
 	safe_write(out, d, sizeof d);
 }
-// Solo se anuncia un sistema de archivos: la raíz.
-static long bsd_getfsstat64(struct ctx* c) {
-	if (!c->a[0]) return 1;                              // sin búfer: solo el recuento
-	if (c->a[1] < 2168) return 0;
-	struct statfs s;
-	if (statfs(tahoe_root ? tahoe_root : "/", &s) != 0) return err();
-	put_statfs(c->a[0], &s, "/");
-	return 1;
+static const struct gmount* gmount_of(const struct statfs* s) { return is_devfs_host(s) ? &gmounts[1] : &gmounts[0]; }
+// getfsstat64(buf, bufsize, flags): sin búfer devuelve el número de montajes; si no, copia los que quepan.
+static long getfsstat_common(uint64_t buf, uint64_t bufsize) {
+	if (!buf) return NGMOUNT;
+	long n = 0;
+	for (size_t i = 0; i < NGMOUNT && (n + 1) * 2168 <= (long)bufsize; i++) {
+		struct statfs s;
+		const char* hp = !strcmp(gmounts[i].on, "/") ? (tahoe_root ? tahoe_root : "/") : gmounts[i].on;
+		if (statfs(hp, &s) != 0) memset(&s, 0, sizeof s);
+		put_statfs(buf + (uint64_t)n * 2168, &s, &gmounts[i]);
+		n++;
+	}
+	return n;
 }
+static long bsd_getfsstat64(struct ctx* c) { return getfsstat_common(c->a[0], c->a[1]); }
+// __mac_getfsstat(buf, bufsize, mac, macsize, flags): igual, sin etiquetas MAC
+static long bsd_mac_getfsstat(struct ctx* c) { return getfsstat_common(c->a[0], c->a[1]); }
 static long bsd_statfs64(struct ctx* c) {
 	char p[4096], b[4200];
 	struct statfs s;
 	if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT;
 	if (statfs(resolve(p, b, sizeof b), &s) != 0) return err();
-	put_statfs(c->a[1], &s, p);
+	put_statfs(c->a[1], &s, gmount_of(&s));
 	return 0;
 }
 static long bsd_fstatfs64(struct ctx* c) {
 	struct statfs s;
 	if (fstatfs((int)c->a[0], &s) != 0) return err();
-	put_statfs(c->a[1], &s, "/");
+	put_statfs(c->a[1], &s, gmount_of(&s));
 	return 0;
 }
+
+// mount(type, path, flags, data) / __mac_mount(..., mac) / fmount(type, fd, flags, data): no hay volúmenes que montar
+// (la raíz de macOS es una carpeta de Linux), pero se respeta la semántica de XNU para lo que sí existe:
+//   MNT_UPDATE sobre un punto de montaje existente (p. ej. `mount -uw /` del arranque) se acepta;
+//   montar sobre una ruta que no existe da ENOENT; cualquier otro montaje nuevo, ENOTSUP (tipo de sistema de archivos
+//   que este núcleo no tiene), que es lo que XNU devuelve cuando no conoce el tipo.
+// unmount/funmount: la raíz y /dev están ocupados (EBUSY); otra ruta no es un punto de montaje (EINVAL).
+static const struct gmount* gmount_at(const char* p) {
+	for (size_t i = 0; i < NGMOUNT; i++) if (!strcmp(gmounts[i].on, p)) return &gmounts[i];
+	return NULL;
+}
+static long do_mount(const char* type, const char* path, uint32_t flags) {
+	logf_("    mount(\"%s\", \"%s\", 0x%x)\n", type, path, flags);
+	const struct gmount* m = gmount_at(path);
+	if (flags & MNT_UPDATE) return m ? 0 : -D_EINVAL;
+	char b[4200]; struct stat st;
+	if (stat(resolve(path, b, sizeof b), &st) != 0) return -D_ENOENT;
+	if (m) return -16;                                  // EBUSY: ya hay algo montado ahí
+	return -45;                                         // ENOTSUP
+}
+static long bsd_mount(struct ctx* c) {
+	char t[64] = "", p[4096];
+	if (c->a[0] && safe_string(c->a[0], t, sizeof t) != 0) return -D_EFAULT;
+	if (safe_string(c->a[1], p, sizeof p) != 0) return -D_EFAULT;
+	return do_mount(t, p, (uint32_t)c->a[2]);
+}
+static long bsd_fmount(struct ctx* c) {
+	char t[64] = "";
+	if (c->a[0] && safe_string(c->a[0], t, sizeof t) != 0) return -D_EFAULT;
+	logf_("    fmount(\"%s\", fd=%d, 0x%lx) -> ENOTSUP\n", t, (int)c->a[1], c->a[2]);
+	return (c->a[2] & MNT_UPDATE) ? 0 : -45;
+}
+static long bsd_unmount(struct ctx* c) {
+	char p[4096];
+	if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT;
+	logf_("    unmount(\"%s\", 0x%lx)\n", p, c->a[1]);
+	return gmount_at(p) ? -16 : -D_EINVAL;
+}
+static long bsd_funmount(struct ctx* c) { (void)c; return -16; }
 
 
 // getattrlist(ruta, attrlist*, búfer, tamaño, opciones): atributos del volumen y del objeto.
@@ -952,7 +1020,8 @@ void emu_fs_init(void) {
 	reg_bsd(338, bsd_stat64);  reg_bsd(339, bsd_fstat64); reg_bsd(340, bsd_lstat64);
 	reg_bsd(24, bsd_getuid);   reg_bsd(25, bsd_geteuid);  reg_bsd(47, bsd_getgid); reg_bsd(43, bsd_getegid);
 	reg_bsd(381, bsd_mac_syscall);
-	reg_bsd(347, bsd_getfsstat64); reg_bsd(345, bsd_statfs64); reg_bsd(346, bsd_fstatfs64);
+	reg_bsd(347, bsd_getfsstat64); reg_bsd(345, bsd_statfs64); reg_bsd(346, bsd_fstatfs64); reg_bsd(426, bsd_mac_getfsstat);
+	reg_bsd(167, bsd_mount); reg_bsd(424, bsd_mount); reg_bsd(526, bsd_fmount); reg_bsd(159, bsd_unmount); reg_bsd(164, bsd_funmount);
 	reg_bsd(242, bsd_fsctl); reg_bsd(220, bsd_getattrlist); reg_bsd(12, bsd_chdir); reg_bsd(13, bsd_fchdir); reg_bsd(344, bsd_getdirentries64); reg_bsd(461, bsd_getattrlistbulk);
 	reg_bsd(41, bsd_dup);      reg_bsd(90, bsd_dup2);     reg_bsd(470, bsd_fstatat64);
 	reg_bsd(463, bsd_openat); reg_bsd(464, bsd_openat);   /* openat_nocancel */     reg_bsd(427, bsd_fsgetpath);

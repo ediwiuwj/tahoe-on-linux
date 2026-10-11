@@ -6,6 +6,7 @@
 #   tools/macos-shell.sh --launchd                # shell unida a launchd (launchctl, defaults... hablan con sus servicios)
 #   tools/macos-shell.sh --launchd -c 'launchctl list'
 #
+# TAHOE_RUN: binario de tahoe-run a usar (por omisión, el del repo).
 # TAHOE_ROOT: carpeta con el sistema base de macOS extraído (por omisión ~/macos26/base/macOS Base System).
 # El entorno se limpia: el programa ve un entorno de macOS (PATH, HOME=/var/root, usuario root), no el de Linux.
 #
@@ -16,7 +17,7 @@
 # encuentra a launchd. TAHOE_BOOT_WAIT: segundos de espera para que arranquen los servicios (por omisión 10).
 ROOT="${TAHOE_ROOT:-$HOME/macos26/base/macOS Base System}"
 TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-RUN="$(cd "$TOOLS/../tahoe-run" && pwd)/tahoe-run"
+RUN="${TAHOE_RUN:-$(cd "$TOOLS/../tahoe-run" && pwd)/tahoe-run}"   # TAHOE_RUN: otro binario (comparar versiones)
 if [ ! -x "$RUN" ]; then echo "falta $RUN: compila con tahoe-run/build.sh" >&2; exit 1; fi
 if [ ! -f "$ROOT/System/Library/dyld/dyld_shared_cache_x86_64" ]; then echo "no encuentro el sistema base de macOS en: $ROOT (define TAHOE_ROOT)" >&2; exit 1; fi
 CACHE="${TAHOE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tahoe-run}"   # el slide de la caché de dyld se calcula una vez
