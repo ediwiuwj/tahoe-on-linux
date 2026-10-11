@@ -914,6 +914,13 @@ static int req_still_valid(const uint8_t* req) {
 	if (safe_read(ext[1], &cur, 8) != 8) return 1;
 	return (cur & ext[2]) == (ext[3] & ext[2]);
 }
+// diagnóstico (MACH=1): máscara, valor esperado y valor actual de una petición de hilo
+static void wl_trace(const char* que, uint64_t kqid, const uint8_t* req) {
+	if (!mach_trace()) return;
+	uint64_t ext[4] = { 0 }, cur = 0; if (req) memcpy(ext, req + 40, 32);
+	if (ext[1]) safe_read(ext[1], &cur, 8);
+	logf_("    WLQ <%d:%ld> %s kqid=0x%lx máscara=0x%lx valor=0x%lx actual=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), que, (unsigned long)kqid, (unsigned long)ext[2], (unsigned long)ext[3], (unsigned long)cur);
+}
 static struct wl_state* wl_states;
 static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -946,6 +953,11 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int
 	my_workloop = j.workloop ? j.kqid : 0;
 	static __thread uint8_t* data;                                   // búfer de datos (32 KB) de los mensajes Mach, uno por hilo
 	if (exit_thread) { j.workloop = 0; nev = -1; }
+	// Punto de no retorno (como XNU al entregar los eventos al hilo): la petición se comprueba otra vez. Si entretanto la
+	// cola dejó de estar encolada (otro hilo la vació, p. ej. un dispatch_sync, y retiró la petición), el hilo llega sin
+	// ella; libdispatch lo trata como «cancelada antes del punto de no retorno» y vuelve. Entregarla caducada lo hace
+	// abortar («BUG IN LIBDISPATCH: Invalid wlh state»).
+	if (j.workloop && j.has_req && j.kqid != ~0ULL && !req_still_valid(j.req)) { wl_trace("entrega: caducada, sin petición", j.kqid, j.req); j.has_req = 0; }
 	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= (j.kqid == ~0ULL ? 0 : WQ_WORKLOOP) | WQ_KEVENT; if (j.has_req) { memcpy((void*)events, j.req, 72); nev = 1; }
 		if (jp->npre) { memcpy((void*)(events + nev * 72), jp->pre, (size_t)jp->npre * 72); nev += jp->npre; }   // ya recogidos por el vigilante
 		else {
@@ -1042,6 +1054,7 @@ void wq_request_workloop(uint64_t kqid, const void* req) {
 	uint8_t copy[72]; memcpy(copy, req, 72);
 	if (start) w->running = 1; else w->pending = 1;
 	pthread_mutex_unlock(&wl_lock);
+	wl_trace(start ? "petición: lanza" : "petición: pendiente", kqid, copy);
 	if (start) wq_spawn(kqid, 1, copy);
 }
 
@@ -1052,6 +1065,7 @@ void wq_cancel_workloop(uint64_t kqid) {
 	while (w && w->kqid != kqid) w = w->next;
 	if (w) { w->pending = 0; w->has_req = 0; }
 	pthread_mutex_unlock(&wl_lock);
+	wl_trace("petición retirada", kqid, NULL);
 }
 
 static pthread_cond_t wl_cv = PTHREAD_COND_INITIALIZER;     // avisa a los vigilantes de que su workloop quedó libre
@@ -1061,12 +1075,16 @@ static void wl_finished(uint64_t kqid) {
 	struct wl_state* w = wl_states;
 	while (w && w->kqid != kqid) w = w->next;
 	// Como en XNU: la petición que llegó con el workloop ocupado sigue activa hasta que se entrega o libdispatch la retira
-	// (EV_DELETE con NOTE_WL_THREAD_REQUEST, ver wq_cancel_workloop); el rebote solo se mira al registrarla y al retirarla.
-	int again = w && w->pending;
+	// (EV_DELETE con NOTE_WL_THREAD_REQUEST, ver wq_cancel_workloop). Al entregarla se comprueba otra vez que la cola siga
+	// en el estado que esperaba ((*addr & mask) == value): el servidor que acaba de terminar puede haberla vaciado, y un
+	// hilo con una petición caducada hace abortar a libdispatch («BUG IN LIBDISPATCH: Invalid wlh state»). Si vuelve a
+	// hacer falta, libdispatch pide otro hilo al encolar.
+	int again = w && w->pending && req_still_valid(w->req);
 	uint8_t copy[72];
 	if (w) { w->pending = 0; w->running = again; memcpy(copy, w->req, 72); }
 	pthread_cond_broadcast(&wl_cv);
 	pthread_mutex_unlock(&wl_lock);
+	if (w) wl_trace(again ? "fin: relanza pendiente" : "fin: libre", kqid, copy);
 	if (again) wq_spawn(kqid, 1, copy); else wl_arm(kqid);
 }
 
@@ -1101,7 +1119,9 @@ static void* wl_watch(void* p) {
 			*avail = WQ_DATA_SIZE;
 			d = kq_drain(kqid, (uint64_t)j->pre, 16, (uint64_t)data, (uint64_t)avail);
 		}
-		if (mach_trace()) logf_("    wl_watch <%d> kqid=0x%lx recogió %ld\n", (int)getpid(), (unsigned long)kqid, d);
+		if (mach_trace()) { logf_("    wl_watch <%d> kqid=0x%lx recogió %ld:", (int)getpid(), (unsigned long)kqid, d);
+			for (long q = 0; q < d && j; q++) { uint64_t id; int16_t fl; uint32_t ff; memcpy(&id, j->pre + q * 72, 8); memcpy(&fl, j->pre + q * 72 + 8, 2); memcpy(&ff, j->pre + q * 72 + 24, 4); logf_(" [id=0x%lx filtro=%d fflags=0x%x]", (unsigned long)id, fl, ff); }
+			logf_("\n"); }
 		if (d > 0) {
 			j->kqid = kqid; j->workloop = 1; j->npre = (int)d; j->pdata = data;
 			pthread_mutex_lock(&wl_lock);
