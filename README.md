@@ -10,15 +10,15 @@ para una GPU Intel Haswell). [Darling](https://github.com/darlinghq/darling) se 
 | Parte | Estado |
 |---|---|
 | Arranque | El `launchd` real de macOS 26 corre como **PID 1** en un espacio de nombres de PID de Linux, sin root. `launchctl list` registra **169 servicios**, en un arranque se cargan unos **155-170 procesos**, y es estable (sin reinicios). Funcionan los dominios de proceso de launchd (servicios XPC de los frameworks, como `authd`), las fases de montaje del arranque (`mount -P`) y las señales de `launchctl kill`/`kickstart -k`. Entre los servicios: `syslogd`, `notifyd`, `cfprefsd`, `configd`, `powerd`, `securityd`, `opendirectoryd`, `diskarbitrationd`, `storagekitd`, `fskitd`, `authd`, `trustd`, `coreservicesd`, `WindowServer`. |
-| Shell de macOS | `tools/macos-shell.sh` abre el `bash` de macOS en la terminal. Con `--launchd` se une a launchd y funcionan las órdenes que usan servicios. Inventario (`tools/shell_survey.sh`, 79 órdenes, arranque normal): **54 funcionan**, 17 no existen en la imagen de Recovery, 5 dan el mismo error que en un Mac real y **3 fallan** (`diskutil info /`, `hdiutil info`, `bless --info`; ver hoja de ruta). |
+| Shell de macOS | `tools/macos-shell.sh` abre el `bash` de macOS en la terminal. Con `--launchd` se une a launchd y funcionan las órdenes que usan servicios. Inventario (`tools/shell_survey.sh`, 79 órdenes, arranque normal): **56 funcionan**, 17 no existen en la imagen de Recovery y 6 dan el mismo error que en un Mac real (entre ellas `bless --info`: el contenedor APFS no tiene volumen Preboot). |
 | Interfaz gráfica | `WindowServer` arranca y pasa `CA::Render::Server::start`; recoveryosd crea el llavero de root y prepara la sesión Aqua (`SLSPackagesInitializeSessionPreferences`), pero **todavía no hay imagen en pantalla**. |
 | Metal | Un kernel de Metal (AIR) traducido a SPIR-V con `metal2vulkan` se ejecuta en la GPU (Intel HD 4400) por Vulkan (`test/run_add_arrays.c`). Aún no está conectado a `tahoe-run`. |
 
 Qué funciona en la shell (con `--launchd`): `ls`, `cp`/`mv`/`rm`, `find`, `grep`, `sed`, `awk`, `sort`, `tar`, `vim`, `less`, `perl`, `curl`,
 `ssh -V`, `ps`, `df`, `mount`, `stat`, `xattr`, `chmod`/`chown`, `sysctl`, `sw_vers`, `uname`, `id`, `date`, `ifconfig`, `netstat`, `ping`,
 `scutil`, `launchctl list`/`print`, `defaults read`/`write`, `plutil`, `pmset`, `ioreg`, `nvram`, `csrutil`, `dscl`, `codesign`, `spctl`,
-`caffeinate`, `installer`, `resetpassword`, `security list-keychains`, `diskutil list`, `diskutil info disk0`/`disk1s1`, `diskutil apfs list`,
-`ls -l /dev/disk*`, `launchctl kill`/`kickstart -k`.
+`caffeinate`, `installer`, `resetpassword`, `security list-keychains`, `diskutil list`, `diskutil info disk0`/`disk1s1`/`/`, `diskutil apfs list`,
+`hdiutil info`, `bless --getBoot`, `ls -l /dev/disk*`, `launchctl kill`/`kickstart -k`.
 
 Los binarios de Apple **no** se incluyen (hay que extraerlos de una Recovery propia). Licencia MIT para el código propio.
 
@@ -56,9 +56,9 @@ Diagnóstico con `tools/diag/` (registro y salidas en `$TAHOE_DIAG_DIR`, por omi
 
 1. **Terminar la shell** (lo que falla en el inventario):
    - `log show`: logd ya corre y entrega su almacén a `log` por fileports, pero no responde a la petición siguiente.
-   - Discos: `diskutil list` e `info` de un disco ya funcionan. Faltan `diskutil info /` (la ruta se traduce a disco en
-     storagekitd), `hdiutil info`, `bless --info`, el nombre del volumen (vacío: el sondeo de APFS no tiene datos que leer) y que
-     el disco salga como interno en vez de «disk image».
+   - Discos: `diskutil list`/`info` (también `info /`), `hdiutil info` y `bless --getBoot` funcionan, y el volumen se llama
+     «macOS Base System». El disco sale como «disk image», igual que el sistema base de una Recovery real (con «PCI-Express»
+     apfs_boot_util exige el volumen VM y launchd entra en pánico). Falta un volumen Preboot para `bless --info`.
    - `ps` no ve los procesos cuyo hilo principal terminó (`ps ax` cuenta 35 frente a 50 servicios en ejecución).
    - `bash` muestra en sus mensajes de error la ruta de Linux del ejecutable en vez de `/bin/bash`.
 2. **Caídas de servicios**: `locationd` (`getpwuid(205)` devuelve NULL dentro de launchd), `opendirectoryd` (espera al abrir
