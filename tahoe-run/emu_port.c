@@ -31,10 +31,11 @@
 // TAHOE_PORTS) con la tabla de puertos y las colas de mensajes. Un nombre de puerto es global: el mismo número
 // designa el mismo puerto en cualquier proceso. El dueño del derecho de recepción es quien lo creó; para despertar
 // a su epoll (EVFILT_MACHPORT) cada puerto tiene un socket de datagramas con nombre abstracto.
-#define MAXPORTS 2048
+#define MAXPORTS 8192                // para todo el sistema (unos 170 procesos en el arranque)
+#define NBUCKET 16384                // índice por nombre: cubeta = (nombre >> 8) % NBUCKET, cadenas por hnext
 #define MAXMSG   512
 #define MSGSZ    (64 * 1024)
-struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; };   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
+struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; };   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
 struct mslot { uint32_t next, size, total, spid, suid, sgid; uint8_t data[MSGSZ - 24]; };
 // Derechos que el núcleo tiene que vigilar para avisar cuando muere su dueño (ver "notificaciones" más abajo):
 //  sonce: un proceso tiene un derecho send-once (normalmente, la respuesta que debe a quien le pidió algo);
@@ -55,6 +56,8 @@ struct skobj { uint32_t name; uint16_t type; int32_t pid; };
 // Mapeos hechos por otro proceso en esta tarea (mach_vm_map con la tarea de otro como destino): Linux no puede mapear en otro
 // proceso, así que se reserva un hueco en una zona común (RMAP_BASE) y el destino lo mapea él mismo al primer acceso.
 #define MAXRMAP 512
+#define MAXEXECW 256
+struct sexecw { int32_t target, watcher; uint32_t port; };   // NOTE_EXEC: quién vigila los exec de qué proceso, y su puerto
 #define RMAP_BASE 0x500000000000ULL
 #define RMAP_SIZE 0x100000000ULL
 struct srmap { int32_t pid; int32_t prot; uint64_t addr, len, off; char path[96]; };
@@ -62,6 +65,7 @@ struct shm {
 	pthread_mutex_t lk; pthread_cond_t cv;
 	uint32_t next_name, free_head, magic, special[8];
 	struct sport ports[MAXPORTS];
+	int32_t bucket[NBUCKET];              // índice+1 del primer puerto de cada cubeta (0 = vacía)
 	struct mslot msgs[MAXMSG];
 	struct sonce so[MAXSO];
 	struct dnreq dn[MAXDN];
@@ -71,6 +75,7 @@ struct shm {
 	struct srmap rmaps[MAXRMAP];
 	uint64_t rmap_next;
 	uint64_t osvariant_status;            // kern.osvariant_status: lo fija launchd (PID 1) una vez y lo leen todos
+	struct sexecw execw[MAXEXECW];
 };
 static struct shm* shm;
 static char shm_path[128], tag[32];
@@ -114,7 +119,7 @@ static void shm_init(void) {
 		shm->next_name = 0x2503;
 		for (int i = 0; i < MAXMSG; i++) shm->msgs[i].next = i + 1 < MAXMSG ? (uint32_t)(i + 2) : 0;   // índices desde 1; 0 = fin
 		shm->free_head = 1;
-		shm->magic = 0x7a110001;
+		shm->magic = 0x7a110002;
 		setenv("TAHOE_PORTS", shm_path, 1);
 		setenv("TAHOE_PORTS_OWNER", tag, 1);
 		atexit(ports_cleanup);
@@ -150,9 +155,20 @@ uint32_t alloc_port(void) {
 	return n;
 }
 
+static uint32_t bucket_of(uint32_t name) { return (name >> 8) & (NBUCKET - 1); }
 static struct sport* find_locked(uint32_t name) {
-	for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used && shm->ports[i].name == name) return &shm->ports[i];
+	for (int32_t i = shm->bucket[bucket_of(name)]; i > 0 && i <= MAXPORTS; i = shm->ports[i - 1].hnext)
+		if (shm->ports[i - 1].used && shm->ports[i - 1].name == name) return &shm->ports[i - 1];
 	return NULL;
+}
+static void bucket_add_locked(struct sport* p) {
+	int32_t* b = &shm->bucket[bucket_of(p->name)];
+	p->hnext = *b; *b = (int32_t)(p - shm->ports) + 1;
+}
+static void bucket_del_locked(struct sport* p) {
+	int32_t me = (int32_t)(p - shm->ports) + 1;
+	for (int32_t* q = &shm->bucket[bucket_of(p->name)]; *q > 0 && *q <= MAXPORTS; q = &shm->ports[*q - 1].hnext)
+		if (*q == me) { *q = p->hnext; p->hnext = 0; return; }
 }
 static int port_index(struct sport* p) { return (int)(p - shm->ports); }
 
@@ -169,6 +185,18 @@ static void poke(uint32_t name, int32_t rpid) {
 // Vacía todos los avisos pendientes del socket: el aviso es un nivel ("hay mensajes"), no un contador; la cola de datagramas
 // de Unix es corta y puede perder avisos, así que tras recibir se vuelve a avisar si aún quedan mensajes.
 static void drain_all(int fd) { char b[64]; if (fd < 0) return; while (recv(fd, b, sizeof b, MSG_DONTWAIT) > 0) {} }
+// Vacía el socket de aviso de un puerto y vuelve a mirar su cola con el cerrojo: si entre tanto llegó un mensaje, su aviso
+// pudo irse con el vaciado (el emisor avisa después de soltar el cerrojo) y el kqueue no despertaría nunca por él (se vio en
+// configd: un mensaje a su propio puerto quedó en cola sin aviso y con él se colgaron powerd y storagekitd). Se avisa de nuevo.
+static void drain_recheck(uint32_t name, int fd) {
+	if (fd < 0) return;
+	drain_all(fd);
+	lock();
+	struct sport* p = find_locked(name);
+	uint32_t cnt = p ? p->count : 0; int32_t rp = p ? p->rpid : 0;
+	unlock();
+	if (cnt) poke(name, rp);
+}
 
 static int make_wake_socket(uint32_t name, int32_t rpid) {
 	int s = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -217,6 +245,7 @@ uint32_t port_create(int is_set) {
 	}
 	{ pthread_cond_t keep = p->cv; memset(p, 0, sizeof *p); p->cv = keep; }   // la variable de condición se inicializó al crear la región
 	p->used = 1; p->is_set = (uint8_t)is_set; p->name = name; p->owner = (int32_t)getpid(); p->rpid = (int32_t)getpid();
+	bucket_add_locked(p);
 	local_sock[port_index(p)] = make_wake_socket(name, p->rpid);
 	unlock();
 	if (trace_all || mach_trace()) logf_("    puerto 0x%x creado por pid %d.%ld (conjunto=%d)\n", name, (int)getpid(), (long)syscall(SYS_gettid), is_set);
@@ -296,7 +325,16 @@ static void sh_add_locked(uint32_t port, int32_t holder) {
 	if (!p || p->rpid == holder) return;                      // solo derechos a puertos de otro proceso
 	sh_put_locked(port, holder);
 }
+// Derechos send-once ya gastados hace poco (puerto, quien lo tenía): un segundo envío con el mismo derecho es una respuesta
+// duplicada, que en XNU no puede ocurrir (el derecho se consume al enviar).
+static struct sonce so_used[256];
+static unsigned so_used_next;
+static int so_was_used_locked(uint32_t port, int32_t holder) {
+	for (int i = 0; i < 256; i++) if (so_used[i].port == port && so_used[i].holder == holder) return 1;
+	return 0;
+}
 static void so_add_locked(uint32_t port, int32_t holder) {
+	for (int i = 0; i < 256; i++) if (so_used[i].port == port && so_used[i].holder == holder) so_used[i].port = 0;
 	for (int i = 0; i < MAXSO; i++) if (!shm->so[i].port) { shm->so[i] = (struct sonce){ port, holder }; return; }
 	logf_("    send-once: tabla llena\n");
 }
@@ -317,7 +355,13 @@ static void msg_rights_locked(const uint8_t* m, uint32_t size, int mode, uint32_
 	uint32_t bits, remote, local; memcpy(&bits, m, 4); memcpy(&remote, m + 8, 4); memcpy(&local, m + 12, 4);
 	uint32_t rd = bits & 0x1f, ld = (bits >> 8) & 0x1f;
 	int32_t me = (int32_t)getpid();
-	if (mode == RIGHTS_SEND && rd == 18) so_take_locked(dest, me);           // responde con su send-once
+	if (mode == RIGHTS_SEND && rd == 18) {                                  // responde con su send-once
+		if (so_take_locked(dest, me)) so_used[so_used_next++ & 255] = (struct sonce){ dest, me };
+		else if (so_was_used_locked(dest, me)) {
+			uint32_t id; memcpy(&id, m + 20, 4);
+			logf_("    send-once: pid %d responde otra vez por 0x%x (id=%u): derecho ya gastado\n", (int)me, dest, id);
+		}
+	}
 	if ((ld == 18 || ld == 21) && local) {                                  // derecho de respuesta send-once
 		if (mode == RIGHTS_SEND && ld == 18) so_take_locked(local, me);
 		else if (mode == RIGHTS_RECV) so_add_locked(local, me);
@@ -372,6 +416,7 @@ static void destroy_locked(struct sport* p) {
 	int i = port_index(p);
 	for (int k = 0; k < MAXPORTS; k++) if (shm->ports[k].used && shm->ports[k].set == name) shm->ports[k].set = 0;
 	if (p->set) { struct sport* st = find_locked(p->set); if (st && st->count >= p->count) st->count -= p->count; }
+	bucket_del_locked(p);
 	p->used = 0;                                              // antes de recorrer: un descriptor no puede volver a destruirlo
 	while (p->head) {                                         // mensajes encolados: sus derechos se destruyen con ellos
 		struct mslot* q = &shm->msgs[p->head - 1]; uint32_t nx = q->next;
@@ -562,13 +607,11 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			q->next = shm->free_head; shm->free_head = idx;
 			int si = port_index(src);
 			int fd1 = local_sock[si], fd2 = -1;
-			uint32_t rem1 = src->count, rname1 = src->name, rname2 = 0, rem2 = 0;
-			int32_t rp1 = src->rpid, rp2 = 0;
-			if (src->set) { struct sport* s = find_locked(src->set); if (s) { fd2 = local_sock[port_index(s)]; rem2 = s->count; rname2 = s->name; rp2 = s->rpid; } }
+			uint32_t rname1 = src->name, rname2 = 0;
+			if (src->set) { struct sport* s = find_locked(src->set); if (s) { fd2 = local_sock[port_index(s)]; rname2 = s->name; } }
 			unlock();
-			drain_all(fd1); drain_all(fd2);
-			if (rem1) poke(rname1, rp1);                        // aún quedan mensajes: renovar el aviso
-			if (rem2) poke(rname2, rp2);
+			drain_recheck(rname1, fd1);                         // si aún quedan mensajes (o llegó uno), se renueva el aviso
+			if (rname2) drain_recheck(rname2, fd2);
 			// materializar los descriptores OOL en memoria nueva de este proceso
 			uint32_t ooff[32], olen[32];
 			int nool = ool_scan(m, sz, ooff, olen, 32);
@@ -689,6 +732,7 @@ void special_port_set(int which, uint32_t name) { pthread_once(&sp_once, sp_init
 static long t_allocate(struct ctx* c) {
 	if (c->a[1] != 1 && c->a[1] != 3) return KERN_INVALID_VALUE_;
 	uint32_t n = port_create(c->a[1] == 3);
+	if (!n) return 6;                                // KERN_RESOURCE_SHORTAGE: tabla llena (no un nombre 0 con éxito)
 	return safe_write(c->a[2], &n, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }
 // mach_port_construct_trap(task, options*, context, *name)
@@ -696,7 +740,8 @@ static long t_construct(struct ctx* c) {
 	uint32_t flags = 0;
 	if (c->a[1]) safe_read(c->a[1], &flags, 4);
 	uint32_t n = port_create(0);                     // construct nunca crea conjuntos (el bit 8 es MPO_IMPORTANCE_RECEIVER)
-	if (n != (uint32_t)-1) {                         // el contexto, o la guarda con MPO_CONTEXT_AS_GUARD (0x1; MPO_STRICT 0x20)
+	if (!n) return 6;                                // KERN_RESOURCE_SHORTAGE: tabla llena (libxpc aborta si recibe éxito con nombre 0)
+	{                         // el contexto, o la guarda con MPO_CONTEXT_AS_GUARD (0x1; MPO_STRICT 0x20)
 		if (flags & 0x1) port_guard(n, c->a[2], (flags & 0x20) != 0);
 		else port_set_context(n, c->a[2]);
 		if (flags & 0x400) { lock(); struct sport* p = find_locked(n); if (p) { p->svc = 1; p->svc_ctx = (flags & 0x1) ? c->a[2] : 0; } unlock(); }   // MPO_SERVICE_PORT
@@ -713,7 +758,7 @@ int port_drain_idle(uint32_t name) {
 	lock(); struct sport* p = find_locked(name);
 	int gone = p == NULL, fd = p ? local_sock[port_index(p)] : -1, cnt = p ? p->count : 0;
 	unlock();
-	if (!cnt) drain_all(fd);
+	if (!cnt) drain_recheck(name, fd);
 	return gone;
 }
 uint64_t port_get_context(uint32_t name) { lock(); struct sport* p = find_locked(name); uint64_t r = p ? p->ctx : 0; unlock(); return r; }
@@ -846,6 +891,14 @@ static long t_type(struct ctx* c) {
 	struct sport* p = find_locked(name);
 	t = p ? (p->is_set ? 1u << 19 : (1u << 17) | (1u << 16)) : (name >> 8) < 0x25 ? (1u << 16) : 0;   // nombres bajos = objetos del kernel
 	unlock();
+	int ktype; int32_t kpid;
+	if (!t && kobj_lookup(name, &ktype, &kpid)) {
+		// objeto del núcleo (puerto de tarea de otro proceso, fileport...): derecho de envío. El de una tarea que ya terminó
+		// es un nombre muerto (MACH_PORT_TYPE_DEAD_NAME), como en XNU al destruirse la tarea: launchd lo mira así para saber
+		// si el proceso de un dominio sigue vivo.
+		int dead = (ktype == KO_TASK || ktype == KO_TASK_NAME) && kill(kpid, 0) != 0 && errno == ESRCH;
+		t = dead ? 1u << 20 : 1u << 16;
+	}
 	if (!t) return KERN_INVALID_NAME_;
 	return safe_write(c->a[2], &t, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }
@@ -1061,6 +1114,42 @@ int kobj_lookup(uint32_t name, int* type, int32_t* pid) {
 	unlock();
 	return ok;
 }
+// ---------------------------------------------------------------- NOTE_EXEC (EVFILT_PROC)
+// Linux no avisa de los exec de otro proceso, pero aquí todo exec de un programa de macOS pasa por exec_common (emu_proc.c):
+// el que vigila crea un puerto propio y lo anota con el pid vigilado; el proceso vigilado, justo antes de hacer exec, manda
+// un mensaje a cada puerto anotado con su pid. El knote de kqueue espera ese puerto además del pidfd (salida).
+uint32_t execwatch_add(int32_t target) {
+	uint32_t port = port_create(0);
+	if (!port) return 0;
+	lock();
+	int slot = -1;
+	for (int i = 0; i < MAXEXECW && slot < 0; i++) if (!shm->execw[i].port) slot = i;
+	for (int i = 0; i < MAXEXECW && slot < 0; i++)                              // reciclar los de vigilantes que ya terminaron
+		if (kill(shm->execw[i].watcher, 0) != 0 && errno == ESRCH) slot = i;
+	if (slot >= 0) shm->execw[slot] = (struct sexecw){ target, (int32_t)getpid(), port };
+	unlock();
+	if (slot < 0) { logf_("    NOTE_EXEC: tabla llena\n"); return port; }  // el knote sigue valiendo para la salida
+	return port;
+}
+void execwatch_del(uint32_t port) {
+	lock();
+	for (int i = 0; i < MAXEXECW; i++) if (shm->execw[i].port == port) { shm->execw[i].port = 0; break; }
+	struct sport* p = find_locked(port);
+	if (p) destroy_locked(p);
+	unlock();
+	flush_notes();
+}
+void execwatch_notify(void) {
+	uint32_t ports[MAXEXECW]; int n = 0;
+	lock();
+	for (int i = 0; i < MAXEXECW; i++) if (shm->execw[i].port && shm->execw[i].target == (int32_t)getpid()) ports[n++] = shm->execw[i].port;
+	unlock();
+	for (int i = 0; i < n; i++) {
+		uint32_t m[6] = { 0x13 /* MACH_MSG_TYPE_COPY_SEND */, 24, ports[i], 0, 0, 0 };
+		port_send_k(ports[i], (const uint8_t*)m, 24, 1);
+	}
+}
+
 // task_name_for_pid(task, pid, *nombre)
 static long t_task_name_for_pid(struct ctx* c) {
 	int32_t pid = (int32_t)c->a[1];

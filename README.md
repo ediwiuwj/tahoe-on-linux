@@ -9,15 +9,16 @@ para una GPU Intel Haswell). [Darling](https://github.com/darlinghq/darling) se 
 
 | Parte | Estado |
 |---|---|
-| Arranque | El `launchd` real de macOS 26 corre como **PID 1** en un espacio de nombres de PID de Linux, sin root. A los 25 s `launchctl list` registra **163 servicios, 50 en ejecución**, y el arranque es estable (sin reinicios). Entre los que lanza: `syslogd`, `notifyd`, `cfprefsd`, `configd`, `powerd`, `securityd`, `opendirectoryd`, `diskarbitrationd`, `coreservicesd`, `WindowServer`. |
-| Shell de macOS | `tools/macos-shell.sh` abre el `bash` de macOS en la terminal. Con `--launchd` se une a launchd y funcionan las órdenes que usan servicios. Inventario (`tools/shell_survey.sh`, 79 órdenes, arranque normal): **52 funcionan**, 17 no existen en la imagen de Recovery, 5 dan el mismo error que en un Mac real y **5 fallan** (ver hoja de ruta). |
+| Arranque | El `launchd` real de macOS 26 corre como **PID 1** en un espacio de nombres de PID de Linux, sin root. `launchctl list` registra **169 servicios**, en un arranque se cargan unos **155-170 procesos**, y es estable (sin reinicios). Funcionan los dominios de proceso de launchd (servicios XPC de los frameworks, como `authd`), las fases de montaje del arranque (`mount -P`) y las señales de `launchctl kill`/`kickstart -k`. Entre los servicios: `syslogd`, `notifyd`, `cfprefsd`, `configd`, `powerd`, `securityd`, `opendirectoryd`, `diskarbitrationd`, `storagekitd`, `fskitd`, `authd`, `trustd`, `coreservicesd`, `WindowServer`. |
+| Shell de macOS | `tools/macos-shell.sh` abre el `bash` de macOS en la terminal. Con `--launchd` se une a launchd y funcionan las órdenes que usan servicios. Inventario (`tools/shell_survey.sh`, 79 órdenes, arranque normal): **54 funcionan**, 17 no existen en la imagen de Recovery, 5 dan el mismo error que en un Mac real y **3 fallan** (`diskutil info /`, `hdiutil info`, `bless --info`; ver hoja de ruta). |
 | Interfaz gráfica | `WindowServer` arranca y pasa `CA::Render::Server::start`; recoveryosd crea el llavero de root y prepara la sesión Aqua (`SLSPackagesInitializeSessionPreferences`), pero **todavía no hay imagen en pantalla**. |
 | Metal | Un kernel de Metal (AIR) traducido a SPIR-V con `metal2vulkan` se ejecuta en la GPU (Intel HD 4400) por Vulkan (`test/run_add_arrays.c`). Aún no está conectado a `tahoe-run`. |
 
 Qué funciona en la shell (con `--launchd`): `ls`, `cp`/`mv`/`rm`, `find`, `grep`, `sed`, `awk`, `sort`, `tar`, `vim`, `less`, `perl`, `curl`,
 `ssh -V`, `ps`, `df`, `mount`, `stat`, `xattr`, `chmod`/`chown`, `sysctl`, `sw_vers`, `uname`, `id`, `date`, `ifconfig`, `netstat`, `ping`,
 `scutil`, `launchctl list`/`print`, `defaults read`/`write`, `plutil`, `pmset`, `ioreg`, `nvram`, `csrutil`, `dscl`, `codesign`, `spctl`,
-`caffeinate`, `installer`, `resetpassword`, `security list-keychains`.
+`caffeinate`, `installer`, `resetpassword`, `security list-keychains`, `diskutil list`, `diskutil info disk0`/`disk1s1`, `diskutil apfs list`,
+`ls -l /dev/disk*`, `launchctl kill`/`kickstart -k`.
 
 Los binarios de Apple **no** se incluyen (hay que extraerlos de una Recovery propia). Licencia MIT para el código propio.
 
@@ -43,8 +44,9 @@ Diagnóstico con `tools/diag/` (registro y salidas en `$TAHOE_DIAG_DIR`, por omi
 
 | Herramienta | Uso |
 |---|---|
-| `msh.sh '<órdenes>' [espera] [límite]` | Órdenes en la shell unida a launchd; siempre limpia. Variables: `STACKS=<proceso>`, `ALL=1`, `MACH=1`, `IOK=1`, `BRK='dir…'`, `PEEK='expr…'`, `TAHOE_RUN=<binario>` |
-| `hang.sh '<orden>' <proceso> [s]` | Vuelca cada hilo de un proceso colgado, simbolizado |
+| `msh.sh '<órdenes>' [espera] [límite]` | Órdenes en la shell unida a launchd; siempre limpia. Variables: `STACKS=<proceso>`, `ALL=1`, `MACH=1`, `IOK=1`, `BRK='dir…'`, `PEEK='expr…'`, `TAHOE_RUN=<binario>`, `CONSOLA=1` (lo que se escribe en `/dev/console`: el registro de launchd) |
+| `hang.sh '<orden>' <proceso> [s]` | Vuelca cada hilo de un proceso colgado, simbolizado; con `STACKS=<proceso>`, además la pila de macOS de cada hilo |
+| `pendientes.py [-v] [registro]` | Con `MACH=1`: peticiones Mach que no recibieron respuesta (quién espera a quién), para seguir cadenas de bloqueos |
 | `ab.sh <N> [binario]` | N arranques con recuento de procesos y caídas: comparar dos versiones antes de dar por bueno un cambio |
 | `clean.sh` | Termina todo `tahoe-run` y limpia `/dev/shm` |
 | `sym.py <dir>…` / `dis.py <dir> [bytes]` | Símbolo (con `ipsw`) o desensamblado de direcciones de la caché de dyld |
@@ -54,12 +56,14 @@ Diagnóstico con `tools/diag/` (registro y salidas en `$TAHOE_DIAG_DIR`, por omi
 
 1. **Terminar la shell** (lo que falla en el inventario):
    - `log show`: logd ya corre y entrega su almacén a `log` por fileports, pero no responde a la petición siguiente.
-   - Discos (`diskutil info`, `hdiutil`, `bless`): el registro IOKit no tiene la jerarquía `IOBlockStorageDevice` → `IOMedia` →
-     `AppleAPFSVolume`. Con ella podrán ejecutarse también las fases de montaje del arranque (`mount -P`), que hoy se sustituyen.
+   - Discos: `diskutil list` e `info` de un disco ya funcionan. Faltan `diskutil info /` (la ruta se traduce a disco en
+     storagekitd), `hdiutil info`, `bless --info`, el nombre del volumen (vacío: el sondeo de APFS no tiene datos que leer) y que
+     el disco salga como interno en vez de «disk image».
    - `ps` no ve los procesos cuyo hilo principal terminó (`ps ax` cuenta 35 frente a 50 servicios en ejecución).
    - `bash` muestra en sus mensajes de error la ruta de Linux del ejecutable en vez de `/bin/bash`.
 2. **Caídas de servicios**: `locationd` (`getpwuid(205)` devuelve NULL dentro de launchd), `opendirectoryd` (espera al abrir
-   `/Search`), CarbonCore (`FileIDTreeStorage` no registrado en `coreservicesd`), `displaypolicyd` (PF238).
+   `/Search`), CarbonCore (`FileIDTreeStorage` no registrado en `coreservicesd`), `displaypolicyd` (PF238), `apsd` (a veces:
+   excepción de `SecurityServer` al firmar su CSR con securityd).
 3. **Señales reales** (`sigreturn`). (`fileport_makeport` ya está.)
 4. **Interfaz gráfica**: servicio HID, pantalla por DRM/KMS, entrada por evdev y Metal sobre Vulkan para WindowServer.
 
@@ -516,4 +520,25 @@ Herramientas usadas para encontrar estos fallos: `tools/diag/` (ver «Probarlo»
   un puerto por cliente hasta llenar la tabla y cualquier proceso abortaba con «Unable to allocate reply port».
 - **Puertos especiales y registrados por proceso y heredados** (`task_create` de XNU): antes eran globales y el último en registrar
   cambiaba el bootstrap de todos.
+
+### Dominios de launchd, discos y señales (11 de octubre de 2026, segunda parte)
+- **Dominios de proceso de launchd** (`pid/N`): `mach_port_type` no conocía los puertos de tarea de otros procesos (objetos
+  del núcleo) y devolvía `KERN_INVALID_NAME`; launchd lo tomaba por un proceso muerto y destruía cada dominio nada más crearlo
+  («slaying domain»). Las búsquedas de servicios desde un proceso daban 124 («Domain is tearing down») y no se cargaban los
+  servicios XPC de los frameworks (`authd`) ni los de aplicación. Ahora es un derecho de envío, o un nombre muerto si la tarea
+  terminó, como en XNU.
+- **`NOTE_EXEC`** en `EVFILT_PROC`: el proceso vigilado avisa por un puerto justo antes de hacer `exec`. launchd ve pasar los
+  servicios de `xpcproxy` a `running`.
+- **Identidad y firma de quien llama**: `proc_pidpath` (`PROC_PIDPATHINFO`), `PROC_PIDCOALITIONINFO`, `CS_OPS_CDHASH` (SHA-1 o
+  SHA-256 del CodeDirectory, sin bibliotecas) y `CS_OPS_PIDOFFSET`. authd los usa para validar a sus clientes.
+- **Señales de launchd**: `proc_signal_delegate` y compañía (`proc_info` 0x11-0x14), y `task_info(TASK_AUDIT_TOKEN)` de la
+  tarea de otro proceso devuelve su token (antes el del que pregunta: launchd se mandaba la señal a sí mismo).
+- **Puertos**: tabla de 8192 con índice por nombre (con los dominios funcionando, la de 2048 se llenaba); aviso perdido entre
+  vaciar el socket de aviso de un puerto y un mensaje que llega a la vez (configd se colgaba y con él powerd y storagekitd);
+  `KERN_RESOURCE_SHORTAGE` con la tabla llena en vez de éxito con nombre 0.
+- **Discos**: jerarquía IOKit de un Mac con APFS (`IOBlockStorageDevice` → disk0 → disk0s1 → disk1 → disk1s1 con el UUID de
+  arranque); nodos `/dev/disk*` y `/dev/rdisk*`. Para que diskarbitrationd anunciara los discos hizo falta: leer bien el tipo
+  de las notificaciones IOKit (el lector de cadenas devolvía siempre el mismo búfer y la notificación de terminación retiraba
+  todos los discos nada más crearlos) y que arranque `fskitd`, que busca el servicio `com_apple_filesystems_lifs` (LiveFS).
+  Con la jerarquía, las fases `mount -P` del arranque se ejecutan de verdad.
 

@@ -184,6 +184,7 @@ static int darwin_to_linux_sig(int s) {
 		SIGWINCH, 0, SIGUSR1, SIGUSR2 };
 	return s > 0 && s < 32 ? m[s] : -1;
 }
+int darwin_sig_to_linux(int s) { return darwin_to_linux_sig(s); }   // para tahoe_run.c (proc_info)
 static struct { uint64_t handler, tramp; uint32_t mask, flags; } sigtab[32];
 static long bsd_sigaction(struct ctx* c) {
 	int s = (int)c->a[0];
@@ -351,26 +352,55 @@ static void on_dump(int sig, siginfo_t* si, void* v) {
 	char sel = tahoe_selector_get();
 	tahoe_selector_set(0);                                      // SYSCALL_DISPATCH_FILTER_ALLOW: las syscalls del anfitrión van directas
 	struct ctx* c = t_cur;
-	uint64_t nr = 0, uca = 0, rip = 0, rsp = 0;
+	uint64_t nr = 0, uca = 0, rip = 0, rsp = 0, fp = 0;
+	char ln[1024]; int k = 0;                                   // cada línea de una vez: los hilos escriben a la vez
 	if (c && safe_read((uint64_t)&c->nr, &nr, 8) == 8 && safe_read((uint64_t)&c->uc, &uca, 8) == 8 && uca) {
 		safe_read(uca + offsetof(ucontext_t, uc_mcontext.gregs) + REG_RIP * 8, &rip, 8);
 		safe_read(uca + offsetof(ucontext_t, uc_mcontext.gregs) + REG_RSP * 8, &rsp, 8);
-		logf_("    HILO <%d:%ld> en llamada clase=%lu num=%lu rip=0x%lx", (int)getpid(), (long)syscall(SYS_gettid), nr >> 24, nr & 0xffffff, rip);
+		safe_read(uca + offsetof(ucontext_t, uc_mcontext.gregs) + REG_RBP * 8, &fp, 8);
+		k += snprintf(ln + k, sizeof ln - k, "    HILO <%d:%ld> en llamada clase=%lu num=%lu rip=0x%lx", (int)getpid(), (long)syscall(SYS_gettid), nr >> 24, nr & 0xffffff, rip);
 		uint64_t a[3] = { 0 }; safe_read((uint64_t)&c->a, a, sizeof a);
 		uint32_t num = (uint32_t)(nr & 0xffffff);
 		if ((nr >> 24) == 2 && (num == 5 || num == 398 || num == 463 || num == 464)) {   // open / openat: la ruta
 			char path[256] = ""; safe_read(num >= 463 ? a[1] : a[0], path, sizeof path - 1); path[255] = 0;
-			logf_(" \"%s\"", path);
-		} else logf_(" args=%lx,%lx,%lx", a[0], a[1], a[2]);
-		logf_(":");
+			k += snprintf(ln + k, sizeof ln - k, " \"%s\"", path);
+		} else k += snprintf(ln + k, sizeof ln - k, " args=%lx,%lx,%lx", a[0], a[1], a[2]);
+		logf_("%s\n", ln);
 	} else {
+		// fuera de una llamada: ejecutando código de macOS (o de tahoe-run, si la señal llegó ahí)
 		ucontext_t* uc = v;
 		rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP]; rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
-		logf_("    HILO <%d:%ld> ejecutando rip=0x%lx:", (int)getpid(), (long)syscall(SYS_gettid), rip);
+		if (rip >= 0x100000000ULL) fp = (uint64_t)uc->uc_mcontext.gregs[REG_RBP];   // código de macOS (tahoe-run vive por debajo)
+		logf_("    HILO <%d:%ld> ejecutando rip=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), rip);
 	}
-	if (rsp) plausible_returns(rsp, 16);
-	logf_("\n");
+	if (fp) {                                                   // marcos exactos (macOS conserva el puntero de marco)
+		k = snprintf(ln, sizeof ln, "    HILO <%d:%ld> marcos (rbp):", (int)getpid(), (long)syscall(SYS_gettid));
+		for (int i = 0; i < 24 && fp && k < (int)sizeof ln - 24; i++) {
+			uint64_t fr[2];
+			if (safe_read(fp, fr, 16) != 16 || !fr[1]) break;
+			k += snprintf(ln + k, sizeof ln - k, " 0x%lx", fr[1]);
+			if (fr[0] <= fp) break;
+			fp = fr[0];
+		}
+		logf_("%s\n", ln);
+	} else if (rsp && uca) { plausible_returns(rsp, 16); logf_("\n"); }
 	tahoe_selector_set(sel);
+}
+// SIGRTMIN+5 desde fuera (tools/diag/hang.sh): volcar todos los hilos del proceso de STACKS, sin terminarlo
+static void on_dump_all(int sig, siginfo_t* si, void* v) {
+	(void)sig;
+	char sel = tahoe_selector_get();
+	tahoe_selector_set(0);
+	long me = syscall(SYS_gettid);
+	DIR* d = opendir("/proc/self/task");
+	struct dirent* e;
+	while (d && (e = readdir(d))) {
+		long t = atol(e->d_name);
+		if (t > 0 && t != me) syscall(SYS_tgkill, getpid(), t, SIGRTMIN + 4);
+	}
+	if (d) closedir(d);
+	tahoe_selector_set(sel);
+	on_dump(SIGRTMIN + 4, si, v);
 }
 // ---- Puntos de interrupción para diagnóstico: /dev/shm/tahoe-break con direcciones en hex (una por línea). En el proceso de
 // /dev/shm/tahoe-stacks se pone un int3 en cada una; al pasar se registran los registros, se restaura el byte original, se
@@ -420,6 +450,8 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
 }
 void diag_breakpoints(void) {
 	if (!diag_target()) return;
+	tahoe_sigaction(SIGRTMIN + 4, on_dump);                     // volcados de hilos a petición (SIGRTMIN+5, ver on_dump_all)
+	tahoe_sigaction(SIGRTMIN + 5, on_dump_all);
 	FILE* f = fopen("/dev/shm/tahoe-break", "r");
 	if (!f) return;
 	char line[64];
@@ -572,18 +604,17 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 		break;
 	}
 	// Programas que se sustituyen por un proceso que sale con éxito: rutas separadas por comas en TAHOE_STUB_EXEC (para
-	// diagnóstico), y las fases de montaje del arranque (`mount -P <fase>`, tareas mount-phase-N de launchd): ejecutan
-	// apfs_boot_util, que busca en IOKit el volumen APFS del UUID de arranque, y el registro aún no tiene la jerarquía de
-	// discos (IOBlockStorageDevice -> IOMedia -> AppleAPFSVolume). El `mount` normal sí se ejecuta (llamadas de emu_fs.c).
+	// diagnóstico). Las fases de montaje del arranque (`mount -P <fase>` -> apfs_boot_util) se ejecutan de verdad: el
+	// registro IOKit ya tiene el volumen APFS del UUID de arranque (io_disks, emu_iokit.inc); los volúmenes Preboot y Update
+	// no existen y apfs_boot_util lo anota y sigue, como en un contenedor sin ellos.
 	{
 		const char* stubs = getenv("TAHOE_STUB_EXEC");
 		if (!stubs) stubs = "";
-		int boot_phase = !strcmp(gpath, "/sbin/mount") && ac >= 2 && !strncmp(av[1], "-P", 2);
 		size_t gl = strlen(gpath);
-		for (const char* p = boot_phase ? gpath : stubs; *p;) {
+		for (const char* p = stubs; *p;) {
 			const char* q = strchr(p, ',');
 			size_t l = q ? (size_t)(q - p) : strlen(p);
-			if (boot_phase || (l == gl && !strncmp(p, gpath, l))) {
+			if (l == gl && !strncmp(p, gpath, l)) {
 				logf_("    exec \"%s\" sustituido por un proceso que sale con 0\n", gpath);
 				char* targv[] = { (char*)"true", NULL };
 				if (spawn) { int pe = posix_spawnp(pidout, "true", NULL, NULL, targv, environ); return pe ? -darwin_errno(pe) : 0; }
@@ -627,6 +658,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 		int pe = posix_spawn(pidout, g_self_exe, NULL, NULL, nargv, nenv);
 		return pe ? -darwin_errno(pe) : 0;
 	}
+	execwatch_notify();                                              // NOTE_EXEC para quien vigila este proceso (kqueue)
 	execve(g_self_exe, nargv, nenv);
 	return -darwin_errno(errno);
 }

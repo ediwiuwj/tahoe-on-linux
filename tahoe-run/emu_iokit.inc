@@ -313,6 +313,61 @@ static int rd_sys(const char* path, char* out, size_t n) {
 	return 1;
 }
 
+// ---- Discos. La raíz de macOS es una carpeta de Linux; se describe como un disco interno con APFS, igual que un Mac, para
+// que diskarbitrationd (DADiskCreateFromIOMedia exige BSD Name/Major/Minor/Unit, Preferred Block Size, Content, Ejectable,
+// Removable, Leaf, Whole, Writable, Size, un icono heredado y un IOBlockStorageDevice por encima), diskutil, bless y
+// apfs_boot_util (busca el AppleAPFSVolume con el UUID de arranque, kern.bootuuid) encuentren lo que esperan:
+//   IOBlockStorageDevice -> IOBlockStorageDriver -> IOMedia disk0 (GPT) -> IOGUIDPartitionScheme -> IOMedia disk0s1
+//   (contenedor APFS) -> AppleAPFSContainerScheme -> AppleAPFSMedia disk1 -> AppleAPFSContainer -> AppleAPFSVolume disk1s1,
+// el volumen montado en / (getfsstat: /dev/disk1s1). Solo es una descripción: no se toca ningún disco real.
+#include <sys/statfs.h>
+#define DISK_BSD_MAJOR 1
+#define BOOT_VOLUME_UUID "B0070000-0000-4000-8000-000000000001"     // = kern.bootuuid (emu_sysctl.c)
+static struct val* d_str(struct val* d, const char* k, const char* v) { v_set(d, k, v_str(v)); return d; }
+static void disk_media(int e, const char* bsd, int unit, int minor, uint64_t size, const char* content, int whole, int leaf) {
+	p_str(e, "BSD Name", bsd); p_num(e, "BSD Major", DISK_BSD_MAJOR, 32); p_num(e, "BSD Minor", (uint64_t)minor, 32);
+	p_num(e, "BSD Unit", (uint64_t)unit, 32); p_num(e, "Preferred Block Size", 4096, 64); p_num(e, "Size", size, 64);
+	p_str(e, "Content", content); p_str(e, "Content Hint", content);
+	p_bool(e, "Whole", whole); p_bool(e, "Leaf", leaf); p_bool(e, "Writable", 1); p_bool(e, "Ejectable", 0);
+	p_bool(e, "Removable", 0); p_bool(e, "Open", 1); p_str(e, "IOClass", io_e[e].cls);
+}
+static void io_disks(int bus) {
+	struct statfs sf;
+	uint64_t size = 0, used = 0;
+	if (tahoe_root && statfs(tahoe_root, &sf) == 0) { size = (uint64_t)sf.f_blocks * sf.f_bsize; used = (uint64_t)(sf.f_blocks - sf.f_bfree) * sf.f_bsize; }
+	if (!size) size = 64ULL << 30;
+	size &= ~4095ULL;
+	int dev = ent_add(bus, "Tahoe Virtual Disk", "IOBlockStorageDevice", "IORegistryEntry IOService", "1f,2", PL_SERVICE, 0);
+	struct val* pc = v_new(V_DICT); d_str(pc, "Physical Interconnect", "Virtual Interface"); d_str(pc, "Physical Interconnect Location", "Internal");
+	v_set(io_e[dev].props, "Protocol Characteristics", pc);
+	struct val* dc = v_new(V_DICT); d_str(dc, "Product Name", "Tahoe Virtual Disk"); d_str(dc, "Vendor Name", "tahoe-run");
+	d_str(dc, "Medium Type", "Solid State"); d_str(dc, "Serial Number", "TAHOE0001");
+	v_set(io_e[dev].props, "Device Characteristics", dc);
+	p_str(dev, "IOClass", "IOBlockStorageDevice");
+	int drv = ent_add(dev, "IOBlockStorageDriver", "IOBlockStorageDriver", "IORegistryEntry IOService IOStorage", "", PL_SERVICE, 0);
+	struct val* icon = v_new(V_DICT); d_str(icon, "CFBundleIdentifier", "com.apple.iokit.IOStorageFamily"); d_str(icon, "IOBundleResourceFile", "Internal.icns");
+	v_set(io_e[drv].props, "IOMediaIcon", icon);
+	p_str(drv, "IOClass", "IOBlockStorageDriver");
+	int d0 = ent_add(drv, "Tahoe Virtual Disk Media", "IOMedia", "IORegistryEntry IOService IOStorage", "", PL_SERVICE, 0);
+	disk_media(d0, "disk0", 0, 0, size, "GUID_partition_scheme", 1, 0);
+	int gpt = ent_add(d0, "IOGUIDPartitionScheme", "IOGUIDPartitionScheme", "IORegistryEntry IOService IOStorage IOPartitionScheme", "", PL_SERVICE, 0);
+	p_str(gpt, "IOClass", "IOGUIDPartitionScheme"); p_str(gpt, "Content Mask", "GUID_partition_scheme");
+	int d0s1 = ent_add(gpt, "Container", "IOMedia", "IORegistryEntry IOService IOStorage", "1", PL_SERVICE, 0);
+	disk_media(d0s1, "disk0s1", 0, 1, size, "7C3457EF-0000-11AA-AA11-00306543ECAC", 0, 0);
+	p_num(d0s1, "Partition ID", 1, 32); p_num(d0s1, "Base", 0, 64); p_str(d0s1, "UUID", "B0070000-0000-4000-8000-0000000000D1");
+	int csch = ent_add(d0s1, "AppleAPFSContainerScheme", "AppleAPFSContainerScheme", "IORegistryEntry IOService IOStorage IOPartitionScheme", "", PL_SERVICE, 0);
+	p_str(csch, "IOClass", "AppleAPFSContainerScheme");
+	int d1 = ent_add(csch, "AppleAPFSMedia", "AppleAPFSMedia", "IORegistryEntry IOService IOStorage IOMedia", "", PL_SERVICE, 0);
+	disk_media(d1, "disk1", 1, 2, size, "EF57347C-0000-11AA-AA11-00306543ECAC", 1, 0);
+	int cont = ent_add(d1, "AppleAPFSContainer", "AppleAPFSContainer", "IORegistryEntry IOService IOStorage IOPartitionScheme", "", PL_SERVICE, 0);
+	p_str(cont, "IOClass", "AppleAPFSContainer"); p_str(cont, "UUID", "B0070000-0000-4000-8000-0000000000C1");
+	p_num(cont, "Size", size, 64); p_num(cont, "CapacityInUse", used, 64);
+	int vol = ent_add(cont, "macOS Base System", "AppleAPFSVolume", "IORegistryEntry IOService IOStorage IOMedia", "1", PL_SERVICE, 0);
+	disk_media(vol, "disk1s1", 1, 3, size, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
+	p_str(vol, "UUID", BOOT_VOLUME_UUID); p_str(vol, "VolGroupUUID", BOOT_VOLUME_UUID);
+	p_num(vol, "Partition ID", 1, 32); p_str(vol, "FullName", "macOS Base System");
+}
+
 static void io_init(void) {
 	if (io_inited) return;
 	io_inited = 1;
@@ -360,7 +415,15 @@ static void io_init(void) {
 	p_str(pm, "IOClass", "IOPMrootDomain");
 	int res = ent_add(root, "IOResources", "IOResources", "IORegistryEntry IOService", "", PL_SERVICE, 0);
 	p_str(res, "IOClass", "IOResources");
-	for (int i = 0; i < 0; i++) {}
+	// LiveFS (lifs.kext): el puente del núcleo para los sistemas de archivos de FSKit. fskitd lo busca al arrancar y, si no
+	// está, sale con error; sin fskitd, diskarbitrationd no termina de sondear los discos sin sistema de archivos (pregunta a
+	// FSKit por sus módulos) y nunca anuncia la lista completa: diskutil se queda esperando.
+	int lifs = ent_add(res, "com_apple_filesystems_lifs", "com_apple_filesystems_lifs", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	p_str(lifs, "IOClass", "com_apple_filesystems_lifs");
+	p_str(lifs, "CFBundleIdentifier", "com.apple.filesystems.lifs");
+	p_str(lifs, "IOMatchCategory", "com_apple_filesystems_lifs");
+	p_str(lifs, "IOProviderClass", "IOResources");
+	p_str(lifs, "IOUserClientClass", "AppleLIFSUserClient");
 
 	int opt = ent_add(plat, "options", "IODTNVRAM", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(opt, "name", "options");
@@ -427,11 +490,7 @@ static void io_init(void) {
 	p_str(keys, "IOClass", "AppleKeyStore");
 	int smc = ent_add(acpi, "AppleSMC", "AppleSMC", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(smc, "IOClass", "AppleSMC");
-	int media = ent_add(root, "Macintosh HD", "IOMedia", "IORegistryEntry IOService", "", PL_SERVICE, 0);
-	p_str(media, "BSD Name", "disk1s1"); p_bool(media, "Leaf", 1); p_bool(media, "Whole", 0); p_bool(media, "Writable", 0);
-	p_str(media, "Content", "41504653-0000-11AA-AA11-00306543ECAC"); p_num(media, "Size", 0x3b9aca00ULL, 64);
-	int whole = ent_add(root, "Tahoe Disk", "IOMedia", "IORegistryEntry IOService", "", PL_SERVICE, 0);
-	p_str(whole, "BSD Name", "disk0"); p_bool(whole, "Whole", 1); p_bool(whole, "Leaf", 0); p_bool(whole, "Writable", 0);
+	io_disks(pci);
 	int cred = ent_add(res, "AppleCredentialManager", "AppleCredentialManager", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(cred, "IOClass", "AppleCredentialManager");
 	int usbc = ent_add(pci, "XHC1", "IOPCIDevice", "IORegistryEntry IOService", "140000", PL_SERVICE | PL_DT, 0);
@@ -623,8 +682,14 @@ static void rq_init(struct rq* r, const struct hdr* h, const uint8_t* req) {
 static void rq_ndr(struct rq* r) { r->p += 8; }
 static uint32_t rq_u32(struct rq* r) { uint32_t v = 0; if (r->p + 4 <= r->len) memcpy(&v, r->b + r->p, 4); r->p += 4; return v; }
 static uint64_t rq_u64(struct rq* r) { uint64_t v = 0; if (r->p + 8 <= r->len) memcpy(&v, r->b + r->p, 8); r->p += 8; return v; }
-static const char* rq_str(struct rq* r) {                                // c_string[*:N]: desplazamiento, cuenta y bytes
-	static __thread char tmp[4100];
+// c_string[*:N]: desplazamiento, cuenta y bytes. Varios búferes en anillo: un mensaje trae a veces dos cadenas que se usan a la
+// vez (tipo y diccionario de add_notification; plano y clave). Con uno solo, la segunda pisaba a la primera y el tipo
+// "IOServiceTerminate" se leía como el diccionario: la notificación de terminación devolvía todos los discos y
+// diskarbitrationd los daba por retirados nada más crearlos.
+static const char* rq_str(struct rq* r) {
+	static __thread char ring[4][4100];
+	static __thread unsigned next;
+	char* tmp = ring[next++ & 3];
 	rq_u32(r); uint32_t n = rq_u32(r);
 	if (n > 4096 || r->p + n > r->len) { tmp[0] = 0; r->p = r->len; return tmp; }
 	memcpy(tmp, r->b + r->p, n); tmp[n] = 0;
@@ -776,8 +841,21 @@ static int32_t uc_hid(struct uc_call* c) {
 		return kIOReturnUnsupported;
 	}
 }
+// LiveFS (AppleLIFSUserClient): fskitd registra con él sus puertos al arrancar. El kext no está (su código va en la colección
+// del núcleo), así que no se conocen sus métodos: se aceptan sin datos de salida y se anota cada selector la primera vez. Los
+// montajes de FSKit no funcionan; basta para que fskitd arranque y conteste qué módulos hay (ninguno de usuario).
+static int32_t uc_lifs(struct uc_call* c) {
+	static uint64_t seen;
+	if (c->selector < 64 && !(seen & (1ull << c->selector))) {
+		seen |= 1ull << c->selector;
+		logf_("    iokit: <%d> lifs selector %u (%u escalares, %u bytes): aceptado sin efecto\n", (int)getpid(), c->selector, c->nsin, c->ninband);
+	}
+	*c->nsout = 0; *c->noutband = 0;
+	return 0;
+}
 static uc_method_fn uc_hook_for(const char* cls) {
 	if (!strcmp(cls, "AppleSMC")) return uc_smc;
+	if (!strcmp(cls, "com_apple_filesystems_lifs")) return uc_lifs;
 	if (!strcmp(cls, "IOHIDSystem")) return uc_hid;
 	return NULL;
 }

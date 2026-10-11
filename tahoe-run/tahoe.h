@@ -40,6 +40,8 @@ extern int trace_all;
 // Módulos
 void emu_sysctl_init(void);
 void emu_fileport_init(void);
+int exe_host_path(int pid, char* out, size_t cap);
+int darwin_sig_to_linux(int s);                         // número de señal de Darwin -> Linux (0 si no hay)   // ruta en el anfitrión del ejecutable de macOS de un proceso
 void emu_fs_init(void);
 void emu_mach_init(void);
 void emu_proc_init(void);
@@ -107,6 +109,9 @@ uint32_t kobj_make(int type, int32_t pid);
 uint32_t kobj_new(int type, int32_t pid);
 void kobj_free(uint32_t name);
 int kobj_lookup(uint32_t name, int* type, int32_t* pid);
+uint32_t execwatch_add(int32_t target);   // NOTE_EXEC: puerto que recibe un mensaje cuando target hace exec
+void execwatch_del(uint32_t port);
+void execwatch_notify(void);             // antes de exec: avisar a quien vigila este proceso
 uint64_t rmap_add(int32_t pid, const char* path, uint64_t off, uint64_t len, int prot, uint64_t align);
 int rmap_fault(uint64_t addr);
 int port_get_attributes(uint32_t name, int flavor, uint32_t* out, uint32_t* cnt);
