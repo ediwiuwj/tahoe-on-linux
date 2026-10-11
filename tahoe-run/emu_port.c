@@ -645,8 +645,37 @@ int osvariant_status_set(uint64_t v) {
 	lock(); int ok = shm->osvariant_status == 0; if (ok) shm->osvariant_status = v; unlock();
 	return ok ? 0 : -1;
 }
-void registered_ports_set(const uint32_t* p, int n) { lock(); for (int i = 0; i < 3; i++) shm->special[i] = i < n ? p[i] : 0; unlock(); }
-static uint32_t registered_port(int i) { lock(); uint32_t v = shm->special[i]; unlock(); return v; }
+// Puertos registrados (mach_ports_register): como en XNU son de cada tarea y los hereda el hijo (task_create copia
+// itk_registered); aquí viajan en TAHOE_REG al hacer exec/posix_spawn. Solo los de launchd (PID 1) se guardan además en la
+// región compartida: son el respaldo de un proceso que no desciende de launchd (la shell que se une con nsenter). Antes
+// eran globales: el último proceso que registraba (p. ej. al crear una sesión) cambiaba el bootstrap de todos los demás.
+static uint32_t reg_local[3]; static int reg_known;
+static pthread_once_t reg_once = PTHREAD_ONCE_INIT;
+static void reg_init(void) {
+	const char* v = getenv("TAHOE_REG");
+	if (v && sscanf(v, "%u,%u,%u", &reg_local[0], &reg_local[1], &reg_local[2]) == 3) reg_known = 1;
+}
+void registered_ports_set(const uint32_t* p, int n) {
+	pthread_once(&reg_once, reg_init);
+	for (int i = 0; i < 3; i++) reg_local[i] = i < n ? p[i] : 0;
+	reg_known = 1;
+	if (getpid() == 1) { lock(); for (int i = 0; i < 3; i++) shm->special[i] = reg_local[i]; unlock(); }
+}
+static uint32_t registered_port(int i) {
+	pthread_once(&reg_once, reg_init);
+	if (reg_known) return reg_local[i];
+	lock(); uint32_t v = shm->special[i]; unlock(); return v;
+}
+// Entorno que hereda un hijo en exec/posix_spawn: sus puertos especiales (el bootstrap, sobre todo) y los registrados, como
+// task_create de XNU. Las acciones de puerto de posix_spawn van antes en el entorno y tienen prioridad (getenv da la primera).
+int ports_inherit_env(char out[][40], int max) {
+	pthread_once(&sp_once, sp_init);
+	pthread_once(&reg_once, reg_init);
+	int k = 0;
+	for (int i = 0; i < 8 && k < max; i++) if (special[i]) snprintf(out[k++], 40, "TAHOE_SP%d=%u", i, special[i]);
+	if (reg_known && k < max) snprintf(out[k++], 40, "TAHOE_REG=%u,%u,%u", reg_local[0], reg_local[1], reg_local[2]);
+	return k;
+}
 uint32_t special_port_get(int which) {
 	pthread_once(&sp_once, sp_init);
 	if (which < 0 || which >= 8) return 0;

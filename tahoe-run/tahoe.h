@@ -115,6 +115,7 @@ int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_
 long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total);
 uint32_t special_port_get(int which);
 void registered_ports_set(const uint32_t* p, int n);
+int ports_inherit_env(char out[][40], int max);
 uint64_t osvariant_status_get(void);
 int osvariant_status_set(uint64_t v);
 void special_port_set(int which, uint32_t name);

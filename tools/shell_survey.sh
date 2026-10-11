@@ -38,4 +38,5 @@ SCRIPT="t() { c=\"\$1\"; f=/tmp/.survey.\$\$; /bin/bash -c \"\$c\" > \$f 2>&1 < 
 "
 for c in "$@"; do SCRIPT+="t $(printf '%q' "$c")
 "; done
+[ -n "$TAHOE_LOGFILE" ] && rm -f "$TAHOE_LOGFILE"          # un registro por inventario (tahoe-run añade al final)
 "$TOOLS/macos-shell.sh" --launchd -c "$SCRIPT"
