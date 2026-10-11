@@ -363,12 +363,68 @@ static void on_dump(int sig, siginfo_t* si, void* v) {
 	logf_("\n");
 	tahoe_selector_set(sel);
 }
+// ---- Puntos de interrupción para diagnóstico: /dev/shm/tahoe-break con direcciones en hex (una por línea). En el proceso de
+// /dev/shm/tahoe-stacks se pone un int3 en cada una; al pasar se registran los registros, se restaura el byte original, se
+// ejecuta esa instrucción paso a paso (TF) y se vuelve a poner el int3.
+#define MAX_BRK 32
+static uint64_t brk_addr[MAX_BRK]; static uint8_t brk_orig[MAX_BRK]; static int nbrk;
+static __thread int brk_step = -1;
+static void brk_poke(uint64_t a, uint8_t v) {
+	uint64_t pg = a & ~4095ULL;
+	mprotect((void*)pg, 8192, PROT_READ | PROT_WRITE | PROT_EXEC);
+	*(volatile uint8_t*)a = v;
+	mprotect((void*)pg, 8192, PROT_READ | PROT_EXEC);
+}
+static void on_sigtrap(int sig, siginfo_t* si, void* v) {
+	(void)sig; (void)si;
+	char sel = tahoe_selector_get();
+	tahoe_selector_set(0);
+	ucontext_t* uc = v; greg_t* g = uc->uc_mcontext.gregs;
+	if (brk_step >= 0) {                                         // vuelta del paso a paso: rearmar
+		brk_poke(brk_addr[brk_step], 0xcc);
+		brk_step = -1;
+		g[REG_EFL] &= ~0x100L;
+	} else {
+		uint64_t at = (uint64_t)g[REG_RIP] - 1;
+		for (int i = 0; i < nbrk; i++) if (brk_addr[i] == at) {
+			logf_("    BRK <%d:%ld> 0x%lx rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
+			      (int)getpid(), (long)syscall(SYS_gettid), at, (unsigned long long)g[REG_RAX], (unsigned long long)g[REG_RBX],
+			      (unsigned long long)g[REG_RCX], (unsigned long long)g[REG_RDX], (unsigned long long)g[REG_RSI], (unsigned long long)g[REG_RDI],
+			      (unsigned long long)g[REG_R8], (unsigned long long)g[REG_R12], (unsigned long long)g[REG_R13], (unsigned long long)g[REG_R14], (unsigned long long)g[REG_R15]);
+			brk_poke(at, brk_orig[i]);
+			g[REG_RIP] = (greg_t)at;
+			g[REG_EFL] |= 0x100L;                                // TF: una instrucción y vuelve aquí
+			brk_step = i;
+			break;
+		}
+	}
+	tahoe_selector_set(sel);
+}
+void diag_breakpoints(void) {
+	if (!diag_target()) return;
+	FILE* f = fopen("/dev/shm/tahoe-break", "r");
+	if (!f) return;
+	char line[64];
+	int mf = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);          // aún no hay memfd: se llama al principio de main
+	while (nbrk < MAX_BRK && fgets(line, sizeof line, f)) {
+		uint64_t a = strtoull(line, NULL, 16);
+		if (!a) continue;
+		uint8_t o; if (mf < 0 || pread(mf, &o, 1, (off_t)a) != 1) continue;
+		brk_addr[nbrk] = a; brk_orig[nbrk] = o; nbrk++;
+	}
+	if (mf >= 0) close(mf);
+	fclose(f);
+	if (!nbrk) return;
+	tahoe_sigaction(SIGTRAP, on_sigtrap);
+	for (int i = 0; i < nbrk; i++) brk_poke(brk_addr[i], 0xcc);
+	logf_("    BRK <%d>: %d puntos puestos\n", (int)getpid(), nbrk);
+}
+
 void diag_dump_threads(void) {
 	static int done;
 	if (done || !diag_target()) return;
 	done = 1;
-	struct sigaction sa = { .sa_sigaction = on_dump, .sa_flags = SA_SIGINFO | SA_ONSTACK };
-	sigaction(SIGRTMIN + 4, &sa, NULL);
+	tahoe_sigaction(SIGRTMIN + 4, on_dump);
 	DIR* d = opendir("/proc/self/task");
 	if (!d) return;
 	long me = syscall(SYS_gettid);

@@ -417,6 +417,10 @@ static long mach_msg2(struct ctx* c) {
 	if (mtr) logf_("    MT pid=%d.%ld %s dest=0x%x(->%d) resp=0x%x id=%d size=%u rcv=%d\n", (int)getpid(), (long)syscall(SYS_gettid), kobject ? "kobj" : "send", h.remote, kobject ? 0 : port_rpid(h.remote), h.local, h.id, ssize, (options & 2) != 0);
 	if (mtr && !kobject) { char s[200] = ""; size_t k = 0, run = 0; for (uint32_t q = 24; q < ssize && k < sizeof s - 2; q++) { uint8_t ch = req[q]; if (ch >= 0x20 && ch < 0x7f) { s[k++] = (char)ch; run++; } else { if (run >= 6) s[k++] = 0x7c; else k -= run; run = 0; } } if (run < 6) k -= run; s[k] = 0; if (k) logf_("      MT textos: %s\n", s); }
 	if (!kobject && h.remote == 0) { if (trace_all) logf_("    mach_msg2: envío al puerto nulo (id=%d) -> MACH_SEND_INVALID_DEST\n", h.id); return 0x10000003; }   // el núcleo rechaza el destino nulo
+	if (!kobject && (h.bits & 0x1f) == 18 && !port_exists(h.remote)) {   // respuesta (MOVE_SEND_ONCE) a un puerto que ya murió
+		if (mtr) logf_("    MT pid=%d respuesta id=%d a 0x%x, que ya no existe -> MACH_SEND_INVALID_DEST\n", (int)getpid(), h.id, h.remote);
+		return MACH_SEND_INVALID_DEST_;                         // XNU consume el derecho send-once y no lo entrega a nadie
+	}
 	if (!kobject && port_exists(h.remote)) {                    // envío a un puerto de usuario: se encola tal cual
 		memcpy(req, &h, sizeof h);
 		if (port_send(h.remote, req, ssize) != 0) {               // el mensaje no se pudo encolar: decirlo, no perderlo en silencio
@@ -436,8 +440,16 @@ static long mach_msg2(struct ctx* c) {
 		n = reply_begin(rep, &h, KERN_SUCCESS_);
 		break;
 	}
-	case 3442: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // task_set_mach_voucher
-	case 3457: {                                                  // _kernelrpc_mach_task_is_self(task) -> boolean
+	// Ids de task sacados de los stubs de libsystem_kernel de macOS 26 (la copia de task.defs de XNU no coincide).
+	case 3440: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // task_set_mach_voucher
+	case 3442: n = reply_begin(rep, &h, 46 /* KERN_NOT_SUPPORTED */); break;   // task_generate_corpse: sin corpses
+	case 3457: {                                                  // task_create_identity_token(task) -> token (puerto)
+		static uint32_t token;                                    // un token de identidad por proceso, como objeto del núcleo
+		if (!token) token = alloc_port();
+		n = reply_port(rep, &h, token, 17);
+		break;
+	}
+	case 3455: {                                                  // _kernelrpc_mach_task_is_self(task) -> boolean
 		n = reply_begin(rep, &h, KERN_SUCCESS_);
 		uint32_t yes = h.remote == 0x103; memcpy(rep + n, &yes, 4); n += 4;   // PORT_TASK_SELF
 		break;

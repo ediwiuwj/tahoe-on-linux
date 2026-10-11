@@ -972,6 +972,13 @@ static void on_sigsegv(int sig, siginfo_t* si, void* v) {
 	_exit(139);
 }
 
+// Manejador del anfitrión que puede interrumpir código del invitado: su rt_sigreturn debe salir del restaurador propio
+// (región exenta del despacho de syscalls); el de glibc acabaría interceptado por SIGSYS.
+int tahoe_sigaction(int sig, void (*h)(int, siginfo_t*, void*)) {
+	struct { void* h; unsigned long flags; void* restorer; unsigned long mask; } ks = {
+		.h = (void*)h, .flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK | 0x04000000 /*SA_RESTORER*/, .restorer = tahoe_restorer, .mask = 0 };
+	return (int)syscall(SYS_rt_sigaction, sig, &ks, NULL, 8);
+}
 static void install_dispatch(void) {
 	{ struct sigaction ss = { .sa_sigaction = on_sigsegv, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER }; sigaction(SIGSEGV, &ss, NULL); }
 	struct sigaction sa = { .sa_sigaction = on_sigill, .sa_flags = SA_SIGINFO | SA_ONSTACK };
@@ -1069,6 +1076,7 @@ int main(int argc, char** argv, char** envp) {
 	struct image di, ei;
 	load_macho(dyld, DYLD_SLIDE, &di);
 	load_macho(exe, 0, &ei);
+	diag_breakpoints();                                          // /dev/shm/tahoe-break en el proceso de /dev/shm/tahoe-stacks
 	if (di.filetype != 7) DIE("%s no es un MH_DYLINKER", dyld);
 	char real[4096];
 	if (!realpath(exe, real)) snprintf(real, sizeof real, "%s", exe);
