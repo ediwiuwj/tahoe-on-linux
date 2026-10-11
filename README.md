@@ -5,17 +5,114 @@ traduce las syscalls BSD y las trampas Mach de XNU en espacio de usuario, y arra
 Objetivo final: que la imagen de la Recovery se vea en pantalla y tener Metal (vía Vulkan, con Indium y `metal2vulkan`
 para una GPU Intel Haswell). [Darling](https://github.com/darlinghq/darling) se usa solo como referencia.
 
-**Estado (4 de octubre de 2026):**
-- El `launchd` de macOS 26 corre como PID 1 en un espacio de nombres de PID, carga ~170 LaunchDaemons y lanza
-  **más de 30 demonios reales** (`syslogd`, `securityd`, `opendirectoryd`, `sandboxd`, `amfid`...). `WindowServer` y
-  `Installer Progress` arrancan y siguen vivos. Todavía **no hay imagen en pantalla**.
-- Un kernel de Metal (AIR) traducido a SPIR-V con `metal2vulkan` ya se ejecuta en la GPU por Vulkan
-  (`test/run_add_arrays.c`); aún no está integrado con Indium/Darling.
-- Detalle técnico, hallazgos y puntos de retoma: más abajo.
+**Estado actual (11 de octubre de 2026)**, medido en la PC de pruebas (i5-4210U Haswell, 5,8 GB de RAM, Arch/Omarchy, kernel 7.2):
+
+| Parte | Estado |
+|---|---|
+| Arranque | El `launchd` real de macOS 26 corre como **PID 1** en un espacio de nombres de PID de Linux, sin root. A los 20 s `launchctl list` registra **162 servicios, 46 en ejecución**. Entre los que lanza: `syslogd`, `notifyd`, `cfprefsd`, `configd`, `powerd`, `securityd`, `opendirectoryd`, `diskarbitrationd`, `coreservicesd`, `WindowServer`. |
+| Shell de macOS | `tools/macos-shell.sh` abre el `bash` de macOS en la terminal. Con `--launchd` se une a launchd y funcionan las órdenes que usan servicios. Inventario (`tools/shell_survey.sh`, 79 órdenes): **52 funcionan**, 17 no existen en la imagen de Recovery, 5 dan el mismo error que en un Mac real y **5 fallan** (ver hoja de ruta). |
+| Interfaz gráfica | `WindowServer` arranca y pasa `CA::Render::Server::start`, pero **todavía no hay imagen en pantalla**. |
+| Metal | Un kernel de Metal (AIR) traducido a SPIR-V con `metal2vulkan` se ejecuta en la GPU (Intel HD 4400) por Vulkan (`test/run_add_arrays.c`). Aún no está conectado a `tahoe-run`. |
+
+Qué funciona en la shell (con `--launchd`): `ls`, `cp`/`mv`/`rm`, `find`, `grep`, `sed`, `awk`, `sort`, `tar`, `vim`, `less`, `perl`, `curl`,
+`ssh -V`, `ps`, `df`, `mount`, `stat`, `xattr`, `chmod`/`chown`, `sysctl`, `sw_vers`, `uname`, `id`, `date`, `ifconfig`, `netstat`, `ping`,
+`scutil`, `launchctl list`/`print`, `defaults read`/`write`, `plutil`, `pmset`, `ioreg`, `nvram`, `csrutil`, `dscl`, `codesign`, `spctl`,
+`caffeinate`, `installer`, `resetpassword`.
 
 Los binarios de Apple **no** se incluyen (hay que extraerlos de una Recovery propia). Licencia MIT para el código propio.
 
+## Probarlo
+
+```sh
+tahoe-run/build.sh <ruta al código de xnu>          # compila tahoe-run (C, estático)
+tools/macos-shell.sh                                 # bash de macOS, sin launchd
+tools/macos-shell.sh --launchd                       # bash de macOS unido a launchd (lo arranca y lo detiene al salir)
+tools/macos-shell.sh --launchd -c 'launchctl list'   # una orden
+tools/shell_survey.sh                                # inventario de órdenes
+```
+`TAHOE_ROOT` indica dónde está el sistema de la Recovery extraído (por omisión `~/macos26/base/macOS Base System`). Las pruebas
+de arranque usan un guardián de memoria (`tools/mem_guard.sh`): con poca RAM, cerrar programas grandes antes.
+
+Diagnóstico con `tools/diag/` (registro y salidas en `$TAHOE_DIAG_DIR`, por omisión `~/.cache/tahoe-diag`):
+
+| Herramienta | Uso |
+|---|---|
+| `msh.sh '<órdenes>' [espera] [límite]` | Órdenes en la shell unida a launchd; siempre limpia. Variables: `STACKS=<proceso>`, `ALL=1`, `MACH=1`, `IOK=1`, `BRK='dir…'`, `PEEK='expr…'`, `TAHOE_RUN=<binario>` |
+| `hang.sh '<orden>' <proceso> [s]` | Vuelca cada hilo de un proceso colgado, simbolizado |
+| `ab.sh <N> [binario]` | N arranques con recuento de procesos y caídas: comparar dos versiones antes de dar por bueno un cambio |
+| `clean.sh` | Termina todo `tahoe-run` y limpia `/dev/shm` |
+| `sym.py <dir>…` / `dis.py <dir> [bytes]` | Símbolo (con `ipsw`) o desensamblado de direcciones de la caché de dyld |
+
+
+## Hoja de ruta, por orden
+
+1. **Terminar la shell** (lo que falla en el inventario):
+   - `log show`: logd no arranca.
+   - `security list-keychains`: se cuelga.
+   - Discos (`diskutil info`, `hdiutil`, `bless`): el registro IOKit no tiene la jerarquía `IOBlockStorageDevice` → `IOMedia` →
+     `AppleAPFSVolume`. Con ella podrán ejecutarse también las fases de montaje del arranque (`mount -P`), que hoy se sustituyen.
+   - `ps` no ve los procesos cuyo hilo principal terminó (`ps ax` cuenta 33 frente a 46 servicios en ejecución).
+   - `bash` muestra en sus mensajes de error la ruta de Linux del ejecutable en vez de `/bin/bash`.
+2. **Caídas de servicios**: `locationd` (`getpwuid(205)` devuelve NULL dentro de launchd), `opendirectoryd` (espera al abrir
+   `/Search`), CarbonCore (`FileIDTreeStorage` no registrado en `coreservicesd`), `displaypolicyd` (PF238).
+3. **Señales reales** (`sigreturn`) y `fileport_makeport`.
+4. **Interfaz gráfica**: servicio HID, pantalla por DRM/KMS, entrada por evdev y Metal sobre Vulkan para WindowServer.
+
+## Qué hay en este repositorio
+
+| Ruta | Contenido |
+|---|---|
+| `tahoe-run/` | La capa de compatibilidad (C): syscalls BSD, trampas Mach, puertos entre procesos, kqueue/workloops, IOKit, XPC... |
+| `patches/` | Parche para [`darlinghq/indium`](https://github.com/darlinghq/indium) (`git am`) |
+| `tools/extract_air.py` | Saca los módulos AIR de un `.metallib` |
+| `tools/compare_syscalls.py` | Compara las syscalls BSD y trampas Mach de un XNU con las de Darling |
+| `tools/map_dyld_cache.py` | Mapea la `dyld_shared_cache` en sus direcciones fijas y lo verifica |
+| `test/sud_syscall_dispatch.c` | Prueba de interceptación de syscalls de macOS con syscall user dispatch |
+| `tools/build_darling_codespace.sh` | Compila `mldr` y `darlingserver` de Darling en un Codespace |
+| `tools/used_syscalls.py` | Lista las syscalls BSD y trampas Mach que invoca un Mach-O x86_64 |
+| `tools/dyld_iterate.py` | Ejecuta un binario de macOS 26 en Darling extrayendo de la caché lo que falte |
+| `tools/narrow_int64.py` | Quita `Int64` de un SPIR-V cuando solo se usa para indexar (conservador) |
+| `test/add_arrays.vulkan1.2.spv` | SPIR-V generado por `metal2vulkan` (aún con `Int64`) |
+| `test/run_add_arrays.c` | Programa mínimo de Vulkan que ejecuta el kernel y comprueba `c = a + b` |
+| `tools/macos-shell.sh` | Shell de macOS sobre `tahoe-run`; con `--launchd`, unida a launchd |
+| `tools/shell_survey.sh` | Inventario: 79 órdenes típicas de macOS clasificadas en OK, ERR, COLGADA o SEÑAL |
+| `tools/mem_guard.sh` | Guardián de memoria de las pruebas (RAM disponible y crecimiento del swap) |
+| `tools/dmg2raw.py` | Convierte la imagen UDIF de la Recovery en imagen cruda (para extraerla con `hfsfuse`) |
+| `tools/iokit_trace.py` | Resume la traza de IOKit |
+| `tools/diag/` | Diagnóstico: `msh.sh`, `hang.sh`, `ab.sh`, `clean.sh`, `sym.py`, `dis.py` (ver «Probarlo») |
+
+### Estado de los parches
+
+- Compilan con `clang` y LLVM 22. Aceptan dispositivos Vulkan 1.2 con `VK_KHR_synchronization2` y
+  `VK_EXT_extended_dynamic_state{,2}`, activan esas extensiones y cargan las funciones de 1.3 por su
+  nombre `KHR`/`EXT` (solo las promovidas en 1.3).
+- Se probaron con `basic-compute` en la GPU descrita: el dispositivo se acepta, se crea y los
+  semáforos funcionan. **No se probó ningún shader**, por el punto 4 de «Lo que se aprendió» (en el historial).
+- Añaden `#include` que faltaban en Iridium (`<cstdint>`, `<stdexcept>`, `<string>`); esos errores ya
+  existían sin los parches.
+
+## Qué no se incluye, a propósito
+
+Se descargó el sistema base de macOS 26.6.2 (recovery de Apple, vía `macrecovery.py` de OpenCorePkg)
+para estudiar dónde viven los frameworks (dentro de `dyld_shared_cache`). Es software de Apple con
+licencia restringida: **no se redistribuye aquí** y cualquier implementación debe ser propia.
+Los fuentes abiertos de Apple (`xnu-12377.121.6`, `dyld-1378`, `objc4-951.7`,
+`libdispatch-1542.100.32`) están en `github.com/apple-oss-distributions`.
+
+## Licencias
+
+- **`tahoe-run/`, notas, `tools/` y `test/`**: [MIT](LICENSE). Quien los use o redistribuya debe conservar el aviso de
+  copyright y la licencia.
+- **`patches/`**: trabajo derivado de [Indium](https://github.com/darlinghq/indium) y por tanto bajo su
+  licencia (MPL-2.0), no bajo la MIT de arriba.
+- [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan) es LGPL-3.0-or-later; no se incluye
+  ningún código suyo, solo un SPIR-V generado con él.
+
 ---
+
+# Historial y detalle técnico
+
+Registro en orden cronológico. Lo que ya no es cierto está marcado.
 
 ## Parte 1: Metal sobre Vulkan en una GPU antigua
 
@@ -57,6 +154,35 @@ Los binarios de Apple **no** se incluyen (hay que extraerlos de una Recovery pro
    marcaría y otro driver podría rechazarlo o comportarse distinto. Por eso se mantiene la versión
    de 32 bits como la correcta. Con este kernel (solo `i32` y `float`) no se puede saber si `hasvk`
    emula de verdad aritmética de 64 bits cuando existe; no se probó.
+
+## Cómo repetir la prueba de traducción
+
+```sh
+# 1. compilar metal2vulkan (Rust >= 1.87) y tener llvm-dis y spirv-val
+git clone https://github.com/steelbrain/metal2vulkan
+(cd metal2vulkan && cargo build --release)   # binario en target/release/metal2vulkan
+
+# 2. extraer AIR de un .metallib (p. ej. indium/test/basic-compute/add.metallib)
+python3 tools/extract_air.py add.metallib out/
+
+# 3. traducir y validar
+metal2vulkan out/module0.air add.spv     # imprime: spirv-val vulkan1.2: PASS
+
+# 4. (opcional) estrechar índices a 32 bits y ejecutar en la GPU
+python3 tools/narrow_int64.py add.spv add32.spv && spirv-val --target-env vulkan1.2 add32.spv
+clang -O1 -o run test/run_add_arrays.c -lvulkan && ./run add32.spv   # OK: 64/64 correctos
+```
+El programa de prueba asume la interfaz de este kernel (3 buffers en `set 0` y 48 bytes de push constants).
+
+## Pasos siguientes de la parte de Metal (4 de octubre de 2026)
+
+1. ~~Quitar el `Int64` y ejecutar el kernel en la GPU.~~ Hecho (puntos 6 y 7). Falta integrar el paso de
+   estrechado en `metal2vulkan` como opción (`--no-int64`) en lugar de usarlo aparte.
+2. Adaptar `Library::newLibrary` de Indium para usar `metal2vulkan` en lugar de Iridium (hay que
+   traducir su reflexión de descriptores y push constants al `OutputInfo` que espera Indium).
+3. Compilar Darling con `ENABLE_METAL` y probar el ejemplo `triangle`.
+4. ~~Subir la base de macOS 11 a macOS 26.~~ Se descartó Darling como base: `tahoe-run` ejecuta el userland real de
+   macOS 26 (ver «Estado actual»). Metal se conectará a `tahoe-run` cuando haya WindowServer.
 
 ## Ejecutar el userland de macOS 26 en Darling (medido el 4 de octubre de 2026)
 
@@ -176,7 +302,11 @@ Programas probados con éxito (`exit=0`): `ls`, `ls -l`, `echo`, `cat`, `uname -
 internas (`echo`, aritmética `$((6*7))`, variables). También funciona el `execve` (se relanza `tahoe-run` con el programa
 nuevo e interpreta `#!`) cuando `bash` lanza directamente una única orden externa.
 
-**Problema abierto: `fork`.** `bash -c 'a; b'` o una tubería hacen `fork` y el hijo aborta con `SIGABRT` justo al
+> **Resuelto (10–11 de octubre):** `fork` funciona; la shell de macOS ejecuta tuberías y listas de órdenes. El hijo reabre
+> `/proc/self/mem` y no hereda la marca de creador de la región de puertos (ver «Shell de macOS»). Lo que sigue es el registro de
+> cuando estaba abierto.
+
+**Problema abierto (4 de octubre): `fork`.** `bash -c 'a; b'` o una tubería hacen `fork` y el hijo aborta con `SIGABRT` justo al
 terminar la reinicialización de `libSystem` en el hijo. Lo averiguado:
 - El kernel de Linux **no hereda** `PR_SET_SYSCALL_USER_DISPATCH` en el hijo de un `fork`; sin reactivarlo con
   `prctl`, las syscalls del hijo se ejecutan como syscalls reales de Linux y devuelven `ENOSYS` en silencio (así es
@@ -219,78 +349,6 @@ el compilador cruzado de Darling y no se han construido todavía.
 falta de la caché y reintenta. Sirve para mapear la cadena de dependencias; se detiene en el fallo
 anterior.
 
-## Qué hay en este repositorio
-
-| Ruta | Contenido |
-|---|---|
-| `patches/` | Parche para [`darlinghq/indium`](https://github.com/darlinghq/indium) (`git am`) |
-| `tools/extract_air.py` | Saca los módulos AIR de un `.metallib` |
-| `tools/compare_syscalls.py` | Compara las syscalls BSD y trampas Mach de un XNU con las de Darling |
-| `tools/map_dyld_cache.py` | Mapea la `dyld_shared_cache` en sus direcciones fijas y lo verifica |
-| `test/sud_syscall_dispatch.c` | Prueba de interceptación de syscalls de macOS con syscall user dispatch |
-| `tools/build_darling_codespace.sh` | Compila `mldr` y `darlingserver` de Darling en un Codespace |
-| `tools/used_syscalls.py` | Lista las syscalls BSD y trampas Mach que invoca un Mach-O x86_64 |
-| `tools/dyld_iterate.py` | Ejecuta un binario de macOS 26 en Darling extrayendo de la caché lo que falte |
-| `tools/narrow_int64.py` | Quita `Int64` de un SPIR-V cuando solo se usa para indexar (conservador) |
-| `test/add_arrays.vulkan1.2.spv` | SPIR-V generado por `metal2vulkan` (aún con `Int64`) |
-| `test/run_add_arrays.c` | Programa mínimo de Vulkan que ejecuta el kernel y comprueba `c = a + b` |
-
-### Estado de los parches
-
-- Compilan con `clang` y LLVM 22. Aceptan dispositivos Vulkan 1.2 con `VK_KHR_synchronization2` y
-  `VK_EXT_extended_dynamic_state{,2}`, activan esas extensiones y cargan las funciones de 1.3 por su
-  nombre `KHR`/`EXT` (solo las promovidas en 1.3).
-- Se probaron con `basic-compute` en la GPU descrita: el dispositivo se acepta, se crea y los
-  semáforos funcionan. **No se probó ningún shader**, por el punto 4.
-- Añaden `#include` que faltaban en Iridium (`<cstdint>`, `<stdexcept>`, `<string>`); esos errores ya
-  existían sin los parches.
-
-## Cómo repetir la prueba de traducción
-
-```sh
-# 1. compilar metal2vulkan (Rust >= 1.87) y tener llvm-dis y spirv-val
-git clone https://github.com/steelbrain/metal2vulkan
-(cd metal2vulkan && cargo build --release)   # binario en target/release/metal2vulkan
-
-# 2. extraer AIR de un .metallib (p. ej. indium/test/basic-compute/add.metallib)
-python3 tools/extract_air.py add.metallib out/
-
-# 3. traducir y validar
-metal2vulkan out/module0.air add.spv     # imprime: spirv-val vulkan1.2: PASS
-
-# 4. (opcional) estrechar índices a 32 bits y ejecutar en la GPU
-python3 tools/narrow_int64.py add.spv add32.spv && spirv-val --target-env vulkan1.2 add32.spv
-clang -O1 -o run test/run_add_arrays.c -lvulkan && ./run add32.spv   # OK: 64/64 correctos
-```
-El programa de prueba asume la interfaz de este kernel (3 buffers en `set 0` y 48 bytes de push constants).
-
-## Pasos siguientes, por orden
-
-1. ~~Quitar el `Int64` y ejecutar el kernel en la GPU.~~ Hecho (puntos 6 y 7). Falta integrar el paso de
-   estrechado en `metal2vulkan` como opción (`--no-int64`) en lugar de usarlo aparte.
-2. Adaptar `Library::newLibrary` de Indium para usar `metal2vulkan` en lugar de Iridium (hay que
-   traducir su reflexión de descriptores y push constants al `OutputInfo` que espera Indium).
-3. Compilar Darling con `ENABLE_METAL` y probar el ejemplo `triangle`.
-4. Subir la base de macOS 11 a macOS 26 (XNU 12377, `dyld` 1378, `objc4` 951): es la parte más
-   grande y no se empezó.
-
-## Qué no se incluye, a propósito
-
-Se descargó el sistema base de macOS 26.6.2 (recovery de Apple, vía `macrecovery.py` de OpenCorePkg)
-para estudiar dónde viven los frameworks (dentro de `dyld_shared_cache`). Es software de Apple con
-licencia restringida: **no se redistribuye aquí** y cualquier implementación debe ser propia.
-Los fuentes abiertos de Apple (`xnu-12377.121.6`, `dyld-1378`, `objc4-951.7`,
-`libdispatch-1542.100.32`) están en `github.com/apple-oss-distributions`.
-
-## Licencias
-
-- **Notas, `tools/` y `test/`**: [MIT](LICENSE). Quien los use o redistribuya debe conservar el aviso de
-  copyright y la licencia.
-- **`patches/`**: trabajo derivado de [Indium](https://github.com/darlinghq/indium) y por tanto bajo su
-  licencia (MPL-2.0), no bajo la MIT de arriba.
-- [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan) es LGPL-3.0-or-later; no se incluye
-  ningún código suyo, solo un SPIR-V generado con él.
-
 ### `launchd` como PID 1 (4 de octubre de 2026)
 
 `unshare --pid --fork --user --map-root-user --mount-proc ./tahoe-run <caché> <root>/usr/lib/dyld <root>/sbin/launchd`
@@ -312,7 +370,9 @@ Qué se vio, por orden:
 > Nota: la versión anterior de esta sección decía que el proceso moría con `SIGILL`. Era el estado de un primer intento
 > y ya no es cierto: hoy `launchd` se queda en ejecución como PID 1.
 
-## Dónde retomar (estado al 4 de octubre de 2026)
+## Dónde estaba el proyecto el 4 de octubre de 2026 (histórico)
+
+> El estado actual está al principio de este documento. Esta sección se conserva como registro.
 
 **Funciona**: `tahoe-run` ejecuta programas reales de macOS 26 (`ls`, `echo`, `cat`, `uname`, `pwd`, `bash` 3.2.57 con
 órdenes internas) sobre Linux, sin XNU ni Darling. Compilar con `tahoe-run/build.sh <xnu>` y ejecutar con
@@ -414,8 +474,8 @@ Ya arrancan sin caerse `remoted`, `configd`, `powerd`, `locationd`, `kernelmanag
 `tools/macos-shell.sh` abre el `/bin/bash` del sistema base de macOS 26 en la terminal de Linux, con un entorno de macOS
 (PATH de macOS, `HOME=/var/root`, usuario root). Funcionan, entre otras, `ls`, `cd`, `cat`, `grep`, `find`, `sed`, `awk`,
 `cp`/`mv`/`rm -r`, `tar`, `ps`, `uname`, `sw_vers`, `id`, `date`, `df`, `plutil`, `csrutil`, `perl`, `vim` y `less`, con
-tuberías, redirecciones y edición de línea. Aún no: lo que necesita servicios de launchd (`defaults`, `diskutil`,
-`launchctl`) y la red (`ifconfig`).
+tuberías, redirecciones y edición de línea. (Al principio no funcionaban lo que necesita servicios de launchd ni la red; hoy
+`ifconfig`, `netstat` y `ping` funcionan, y `launchctl` y `defaults` con `--launchd`: ver la sección siguiente.)
 
 ```
 tools/macos-shell.sh                  # sesión interactiva
@@ -426,6 +486,15 @@ rutas confinadas a la raíz de macOS (solo `/dev` viene de Linux, con las pts co
 directorio actual; termios de Darwin; `poll`; `sysctl KERN_PROC`/`KERN_PROCARGS2` con los procesos de macOS; atributos
 extendidos; uid/gid emulados.
 
-**Pendiente**: `opendirectoryd` (se queda esperando al abrir `/Search`), clientes de CarbonCore (`FileIDTreeStorage` no registrado en
-`coreservicesd`), `displaypolicyd` (PF238), señales reales (`sigreturn`), `fileport_makeport`. Después: WindowServer, pantalla por
-DRM/KMS, entrada por evdev y Metal.
+Lo que quedaba pendiente entonces está ahora en «Hoja de ruta», al principio.
+
+### Shell unida a launchd y herramientas de diagnóstico (11 de octubre de 2026)
+`tools/macos-shell.sh --launchd` arranca launchd en su propio espacio de PID (o se une a uno que ya corre) y mete la shell con
+`nsenter`, compartiendo la región de puertos Mach: sin puerto bootstrap propio usa el que launchd registró, como un proceso de
+macOS. Así funcionan `launchctl list`/`print`, `defaults read/write` (cfprefsd), `scutil`, `pmset`, `ioreg`, `nvram`, `dscl`.
+Además, desde esta fecha: `sysctl` (identificadores especiales `{0,1}`, `{0,2}`, `{0,4}`), `mount`/`umount` y `df` con la raíz
+y `devfs` (llamadas de montaje como XNU), y `caffeinate`: el hilo gestor de eventos de libdispatch se lanza con
+`WQ_FLAG_THREAD_EVENT_MANAGER`, sin lo cual ningún temporizador de la cola principal o de las globales (`dispatch_after`) se
+disparaba en ningún proceso.
+
+Herramientas usadas para encontrar estos fallos: `tools/diag/` (ver «Probarlo»).

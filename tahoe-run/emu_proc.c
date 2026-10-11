@@ -571,16 +571,19 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 		}
 		break;
 	}
-	// Programas que dependen de hardware/IOKit de verdad (montaje de volúmenes, fsck...) se sustituyen por un
-	// proceso que sale con éxito. Lista configurable en TAHOE_STUB_EXEC (rutas separadas por comas).
+	// Programas que se sustituyen por un proceso que sale con éxito: rutas separadas por comas en TAHOE_STUB_EXEC (para
+	// diagnóstico), y las fases de montaje del arranque (`mount -P <fase>`, tareas mount-phase-N de launchd): ejecutan
+	// apfs_boot_util, que busca en IOKit el volumen APFS del UUID de arranque, y el registro aún no tiene la jerarquía de
+	// discos (IOBlockStorageDevice -> IOMedia -> AppleAPFSVolume). El `mount` normal sí se ejecuta (llamadas de emu_fs.c).
 	{
 		const char* stubs = getenv("TAHOE_STUB_EXEC");
-		if (!stubs) stubs = "/sbin/mount";
+		if (!stubs) stubs = "";
+		int boot_phase = !strcmp(gpath, "/sbin/mount") && ac >= 2 && !strncmp(av[1], "-P", 2);
 		size_t gl = strlen(gpath);
-		for (const char* p = stubs; *p;) {
+		for (const char* p = boot_phase ? gpath : stubs; *p;) {
 			const char* q = strchr(p, ',');
 			size_t l = q ? (size_t)(q - p) : strlen(p);
-			if (l == gl && !strncmp(p, gpath, l)) {
+			if (boot_phase || (l == gl && !strncmp(p, gpath, l))) {
 				logf_("    exec \"%s\" sustituido por un proceso que sale con 0\n", gpath);
 				char* targv[] = { (char*)"true", NULL };
 				if (spawn) { int pe = posix_spawnp(pidout, "true", NULL, NULL, targv, environ); return pe ? -darwin_errno(pe) : 0; }
@@ -745,7 +748,10 @@ static void wl_arm(uint64_t kqid);
 // la de la petición, lo encolado en esa cola no se vacía nunca. pp es un pthread_priority_t; sin QoS, LEGACY (4).
 #define WQ_OVERCOMMIT 0x00010000u
 #define WQ_COOPERATIVE 0x01000000u
+#define WQ_EVENT_MANAGER 0x00100000u   // hilo gestor de eventos de libdispatch (WORKQ_THREAD_QOS_MANAGER de XNU)
+#define PP_EVENT_MANAGER 0x02000000u   // _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG
 static uint32_t prio_from_pp(uint32_t pp, int coop) {
+	if (pp & PP_EVENT_MANAGER) return WQ_EVENT_MANAGER;              // knote del gestor (p. ej. su EVFILT_USER de aviso)
 	uint32_t qos = 4;                                                  // THREAD_QOS_LEGACY: los hilos de la cola por omisión
 	if (!(pp & (0x20000000u | 0x02000000u)) && (pp & 0x3f00u)) qos = (uint32_t)__builtin_ffs((int)((pp & 0x3f00u) >> 8));
 	if (coop) qos |= WQ_COOPERATIVE;
@@ -783,7 +789,10 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int
 	uint64_t self = (uint64_t)base + WQ_STACK;
 	if (first) memset(base + WQ_STACK - 0x3000, 0, 0x3000 + psize);   // pthread_t limpio solo la primera vez
 	uint64_t kqid_slot = self - 0x2000, events = kqid_slot + 8;
-	uint64_t flags = WQ_NEWSPI | WQ_PRIO_QOS | (jp->prio ? jp->prio : 4);
+	// Banderas como workq_setup_and_run de XNU: el hilo gestor lleva EVENT_MANAGER en lugar de la QoS. Sin ella,
+	// libdispatch (_dispatch_wlh_worker_thread_init) no se reconoce como gestor: no vacía su cola ni programa los
+	// temporizadores de las colas que no son workloop (dispatch_after en la cola principal o en las globales).
+	uint64_t flags = (jp->prio & WQ_EVENT_MANAGER) ? (WQ_NEWSPI | WQ_EVENT_MANAGER) : (WQ_NEWSPI | WQ_PRIO_QOS | (jp->prio ? jp->prio : 4));
 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, self + tsd_offset); flags |= WQ_TSD_SET; }
 	if (!first) flags |= WQ_REUSE;
 	int nev = 0;
@@ -869,7 +878,7 @@ static void wq_spawn(uint64_t kqid, int workloop, const uint8_t* req) {
 	if (!j) return;
 	j->kqid = kqid; j->workloop = workloop;
 	if (req) { j->has_req = 1; memcpy(j->req, req, 72); j->prio = prio_from_kev(req); }
-	if (kqid == ~0ULL) j->prio = (j->prio & 0xffu) | WQ_OVERCOMMIT;   // la kqueue de la cola: hilos de eventos overcommit (kqwq de XNU)
+	if (kqid == ~0ULL && !(j->prio & WQ_EVENT_MANAGER)) j->prio = (j->prio & 0xffu) | WQ_OVERCOMMIT;   // la kqueue de la cola: hilos de eventos overcommit (kqwq de XNU)
 	wq_spawn_job(j);
 }
 
@@ -951,7 +960,15 @@ static void* wl_watch(void* p) {
 			pthread_mutex_lock(&wl_lock);
 			j->prio = w->has_req ? prio_from_kev(w->req) : prio_from_kev(j->pre);
 			pthread_mutex_unlock(&wl_lock);
-			if (kqid == ~0ULL) j->prio = (j->prio & 0xffu) | WQ_OVERCOMMIT;
+			if (kqid == ~0ULL) {
+				// La kqueue de la cola (kqworkq de XNU) entrega los eventos de knotes del gestor (QoS con EVENT_MANAGER, como
+				// el EVFILT_USER con que libdispatch lo despierta) a un hilo gestor, y el resto a hilos overcommit. Si el
+				// lote trae alguno del gestor va entero a él: el gestor procesa todos los eventos que recibe antes de vaciar
+				// su cola, y así los mensajes Mach recogidos siguen en un solo búfer.
+				int mgr = 0;
+				for (int i = 0; i < j->npre; i++) if (prio_from_kev(j->pre + i * 72) & WQ_EVENT_MANAGER) mgr = 1;
+				j->prio = mgr ? WQ_EVENT_MANAGER : (j->prio & 0xffu) | WQ_OVERCOMMIT;
+			}
 			wq_spawn_job(j);
 			continue;
 		}
@@ -1011,7 +1028,7 @@ static long bsd_workq_kernreturn(struct ctx* c) {
 	case 0x400: case 0x10: return 0;                                   // SETUP_DISPATCH, NEWSPISUPP
 	case 0x20: case 0x30: {                                            // REQTHREADS(n): hilos de trabajo normales
 		long n = (long)(int)c->a[2];                                  // arg2 = cuántos, arg3 = pthread_priority_t; 0x30 = cooperativos
-		uint32_t prio = prio_from_pp((uint32_t)c->a[3], op == 0x30);
+		uint32_t prio = prio_from_pp((uint32_t)c->a[3] & ~PP_EVENT_MANAGER, op == 0x30);   // sin kevent no hay hilo gestor
 		for (long i = 0; i < n && i < 8; i++) {
 			struct wq_job* j = calloc(1, sizeof *j);
 			if (!j) break;
