@@ -24,6 +24,9 @@ struct entry {
 #define CTL_KERN 1
 #define CTL_HW 6
 static char boot_session[40] = "B0070000-0000-4000-8000-000000000003";
+// Centinela del sandbox (security.mac.sandbox.sentinel): una cadena por arranque, ".sb-" y 8 cifras hex. Security la usa para
+// nombrar los temporales de sus escrituras atómicas (p. ej. al crear un llavero); sin ella, deshace la creación.
+static char sb_sentinel[16] = ".sb-00000000";
 // Identificadores reales de Darwin cuando existen; el resto (nombres dinámicos) usan 0x7000 + n.
 static struct entry table[] = {
 	{ "kern.ostype", { CTL_KERN, 1 }, K_STR, 0, "Darwin" },
@@ -77,6 +80,7 @@ static struct entry table[] = {
 	{ "kern.hv_vmm_present", { 201, 0x7217 }, K_INT, 0, NULL },
 	{ "vm.darkwake_mode", { 201, 0x7218 }, K_INT, 0, NULL },
 	{ "net.inet6.send.opmode", { 201, 0x7219 }, K_INT, 0, NULL },
+	{ "security.mac.sandbox.sentinel", { 201, 0x721e }, K_STR, 0, sb_sentinel },
 	{ "kern.hostid", { CTL_KERN, 11 }, K_INT, 0, NULL },
 	{ "kern.safeboot", { CTL_KERN, 66 }, K_INT, 0, NULL },
 	{ "hw.target", { 201, 0x721a }, K_STR, 0, "J152fAP" },              // MobileGestalt (HWModelStr) lo usa: el del MacBookPro16,1
@@ -113,7 +117,7 @@ void emu_sysctl_init(void) {
 	FILE* bf = fopen("/proc/sys/kernel/random/boot_id", "r");
 	if (bf) {
 		char b[64] = "";
-		if (fgets(b, sizeof b, bf) && strlen(b) >= 36) { for (int i = 0; i < 36; i++) boot_session[i] = (b[i] >= 'a' && b[i] <= 'f') ? (char)(b[i] - 32) : b[i]; boot_session[36] = 0; }
+		if (fgets(b, sizeof b, bf) && strlen(b) >= 36) { for (int i = 0; i < 36; i++) boot_session[i] = (b[i] >= 'a' && b[i] <= 'f') ? (char)(b[i] - 32) : b[i]; boot_session[36] = 0; snprintf(sb_sentinel, sizeof sb_sentinel, ".sb-%.8s", b); }
 		fclose(bf);
 	}
 	long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
