@@ -26,6 +26,7 @@ void reg_mach(unsigned num, emu_fn fn);
 void logf_(const char* fmt, ...);
 int darwin_errno(int linux_errno);
 int darwin_open_flags(int darwin_flags);
+long open_symlink(int dfd, const char* p, int dflags, int lflags, long fd);   // O_SYMLINK de Darwin
 ssize_t safe_read(uint64_t addr, void* buf, size_t len);
 ssize_t safe_write(uint64_t addr, const void* buf, size_t len);
 int safe_string(uint64_t addr, char* out, size_t max);

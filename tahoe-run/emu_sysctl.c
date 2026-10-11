@@ -406,6 +406,21 @@ long bsd_sysctl(struct ctx* c) {
 	uint32_t n = (uint32_t)c->a[1];
 	if (n == 0 || n > 16 || safe_read(c->a[0], mib, n * 4) != (ssize_t)(n * 4)) return -D_EINVAL;
 
+	// vfs.generic: sistemas de archivos que tiene el núcleo (getvfsbyname). VFS_MAXTYPENUM (1) y VFS_CONF (2, struct vfsconf:
+	// reservado, nombre[15], typenum, refcount, flags, 2 reservados = 40 bytes). Son los que tahoe-run sabe presentar o montar,
+	// con los mismos números de tipo que statfs (emu_fs.c): mount_tmpfs ve así que tmpfs ya está y no intenta cargar su kext.
+	if (n >= 3 && mib[0] == 3 && mib[1] == 0 && (mib[2] == 1 || (mib[2] == 2 && n == 4))) {
+		static const struct { const char* name; int typenum; } vfs[] = { { "devfs", 0x13 }, { "apfs", 0x18 }, { "tmpfs", 0x1d } };
+		if (mib[2] == 1) { int32_t max = 0x1e; return sc_out(c, &max, 4); }
+		for (size_t i = 0; i < sizeof vfs / sizeof vfs[0]; i++) if (vfs[i].typenum == mib[3]) {
+			uint8_t vc[40] = { 0 };
+			strncpy((char*)vc + 4, vfs[i].name, 14);
+			memcpy(vc + 20, &vfs[i].typenum, 4);
+			int32_t refs = 1; memcpy(vc + 24, &refs, 4);
+			return sc_out(c, vc, sizeof vc);
+		}
+		return -45;                                        // ENOTSUP: no hay sistema de archivos con ese número (como XNU)
+	}
 	if (n >= 3 && mib[0] == 1 && mib[1] == 14) {         // kern.proc.*: KERN_PROC_ALL (0), KERN_PROC_PID (1)
 		uint8_t one[648];
 		if (n == 4 && mib[2] == 1) {

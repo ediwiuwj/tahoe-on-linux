@@ -531,7 +531,15 @@ int darwin_open_flags(int f) {
 	if (f & 0x100000) o |= O_DIRECTORY;
 	if (f & 0x400000) o |= O_DSYNC;
 	if (f & 0x1000000) o |= O_CLOEXEC;
+	if (f & 0x200000) o |= O_NOFOLLOW;               // O_SYMLINK: ver open_symlink
 	return o;
+}
+// O_SYMLINK (0x200000) de Darwin: si la ruta es un enlace simbólico, se abre el propio enlace (ditto lo usa para copiar
+// enlaces que no apuntan a nada). Con O_NOFOLLOW Linux da ELOOP; entonces se abre el enlace con O_PATH (vale para fstat,
+// readlinkat y fchown, que es lo que se hace con él).
+long open_symlink(int dfd, const char* p, int dflags, int lflags, long fd) {
+	if (fd >= 0 || !(dflags & 0x200000) || errno != ELOOP) return fd;
+	return syscall(SYS_openat, dfd, p, O_PATH | O_NOFOLLOW | (lflags & O_CLOEXEC));
 }
 static long bsd_open(struct ctx* c) {
 	char path[4096], full[4200];
@@ -550,7 +558,7 @@ static long bsd_open(struct ctx* c) {
 	long fd = -1;
 	if (tahoe_root && path[0] == '/' && !tahoe_host_passthrough(path)) {
 		snprintf(full, sizeof full, "%s%s", tahoe_root, path);
-		fd = syscall(SYS_open, full, flags, (int)c->a[2]);
+		fd = open_symlink(AT_FDCWD, full, (int)c->a[1], flags, syscall(SYS_open, full, flags, (int)c->a[2]));
 		if (fd < 0 && ((flags & O_CREAT) || !tahoe_host_passthrough(path))) goto done;   // fuera de /dev, solo la raíz de macOS
 	}
 	if (fd < 0) { char al[64]; fd = syscall(SYS_open, tahoe_dev_alias(path, al, sizeof al), flags, (int)c->a[2]); }
