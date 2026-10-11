@@ -307,6 +307,15 @@ void diag_crash(ucontext_t* uc) {
 			logf_("\n    abort <%d>: rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r12=%llx r13=%llx r14=%llx r15=%llx", (int)getpid(),
 				(unsigned long long)g[REG_RAX], (unsigned long long)g[REG_RBX], (unsigned long long)g[REG_RCX], (unsigned long long)g[REG_RDX], (unsigned long long)g[REG_RSI],
 				(unsigned long long)g[REG_RDI], (unsigned long long)g[REG_R8], (unsigned long long)g[REG_R12], (unsigned long long)g[REG_R13], (unsigned long long)g[REG_R14], (unsigned long long)g[REG_R15]);
+			logf_("\n    abort <%d>: marcos (rbp):", (int)getpid());          // pila exacta: macOS conserva el puntero de marco
+			uint64_t fp = (uint64_t)g[REG_RBP];
+			for (int k = 0; k < 32 && fp; k++) {
+				uint64_t fr[2];
+				if (safe_read(fp, fr, 16) != 16 || !fr[1]) break;
+				logf_(" 0x%lx", fr[1]);
+				if (fr[0] <= fp) break;
+				fp = fr[0];
+			}
 			logf_("\n    abort: llamadas plausibles:");
 			int shown = 0;
 			for (int k = 0; k < (int)(got / 8) && shown < 24; k++) {
@@ -471,7 +480,7 @@ static int darwin_wait_status(int st) {
 static long bsd_fork(struct ctx* c) {
 	long p = syscall(SYS_fork);
 	if (p < 0) return -darwin_errno(errno);
-	if (p == 0) reenable_dispatch();                     // el hijo empieza sin interceptación
+	if (p == 0) { memfd_reopen(); reenable_dispatch(); }  // el hijo: su propia memoria; empieza sin interceptación
 	// Convenio de Darwin: hijo rax=pid del padre, rdx=1; padre rax=pid del hijo, rdx=0. libsyscall devuelve 0 al hijo
 	// al ver rdx != 0, y libc ejecuta entonces los manejadores de hijo (reinicio de puertos Mach, hilo principal...).
 	c->has_ret2 = 1;
@@ -511,10 +520,7 @@ static int read_strv(uint64_t addr, char*** out, int max) {
 
 // Ruta del programa (vista de macOS) -> ruta real en el host.
 static void host_path(const char* guest, char* out, size_t cap) {
-	if (tahoe_root && guest[0] == '/') {
-		snprintf(out, cap, "%s%s", tahoe_root, guest);
-		if (access(out, F_OK) == 0) return;
-	}
+	if (tahoe_root && guest[0] == '/' && !tahoe_host_passthrough(guest)) { snprintf(out, cap, "%s%s", tahoe_root, guest); return; }
 	snprintf(out, cap, "%s", guest);
 }
 

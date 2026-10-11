@@ -104,6 +104,14 @@ static void memfd_init(void) {
 	close(fd);
 	if (memfd < 0) DIE("no puedo reservar el descriptor de /proc/self/mem: %s", strerror(errno));
 }
+// Tras fork: /proc/self/mem queda ligado a la memoria de quien lo abrió, así que el hijo heredaba el del padre y leía y
+// escribía la memoria del padre (respuestas MIG incluidas). Se reabre en el mismo número.
+void memfd_reopen(void) {
+	int fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+	if (fd < 0) DIE("hijo: no puedo abrir /proc/self/mem: %s", strerror(errno));
+	if (dup3(fd, memfd, O_CLOEXEC) < 0) DIE("hijo: dup3 de /proc/self/mem: %s", strerror(errno));
+	close(fd);
+}
 ssize_t safe_read(uint64_t addr, void* buf, size_t len) {
 	size_t done = 0;
 	while (done < len) {
@@ -523,12 +531,12 @@ static long bsd_open(struct ctx* c) {
 	if (!strcmp(path, "/dev/console")) strcpy(path, "/dev/null");        // sin consola real dentro del entorno
 	int flags = darwin_open_flags((int)c->a[1]);
 	long fd = -1;
-	if (tahoe_root && path[0] == '/') {
+	if (tahoe_root && path[0] == '/' && !tahoe_host_passthrough(path)) {
 		snprintf(full, sizeof full, "%s%s", tahoe_root, path);
 		fd = syscall(SYS_open, full, flags, (int)c->a[2]);
-		if (fd < 0 && (flags & O_CREAT)) goto done;            // crear siempre dentro de la raíz, nunca en el host
+		if (fd < 0 && ((flags & O_CREAT) || !tahoe_host_passthrough(path))) goto done;   // fuera de /dev, solo la raíz de macOS
 	}
-	if (fd < 0) fd = syscall(SYS_open, path, flags, (int)c->a[2]);
+	if (fd < 0) { char al[64]; fd = syscall(SYS_open, tahoe_dev_alias(path, al, sizeof al), flags, (int)c->a[2]); }
 done:
 	if (trace_all || fd < 0) logf_("    open(\"%s\") -> %ld%s%s\n", path, fd, fd < 0 ? " " : "", fd < 0 ? strerror(errno) : "");
 	return fd < 0 ? -darwin_errno(errno) : fd;
@@ -967,11 +975,10 @@ static int emulate_sidt(ucontext_t* uc) {
 	return 1;
 }
 static void on_sigsegv(int sig, siginfo_t* si, void* v) {
-	(void)sig;
 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
 	if (si->si_code == 0x80 /*SI_KERNEL*/ && emulate_sidt(v)) { selector = SYSCALL_DISPATCH_FILTER_BLOCK; return; }
 	if (rmap_fault((uint64_t)si->si_addr)) { selector = SYSCALL_DISPATCH_FILTER_BLOCK; return; }   // memoria que otro proceso mapeó aquí
-	logf_("    SIGSEGV <%d> hilo %ld dirección=%p rip=0x%llx\n", getpid(), (long)syscall(SYS_gettid), si->si_addr, (unsigned long long)((ucontext_t*)v)->uc_mcontext.gregs[REG_RIP]);
+	logf_("    %s <%d> hilo %ld dirección=%p rip=0x%llx\n", sig == SIGBUS ? "SIGBUS" : "SIGSEGV", getpid(), (long)syscall(SYS_gettid), si->si_addr, (unsigned long long)((ucontext_t*)v)->uc_mcontext.gregs[REG_RIP]);
 	diag_crash(v);
 	diag_dump_threads();
 	_exit(139);
@@ -986,6 +993,7 @@ int tahoe_sigaction(int sig, void (*h)(int, siginfo_t*, void*)) {
 }
 static void install_dispatch(void) {
 	tahoe_sigaction(SIGSEGV, on_sigsegv);                      // vuelve al invitado: restaurador propio (sidt, zona común)
+	tahoe_sigaction(SIGBUS, on_sigsegv);                       // acceso fuera de un archivo proyectado: mismo diagnóstico
 	struct sigaction sa = { .sa_sigaction = on_sigill, .sa_flags = SA_SIGINFO | SA_ONSTACK };
 	sigaction(SIGILL, &sa, NULL);
 	stack_t ss = { .ss_sp = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), .ss_size = 1 << 18 };
@@ -1089,7 +1097,11 @@ int main(int argc, char** argv, char** envp) {
 	const char* guest = real;
 	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
 	if (rl && !strncmp(real, tahoe_root, rl) && real[rl] == '/') guest = real + rl;
-	if (tahoe_root && chdir(tahoe_root) != 0) LOG("aviso: no puedo entrar en TAHOE_ROOT: %s\n", strerror(errno));   // cwd inicial = "/" de macOS
+	if (tahoe_root) {                                            // cwd inicial = "/" de macOS, salvo que ya estemos dentro (exec hereda el cwd)
+		char cwd[4300]; size_t rl = strlen(tahoe_root);
+		int inside = getcwd(cwd, sizeof cwd) && !strncmp(cwd, tahoe_root, rl) && (cwd[rl] == '/' || cwd[rl] == 0);
+		if (!inside && chdir(tahoe_root) != 0) LOG("aviso: no puedo entrar en TAHOE_ROOT: %s\n", strerror(errno));
+	}
 	uint64_t sp = build_stack(ei.mh, argc - 3, argv + 3, envp, guest);
 	memfd_init();
 	emu_sysctl_init();
@@ -1103,7 +1115,8 @@ int main(int argc, char** argv, char** envp) {
 	emu_sem_init();
 	emu_psynch_init();
 	emu_cs_init();
-	emu_cred_init();                                             // al final: sustituye los get/set*id provisionales
+	emu_cred_init();
+	emu_fs_xattr_init();                                             // al final: sustituye los get/set*id provisionales
 	// Las variantes *_nocancel de Darwin son iguales a las normales salvo por el punto de cancelación de hilos.
 	static const struct { unsigned nocancel, normal; } alias[] = {
 		// todas las variantes *_nocancel de syscalls.master (sin puntos de cancelación, mismo efecto)

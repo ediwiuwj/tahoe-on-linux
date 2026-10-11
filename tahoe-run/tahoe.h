@@ -73,6 +73,13 @@ uint32_t cred_euid(void);
 uint32_t cred_egid(void);
 void cred_env(char* out, size_t cap);
 void emu_cred_init(void);
+void emu_fs_xattr_init(void);
+int tahoe_host_passthrough(const char* p);
+const char* tahoe_dev_alias(const char* p, char* buf, size_t cap);
+void memfd_reopen(void);
+uint32_t guest_uid(uint32_t u);
+uint32_t darwin_dev(unsigned ma, unsigned mi);
+uint32_t guest_gid(uint32_t g);
 #include <signal.h>
 int tahoe_sigaction(int sig, void (*h)(int, siginfo_t*, void*));
 int port_eventfd(uint32_t name);

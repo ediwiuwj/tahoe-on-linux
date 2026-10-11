@@ -145,7 +145,51 @@ static long sc_out(struct ctx* c, const void* data, size_t len) {
 // kinfo_proc de Darwin (648 bytes): solo se rellenan pid, estado, nombre, ppid y propietario, desde /proc.
 #include <dirent.h>
 #include <stdlib.h>
+// Procesos de macOS = procesos de tahoe-run (mismo ejecutable que este). Su cmdline es: tahoe-run <caché> <dyld> <programa>
+// [args...]; el programa y sus argumentos son los que ve macOS (la ruta, sin la raíz de macOS).
+static int read_file(const char* path, char* buf, size_t cap) {
+	FILE* f = fopen(path, "r"); if (!f) return -1;
+	size_t n = fread(buf, 1, cap - 1, f); fclose(f); buf[n] = 0; return (int)n;
+}
+static int is_tahoe_proc(int pid) {
+	static char self[512]; static ssize_t sl = -1;
+	if (sl < 0) { sl = readlink("/proc/self/exe", self, sizeof self - 1); if (sl > 0) self[sl] = 0; }
+	char p[64], e[512]; snprintf(p, sizeof p, "/proc/%d/exe", pid);
+	ssize_t n = readlink(p, e, sizeof e - 1);
+	if (n <= 0 || sl <= 0) return 0;
+	e[n] = 0;
+	return !strcmp(e, self);
+}
+// argv de macOS del proceso: devuelve argc y deja los argumentos (separados por NUL) en out
+static int guest_argv(int pid, char* out, size_t cap, size_t* len) {
+	char p[64], buf[16384]; snprintf(p, sizeof p, "/proc/%d/cmdline", pid);
+	int n = read_file(p, buf, sizeof buf); if (n <= 0) return -1;
+	int idx = 0, argc = 0; size_t o = 0;
+	for (int i = 0; i < n; ) {
+		const char* a = buf + i; size_t l = strlen(a);
+		if (idx >= 3) {
+			const char* g = a;
+			size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+			if (idx == 3 && rl && !strncmp(a, tahoe_root, rl) && a[rl] == '/') g = a + rl;
+			size_t gl = strlen(g);
+			if (o + gl + 1 > cap) break;
+			memcpy(out + o, g, gl + 1); o += gl + 1; argc++;
+		}
+		i += (int)l + 1; idx++;
+	}
+	*len = o;
+	return argc;
+}
+static uint32_t proc_euid(int pid) {
+	char p[64], env[32768]; snprintf(p, sizeof p, "/proc/%d/environ", pid);
+	FILE* f = fopen(p, "r"); if (!f) return 0;
+	size_t n = fread(env, 1, sizeof env - 1, f); fclose(f); env[n] = 0;
+	for (size_t i = 0; i < n; i += strlen(env + i) + 1)
+		if (!strncmp(env + i, "TAHOE_CRED=", 11)) { unsigned a, b; if (sscanf(env + i + 11, "%u,%u", &a, &b) == 2) return b; }
+	return 0;
+}
 static int fill_kinfo(int pid, uint8_t* o) {
+	if (!is_tahoe_proc(pid)) return -1;
 	char path[64], buf[512];
 	snprintf(path, sizeof path, "/proc/%d/stat", pid);
 	FILE* f = fopen(path, "r");
@@ -157,18 +201,26 @@ static int fill_kinfo(int pid, uint8_t* o) {
 	char* rp = strrchr(buf, ')');
 	if (!lp || !rp) return -1;
 	char comm[17] = { 0 };
-	size_t cl = (size_t)(rp - lp - 1) < 16 ? (size_t)(rp - lp - 1) : 16;
-	memcpy(comm, lp + 1, cl);
-	char state; int ppid = 0, pgrp = 0, sess = 0;
-	sscanf(rp + 2, "%c %d %d %d", &state, &ppid, &pgrp, &sess);
+	{   // nombre: el del programa de macOS (argv[0] de macOS, sin ruta)
+		char av[4096]; size_t al = 0;
+		if (guest_argv(pid, av, sizeof av, &al) > 0) { const char* b = strrchr(av, '/'); snprintf(comm, sizeof comm, "%s", b ? b + 1 : av); }
+		else { size_t cl = (size_t)(rp - lp - 1) < 16 ? (size_t)(rp - lp - 1) : 16; memcpy(comm, lp + 1, cl); }
+	}
+	char state; int ppid = 0, pgrp = 0, sess = 0, tty = 0, tpgid = -1;
+	sscanf(rp + 2, "%c %d %d %d %d %d", &state, &ppid, &pgrp, &sess, &tty, &tpgid);
 	memset(o, 0, 648);
-	int32_t p_flag = 0x4 /*P_CONTROLT*/; uint8_t stat = (state == 'Z') ? 5 : (state == 'T') ? 4 : (state == 'S' || state == 'D') ? 3 : 2;
+	int32_t p_flag = 0x4 /*P_LP64*/ | 0x2 /*P_CONTROLT*/; uint8_t stat = (state == 'Z') ? 5 : (state == 'T') ? 4 : (state == 'S' || state == 'D') ? 3 : 2;
 	memcpy(o + 32, &p_flag, 4); o[36] = stat; memcpy(o + 40, &pid, 4);
 	memcpy(o + 243, comm, 16);
-	uint32_t uid = getuid(), gid = getgid();
+	uint32_t uid = proc_euid(pid), gid = 0;
 	memcpy(o + 312 + 80, &uid, 4); memcpy(o + 312 + 84, &uid, 4); memcpy(o + 312 + 88, &gid, 4); memcpy(o + 312 + 92, &gid, 4);   // e_pcred: ruid, svuid, rgid, svgid
 	memcpy(o + 416 + 4, &uid, 4);                                                                                              // e_ucred.cr_uid
 	memcpy(o + 560, &ppid, 4); memcpy(o + 564, &pgrp, 4);
+	// terminal de control: tty_nr de Linux -> dev_t de Darwin (mayor << 24 | menor), como st_rdev en stat; NODEV si no tiene
+	int32_t tdev = -1;
+	if (tty) { unsigned ma = ((unsigned)tty >> 8) & 0xfff, mi = ((unsigned)tty & 0xff) | (((unsigned)tty >> 12) & 0xfff00); tdev = (int32_t)darwin_dev(ma, mi); }
+	memcpy(o + 572, &tdev, 4); memcpy(o + 576, &tpgid, 4);
+	if (!tty) { p_flag &= ~0x2; memcpy(o + 32, &p_flag, 4); }
 	return 0;
 }
 
@@ -183,7 +235,8 @@ long bsd_sysctl(struct ctx* c) {
 			if (fill_kinfo(mib[3], one) < 0) { uint64_t z = 0; safe_write(c->a[3], &z, 8); return -3; /* ESRCH */ }
 			return sc_out(c, one, sizeof one);
 		}
-		if (mib[2] == 0 || mib[2] == 2 || mib[2] == 4) {      // ALL / PGRP / UID...: se devuelven todos los procesos del espacio de PID
+		if (mib[2] >= 0 && mib[2] <= 6 && mib[2] != 1) {      // ALL 0, PGRP 2, SESSION 3, TTY 4, UID 5, RUID 6
+			if (trace_all || access("/dev/shm/tahoe-mach-trace", F_OK) == 0) logf_("    sysctl kern.proc sub=%d arg=%d\n", mib[2], n >= 4 ? mib[3] : -1);
 			DIR* d = opendir("/proc");
 			size_t cap = 64 * 648, used = 0;
 			uint8_t* all = malloc(cap);
@@ -192,13 +245,43 @@ long bsd_sysctl(struct ctx* c) {
 				int pid = atoi(de->d_name);
 				if (pid <= 0 || !all) continue;
 				if (used + 648 > cap) { cap *= 2; all = realloc(all, cap); }
-				if (fill_kinfo(pid, all + used) == 0) used += 648;
+				if (fill_kinfo(pid, all + used) != 0) continue;
+				uint8_t* k = all + used; int32_t pg, ui; memcpy(&pg, k + 564, 4); memcpy(&ui, k + 416 + 4, 4);
+				int arg = n >= 4 ? mib[3] : 0, keep = 1;
+				if (mib[2] == 2) keep = pg == arg;
+				else if (mib[2] == 3) keep = getsid(pid) == arg;
+				else if (mib[2] == 5 || mib[2] == 6) keep = ui == arg;
+				if (keep) used += 648;
 			}
 			if (d) closedir(d);
 			long r = sc_out(c, all, used);
 			free(all);
 			return r;
 		}
+	}
+	if (n == 3 && mib[0] == 1 && mib[1] == 49) {         // KERN_PROCARGS2: argc, ruta del ejecutable, argv y entorno
+		int pid = mib[2];
+		if (!is_tahoe_proc(pid)) return -D_EINVAL;
+		char av[16384]; size_t al = 0;
+		int argc = guest_argv(pid, av, sizeof av, &al);
+		if (argc <= 0) return -D_EINVAL;
+		size_t cap = 4 + al + 8 + al + 8192, k = 0;
+		uint8_t* b = calloc(1, cap);
+		memcpy(b, &argc, 4); k = 4;
+		size_t pl = strlen(av) + 1; memcpy(b + k, av, pl); k += pl;           // ruta del ejecutable
+		k = (k + 7) & ~(size_t)7;                                              // relleno de NUL hasta alinear
+		memcpy(b + k, av, al); k += al;                                        // argv
+		char ep[64], env[8192]; snprintf(ep, sizeof ep, "/proc/%d/environ", pid);
+		FILE* f = fopen(ep, "r");
+		size_t en = f ? fread(env, 1, sizeof env - 1, f) : 0; if (f) fclose(f);
+		for (size_t i = 0; i < en; i += strlen(env + i) + 1) {                  // entorno, sin las variables internas
+			size_t l = strlen(env + i);
+			if (!strncmp(env + i, "TAHOE_", 6) || k + l + 1 > cap) continue;
+			memcpy(b + k, env + i, l + 1); k += l + 1;
+		}
+		long r = sc_out(c, b, k);
+		free(b);
+		return r;
 	}
 	if (n == 2 && mib[0] == 0 && mib[1] == 3) {          // name2oid: nombre en newp -> identificador
 		char name[256];

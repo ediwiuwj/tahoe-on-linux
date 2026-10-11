@@ -114,6 +114,73 @@ static uint32_t kev_vendor(const char* name) {
 	return 0;
 }
 
+// ---- Terminales: struct termios de Darwin (flags de 8 bytes, c_cc[20], velocidades) <-> la de Linux. Los bits y los
+// índices de c_cc son distintos en cada sistema; se traducen uno a uno.
+#include <termios.h>
+struct dtermios { uint64_t iflag, oflag, cflag, lflag; uint8_t cc[20]; uint8_t pad[4]; uint64_t ispeed, ospeed; };
+struct bitmap { uint64_t d; tcflag_t l; };
+static const struct bitmap IMAP[] = { {0x1,IGNBRK},{0x2,BRKINT},{0x4,IGNPAR},{0x8,PARMRK},{0x10,INPCK},{0x20,ISTRIP},{0x40,INLCR},
+	{0x80,IGNCR},{0x100,ICRNL},{0x200,IXON},{0x400,IXOFF},{0x800,IXANY},{0x2000,IMAXBEL},{0x4000,IUTF8} };
+static const struct bitmap OMAP[] = { {0x1,OPOST},{0x2,ONLCR},{0x4,XTABS},{0x10,OCRNL},{0x20,ONOCR},{0x40,ONLRET} };
+static const struct bitmap CMAP[] = { {0x400,CSTOPB},{0x800,CREAD},{0x1000,PARENB},{0x2000,PARODD},{0x4000,HUPCL},{0x8000,CLOCAL} };
+static const struct bitmap LMAP[] = { {0x1,ECHOKE},{0x2,ECHOE},{0x4,ECHOK},{0x8,ECHO},{0x10,ECHONL},{0x20,ECHOPRT},{0x40,ECHOCTL},
+	{0x80,ISIG},{0x100,ICANON},{0x400,IEXTEN},{0x800,EXTPROC},{0x400000,TOSTOP},{0x800000,FLUSHO},{0x20000000,PENDIN},{0x80000000,NOFLSH} };
+// índice de c_cc de Darwin -> de Linux (-1: no existe)
+static const int CCMAP[20] = { VEOF, VEOL, VEOL2, VERASE, VWERASE, VKILL, VREPRINT, -1, VINTR, VQUIT, VSUSP, -1, VSTART, VSTOP,
+	VLNEXT, VDISCARD, VMIN, VTIME, -1, -1 };
+#define NB(a) (sizeof a / sizeof a[0])
+static tcflag_t to_l(uint64_t d, const struct bitmap* m, size_t n) { tcflag_t r = 0; for (size_t i = 0; i < n; i++) if (d & m[i].d) r |= m[i].l; return r; }
+static uint64_t to_d(tcflag_t l, const struct bitmap* m, size_t n) { uint64_t r = 0; for (size_t i = 0; i < n; i++) if ((l & m[i].l) == m[i].l) r |= m[i].d; return r; }
+static void term_to_darwin(const struct termios* t, struct dtermios* d) {
+	memset(d, 0, sizeof *d);
+	d->iflag = to_d(t->c_iflag, IMAP, NB(IMAP));
+	d->oflag = to_d(t->c_oflag, OMAP, NB(OMAP));
+	d->cflag = to_d(t->c_cflag, CMAP, NB(CMAP)) | (uint64_t)(((t->c_cflag & CSIZE) >> 4) << 8);   // CS5..CS8
+	d->lflag = to_d(t->c_lflag, LMAP, NB(LMAP));
+	for (int i = 0; i < 20; i++) d->cc[i] = CCMAP[i] >= 0 ? t->c_cc[CCMAP[i]] : 0xff;              // _POSIX_VDISABLE
+	d->ispeed = d->ospeed = 38400;
+}
+static void term_to_linux(const struct dtermios* d, struct termios* t) {
+	speed_t sp = cfgetospeed(t);
+	t->c_iflag = to_l(d->iflag, IMAP, NB(IMAP));
+	t->c_oflag = to_l(d->oflag, OMAP, NB(OMAP));
+	t->c_cflag = (t->c_cflag & CBAUD) | to_l(d->cflag, CMAP, NB(CMAP)) | (tcflag_t)(((d->cflag >> 8) & 3) << 4);
+	t->c_lflag = to_l(d->lflag, LMAP, NB(LMAP));
+	for (int i = 0; i < 20; i++) if (CCMAP[i] >= 0) t->c_cc[CCMAP[i]] = d->cc[i] == 0xff ? _POSIX_VDISABLE : d->cc[i];
+	cfsetospeed(t, sp); cfsetispeed(t, sp);
+}
+static long tty_ioctl(int fd, uint32_t req, uint64_t arg, int* handled) {
+	*handled = 1;
+	switch (req) {
+	case 0x40487413: {                                        // TIOCGETA
+		struct termios t; if (tcgetattr(fd, &t) < 0) return err();
+		struct dtermios d; term_to_darwin(&t, &d);
+		return safe_write(arg, &d, sizeof d) == (ssize_t)sizeof d ? 0 : -D_EFAULT;
+	}
+	case 0x80487414: case 0x80487415: case 0x80487416: {      // TIOCSETA / TIOCSETAW / TIOCSETAF
+		struct dtermios d; if (safe_read(arg, &d, sizeof d) != (ssize_t)sizeof d) return -D_EFAULT;
+		struct termios t; if (tcgetattr(fd, &t) < 0) return err();
+		term_to_linux(&d, &t);
+		int when = req == 0x80487414 ? TCSANOW : req == 0x80487415 ? TCSADRAIN : TCSAFLUSH;
+		return tcsetattr(fd, when, &t) < 0 ? err() : 0;
+	}
+	case 0x40087468: { struct winsize w; if (ioctl(fd, TIOCGWINSZ, &w) < 0) return err(); return safe_write(arg, &w, 8) == 8 ? 0 : -D_EFAULT; }   // TIOCGWINSZ
+	case 0x80087467: { struct winsize w; if (safe_read(arg, &w, 8) != 8) return -D_EFAULT; return ioctl(fd, TIOCSWINSZ, &w) < 0 ? err() : 0; }  // TIOCSWINSZ
+	case 0x40047477: { int g = tcgetpgrp(fd); if (g < 0) return err(); return safe_write(arg, &g, 4) == 4 ? 0 : -D_EFAULT; }                    // TIOCGPGRP
+	case 0x80047476: { int g; if (safe_read(arg, &g, 4) != 4) return -D_EFAULT; return tcsetpgrp(fd, g) < 0 ? err() : 0; }                    // TIOCSPGRP
+	case 0x20007461: return ioctl(fd, TIOCSCTTY, 0) < 0 ? err() : 0;                                                                         // TIOCSCTTY
+	case 0x20007471: return ioctl(fd, TIOCNOTTY) < 0 ? err() : 0;                                                                            // TIOCNOTTY
+	case 0x40047473: { int n; if (ioctl(fd, TIOCOUTQ, &n) < 0) return err(); return safe_write(arg, &n, 4) == 4 ? 0 : -D_EFAULT; }           // TIOCOUTQ
+	case 0x80017472: { char ch; if (safe_read(arg, &ch, 1) != 1) return -D_EFAULT; return ioctl(fd, TIOCSTI, &ch) < 0 ? err() : 0; }        // TIOCSTI
+	case 0x4004667a: {                                        // FIODTYPE: tipo de dispositivo (D_TTY = 3)
+		if (!isatty(fd)) return -25;
+		int t = 3; return safe_write(arg, &t, 4) == 4 ? 0 : -D_EFAULT;
+	}
+	}
+	*handled = 0;
+	return 0;
+}
+
 // ioctl de Darwin: las de FIO* genéricas y las de los sockets de eventos; el resto, ENOTTY (lo correcto para isatty()).
 static long net_ioctl(struct ctx* c) {
 	int fd = (int)c->a[0];
@@ -132,6 +199,7 @@ static long net_ioctl(struct ctx* c) {
 	case 0x20006601: return fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ? err() : 0;   // FIOCLEX
 	case 0x20006602: return fcntl(fd, F_SETFD, 0) < 0 ? err() : 0;            // FIONCLEX
 	}
+	{ int handled; long r = tty_ioctl(fd, req, arg, &handled); if (handled) return r; }
 	if (is_kev(fd)) {
 		switch (req) {
 		case 0x40046501: { uint32_t id = 0; return safe_write(arg, &id, 4) == 4 ? 0 : -D_EFAULT; }   // SIOCGKEVID: último id de evento

@@ -15,18 +15,37 @@
 #include <unistd.h>
 
 #include <linux/falloc.h>
+#include <dirent.h>
 #include "tahoe.h"
 
 static long err(void) { return -darwin_errno(errno); }
 #define RET(r) do { long r_ = (r); return r_ < 0 ? err() : r_; } while (0)
 
-// Resuelve una ruta del programa: si TAHOE_ROOT existe y contiene el archivo, se usa esa; si no, la del host.
+// dev_t de Darwin: mayor en los 8 bits altos, menor en los 24 bajos. Las pseudoterminales de Linux (mayores 136-143) son las
+// ttys de macOS (mayor 16); el resto se recorta a 8 bits.
+uint32_t darwin_dev(unsigned ma, unsigned mi) {
+	if (ma >= 136 && ma <= 143) { mi += (ma - 136) * 256; ma = 16; }
+	return ((ma & 0xff) << 24) | (mi & 0xffffff);
+}
+// Dueños vistos desde macOS: los archivos del usuario de Linux que ejecuta tahoe-run son los del sistema (root/wheel),
+// como en una instalación real; fuera de un espacio de nombres de usuario ese uid no es 0.
+uint32_t guest_uid(uint32_t u) { return u == (uint32_t)getuid() ? 0 : u; }
+uint32_t guest_gid(uint32_t g) { return g == (uint32_t)getgid() ? 0 : g; }
+// Rutas que el invitado ve del anfitrión: solo los dispositivos (/dev). Todo lo demás vive bajo TAHOE_ROOT; si no existe
+// ahí, no existe (antes se caía a la ruta del anfitrión y el invitado veía, p. ej., /usr/bin/ls de Linux, y podía crear
+// archivos fuera de su raíz).
+int tahoe_host_passthrough(const char* p) { return !strcmp(p, "/dev") || !strncmp(p, "/dev/", 5); }
+// Terminales: en macOS son /dev/ttysNNN; en Linux, /dev/pts/N. ttyname() de macOS solo busca en /dev, así que se presentan
+// con el nombre de macOS (y getdirentries de /dev las añade).
+const char* tahoe_dev_alias(const char* p, char* buf, size_t cap) {
+	unsigned n; char extra;
+	if (sscanf(p, "/dev/ttys%u%c", &n, &extra) == 1) { snprintf(buf, cap, "/dev/pts/%u", n); return buf; }
+	return p;
+}
+// Resuelve una ruta absoluta del programa bajo TAHOE_ROOT (salvo /dev, del anfitrión).
 static const char* resolve(const char* guest, char* buf, size_t cap) {
-	if (tahoe_root && guest[0] == '/') {
-		snprintf(buf, cap, "%s%s", tahoe_root, guest);
-		if (access(buf, F_OK) == 0) return buf;
-	}
-	return guest;
+	if (tahoe_root && guest[0] == '/' && !tahoe_host_passthrough(guest)) { snprintf(buf, cap, "%s%s", tahoe_root, guest); return buf; }
+	return tahoe_dev_alias(guest, buf, cap);                                                // /dev: siempre el del anfitrión (el de la raíz está vacío)
 }
 
 // ---------------------------------------------------------------- memoria
@@ -80,13 +99,13 @@ static void put_stat(uint64_t out, const struct stat* s, uint32_t flags) {
 	uint8_t d[144];
 	memset(d, 0, sizeof d);
 #define W(type, off, v) do { type t_ = (type)(v); memcpy(d + (off), &t_, sizeof t_); } while (0)
-	W(int32_t, 0, (major(s->st_dev) << 24) | (minor(s->st_dev) & 0xffffff));
+	W(int32_t, 0, darwin_dev(major(s->st_dev), minor(s->st_dev)));
 	W(uint16_t, 4, s->st_mode);
 	W(uint16_t, 6, s->st_nlink);
 	W(uint64_t, 8, s->st_ino);
-	W(uint32_t, 16, s->st_uid);
-	W(uint32_t, 20, s->st_gid);
-	W(int32_t, 24, (major(s->st_rdev) << 24) | (minor(s->st_rdev) & 0xffffff));
+	W(uint32_t, 16, guest_uid(s->st_uid));
+	W(uint32_t, 20, guest_gid(s->st_gid));
+	W(int32_t, 24, darwin_dev(major(s->st_rdev), minor(s->st_rdev)));
 	W(int64_t, 32, s->st_atim.tv_sec);  W(int64_t, 40, s->st_atim.tv_nsec);
 	W(int64_t, 48, s->st_mtim.tv_sec);  W(int64_t, 56, s->st_mtim.tv_nsec);
 	W(int64_t, 64, s->st_ctim.tv_sec);  W(int64_t, 72, s->st_ctim.tv_nsec);
@@ -112,6 +131,80 @@ static long do_stat(struct ctx* c, int follow) {
 }
 static long bsd_stat64(struct ctx* c) { return do_stat(c, 1); }
 static long bsd_lstat64(struct ctx* c) { return do_stat(c, 0); }
+// stat64_extended / lstat64_extended / fstat64_extended: como stat, más la ACL (no hay: tamaño 0)
+static long ext_tail(struct ctx* c, long r) {
+	if (r == 0 && c->a[3]) { uint64_t z = 0; safe_write(c->a[3], &z, 8); }
+	return r;
+}
+static long bsd_stat64_ext(struct ctx* c) { return ext_tail(c, do_stat(c, 1)); }
+static long bsd_lstat64_ext(struct ctx* c) { return ext_tail(c, do_stat(c, 0)); }
+static long bsd_fstat64(struct ctx* c);
+static long bsd_fstat64_ext(struct ctx* c) { return ext_tail(c, bsd_fstat64(c)); }
+
+// ---- atributos extendidos: los de macOS ("com.apple.quarantine"...) se guardan como user.<nombre> en Linux; los internos
+// de tahoe-run (user.tahoe.*) no se muestran. options: XATTR_NOFOLLOW 0x1, XATTR_CREATE 0x2, XATTR_REPLACE 0x4.
+#include <sys/xattr.h>
+static int xname(uint64_t a, char* out, size_t cap) {
+	char n[256]; if (safe_string(a, n, sizeof n) != 0) return -D_EFAULT;
+	snprintf(out, cap, "user.%s", n); return 0;
+}
+static long xerr(void) { return errno == ENODATA ? -93 /* ENOATTR */ : errno == ENOTSUP ? -45 : err(); }
+// getxattr(ruta, nombre, valor, tamaño, posición, opciones) / fgetxattr(fd, ...)
+static long xget(struct ctx* c, int byfd) {
+	char p[4096], b[4200], nm[300]; long e;
+	if ((e = xname(c->a[1], nm, sizeof nm))) return e;
+	size_t sz = c->a[3]; uint8_t* v = sz ? malloc(sz) : NULL;
+	ssize_t r;
+	if (byfd) r = fgetxattr((int)c->a[0], nm, v, sz);
+	else { if (safe_string(c->a[0], p, sizeof p) != 0) { free(v); return -D_EFAULT; } const char* hp = resolve(p, b, sizeof b); r = (c->a[5] & 1) ? lgetxattr(hp, nm, v, sz) : getxattr(hp, nm, v, sz); }
+	if (r < 0) { e = errno == ERANGE ? -34 : xerr(); free(v); return e; }
+	if (sz && r > 0 && safe_write(c->a[2], v, (size_t)r) != r) r = -D_EFAULT;
+	free(v); return r;
+}
+static long xset(struct ctx* c, int byfd) {
+	char p[4096], b[4200], nm[300]; long e;
+	if ((e = xname(c->a[1], nm, sizeof nm))) return e;
+	size_t sz = c->a[3]; uint8_t* v = malloc(sz ? sz : 1);
+	if (sz && safe_read(c->a[2], v, sz) != (ssize_t)sz) { free(v); return -D_EFAULT; }
+	int fl = (c->a[5] & 2) ? XATTR_CREATE : (c->a[5] & 4) ? XATTR_REPLACE : 0;
+	int r;
+	if (byfd) r = fsetxattr((int)c->a[0], nm, v, sz, fl);
+	else { if (safe_string(c->a[0], p, sizeof p) != 0) { free(v); return -D_EFAULT; } const char* hp = resolve(p, b, sizeof b); r = (c->a[5] & 1) ? lsetxattr(hp, nm, v, sz, fl) : setxattr(hp, nm, v, sz, fl); }
+	free(v);
+	return r < 0 ? xerr() : 0;
+}
+// removexattr(ruta, nombre, opciones)
+static long xremove(struct ctx* c, int byfd) {
+	char p[4096], b[4200], nm[300]; long e;
+	if ((e = xname(c->a[1], nm, sizeof nm))) return e;
+	int r;
+	if (byfd) r = fremovexattr((int)c->a[0], nm);
+	else { if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT; const char* hp = resolve(p, b, sizeof b); r = (c->a[2] & 1) ? lremovexattr(hp, nm) : removexattr(hp, nm); }
+	return r < 0 ? xerr() : 0;
+}
+// listxattr(ruta, lista, tamaño, opciones): nombres separados por NUL, sin "user." ni los internos
+static long xlist(struct ctx* c, int byfd) {
+	char p[4096], b[4200], raw[8192], out[8192];
+	ssize_t r;
+	if (byfd) r = flistxattr((int)c->a[0], raw, sizeof raw);
+	else { if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT; const char* hp = resolve(p, b, sizeof b); r = (c->a[3] & 1) ? llistxattr(hp, raw, sizeof raw) : listxattr(hp, raw, sizeof raw); }
+	if (r < 0) return errno == ENOTSUP ? 0 : err();
+	size_t o = 0;
+	for (ssize_t i = 0; i < r; i += (ssize_t)strlen(raw + i) + 1) {
+		const char* n = raw + i;
+		if (strncmp(n, "user.", 5) || !strncmp(n, "user.tahoe.", 11)) continue;
+		size_t l = strlen(n + 5) + 1;
+		memcpy(out + o, n + 5, l); o += l;
+	}
+	if (!c->a[1] || !c->a[2]) return (long)o;
+	if (c->a[2] < o) return -34;                                  // ERANGE
+	return safe_write(c->a[1], out, o) == (ssize_t)o ? (long)o : -D_EFAULT;
+}
+static long bsd_getxattr(struct ctx* c) { return xget(c, 0); }   static long bsd_fgetxattr(struct ctx* c) { return xget(c, 1); }
+static long bsd_setxattr(struct ctx* c) { return xset(c, 0); }   static long bsd_fsetxattr(struct ctx* c) { return xset(c, 1); }
+static long bsd_removexattr(struct ctx* c) { return xremove(c, 0); }   static long bsd_fremovexattr(struct ctx* c) { return xremove(c, 1); }
+static long bsd_listxattr(struct ctx* c) { return xlist(c, 0); }   static long bsd_flistxattr(struct ctx* c) { return xlist(c, 1); }
+
 static long bsd_fstat64(struct ctx* c) {
 	struct stat s;
 	if (fstat((int)c->a[0], &s) != 0) return err();
@@ -412,6 +505,29 @@ static long bsd_getdirentries64(struct ctx* c) {
 	if (want < 512) want = 512 < sizeof lin ? 512 : sizeof lin;
 	long n = syscall(SYS_getdents64, fd, lin, want);
 	if (n < 0) return err();
+	// /dev del anfitrión: al acabar sus entradas se añaden las terminales con nombre de macOS (ttysNNN = /dev/pts/N)
+	static uint8_t dev_synth[4096];
+	struct stat ds, dd;
+	int is_dev = fd >= 0 && fd < 4096 && fstat(fd, &ds) == 0 && stat("/dev", &dd) == 0 && ds.st_ino == dd.st_ino && ds.st_dev == dd.st_dev;
+	if (is_dev && n > 0 && start == 0) dev_synth[fd] = 0;
+	if (is_dev && n == 0 && !dev_synth[fd]) {
+		dev_synth[fd] = 1;
+		DIR* pd = opendir("/dev/pts");
+		struct dirent* pe;
+		long k = 0;
+		while (pd && (pe = readdir(pd)) && k + 64 < (long)sizeof lin) {
+			unsigned num; char extra;
+			if (sscanf(pe->d_name, "%u%c", &num, &extra) != 1) continue;
+			char nm[16]; snprintf(nm, sizeof nm, "ttys%03u", num);
+			uint8_t* r = lin + k; size_t nl = strlen(nm); uint16_t rl = (uint16_t)((19 + nl + 1 + 7) & ~7UL);
+			memset(r, 0, rl);
+			*(uint64_t*)r = pe->d_ino; *(int64_t*)(r + 8) = (int64_t)(0x7fff0000 + num); *(uint16_t*)(r + 16) = rl; r[18] = DT_CHR;
+			memcpy(r + 19, nm, nl + 1);
+			k += rl;
+		}
+		if (pd) closedir(pd);
+		n = k;
+	}
 	uint8_t* out = malloc(gsize);
 	size_t used = 0;
 	off_t prev = start;
@@ -515,8 +631,8 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 	if (common & A_CMN_CHGTIME) { PTS(s->st_ctim); rc |= A_CMN_CHGTIME; }
 	if (common & A_CMN_ACCTIME) { PTS(s->st_atim); rc |= A_CMN_ACCTIME; }
 	if (common & A_CMN_FNDRINFO) { memset(o + n, 0, 32); n += 32; rc |= A_CMN_FNDRINFO; }
-	if (common & A_CMN_OWNERID) { P32(s->st_uid); rc |= A_CMN_OWNERID; }
-	if (common & A_CMN_GRPID) { P32(s->st_gid); rc |= A_CMN_GRPID; }
+	if (common & A_CMN_OWNERID) { P32(guest_uid(s->st_uid)); rc |= A_CMN_OWNERID; }
+	if (common & A_CMN_GRPID) { P32(guest_gid(s->st_gid)); rc |= A_CMN_GRPID; }
 	if (common & A_CMN_ACCESSMASK) { P32(s->st_mode & 07777); rc |= A_CMN_ACCESSMASK; }
 	if (common & A_CMN_FLAGS) { P32(0); rc |= A_CMN_FLAGS; }
 	if (common & A_CMN_GENCOUNT) { P32(0); rc |= A_CMN_GENCOUNT; }
@@ -682,11 +798,11 @@ static long bsd_openat(struct ctx* c) {
 	if (dfd == -2) dfd = AT_FDCWD;
 	int flags = darwin_open_flags((int)c->a[2]);
 	long fd = -1;
-	if (tahoe_root && path[0] == '/') {
+	if (tahoe_root && path[0] == '/' && !tahoe_host_passthrough(path)) {
 		snprintf(full, sizeof full, "%s%s", tahoe_root, path);
 		fd = syscall(SYS_openat, dfd, full, flags, (int)c->a[3]);
 	}
-	if (fd < 0) fd = syscall(SYS_openat, dfd, path, flags, (int)c->a[3]);
+	if (fd < 0 && (!tahoe_root || path[0] != '/' || tahoe_host_passthrough(path))) { char al[64]; fd = syscall(SYS_openat, dfd, tahoe_dev_alias(path, al, sizeof al), flags, (int)c->a[3]); }
 	if (trace_all || fd < 0) logf_("    openat(%d, \"%s\") -> %ld%s%s\n", (int)c->a[0], path, fd, fd < 0 ? " " : "", fd < 0 ? strerror(errno) : "");
 	return fd < 0 ? err() : fd;
 }
@@ -751,6 +867,11 @@ void populate_data_volume(void) {
 	nftw(tmpl_root, tmpl_copy, 32, FTW_PHYS);
 }
 
+void emu_fs_xattr_init(void) {                                  // tras emu_fs2_init (sustituye su getxattr provisional)
+	reg_bsd(234, bsd_getxattr); reg_bsd(235, bsd_fgetxattr); reg_bsd(236, bsd_setxattr); reg_bsd(237, bsd_fsetxattr);
+	reg_bsd(238, bsd_removexattr); reg_bsd(239, bsd_fremovexattr); reg_bsd(240, bsd_listxattr); reg_bsd(241, bsd_flistxattr);
+	reg_bsd(341, bsd_stat64_ext); reg_bsd(342, bsd_lstat64_ext); reg_bsd(343, bsd_fstat64_ext);
+}
 void emu_fs_init(void) {
 	reg_bsd(73, bsd_munmap);   reg_bsd(74, bsd_mprotect); reg_bsd(75, bsd_madvise); reg_bsd(197, bsd_mmap);
 	reg_bsd(199, bsd_lseek);   reg_bsd(153, bsd_pread);   reg_bsd(154, bsd_pwrite);

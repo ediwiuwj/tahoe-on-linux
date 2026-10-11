@@ -22,8 +22,8 @@ static long err(void) { return -darwin_errno(errno); }
 static long rpath(uint64_t addr, char* out, size_t cap) {
 	char g[4096];
 	if (safe_string(addr, g, sizeof g) != 0) return -D_EFAULT;
-	if (tahoe_root && g[0] == '/') snprintf(out, cap, "%s%s", tahoe_root, g);
-	else snprintf(out, cap, "%s", g);
+	if (tahoe_root && g[0] == '/' && !tahoe_host_passthrough(g)) snprintf(out, cap, "%s%s", tahoe_root, g);
+	else { char al[64]; snprintf(out, cap, "%s", tahoe_dev_alias(g, al, sizeof al)); }
 	return 0;
 }
 #define PATH1(var, argi) char var[4400]; { long e_ = rpath(c->a[argi], var, sizeof var); if (e_) return e_; }
@@ -135,8 +135,8 @@ static int dfd(uint64_t v) { return (int)v == -2 ? AT_FDCWD : (int)v; }
 static long apath(uint64_t addr, char* out, size_t cap) {
 	char g[4096];
 	if (safe_string(addr, g, sizeof g) != 0) return -D_EFAULT;
-	if (tahoe_root && g[0] == '/') snprintf(out, cap, "%s%s", tahoe_root, g);
-	else snprintf(out, cap, "%s", g);
+	if (tahoe_root && g[0] == '/' && !tahoe_host_passthrough(g)) snprintf(out, cap, "%s%s", tahoe_root, g);
+	else { char al[64]; snprintf(out, cap, "%s", tahoe_dev_alias(g, al, sizeof al)); }
 	return 0;
 }
 static long bsd_renameat(struct ctx* c) { char a[4400], b[4400]; long e; if ((e = apath(c->a[1], a, sizeof a)) || (e = apath(c->a[3], b, sizeof b))) return e; RET(renameat(dfd(c->a[0]), a, dfd(c->a[2]), b)); }
