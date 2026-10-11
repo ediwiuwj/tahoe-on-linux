@@ -13,6 +13,7 @@
 #include <sys/timerfd.h>
 
 #include <sched.h>
+#include <signal.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include "tahoe.h"
@@ -45,6 +46,15 @@ struct mslot { uint32_t next, size, total, spid, suid, sgid; uint8_t data[MSGSZ 
 struct sonce { uint32_t port; int32_t holder; };
 struct dnreq { uint32_t port, notify; int32_t pid; };
 struct sproc { int32_t pid; uint64_t start; };
+// Objetos del núcleo con nombre de puerto (tareas de otros procesos, tokens de identidad...): el nombre lleva a su tipo y pid.
+#define MAXKOBJ 1024
+struct skobj { uint32_t name; uint16_t type; int32_t pid; };
+// Mapeos hechos por otro proceso en esta tarea (mach_vm_map con la tarea de otro como destino): Linux no puede mapear en otro
+// proceso, así que se reserva un hueco en una zona común (RMAP_BASE) y el destino lo mapea él mismo al primer acceso.
+#define MAXRMAP 512
+#define RMAP_BASE 0x500000000000ULL
+#define RMAP_SIZE 0x100000000ULL
+struct srmap { int32_t pid; int32_t prot; uint64_t addr, len, off; char path[96]; };
 struct shm {
 	pthread_mutex_t lk; pthread_cond_t cv;
 	uint32_t next_name, free_head, magic, special[8];
@@ -53,6 +63,9 @@ struct shm {
 	struct sonce so[MAXSO];
 	struct dnreq dn[MAXDN];
 	struct sproc procs[MAXPROC];
+	struct skobj kobjs[MAXKOBJ];
+	struct srmap rmaps[MAXRMAP];
+	uint64_t rmap_next;
 };
 static struct shm* shm;
 static char shm_path[128], tag[32];
@@ -867,9 +880,77 @@ static long t_get_attributes(struct ctx* c) {
 	return KERN_OK;
 }
 // task_name_for_pid(host, pid, *puerto): puerto de nombre de tarea ficticio por proceso
+// Reserva en la zona común un hueco para `len` bytes del archivo `path` (desde `off`) en la tarea `pid`. Devuelve la dirección.
+uint64_t rmap_add(int32_t pid, const char* path, uint64_t off, uint64_t len, int prot, uint64_t align) {
+	if (align < 4096) align = 4096;
+	lock();
+	uint64_t a = (RMAP_BASE + shm->rmap_next + align - 1) & ~(align - 1);
+	uint64_t r = 0;
+	if (a + len <= RMAP_BASE + RMAP_SIZE) {
+		for (int i = 0; i < MAXRMAP; i++) if (!shm->rmaps[i].pid) {
+			struct srmap* e = &shm->rmaps[i];
+			e->pid = pid; e->prot = prot; e->addr = a; e->len = len; e->off = off;
+			snprintf(e->path, sizeof e->path, "%s", path);
+			shm->rmap_next = a + len - RMAP_BASE;
+			r = a;
+			break;
+		}
+	}
+	unlock();
+	if (!r) logf_("    rmap: sin hueco para 0x%lx bytes\n", len);
+	return r;
+}
+// Fallo de página en la zona común: si otro proceso mapeó ahí algo para esta tarea, se mapea ahora. 1 = resuelto.
+int rmap_fault(uint64_t addr) {
+	if (addr < RMAP_BASE || addr >= RMAP_BASE + RMAP_SIZE || !shm) return 0;
+	struct srmap e = { 0 };
+	lock();
+	for (int i = 0; i < MAXRMAP; i++) {
+		struct srmap* q = &shm->rmaps[i];
+		if (q->pid == (int32_t)getpid() && addr >= q->addr && addr < q->addr + q->len) { e = *q; break; }
+	}
+	unlock();
+	if (!e.pid) return 0;
+	int fd = open(e.path, O_RDWR | O_CLOEXEC);
+	if (fd < 0) return 0;
+	void* p = mmap((void*)e.addr, e.len, e.prot & 7, MAP_SHARED | MAP_FIXED, fd, (off_t)e.off);
+	close(fd);
+	return p != MAP_FAILED;
+}
+// Nombre (estable por tipo y pid) de un objeto del núcleo; se reutiliza si ya existe.
+uint32_t kobj_make(int type, int32_t pid) {
+	lock();
+	uint32_t r = 0;
+	for (int i = 0; i < MAXKOBJ && !r; i++) if (shm->kobjs[i].name && shm->kobjs[i].type == type && shm->kobjs[i].pid == pid) r = shm->kobjs[i].name;
+	if (!r) {
+		r = shm->next_name; shm->next_name += 0x100;
+		int put = 0;
+		for (int i = 0; i < MAXKOBJ; i++) if (!shm->kobjs[i].name) { shm->kobjs[i] = (struct skobj){ r, (uint16_t)type, pid }; put = 1; break; }
+		if (!put) logf_("    kobj: tabla llena\n");
+	}
+	unlock();
+	return r;
+}
+int kobj_lookup(uint32_t name, int* type, int32_t* pid) {
+	if (name == 0x103) { *type = KO_TASK; *pid = (int32_t)getpid(); return 1; }   // mach_task_self
+	lock();
+	int ok = 0;
+	for (int i = 0; i < MAXKOBJ; i++) if (shm->kobjs[i].name == name) { *type = shm->kobjs[i].type; *pid = shm->kobjs[i].pid; ok = 1; break; }
+	unlock();
+	return ok;
+}
+// task_name_for_pid(task, pid, *nombre)
 static long t_task_name_for_pid(struct ctx* c) {
-	uint32_t n = alloc_port();
+	int32_t pid = (int32_t)c->a[1];
+	if (pid <= 0 || kill(pid, 0) != 0) return 5 /* KERN_FAILURE */;
+	uint32_t n = pid == (int32_t)getpid() ? 0x103 : kobj_make(KO_TASK_NAME, pid);
 	return safe_write(c->a[2], &n, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
+}
+// pid_for_task(tarea, *pid)
+static long t_pid_for_task(struct ctx* c) {
+	int type; int32_t pid;
+	if (!kobj_lookup((uint32_t)c->a[0], &type, &pid) || (type != KO_TASK && type != KO_TASK_NAME)) return 5;
+	return safe_write(c->a[1], &pid, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }
 
 // mach_port_request_notification_trap(task, nombre, variante, sync, aviso, polí, *anterior)
@@ -909,7 +990,7 @@ static long t_request_notification(struct ctx* c) {
 
 void emu_port_init(void) {
 	reg_mach(42, t_unguard); reg_mach(77, t_request_notification);
-	reg_mach(41, t_guard); reg_mach(40, t_get_attributes); reg_mach(44, t_task_name_for_pid);
+	reg_mach(41, t_guard); reg_mach(40, t_get_attributes); reg_mach(44, t_task_name_for_pid); reg_mach(46, t_pid_for_task);
 	reg_mach(70, t_voucher_create);
 	reg_mach(91, t_mk_create); reg_mach(92, t_mk_destroy); reg_mach(93, t_mk_arm); reg_mach(94, t_mk_cancel); reg_mach(95, t_mk_arm_leeway);
 	reg_mach(43, t_activity_id);

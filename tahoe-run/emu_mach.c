@@ -75,6 +75,7 @@ static size_t mig_make_memory_entry(const struct hdr* req, const uint8_t* m, uin
 		if (ok && mmap((void*)off, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) ok = 0;
 	}
 	if (fd >= 0) close(fd);
+	if (mach_trace()) { uint32_t perm = 0; memcpy(&perm, m + 64, 4); logf_("    MT pid=%d make_memory_entry tamaño=0x%lx dir=0x%lx permiso=0x%x -> puerto 0x%x %s\n", (int)getpid(), size, off, perm, port, ok ? "ok" : "FALLO"); }
 	if (!ok) return reply_begin(r, req, KERN_INVALID_ARG);
 	size_t n = reply_port(r, req, port, 17);
 	memcpy(r + n, NDR_LE, 8); memcpy(r + n + 8, &len, 8);
@@ -97,6 +98,15 @@ static size_t mig_mach_vm_map(const struct hdr* req, const uint8_t* m, uint8_t* 
 	memcpy(&flags, m + 72, 4);
 	memcpy(&cur, m + 88, 4);
 	int32_t kr = KERN_SUCCESS_;
+	int ttype; int32_t tpid;
+	if (objname && kobj_lookup(req->remote, &ttype, &tpid) && ttype == KO_TASK && tpid != (int32_t)getpid()) {
+		// la tarea destino es otro proceso: se reserva el hueco en la zona común y él lo mapeará al usarlo
+		uint64_t moff; memcpy(&moff, m + 76, 8);
+		char path[128]; me_path(path, sizeof path, objname);
+		addr = rmap_add(tpid, path, moff, round_up(size), cur & 7, mask + 1);
+		if (!addr) kr = KERN_NO_SPACE_;
+		goto done;
+	}
 	if (objname) {                                          // objeto = entrada de memoria compartida
 		uint64_t moff; memcpy(&moff, m + 76, 8);
 		char path[128]; me_path(path, sizeof path, objname);
@@ -127,6 +137,7 @@ static size_t mig_mach_vm_map(const struct hdr* req, const uint8_t* m, uint8_t* 
 		addr = (uint64_t)p;
 	}
 done:;
+	if (mach_trace() && objname) logf_("    MT pid=%d vm_map objeto=0x%x tamaño=0x%lx flags=0x%x prot=%d -> 0x%lx kr=%d\n", (int)getpid(), objname, size, flags, cur, addr, kr);
 	size_t n = reply_begin(r, req, kr);
 	memcpy(r + n, &addr, 8);                                    // address (salida)
 	return n + 8;
@@ -444,9 +455,14 @@ static long mach_msg2(struct ctx* c) {
 	case 3440: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // task_set_mach_voucher
 	case 3442: n = reply_begin(rep, &h, 46 /* KERN_NOT_SUPPORTED */); break;   // task_generate_corpse: sin corpses
 	case 3457: {                                                  // task_create_identity_token(task) -> token (puerto)
-		static uint32_t token;                                    // un token de identidad por proceso, como objeto del núcleo
-		if (!token) token = alloc_port();
-		n = reply_port(rep, &h, token, 17);
+		n = reply_port(rep, &h, kobj_make(KO_IDENTITY_TOKEN, (int32_t)getpid()), 17);   // el token identifica a este proceso
+		break;
+	}
+	case 3458: {                                                  // task_identity_token_get_task_port(token, flavor) -> tarea
+		int type; int32_t pid;
+		if (!kobj_lookup(h.remote, &type, &pid) || type != KO_IDENTITY_TOKEN) { n = reply_begin(rep, &h, 4 /* KERN_INVALID_ARGUMENT */); break; }
+		if (pid != (int32_t)getpid() && kill(pid, 0) != 0) { n = reply_begin(rep, &h, 5 /* KERN_FAILURE: ya no existe */); break; }
+		n = reply_port(rep, &h, pid == (int32_t)getpid() ? 0x103 : kobj_make(KO_TASK, pid), 17);
 		break;
 	}
 	case 3455: {                                                  // _kernelrpc_mach_task_is_self(task) -> boolean

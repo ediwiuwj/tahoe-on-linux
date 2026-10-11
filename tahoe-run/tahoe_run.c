@@ -966,6 +966,7 @@ static void on_sigsegv(int sig, siginfo_t* si, void* v) {
 	(void)sig;
 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
 	if (si->si_code == 0x80 /*SI_KERNEL*/ && emulate_sidt(v)) { selector = SYSCALL_DISPATCH_FILTER_BLOCK; return; }
+	if (rmap_fault((uint64_t)si->si_addr)) { selector = SYSCALL_DISPATCH_FILTER_BLOCK; return; }   // memoria que otro proceso mapeó aquí
 	logf_("    SIGSEGV <%d> hilo %ld dirección=%p rip=0x%llx\n", getpid(), (long)syscall(SYS_gettid), si->si_addr, (unsigned long long)((ucontext_t*)v)->uc_mcontext.gregs[REG_RIP]);
 	diag_crash(v);
 	diag_dump_threads();
@@ -980,7 +981,7 @@ int tahoe_sigaction(int sig, void (*h)(int, siginfo_t*, void*)) {
 	return (int)syscall(SYS_rt_sigaction, sig, &ks, NULL, 8);
 }
 static void install_dispatch(void) {
-	{ struct sigaction ss = { .sa_sigaction = on_sigsegv, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER }; sigaction(SIGSEGV, &ss, NULL); }
+	tahoe_sigaction(SIGSEGV, on_sigsegv);                      // vuelve al invitado: restaurador propio (sidt, zona común)
 	struct sigaction sa = { .sa_sigaction = on_sigill, .sa_flags = SA_SIGINFO | SA_ONSTACK };
 	sigaction(SIGILL, &sa, NULL);
 	stack_t ss = { .ss_sp = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), .ss_size = 1 << 18 };
