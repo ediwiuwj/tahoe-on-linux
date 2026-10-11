@@ -141,7 +141,7 @@ static void sync_fd(int kq, int fd) {
 #define NOTE_EXEC 0x20000000u
 // EVFILT_PROC con NOTE_EXEC: ¿llegó un aviso de exec? (se consume) / ¿terminó el proceso? (el pidfd es legible)
 static int proc_exec_pending(struct knote* n) {
-	uint8_t* m = NULL; uint32_t sz = 0, snd[3];
+	uint8_t* m = NULL; uint32_t sz = 0, snd[5];
 	if (port_receive(n->xport, 0, &m, &sz, snd, 0, 0) != 0) return 0;
 	free(m);
 	return 1;
@@ -527,7 +527,7 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 				else { k.fflags = 0; k.ext[0] = k.ext[1] = k.ext[2] = k.ext[3] = 0; }   // sin recepción directa: solo "hay mensaje"
 			}
 			else if (n->k.filter == EVFILT_FS) {
-				uint8_t* m = NULL; uint32_t sz = 0, snd[3];
+				uint8_t* m = NULL; uint32_t sz = 0, snd[5];
 				if (port_receive(n->xport, 0, &m, &sz, snd, 0, 0) != 0) continue;   // aviso sin mensaje
 				uint32_t vq = 0; if (sz >= 24) memcpy(&vq, m + 20, 4);
 				free(m);

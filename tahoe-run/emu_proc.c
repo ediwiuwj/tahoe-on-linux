@@ -1331,16 +1331,6 @@ static long bsd_proc_rlimit_control(struct ctx* c) { (void)c; return 0; }   // l
 
 static long bsd_audit_session_self(struct ctx* c) { (void)c; return 0x1503; }   // puerto ficticio de la sesión de auditoría
 
-// getaudit_addr(auditinfo_addr_t*, tamaño 0x30): auid=-1 (sin sesión de inicio), máscara 0, terminal vacío y
-// un identificador de sesión de auditoría no nulo.
-static long bsd_getaudit_addr(struct ctx* c) {
-	uint8_t a[0x30] = { 0 };
-	uint32_t auid = (uint32_t)-1, asid = (uint32_t)getpid();
-	memcpy(a, &auid, 4);
-	memcpy(a + 36, &asid, 4);
-	return safe_write(c->a[0], a, c->a[1] < sizeof a ? c->a[1] : sizeof a) < 0 ? -D_EFAULT : 0;
-}
-
 // sigsuspend(mask): aquí no hay señales de Darwin reales todavía; el hilo se duerme hasta que Linux lo interrumpa.
 static long bsd_sigsuspend(struct ctx* c) { (void)c; syscall(SYS_pause); return -4; /* EINTR */ }
 
@@ -1428,14 +1418,12 @@ void emu_proc_init(void) {
 	reg_bsd(322, bsd_proc_rlimit_control);   // iopolicysys: sin efecto
 	reg_bsd(331, bsd_proc_rlimit_control);   // __disable_threadsignal: sin efecto
 	reg_bsd(111, bsd_sigsuspend); reg_bsd(410, bsd_sigsuspend);
-	reg_bsd(357, bsd_getaudit_addr);
 	reg_bsd(428, bsd_audit_session_self);
 	reg_bsd(446, bsd_proc_rlimit_control);
 	reg_bsd(243, bsd_proc_rlimit_control);   // initgroups: sin efecto
 	reg_bsd(499, bsd_work_interval_ctl);
 	reg_bsd(440, bsd_proc_rlimit_control);   // memorystatus_control: sin efecto reg_bsd(444, bsd_proc_rlimit_control);   // change_fdguard_np
 	reg_bsd(552, bsd_proc_rlimit_control);   // record_system_event: sin efecto
-	reg_bsd(358, bsd_proc_rlimit_control);   // setaudit_addr: sin efecto
 	reg_bsd(50, bsd_proc_rlimit_control);   // setlogin: sin efecto
 	reg_bsd(367, bsd_workq_open); reg_bsd(368, bsd_workq_kernreturn);
 	reg_bsd(360, bsd_bsdthread_create); reg_bsd(361, bsd_bsdthread_terminate);

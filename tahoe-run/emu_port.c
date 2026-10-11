@@ -36,7 +36,7 @@
 #define MAXMSG   512
 #define MSGSZ    (64 * 1024)
 struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; };   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
-struct mslot { uint32_t next, size, total, spid, suid, sgid; uint8_t data[MSGSZ - 24]; };
+struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint8_t data[MSGSZ - 32]; };   // sauid/sasid: sesión de auditoría del remitente
 // Derechos que el núcleo tiene que vigilar para avisar cuando muere su dueño (ver "notificaciones" más abajo):
 //  sonce: un proceso tiene un derecho send-once (normalmente, la respuesta que debe a quien le pidió algo);
 //  dnreq: un proceso pidió MACH_NOTIFY_DEAD_NAME sobre un puerto (aviso al puerto `notify` cuando muera);
@@ -551,7 +551,8 @@ static int port_send_k(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 	struct mslot* q = &shm->msgs[idx - 1];
 	shm->free_head = q->next;
 	q->next = 0; q->size = size; q->total = (uint32_t)total;
-	q->spid = kernel ? 0 : (uint32_t)getpid(); q->suid = kernel ? 0 : cred_euid(); q->sgid = kernel ? 0 : cred_egid();   // para el trailer de auditoría del receptor
+	q->spid = kernel ? 0 : (uint32_t)getpid(); q->suid = kernel ? 0 : cred_euid(); q->sgid = kernel ? 0 : cred_egid();
+	q->sauid = kernel ? (uint32_t)-1 : cred_auid(); q->sasid = kernel ? 0 : cred_asid();   // para el trailer de auditoría del receptor
 	if (!kernel) msg_rights_locked(msg, size, RIGHTS_SEND, dest);
 	memcpy(q->data, msg, size);
 	uint32_t pos = size;
@@ -575,7 +576,7 @@ static int port_send_k(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 
 // Saca un mensaje de un puerto o de cualquier miembro de un conjunto. timeout_ms < 0: sin plazo.
 // Devuelve 0 con *out/*size (a liberar con free), o un código mach_msg de error.
-int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, uint32_t* sender /* pid, uid, gid */, uint32_t limit, int large) {
+int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, uint32_t* sender /* pid, uid, gid, auid, asid */, uint32_t limit, int large) {
 	struct timespec dl;
 	if (timeout_ms >= 0) { clock_gettime(CLOCK_MONOTONIC, &dl); dl.tv_sec += timeout_ms / 1000; dl.tv_nsec += (timeout_ms % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; } }
 	lock();
@@ -601,7 +602,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			msg_rights_locked(q->data, q->size, RIGHTS_RECV, src->name);
 			if (src->set) { struct sport* s = find_locked(src->set); if (s && s->count) s->count--; }
 			uint32_t sz = q->size, tot = q->total;
-			if (sender) { sender[0] = q->spid; sender[1] = q->suid; sender[2] = q->sgid; }
+			if (sender) { sender[0] = q->spid; sender[1] = q->suid; sender[2] = q->sgid; sender[3] = q->sauid; sender[4] = q->sasid; }
 			uint8_t* m = malloc(tot ? tot : 1);
 			memcpy(m, q->data, tot);
 			q->next = shm->free_head; shm->free_head = idx;

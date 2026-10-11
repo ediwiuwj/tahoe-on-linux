@@ -339,7 +339,7 @@ static size_t mig_task_info(const struct hdr* req, const uint8_t* m, uint8_t* r)
 	memcpy(&flavor, m + 32, 4);
 	memcpy(&cap, m + 36, 4);
 	if (flavor == 15 && cap >= 8) {                             // audit_token_t: 8 enteros
-		uint32_t tok[8] = { (uint32_t)-1, geteuid(), getegid(), getuid(), getgid(), (uint32_t)getpid(), 0, 1 };
+		uint32_t tok[8] = { cred_auid(), cred_euid(), cred_egid(), cred_euid(), cred_egid(), (uint32_t)getpid(), cred_asid(), 1 };   // auid, euid, egid, ruid, rgid, pid, asid
 		int ktype; int32_t kpid;
 		if (kobj_lookup(req->remote, &ktype, &kpid) && (ktype == KO_TASK || ktype == KO_TASK_NAME) && kpid != (int32_t)getpid()) {
 			// la tarea de otro proceso (task_name_for_pid...): su token, no el de quien pregunta. launchd lo usa como destino de
@@ -353,7 +353,7 @@ static size_t mig_task_info(const struct hdr* req, const uint8_t* m, uint8_t* r)
 				else if (!strncmp(ln, "Gid:", 4)) sscanf(ln + 4, "%u %u", &rg, &eg);
 			}
 			fclose(f);
-			uint32_t o[8] = { (uint32_t)-1, eu, eg, ru, rg, (uint32_t)kpid, 0, 1 };
+			uint32_t o[8] = { (uint32_t)-1, eu, eg, ru, rg, (uint32_t)kpid, 100000, 1 };   // sesión del sistema (la propia del otro proceso no se conoce aquí)
 			memcpy(tok, o, sizeof tok);
 		}
 		size_t n = reply_begin(r, req, KERN_SUCCESS_);
@@ -457,7 +457,7 @@ static uint32_t rx_disp(uint32_t tx) {
 // Devuelve 0 o un código mach_msg; *total = bytes escritos (mensaje + trailer).
 long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total) {
 	uint32_t elems = (uint32_t)(options >> 24) & 0xf, tsize = elems == 0 ? 8 : elems == 1 ? 12 : elems == 2 ? 20 : elems == 3 ? 52 : 68;
-	uint8_t* m; uint32_t size, snd[3] = { 0, 0, 0 };
+	uint8_t* m; uint32_t size, snd[5] = { 0, 0, 0, (uint32_t)-1, 0 };
 	int large = (options & 0x4) != 0;                         // MACH_RCV_LARGE
 	int r = port_receive(rcv_name, timeout_ms, &m, &size, snd, cap > tsize ? cap - tsize : 1, large);
 	if (r == 0x10004004 && large) {                           // el mensaje sigue en la cola; el receptor lee el tamaño de la cabecera
@@ -492,7 +492,7 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 		}
 	}
 	uint8_t tr[68] = { 0 };
-	uint32_t seq = 0, uid = snd[1], gid = snd[2], at[8] = { (uint32_t)-1, snd[1], snd[2], snd[1], snd[2], snd[0], 0, 1 };
+	uint32_t seq = 0, uid = snd[1], gid = snd[2], at[8] = { snd[3], snd[1], snd[2], snd[1], snd[2], snd[0], snd[4], 1 };   // audit_token_t: auid, euid, egid, ruid, rgid, pid, asid, versión
 	memcpy(tr + 4, &tsize, 4);
 	if (tsize >= 12) memcpy(tr + 8, &seq, 4);
 	if (tsize >= 20) { memcpy(tr + 12, &uid, 4); memcpy(tr + 16, &gid, 4); }

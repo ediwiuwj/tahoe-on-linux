@@ -17,6 +17,15 @@ static uint32_t ruid, euid, svuid, rgid, egid, svgid;
 static uint32_t groups[NGROUPS_MAX_];
 static int ngroups = 1;                       // como root: grupo 0
 
+// Sesión de auditoría (BSM de XNU): auid (usuario de la sesión de inicio, -1 = ninguno), asid (identificador de la
+// sesión), banderas y máscara. Se heredan como las credenciales. launchd y sus servicios están en la sesión del sistema;
+// setaudit_addr con AU_ASSIGN_ASID crea una nueva (loginwindow / SessionCreate para la sesión de la consola). Los
+// servicios distinguen así las sesiones de usuario: launchservicesd guarda una por asid y aborta si la ve dos veces.
+#define AU_DEFAULT_ASID 100000u                                  // primera sesión asignada por XNU (ASSIGNED_ASID_MIN)
+static uint32_t au_auid = (uint32_t)-1, au_asid = AU_DEFAULT_ASID, au_mask[2];
+static uint64_t au_flags;
+uint32_t cred_auid(void) { return au_auid; }
+uint32_t cred_asid(void) { return au_asid; }
 uint32_t cred_euid(void) { return euid; }
 uint32_t cred_egid(void) { return egid; }
 
@@ -24,6 +33,7 @@ uint32_t cred_egid(void) { return egid; }
 void cred_env(char* out, size_t cap) {
 	int k = snprintf(out, cap, "TAHOE_CRED=%u,%u,%u,%u,%u,%u", ruid, euid, svuid, rgid, egid, svgid);
 	for (int i = 0; i < ngroups && k > 0 && (size_t)k < cap; i++) k += snprintf(out + k, cap - (size_t)k, ",%u", groups[i]);
+	if (k > 0 && (size_t)k < cap) snprintf(out + k, cap - (size_t)k, "/%u,%u,%u,%u,%llu", au_auid, au_asid, au_mask[0], au_mask[1], (unsigned long long)au_flags);   // /sesión de auditoría
 }
 static void cred_load(void) {
 	const char* v = getenv("TAHOE_CRED");
@@ -35,6 +45,35 @@ static void cred_load(void) {
 	ruid = (uint32_t)x[0]; euid = (uint32_t)x[1]; svuid = (uint32_t)x[2]; rgid = (uint32_t)x[3]; egid = (uint32_t)x[4]; svgid = (uint32_t)x[5];
 	ngroups = 0;
 	for (int i = 6; i < n; i++) groups[ngroups++] = (uint32_t)x[i];
+	const char* a = strchr(getenv("TAHOE_CRED"), '/');
+	if (a) { unsigned long long f = 0; unsigned u = 0, s = 0, m0 = 0, m1 = 0;
+		if (sscanf(a + 1, "%u,%u,%u,%u,%llu", &u, &s, &m0, &m1, &f) >= 2) { au_auid = u; au_asid = s; au_mask[0] = m0; au_mask[1] = m1; au_flags = f; } }
+}
+// getaudit_addr / setaudit_addr (auditinfo_addr_t, 0x30 bytes): auid, máscara (2×u32), terminal (24 bytes), asid (+36)
+// y banderas (+40). AU_ASSIGN_ASID (-1) en asid pide una sesión nueva: se le da un número propio (sesión base + pid, único
+// mientras viva quien la creó). Solo root cambia la sesión.
+static long b_getaudit_addr(struct ctx* c) {
+	uint8_t a[0x30] = { 0 };
+	memcpy(a, &au_auid, 4); memcpy(a + 4, au_mask, 8); memcpy(a + 36, &au_asid, 4); memcpy(a + 40, &au_flags, 8);
+	return safe_write(c->a[0], a, c->a[1] < sizeof a ? c->a[1] : sizeof a) < 0 ? -D_EFAULT : 0;
+}
+static long b_setaudit_addr(struct ctx* c) {
+	uint8_t a[0x30] = { 0 };
+	if (c->a[1] < sizeof a || safe_read(c->a[0], a, sizeof a) != sizeof a) return -D_EINVAL;
+	if (euid != 0) return -D_EPERM;
+	uint32_t auid, asid; uint64_t fl;
+	memcpy(&auid, a, 4); memcpy(&asid, a + 36, 4); memcpy(&fl, a + 40, 8);
+	au_auid = auid; memcpy(au_mask, a + 4, 8); au_flags = fl;
+	au_asid = asid == (uint32_t)-1 ? AU_DEFAULT_ASID + (uint32_t)getpid() : asid;
+	memcpy(a + 36, &au_asid, 4);
+	safe_write(c->a[0], a, sizeof a);                               // como XNU: devuelve el asid asignado
+	return 0;
+}
+static long b_getauid(struct ctx* c) { return safe_write(c->a[0], &au_auid, 4) == 4 ? 0 : -D_EFAULT; }
+static long b_setauid(struct ctx* c) {
+	uint32_t v; if (safe_read(c->a[0], &v, 4) != 4) return -D_EFAULT;
+	if (euid != 0) return -D_EPERM;
+	au_auid = v; return 0;
 }
 
 #define D_EPERM 1
@@ -128,4 +167,5 @@ void emu_cred_init(void) {
 	reg_bsd(126, b_setreuid); reg_bsd(127, b_setregid);
 	reg_bsd(79, b_getgroups); reg_bsd(80, b_setgroups); reg_bsd(243, b_initgroups);
 	reg_bsd(293, b_identitysvc);
+	reg_bsd(357, b_getaudit_addr); reg_bsd(358, b_setaudit_addr); reg_bsd(353, b_getauid); reg_bsd(354, b_setauid);
 }

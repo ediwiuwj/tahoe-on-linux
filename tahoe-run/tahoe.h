@@ -83,6 +83,8 @@ void diag_dump_threads(void);
 void diag_breakpoints(void);
 uint32_t cred_euid(void);
 uint32_t cred_egid(void);
+uint32_t cred_auid(void);           // emu_cred.c: sesión de auditoría del proceso (auid, asid)
+uint32_t cred_asid(void);
 void cred_env(char* out, size_t cap);
 void emu_cred_init(void);
 void emu_fs_xattr_init(void);
