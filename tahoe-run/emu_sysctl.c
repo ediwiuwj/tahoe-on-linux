@@ -158,7 +158,9 @@ static int read_file(const char* path, char* buf, size_t cap) {
 static int is_tahoe_proc(int pid) {
 	static char self[512]; static ssize_t sl = -1;
 	if (sl < 0) { sl = readlink("/proc/self/exe", self, sizeof self - 1); if (sl > 0) self[sl] = 0; }
-	char p[64], e[512]; snprintf(p, sizeof p, "/proc/%d/exe", pid);
+	char d[128], p[160], e[512];
+	if (proc_dir(pid, d, sizeof d) != 0) return 0;
+	snprintf(p, sizeof p, "%s/exe", d);
 	ssize_t n = readlink(p, e, sizeof e - 1);
 	if (n <= 0 || sl <= 0) return 0;
 	e[n] = 0;
@@ -166,7 +168,9 @@ static int is_tahoe_proc(int pid) {
 }
 // argv de macOS del proceso: devuelve argc y deja los argumentos (separados por NUL) en out
 static int guest_argv(int pid, char* out, size_t cap, size_t* len) {
-	char p[64], buf[16384]; snprintf(p, sizeof p, "/proc/%d/cmdline", pid);
+	char d[128], p[160], buf[16384];
+	if (proc_dir(pid, d, sizeof d) != 0) return -1;
+	snprintf(p, sizeof p, "%s/cmdline", d);
 	int n = read_file(p, buf, sizeof buf); if (n <= 0) return -1;
 	int idx = 0, argc = 0; size_t o = 0;
 	for (int i = 0; i < n; ) {
@@ -185,7 +189,9 @@ static int guest_argv(int pid, char* out, size_t cap, size_t* len) {
 	return argc;
 }
 static uint32_t proc_euid(int pid) {
-	char p[64], env[32768]; snprintf(p, sizeof p, "/proc/%d/environ", pid);
+	char d[128], p[160], env[32768];
+	if (proc_dir(pid, d, sizeof d) != 0) return 0;
+	snprintf(p, sizeof p, "%s/environ", d);
 	FILE* f = fopen(p, "r"); if (!f) return 0;
 	size_t n = fread(env, 1, sizeof env - 1, f); fclose(f); env[n] = 0;
 	for (size_t i = 0; i < n; i += strlen(env + i) + 1)
@@ -194,8 +200,9 @@ static uint32_t proc_euid(int pid) {
 }
 static int fill_kinfo(int pid, uint8_t* o) {
 	if (!is_tahoe_proc(pid)) return -1;
-	char path[64], buf[512];
-	snprintf(path, sizeof path, "/proc/%d/stat", pid);
+	char dir[128], path[160], buf[512];
+	if (proc_dir(pid, dir, sizeof dir) != 0) return -1;
+	snprintf(path, sizeof path, "%s/stat", dir);   // el de un hilo vivo si el líder es zombi: su estado es el del proceso
 	FILE* f = fopen(path, "r");
 	if (!f) return -1;
 	size_t n = fread(buf, 1, sizeof buf - 1, f);
@@ -225,6 +232,16 @@ static int fill_kinfo(int pid, uint8_t* o) {
 	if (tty) { unsigned ma = ((unsigned)tty >> 8) & 0xfff, mi = ((unsigned)tty & 0xff) | (((unsigned)tty >> 12) & 0xfff00); tdev = (int32_t)darwin_dev(ma, mi); }
 	memcpy(o + 572, &tdev, 4); memcpy(o + 576, &tpgid, 4);
 	if (!tty) { p_flag &= ~0x2; memcpy(o + 32, &p_flag, 4); }
+	if (sess == pid) { int32_t ef = 0x2; memcpy(o + 612, &ef, 4); }   // e_flag: EPROC_SLEADER (la «s» de STAT en ps)
+	{   // p_starttime (timeval al principio de extern_proc): campo 22 de stat, en ticks desde el arranque del sistema
+		unsigned long long start = 0; int fi = 3;
+		for (char* q = rp + 2; *q && fi < 22; q++) if (*q == ' ') { fi++; if (fi == 22) start = strtoull(q + 1, NULL, 10); }
+		long hz = sysconf(_SC_CLK_TCK); if (hz <= 0) hz = 100;
+		struct timespec now, up; clock_gettime(CLOCK_REALTIME, &now); clock_gettime(CLOCK_BOOTTIME, &up);
+		double s = (double)now.tv_sec + now.tv_nsec / 1e9 - (up.tv_sec + up.tv_nsec / 1e9) + (double)start / (double)hz;
+		int64_t sec = (int64_t)s; int32_t usec = (int32_t)((s - (double)sec) * 1e6);
+		memcpy(o, &sec, 8); memcpy(o + 8, &usec, 4);
+	}
 	return 0;
 }
 
@@ -433,7 +450,9 @@ long bsd_sysctl(struct ctx* c) {
 		size_t pl = strlen(av) + 1; memcpy(b + k, av, pl); k += pl;           // ruta del ejecutable
 		k = (k + 7) & ~(size_t)7;                                              // relleno de NUL hasta alinear
 		memcpy(b + k, av, al); k += al;                                        // argv
-		char ep[64], env[8192]; snprintf(ep, sizeof ep, "/proc/%d/environ", pid);
+		char ed[128], ep[160], env[8192];
+		if (proc_dir(pid, ed, sizeof ed) != 0) snprintf(ed, sizeof ed, "/proc/%d", pid);
+		snprintf(ep, sizeof ep, "%s/environ", ed);
 		FILE* f = fopen(ep, "r");
 		size_t en = f ? fread(env, 1, sizeof env - 1, f) : 0; if (f) fclose(f);
 		for (size_t i = 0; i < en; i += strlen(env + i) + 1) {                  // entorno, sin las variables internas
