@@ -274,7 +274,7 @@ static struct val* any_parse(const uint8_t* p, size_t len) {
 }
 
 // ------------------------------------------------------------------ el registro
-#define IO_MAXENT 96
+#define IO_MAXENT 192
 enum { PL_SERVICE = 1, PL_DT = 2, PL_POWER = 4 };   // planos (máscara): IOService, IODeviceTree, IOPower
 struct ioent {
 	const char* name; const char* cls; const char* supers;   // supers: nombres separados por espacios, de la más cercana a la raíz
@@ -490,6 +490,14 @@ static void io_init(void) {
 	p_str(di2, "IOProviderClass", "IOResources");
 	p_str(di2, "IOResourceMatch", "IOKit");
 	p_str(di2, "IOUserClientClass", "DIDeviceCreatorUserClient");
+	// Gestor de GPU (AppleGPUWrangler.kext, dentro de AppleGraphicsControl): GPUWrangler.framework lo busca al iniciar las
+	// pantallas (CoreDisplay, en WSInitialize de WindowServer), espera a que aparezca y lo abre para enumerar las GPU.
+	int gw = ent_add(res, "AppleGPUWrangler", "AppleGPUWrangler", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	p_str(gw, "IOClass", "AppleGPUWrangler");
+	p_str(gw, "CFBundleIdentifier", "com.apple.AppleGPUWrangler");
+	p_str(gw, "IOMatchCategory", "AppleGPUWrangler");
+	p_str(gw, "IOProviderClass", "IOResources");
+	p_str(gw, "IOUserClientClass", "AppleGPUWranglerUserClient");
 	// Vigilante del sistema (Watchdog.kext, com.apple.driver.watchdog): watchdogd lo abre al arrancar y le avisa periódicamente
 	// de que userspace sigue vivo; si no lo encuentra y no está en una máquina virtual, aborta. Sin núcleo de macOS no hay a
 	// quién reiniciar: el servicio está y sus métodos se aceptan sin efecto (uc_watchdog).
@@ -895,7 +903,11 @@ static void notif_send(struct ioobj* o, int type) {
 
 // ------------------------------------------------------------------ user clients: ganchos por clase
 // Un gancho recibe la conexión y la llamada y devuelve kIOReturn*. Aquí no hay ninguno (los registran el puente DRM/Metal).
-struct uc_call { int ent; uint32_t selector; const uint64_t* sin; uint32_t nsin; const uint8_t* inband; uint32_t ninband; uint64_t* sout; uint32_t* nsout; uint8_t* outband; uint32_t* noutband; };
+// Llamada a un método de un user client (io_connect_method). Al entrar, *nsout y *noutband son lo que pide quien llama
+// (como mucho 16 escalares y 4096 bytes); el gancho los deja en lo que devuelve. Las estructuras grandes viajan fuera de
+// línea: ool_in/ool_in_size (entrada) y ool_out/ool_out_size (salida, *ool_out_len lo escrito), memoria de este proceso.
+struct uc_call { int ent; uint32_t selector; const uint64_t* sin; uint32_t nsin; const uint8_t* inband; uint32_t ninband; uint64_t* sout; uint32_t* nsout; uint8_t* outband; uint32_t* noutband;
+	uint64_t ool_in, ool_in_size, ool_out, ool_out_size, *ool_out_len; };
 typedef int32_t (*uc_method_fn)(struct uc_call*);
 // AppleSMC: selector 2 (kSMCHandleYPCEvent) con SMCKeyData_t de 80 bytes; el resultado va en el byte 40. Sin SMC real, toda clave
 // responde "no encontrada" (0x84), que es lo que esperan los clientes ante una clave ausente.
@@ -978,7 +990,17 @@ static int32_t uc_watchdog(struct uc_call* c) {
 	*c->nsout = 0; *c->noutband = 0;
 	return 0;
 }
+// AppleGPUWranglerUserClient: de momento cada selector se anota con sus entradas (para conocer la interfaz que usa
+// GPUWrangler.framework) y se responde «no soportado».
+static int32_t uc_gpuwrangler(struct uc_call* c) {
+	char a[200] = ""; int k = 0;
+	for (uint32_t i = 0; i < c->nsin && i < 8 && k < 180; i++) k += snprintf(a + k, sizeof a - (size_t)k, " 0x%lx", (unsigned long)c->sin[i]);
+	logf_("    iokit: <%d> GPUWrangler selector %u escalares=%u:%s entrada=%uB salida pedida=%u escalares/%uB\n", (int)getpid(), c->selector, c->nsin, a, c->ninband, *c->nsout, *c->noutband);
+	*c->nsout = 0; *c->noutband = 0;
+	return kIOReturnUnsupported;
+}
 static uc_method_fn uc_hook_for(const char* cls) {
+	if (!strcmp(cls, "AppleGPUWrangler")) return uc_gpuwrangler;
 	if (!strcmp(cls, "IOWatchdog")) return uc_watchdog;
 	if (!strcmp(cls, "AppleSMC")) return uc_smc;
 	if (!strcmp(cls, "com_apple_filesystems_lifs")) return uc_lifs;
@@ -1402,15 +1424,22 @@ static size_t mig_iokit(const struct hdr* h, const uint8_t* req, uint8_t* rep, i
 		rq_ndr(&q); uc.selector = rq_u32(&q);
 		uint32_t nsin = rq_u32(&q); uint64_t sin[16] = { 0 }; for (uint32_t i = 0; i < nsin && i < 16; i++) sin[i] = rq_u64(&q);
 		uc.sin = sin; uc.nsin = nsin; uc.inband = rq_bytes(&q, &uc.ninband);
-		uint64_t sout[16] = { 0 }; uint32_t nsout = 16, nout = 4096; static __thread uint8_t outband[4096];
-		uc.sout = sout; uc.nsout = &nsout; uc.outband = outband; uc.noutband = &nout;
+		uc.ool_in = rq_u64(&q); uc.ool_in_size = rq_u64(&q);                  // ool_input, ool_input_size
+		uint32_t want_out = rq_u32(&q), want_sout = rq_u32(&q);              // inband_outputCnt, scalar_outputCnt
+		uc.ool_out = rq_u64(&q); uc.ool_out_size = rq_u64(&q);               // ool_output, ool_output_size
+		if (q.p > q.len) { want_out = 4096; want_sout = 16; uc.ool_in = uc.ool_in_size = uc.ool_out = uc.ool_out_size = 0; }   // petición corta
+		uint32_t cap_out = want_out < 4096 ? want_out : 4096, cap_sout = want_sout < 16 ? want_sout : 16;
+		uint64_t sout[16] = { 0 }, ool_len = 0; uint32_t nsout = cap_sout, nout = cap_out; static __thread uint8_t outband[4096];
+		uc.sout = sout; uc.nsout = &nsout; uc.outband = outband; uc.noutband = &nout; uc.ool_out_len = &ool_len;
 		int32_t r = fn(&uc);
 		if (trace_all || r) logf_("    iokit: <%d> %s selector %u -> 0x%x\n", (int)getpid(), io_e[self->ent].cls, uc.selector, (unsigned)r);
 		if (r) return rp_err(rep, h, r);
+		if (nout > cap_out) nout = cap_out;
+		if (nsout > cap_sout) nsout = cap_sout;
 		size_t n = reply_begin(rep, h, KERN_SUCCESS_);
 		memcpy(rep + n, &nout, 4); memcpy(rep + n + 4, outband, nout); n += 4 + ((nout + 3) & ~3u);
 		memcpy(rep + n, &nsout, 4); memcpy(rep + n + 4, sout, nsout * 8); n += 4 + nsout * 8;
-		uint64_t osz = 0; memcpy(rep + n, &osz, 8);
+		memcpy(rep + n, &ool_len, 8);                                          // ool_output_size: lo escrito fuera de línea
 		return n + 8;
 	}
 	}

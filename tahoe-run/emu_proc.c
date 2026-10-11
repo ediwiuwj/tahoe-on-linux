@@ -926,7 +926,7 @@ static __thread uint64_t my_workloop;   // workloop que atiende este hilo
 #define WQ_DATA_SIZE 32768
 // npre/pre/pdata: eventos que el vigilante ya recogió del kqueue (y el búfer donde quedaron los mensajes Mach recibidos).
 struct wq_job { uint64_t kqid; int workloop, has_req, npre; uint32_t prio; uint8_t req[72]; uint8_t pre[16 * 72]; uint8_t* pdata; struct wq_job* next; };
-struct wl_state { uint64_t kqid; int running, pending, watching, has_req; uint8_t req[72]; struct wl_state* next; };   // watching: ya tiene vigilante
+struct wl_state { uint64_t kqid; int running, pending, watching, has_req, owned; uint8_t req[72]; struct wl_state* next; };   // watching: ya tiene vigilante; owned: petición en espera porque la cola tiene propietario
 extern int kq_workloop_fd(uint64_t);
 extern long kq_drain(uint64_t, uint64_t, int, uint64_t, uint64_t);
 static void wl_arm(uint64_t kqid);
@@ -956,6 +956,18 @@ static int req_still_valid(const uint8_t* req) {
 	if (safe_read(ext[1], &cur, 8) != 8) return 1;
 	return (cur & ext[2]) == (ext[3] & ext[2]);
 }
+// Propietario de la cola (NOTE_WL_DISCOVER_OWNER, 0x80): XNU lee el nombre del hilo propietario de los bits bajos de
+// dq_state (kdata & ~3). Mientras un workloop tiene propietario (un hilo que vacía la cola por su cuenta, p. ej. con
+// dispatch_sync), su petición de hilo no se atiende: queda pendiente hasta que el propietario la suelta. Si se atendía,
+// el hilo no podía tomar la cola, volvía a pedirla y terminaba, en bucle (systemstats gastaba así 1,4 núcleos).
+static uint32_t req_owner(const uint8_t* req) {
+	uint32_t ff; memcpy(&ff, req + 24, 4);
+	if (!(ff & 0x80u)) return 0;
+	uint64_t ext[4]; memcpy(ext, req + 40, 32);
+	uint64_t cur;
+	if (!ext[1] || safe_read(ext[1], &cur, 8) != 8) return 0;
+	return (uint32_t)cur & ~3u;
+}
 // diagnóstico (MACH=1): máscara, valor esperado y valor actual de una petición de hilo
 static void wl_trace(const char* que, uint64_t kqid, const uint8_t* req) {
 	if (!wl_trace_on()) return;
@@ -965,6 +977,45 @@ static void wl_trace(const char* que, uint64_t kqid, const uint8_t* req) {
 }
 static struct wl_state* wl_states;
 static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
+static void wq_spawn(uint64_t kqid, int workloop, const uint8_t* req);
+// Peticiones en espera de que su cola deje de tener propietario: un hilo las revisa cada 10 ms mientras haya alguna (la
+// liberación llega también con NOTE_WL_END_OWNERSHIP, pero así no depende de ella). Llamar con wl_lock tomado.
+static pthread_cond_t wl_owner_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t wl_cv;                                   // (definida más abajo) avisa a los vigilantes
+static int wl_owner_started;
+static void* wl_owner_poll(void* p) {
+	(void)p;
+	pthread_mutex_lock(&wl_lock);
+	for (;;) {
+		int any = 0;
+		for (struct wl_state* w = wl_states; w; w = w->next) {
+			if (!w->owned) continue;
+			if (!w->pending || w->running || !req_still_valid(w->req)) { w->owned = 0; pthread_cond_broadcast(&wl_cv); continue; }
+			if (req_owner(w->req)) { any = 1; continue; }
+			w->owned = 0; w->pending = 0; w->running = 1;           // el propietario la soltó: ahora sí, un hilo
+			uint8_t copy[72]; memcpy(copy, w->req, 72); uint64_t kq = w->kqid;
+			pthread_mutex_unlock(&wl_lock);
+			wl_trace("propietario libre: lanza", kq, copy);
+			wq_spawn(kq, 1, copy);
+			pthread_mutex_lock(&wl_lock);
+			any = 1;                                                 // la lista pudo cambiar: otra vuelta
+			break;
+		}
+		if (any) { struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 10000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+			pthread_cond_timedwait(&wl_owner_cv, &wl_lock, &dl); }
+		else pthread_cond_wait(&wl_owner_cv, &wl_lock);
+	}
+	return NULL;
+}
+static void wl_defer_owned_locked(struct wl_state* w) {
+	w->owned = 1; w->pending = 1; w->running = 0;
+	if (!wl_owner_started) {
+		wl_owner_started = 1;
+		pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+		pthread_t th; if (pthread_create(&th, &at, wl_owner_poll, NULL)) wl_owner_started = 0;
+	}
+	pthread_cond_signal(&wl_owner_cv);
+}
 
 // Hilos de las colas de trabajo: un grupo reutilizable. Cuando libpthread "aparca" un hilo (workq_kernreturn) no se
 // termina: se vuelve a la función del anfitrión con siglongjmp y el hilo espera la siguiente petición. Así las pilas
@@ -1094,6 +1145,7 @@ void wq_request_workloop(uint64_t kqid, const void* req) {
 	int start = !w->running;
 	memcpy(w->req, req, 72); w->has_req = 1;
 	uint8_t copy[72]; memcpy(copy, req, 72);
+	if (start && req_owner(req)) { wl_defer_owned_locked(w); pthread_mutex_unlock(&wl_lock); wl_trace("petición: cola con propietario, espera", kqid, copy); return; }
 	if (start) w->running = 1; else w->pending = 1;
 	pthread_mutex_unlock(&wl_lock);
 	wl_trace(start ? "petición: lanza" : "petición: pendiente", kqid, copy);
@@ -1105,7 +1157,7 @@ void wq_cancel_workloop(uint64_t kqid) {
 	pthread_mutex_lock(&wl_lock);
 	struct wl_state* w = wl_states;
 	while (w && w->kqid != kqid) w = w->next;
-	if (w) { w->pending = 0; w->has_req = 0; }
+	if (w) { w->pending = 0; w->has_req = 0; if (w->owned) { w->owned = 0; pthread_cond_broadcast(&wl_cv); } }
 	pthread_mutex_unlock(&wl_lock);
 	wl_trace("petición retirada", kqid, NULL);
 }
@@ -1123,6 +1175,14 @@ static void wl_finished(uint64_t kqid) {
 	// hacer falta, libdispatch pide otro hilo al encolar.
 	int again = w && w->pending && req_still_valid(w->req);
 	uint8_t copy[72];
+	if (again && req_owner(w->req)) {                                // la cola tiene propietario: esperar a que la suelte
+		wl_defer_owned_locked(w); memcpy(copy, w->req, 72);
+		pthread_cond_broadcast(&wl_cv);
+		pthread_mutex_unlock(&wl_lock);
+		wl_trace("fin: cola con propietario, espera", kqid, copy);
+		wl_arm(kqid);
+		return;
+	}
 	if (w) { w->pending = 0; w->running = again; memcpy(copy, w->req, 72); }
 	pthread_cond_broadcast(&wl_cv);
 	pthread_mutex_unlock(&wl_lock);
@@ -1144,7 +1204,7 @@ static void* wl_watch(void* p) {
 	if (!w || fd < 0) return NULL;
 	for (;;) {
 		pthread_mutex_lock(&wl_lock);
-		while (w->running) pthread_cond_wait(&wl_cv, &wl_lock);
+		while (w->running || w->owned) pthread_cond_wait(&wl_cv, &wl_lock);   // con propietario, los eventos son suyos
 		pthread_mutex_unlock(&wl_lock);
 		struct pollfd pf = { .fd = fd, .events = POLLIN };
 		if (poll(&pf, 1, -1) < 0) { if (errno == EINTR) continue; logf_("    wl_watch <%d>: poll falló: %s\n", (int)getpid(), strerror(errno)); break; }
@@ -1201,6 +1261,7 @@ static void* wl_watch(void* p) {
 		pthread_mutex_lock(&wl_lock);                               // aviso falso: liberar, salvo que entretanto llegara una petición
 		int again = w->pending && req_still_valid(w->req);
 		uint8_t copy[72]; memcpy(copy, w->req, 72);
+		if (again && req_owner(w->req)) { wl_defer_owned_locked(w); pthread_mutex_unlock(&wl_lock); continue; }
 		w->pending = 0; w->running = again;
 		pthread_mutex_unlock(&wl_lock);
 		if (again) wq_spawn(kqid, 1, copy);

@@ -86,7 +86,7 @@ if [ -z "$L" ]; then
 		nice -n 10 "$RUN" "$DYLD_CACHE" "$ROOT/usr/lib/dyld" "$ROOT/sbin/launchd" \
 		< /dev/null > /dev/null 2>&1 &
 	U=$! STARTED=1
-	for _ in $(seq 50); do L=$(find_launchd); [ -n "$L" ] && [ -n "$(find_region "$L")" ] && break; sleep 0.2; done
+	for _ in $(seq 300); do L=$(find_launchd); [ -n "$L" ] && [ -n "$(find_region "$L")" ] && break; sleep 0.2; done
 	if [ -z "$L" ]; then echo "launchd no arrancó (registro: $LOG)" >&2; touch /dev/shm/tahoe-guard-stop; exit 1; fi
 	echo "launchd arrancado (pid $L en Linux); esperando ${TAHOE_BOOT_WAIT:-10} s a los servicios..." >&2
 	sleep "${TAHOE_BOOT_WAIT:-10}"
