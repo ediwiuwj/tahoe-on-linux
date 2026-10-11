@@ -916,7 +916,7 @@ static int req_still_valid(const uint8_t* req) {
 }
 // diagnóstico (MACH=1): máscara, valor esperado y valor actual de una petición de hilo
 static void wl_trace(const char* que, uint64_t kqid, const uint8_t* req) {
-	if (!mach_trace()) return;
+	if (!wl_trace_on()) return;
 	uint64_t ext[4] = { 0 }, cur = 0; if (req) memcpy(ext, req + 40, 32);
 	if (ext[1]) safe_read(ext[1], &cur, 8);
 	logf_("    WLQ <%d:%ld> %s kqid=0x%lx máscara=0x%lx valor=0x%lx actual=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), que, (unsigned long)kqid, (unsigned long)ext[2], (unsigned long)ext[3], (unsigned long)cur);
@@ -972,12 +972,12 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int
 		wq_park_ok = 1;
 		static __thread uint32_t kp_cache; if (!kp_cache) kp_cache = alloc_port();
 		uint32_t kp = kp_cache;
-		if (mach_trace()) logf_("    THR <%d:%ld> hilo de cola puerto 0x%x %s kqid=0x%lx eventos=%d\n", (int)getpid(), (long)syscall(SYS_gettid), kp, j.workloop ? (j.kqid == ~0ULL ? "kq-cola" : "workloop") : "trabajador", j.kqid, nev);
+		if (wl_trace_on()) logf_("    THR <%d:%ld> hilo de cola puerto 0x%x %s kqid=0x%lx eventos=%d\n", (int)getpid(), (long)syscall(SYS_gettid), kp, j.workloop ? (j.kqid == ~0ULL ? "kq-cola" : "workloop") : "trabajador", j.kqid, nev);
 		enter_guest_thread(wqthread_fn, self - 0x3000, self, kp, (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)(int64_t)nev);
 	}
 	wq_park_ok = 0;                                                  // volvió el hilo aparcado
 	t_cur = NULL;                                                    // salió de la llamada con siglongjmp
-	if (mach_trace()) logf_("    THR <%d:%ld> fin del trabajo\n", (int)getpid(), (long)syscall(SYS_gettid));
+	if (wl_trace_on()) logf_("    THR <%d:%ld> fin del trabajo\n", (int)getpid(), (long)syscall(SYS_gettid));
 }
 
 static void* wq_main(void* p) {
@@ -1119,7 +1119,7 @@ static void* wl_watch(void* p) {
 			*avail = WQ_DATA_SIZE;
 			d = kq_drain(kqid, (uint64_t)j->pre, 16, (uint64_t)data, (uint64_t)avail);
 		}
-		if (mach_trace()) { logf_("    wl_watch <%d> kqid=0x%lx recogió %ld:", (int)getpid(), (unsigned long)kqid, d);
+		if (wl_trace_on()) { logf_("    wl_watch <%d> kqid=0x%lx recogió %ld:", (int)getpid(), (unsigned long)kqid, d);
 			for (long q = 0; q < d && j; q++) { uint64_t id; int16_t fl; uint32_t ff; memcpy(&id, j->pre + q * 72, 8); memcpy(&fl, j->pre + q * 72 + 8, 2); memcpy(&ff, j->pre + q * 72 + 24, 4); logf_(" [id=0x%lx filtro=%d fflags=0x%x]", (unsigned long)id, fl, ff); }
 			logf_("\n"); }
 		if (d > 0) {
