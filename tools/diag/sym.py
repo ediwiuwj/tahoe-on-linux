@@ -5,8 +5,16 @@
 # TAHOE_ROOT: sistema de macOS extraído (por omisión ~/macos26/base/macOS Base System).
 import bisect, os, re, struct, subprocess, sys
 ROOT = os.environ.get("TAHOE_ROOT", os.path.expanduser("~/macos26/base/macOS Base System"))
-C = os.path.join(ROOT, "System/Library/dyld/dyld_shared_cache_x86_64")
-D = os.path.expanduser("~/.cache/tahoe-syms"); os.makedirs(D, exist_ok=True)
+def find_cache(root):
+    # la de la Recovery está en el sistema; la de un macOS completo, en el cryptex de Preboot (x86_64h en Haswell o posterior)
+    for c in ("System/Library/dyld/dyld_shared_cache_x86_64",
+              "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h",
+              "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64"):
+        if os.path.exists(os.path.join(root, c)): return os.path.join(root, c)
+    sys.exit("no encuentro la caché de dyld en " + root)
+C = find_cache(ROOT)
+# símbolos guardados por caché (la Recovery y el sistema completo son versiones distintas)
+D = os.path.expanduser("~/.cache/tahoe-syms/%s-%x" % (os.path.basename(C), os.path.getsize(C))); os.makedirs(D, exist_ok=True)
 f = open(C, 'rb'); io, ic = struct.unpack_from('<II', f.read(0x1c8), 0x1c0)   # imagesOffset, imagesCount
 f.seek(io); t = f.read(ic * 32); im = []
 for i in range(ic):

@@ -18,7 +18,7 @@ for P in $(pgrep -x tahoe-run); do
 	for t in /proc/$P/task/*; do
 		s=$(cat $t/syscall 2>/dev/null); pc=$(echo "$s" | awk '{print $NF}'); nr=$(echo "$s" | awk '{print $1}')
 		w=$(cat $t/wchan 2>/dev/null); st=$(awk '{print $3}' $t/stat)
-		case "$pc" in 0x7ff8*|0x7ff9*) where=$(python3 "$DIAG/sym.py" ${pc#0x} 2>/dev/null | cut -d' ' -f2-);;
+		case "$pc" in 0x7ff8*|0x7ff9*|0x7ffa*|0x7ffb*|0x7ffc*|0x7ffd*|0x7ffe*) where=$(python3 "$DIAG/sym.py" ${pc#0x} 2>/dev/null | cut -d' ' -f2-);;
 			0x*) where=$(addr2line -f -s -e "$RUN" "$pc" 2>/dev/null | paste -sd' ');; *) where=;; esac
 		echo "   $(basename $t) $st nr=$nr wchan=$w pc=$pc $where"
 	done
