@@ -435,10 +435,17 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
 			FILE* pk = fopen("/dev/shm/tahoe-peek", "r");       // además: valor de 8 bytes en esas direcciones
 			if (pk) { char ln[64]; while (fgets(ln, sizeof ln, pk)) {
 				uint64_t a, v = 0;
-				static const struct { const char* n; int r; } rn[] = { {"rax",REG_RAX},{"rsi",REG_RSI},{"rdi",REG_RDI},{"rbx",REG_RBX},{"rsp",REG_RSP},{"rbp",REG_RBP},{"r12",REG_R12},{"r13",REG_R13},{"r14",REG_R14},{"r15",REG_R15} };
-				a = 0; for (size_t q = 0; q < sizeof rn / sizeof rn[0]; q++) if (!strncmp(ln, rn[q].n, 3)) a = (uint64_t)g[rn[q].r] + (ln[3] == '+' ? strtoull(ln + 4, NULL, 16) : 0);
-				if (!a) a = strtoull(ln, NULL, 16);
-				if (a && safe_read(a, &v, 8) == 8) logf_("    PEEK %.*s[0x%lx] = 0x%lx\n", (int)strcspn(ln, "\n"), ln, a, v); } fclose(pk); }
+				char* e = ln; int deref = *e == '*';                // *expr: además, el texto al que apunta el valor leído
+				if (deref) e++;
+				static const struct { const char* n; int r; } rn[] = { {"rax",REG_RAX},{"rsi",REG_RSI},{"rdi",REG_RDI},{"rbx",REG_RBX},{"rsp",REG_RSP},{"rbp",REG_RBP},{"rcx",REG_RCX},{"rdx",REG_RDX},{"r8",REG_R8},{"r9",REG_R9},{"r12",REG_R12},{"r13",REG_R13},{"r14",REG_R14},{"r15",REG_R15} };
+				a = 0; for (size_t q = 0; q < sizeof rn / sizeof rn[0]; q++) { size_t nl = strlen(rn[q].n);
+					if (!strncmp(e, rn[q].n, nl) && (e[nl] == '+' || e[nl] == '\n' || e[nl] == 0)) { a = (uint64_t)g[rn[q].r] + (e[nl] == '+' ? strtoull(e + nl + 1, NULL, 16) : 0); break; } }
+				if (!a) a = strtoull(e, NULL, 16);
+				if (a && safe_read(a, &v, 8) == 8) {
+					logf_("    PEEK %.*s[0x%lx] = 0x%lx\n", (int)strcspn(ln, "\n"), ln, a, v);
+					char t[65] = { 0 };
+					if (deref && v && safe_read(v, t, 64) > 0) { for (int q = 0; q < 64 && t[q]; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK *: \"%s\"\n", t); }
+				} } fclose(pk); }
 			brk_poke(at, brk_orig[i]);
 			g[REG_RIP] = (greg_t)at;
 			g[REG_EFL] |= 0x100L;                                // TF: una instrucción y vuelve aquí

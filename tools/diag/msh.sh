@@ -11,7 +11,8 @@
 #   IOK=1             traza de IOKit
 #   CONSOLA=1         lo que se escribe en /dev/console (launchd anota ahí sus errores) se imprime al final
 #   BRK='dir dir...'  int3 en esas direcciones (hex) del proceso de STACKS: registra los registros al pasar (BRK)
-#   PEEK='expr...'    con BRK: lee 8 bytes en cada dirección o registro+desplazamiento (p. ej. rdi+0x50)
+#   PEEK='expr...'    con BRK: lee 8 bytes en cada dirección o registro+desplazamiento (p. ej. rdi+0x50); con * delante
+#                     (*rcx+0x10) muestra además el texto al que apunta ese valor (cadenas C, CFString constantes)
 #   TAHOE_RUN=<bin>   otro binario de tahoe-run (comparar versiones)
 #   TAHOE_DEPURAR=0   arranque normal; por omisión se usa el modo depuración (macos-shell.sh --depurar), en el que
 #                     recoveryosd no reinicia si falla, para poder seguir mirando)
