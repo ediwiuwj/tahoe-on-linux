@@ -77,6 +77,7 @@ void emu_fs_xattr_init(void);
 int tahoe_host_passthrough(const char* p);
 const char* tahoe_dev_alias(const char* p, char* buf, size_t cap);
 void memfd_reopen(void);
+void ports_forked_child(void);
 uint32_t guest_uid(uint32_t u);
 uint32_t darwin_dev(unsigned ma, unsigned mi);
 uint32_t guest_gid(uint32_t g);

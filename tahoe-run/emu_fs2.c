@@ -147,7 +147,7 @@ static long bsd_renameatx(struct ctx* c) {      // flags de Darwin: RENAME_SWAP 
 	if (f & 2) lf |= 2; if (f & 4) lf |= 1;
 	RET(renameat2(dfd(c->a[0]), a, dfd(c->a[2]), b, lf));
 }
-static long bsd_unlinkat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(unlinkat(dfd(c->a[0]), p, (c->a[2] & 0x80) ? AT_REMOVEDIR : 0)); }   // AT_REMOVEDIR de Darwin = 0x80
+static long bsd_unlinkat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(unlinkat(dfd(c->a[0]), p, (c->a[2] & 0x180) ? AT_REMOVEDIR : 0)); }   // AT_REMOVEDIR = 0x80, AT_REMOVEDIR_DATALESS = 0x100 (rm -r)
 static long bsd_mkdirat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(mkdirat(dfd(c->a[0]), p, (mode_t)c->a[2])); }
 static long bsd_symlinkat(struct ctx* c) {
 	char tgt[4096], l[4400];

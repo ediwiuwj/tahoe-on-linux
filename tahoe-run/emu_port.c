@@ -84,12 +84,14 @@ void ports_cleanup(void) {                       // solo el proceso que creó la
 	if (glob(pat, 0, NULL, &g) == 0) { for (size_t i = 0; i < g.gl_pathc; i++) unlink(g.gl_pathv[i]); globfree(&g); }
 }
 
+// Tras fork: el hijo no es el creador de la región (si sale, no debe borrarla: la usan los demás).
+void ports_forked_child(void) { is_creator = 0; }
 static void shm_init(void) {
 	const char* env = getenv("TAHOE_PORTS");
 	int creator = 0;
 	if (env) snprintf(shm_path, sizeof shm_path, "%s", env);
 	else { struct timespec tsn; clock_gettime(CLOCK_REALTIME, &tsn); snprintf(tag, sizeof tag, "%lx%lx", (long)tsn.tv_sec, (long)tsn.tv_nsec); snprintf(shm_path, sizeof shm_path, "/dev/shm/tahoe-ports-%s", tag); creator = 1; }
-	int fd = open(shm_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+	int fd = open(shm_path, O_RDWR | (creator ? O_CREAT : 0) | O_CLOEXEC, 0600);   // solo el creador la crea
 	if (fd < 0) { logf_("    puertos: no puedo abrir %s: %s\n", shm_path, strerror(errno)); exit(70); }
 	if (creator && ftruncate(fd, sizeof(struct shm)) != 0) { logf_("    puertos: ftruncate: %s\n", strerror(errno)); exit(70); }
 	shm = mmap(NULL, sizeof(struct shm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

@@ -480,7 +480,7 @@ static int darwin_wait_status(int st) {
 static long bsd_fork(struct ctx* c) {
 	long p = syscall(SYS_fork);
 	if (p < 0) return -darwin_errno(errno);
-	if (p == 0) { memfd_reopen(); reenable_dispatch(); }  // el hijo: su propia memoria; empieza sin interceptación
+	if (p == 0) { memfd_reopen(); ports_forked_child(); reenable_dispatch(); }  // el hijo: su propia memoria, no es el creador
 	// Convenio de Darwin: hijo rax=pid del padre, rdx=1; padre rax=pid del hijo, rdx=0. libsyscall devuelve 0 al hijo
 	// al ver rdx != 0, y libc ejecuta entonces los manejadores de hijo (reinicio de puertos Mach, hilo principal...).
 	c->has_ret2 = 1;
