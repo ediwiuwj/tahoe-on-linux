@@ -66,6 +66,17 @@ static void emu_disk_stat(int minor_, int raw, struct stat* s) {
 	s->st_blksize = 4096;
 }
 
+// dev_t de macOS para el st_dev de un archivo: lo que está en la raíz de macOS (TAHOE_ROOT, en un sistema de archivos del
+// anfitrión) es del volumen /dev/disk1s1, como en un Mac (stat("/").st_dev = dev_t de disk1s1). Así se traduce una ruta a
+// su disco (diskutil info /, devname). El resto (/dev, terminales...) conserva su dispositivo.
+#define ROOT_VOLUME_MINOR 3                                           // disk1s1 en emu_disks
+static uint32_t guest_dev(dev_t d) {
+	static dev_t root; static int known;
+	if (!known) { struct stat rs; known = 1; root = (tahoe_root && stat(tahoe_root, &rs) == 0) ? rs.st_dev : (dev_t)-1; }
+	if (tahoe_root && d == root) return darwin_dev(EMU_DISK_MAJOR, ROOT_VOLUME_MINOR);
+	return darwin_dev(major(d), minor(d));
+}
+
 // Resuelve una ruta absoluta del programa bajo TAHOE_ROOT (salvo /dev, del anfitrión).
 static const char* resolve(const char* guest, char* buf, size_t cap) {
 	if (tahoe_root && guest[0] == '/' && !tahoe_host_passthrough(guest)) { snprintf(buf, cap, "%s%s", tahoe_root, guest); return buf; }
@@ -124,7 +135,7 @@ static void put_stat(uint64_t out, const struct stat* s, uint32_t flags) {
 	uint8_t d[144];
 	memset(d, 0, sizeof d);
 #define W(type, off, v) do { type t_ = (type)(v); memcpy(d + (off), &t_, sizeof t_); } while (0)
-	W(int32_t, 0, darwin_dev(major(s->st_dev), minor(s->st_dev)));
+	W(int32_t, 0, guest_dev(s->st_dev));
 	W(uint16_t, 4, s->st_mode);
 	W(uint16_t, 6, s->st_nlink);
 	W(uint64_t, 8, s->st_ino);
@@ -381,8 +392,11 @@ static void put_statfs(uint64_t out, const struct statfs* s, const struct gmount
 	W(uint64_t, 24, s->f_bavail);
 	W(uint64_t, 32, s->f_files);
 	W(uint64_t, 40, s->f_ffree);
-	W(uint32_t, 48, s->f_fsid.__val[0]);
-	W(uint32_t, 52, s->f_fsid.__val[1]);
+	{                                                                // f_fsid: {dev_t del dispositivo, tipo de vfs}, como en XNU
+		int raw, dm = emu_disk_node(m->from, &raw);
+		if (dm >= 0) { W(uint32_t, 48, darwin_dev(EMU_DISK_MAJOR, dm)); W(uint32_t, 52, m->ftype); }
+		else { W(uint32_t, 48, s->f_fsid.__val[0]); W(uint32_t, 52, s->f_fsid.__val[1]); }
+	}
 	W(uint32_t, 60, m->ftype);
 	W(uint32_t, 64, m->flags);
 	strncpy((char*)d + 72, m->type, 15);
@@ -436,7 +450,11 @@ static const struct gmount* gmount_at(const char* p) {
 static long do_mount(const char* type, const char* path, uint32_t flags) {
 	logf_("    mount(\"%s\", \"%s\", 0x%x)\n", type, path, flags);
 	const struct gmount* m = gmount_at(path);
-	if (flags & MNT_UPDATE) return m ? 0 : -D_EINVAL;
+	if (flags & MNT_UPDATE) {
+		if (!m) return -D_EINVAL;
+		vfs_event_signal(0x100);                        // VQ_UPDATE, como vfs_event_signal tras una actualización en XNU
+		return 0;
+	}
 	char b[4200]; struct stat st;
 	if (stat(resolve(path, b, sizeof b), &st) != 0) return -D_ENOENT;
 	if (m) return -16;                                  // EBUSY: ya hay algo montado ahí
@@ -473,12 +491,22 @@ static long bsd_funmount(struct ctx* c) { (void)c; return -16; }
 #define ATTR_VOL_CAPABILITIES 0x00020000u
 #define ATTR_VOL_UUID  0x00040000u
 static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t file, uint32_t cmnext, const char* name, const char* fullpath, const struct stat* s, int pack_inval);
+// Copia el resultado de getattrlist como XNU: si no cabe se copia lo que quepa (truncado, sin error), y el primer campo
+// lleva lo copiado, o lo necesario con FSOPT_REPORT_FULLSIZE (0x4).
+static long attr_copyout(uint64_t dst, uint64_t size, uint64_t opts, uint8_t* buf, size_t n) {
+	size_t m = n < size ? n : size;
+	uint32_t len = (opts & 0x4) ? (uint32_t)n : (uint32_t)m;
+	memcpy(buf, &len, 4);
+	return safe_write(dst, buf, m) == (ssize_t)m ? 0 : -D_EFAULT;
+}
+
 static long bsd_getattrlist(struct ctx* c) {
 	char p[4096], b[4200];
 	uint32_t al[6] = { 0 };
 	struct stat s;
 	if (safe_string(c->a[0], p, sizeof p) != 0 || safe_read(c->a[1], al, sizeof al) != sizeof al) return -D_EFAULT;
 	uint32_t common = al[1], vol = al[2];
+	if (trace_all || (diag_target() && diag_all())) logf_("    getattrlist(\"%s\") common=0x%x vol=0x%x dir=0x%x file=0x%x opts=0x%lx\n", p, common, vol, al[3], al[4], (long)c->a[4]);
 	if (!vol) {                                           // atributos del objeto: empaquetado general
 		int nofollow = (c->a[4] & 1) != 0;
 		struct stat st;
@@ -493,8 +521,7 @@ static long bsd_getattrlist(struct ctx* c) {
 		base = base && base[1] ? base + 1 : gp2;
 		static uint8_t buf[8192];
 		size_t n = pack_entry(buf, common, al[3], al[4], (c->a[4] & 0x20) ? al[5] : 0, base, gp2, &st, (c->a[4] & 8) != 0);
-		if (n > c->a[3]) { uint32_t tot = (uint32_t)n; safe_write(c->a[2], &tot, c->a[3] >= 4 ? 4 : 0); return 0; }
-		return safe_write(c->a[2], buf, n) == (ssize_t)n ? 0 : -D_EFAULT;
+		return attr_copyout(c->a[2], c->a[3], c->a[4], buf, n);
 	}
 	// Atributos de volumen (con algunos comunes). Orden de sys/attr.h: longitud, returned_attrs (si se pidió), comunes y de
 	// volumen por orden de bit. Las cadenas van al final y se señalan con attrreference_t {desplazamiento desde la propia
@@ -520,8 +547,8 @@ static long bsd_getattrlist(struct ctx* c) {
 		PUT(rs, 20);
 	}
 	char gpath[4096] = "";
-	if (common & ATTR_CMN_DEVID) { uint32_t d = (major(s.st_dev) << 24) | (minor(s.st_dev) & 0xffffff); PUT(&d, 4); }
-	if (common & ATTR_CMN_FSID) { uint32_t f2[2] = { (uint32_t)s.st_dev, 0x18 }; PUT(f2, 8); }
+	if (common & ATTR_CMN_DEVID) { uint32_t d = guest_dev(s.st_dev); PUT(&d, 4); }
+	if (common & ATTR_CMN_FSID) { uint32_t f2[2] = { guest_dev(s.st_dev), 0x18 }; PUT(f2, 8); }
 	if (common & ATTR_CMN_FULLPATH) {                     // ruta absoluta tal como la ve macOS (sin la raíz del host)
 		char real[4096];
 		const char* rp = realpath(rpv, real) ? real : p;
@@ -544,7 +571,7 @@ static long bsd_getattrlist(struct ctx* c) {
 	if (vol & 0x400) PUTU32(0);                            // DIRCOUNT
 	if (vol & 0x800) PUTU32(sf.f_files);                   // MAXOBJCOUNT
 	if (vol & 0x1000) PUTREF("/");                         // MOUNTPOINT
-	if (vol & 0x2000) PUTREF("Macintosh HD");              // NAME
+	if (vol & 0x2000) PUTREF("macOS Base System");         // NAME: el del volumen de la Recovery (AppleAPFSVolume en IOKit)
 	if (vol & 0x4000) PUTU32(0x1000 | 0x4000);             // MOUNTFLAGS: MNT_LOCAL | MNT_ROOTFS
 	if (vol & 0x8000) PUTREF("/dev/disk1s1");              // MOUNTEDDEVICE
 	if (vol & 0x10000) PUTU64(0);                          // ENCODINGSUSED
@@ -559,7 +586,9 @@ static long bsd_getattrlist(struct ctx* c) {
 		PUT(caps, 32);
 	}
 	if (vol & ATTR_VOL_UUID) {
-		static const uint8_t uuid[16] = { 0x74, 0x61, 0x68, 0x6f, 0x65, 0x2d, 0x72, 0x75, 0x6e, 0x2d, 0x72, 0x6f, 0x6f, 0x74, 0x00, 0x01 };
+		// el UUID del volumen de arranque (kern.bootuuid y AppleAPFSVolume en IOKit): diskarbitrationd solo toma el nombre del
+		// volumen montado si coincide con el del disco
+		static const uint8_t uuid[16] = { 0xB0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
 		PUT(uuid, 16);
 	}
 	if (vol & 0x80000) PUTU32(0);                          // MOUNTEXTFLAGS
@@ -586,10 +615,7 @@ static long bsd_getattrlist(struct ctx* c) {
 #undef PUTU32
 #undef PUTU64
 #undef PUTREF
-	uint32_t total = (uint32_t)n;
-	memcpy(out, &total, 4);
-	if (n > c->a[3]) { safe_write(c->a[2], &total, c->a[3] >= 4 ? 4 : 0); return 0; }   // no cabe: solo la longitud
-	return safe_write(c->a[2], out, n) == (ssize_t)n ? 0 : -D_EFAULT;
+	return attr_copyout(c->a[2], c->a[3], c->a[4], out, n);
 }
 
 
@@ -735,8 +761,8 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 #define P64(v) do { uint64_t t_ = (uint64_t)(v); memcpy(o + n, &t_, 8); n += 8; } while (0)
 #define PTS(ts) do { P64((ts).tv_sec); P64((ts).tv_nsec); } while (0)
 	if (common & A_CMN_NAME) { name_ref = n; n += 8; rc |= A_CMN_NAME; }
-	if (common & A_CMN_DEVID) { P32((major(s->st_dev) << 24) | (minor(s->st_dev) & 0xffffff)); rc |= A_CMN_DEVID; }
-	if (common & A_CMN_FSID) { P32((uint32_t)s->st_dev); P32(0x18); rc |= A_CMN_FSID; }
+	if (common & A_CMN_DEVID) { P32(guest_dev(s->st_dev)); rc |= A_CMN_DEVID; }
+	if (common & A_CMN_FSID) { P32(guest_dev(s->st_dev)); P32(0x18); rc |= A_CMN_FSID; }
 	if (common & A_CMN_OBJTYPE) { P32(vtype_of(s->st_mode)); rc |= A_CMN_OBJTYPE; }
 	if (common & A_CMN_OBJTAG) { P32(0x17); rc |= A_CMN_OBJTAG; }                         // VT_APFS
 	if (common & A_CMN_OBJID) { P32((uint32_t)s->st_ino); P32((uint32_t)(s->st_ino >> 32)); rc |= A_CMN_OBJID; }
@@ -771,7 +797,11 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 	if (dir) {
 		if (dir & A_DIR_LINKCOUNT) { P32(isdir ? s->st_nlink : 0); if (isdir) rd |= A_DIR_LINKCOUNT; }
 		if (dir & A_DIR_ENTRYCOUNT) { P32(0); if (isdir) rd |= A_DIR_ENTRYCOUNT; }
-		if (dir & A_DIR_MOUNTSTATUS) { P32(0); if (isdir) rd |= A_DIR_MOUNTSTATUS; }
+		if (dir & A_DIR_MOUNTSTATUS) {                                                    // DIR_MNTSTATUS_MNTPOINT si es raíz de un montaje
+			uint32_t ms = 0;
+			for (size_t i = 0; isdir && fullpath && i < NGMOUNT; i++) if (!strcmp(fullpath, gmounts[i].on)) ms = 0x1;
+			P32(ms); if (isdir) rd |= A_DIR_MOUNTSTATUS;
+		}
 	}
 	// archivo: solo valen para no directorios
 	if (file & A_FILE_LINKCOUNT) { P32(isdir ? 0 : s->st_nlink); if (!isdir) rf |= A_FILE_LINKCOUNT; }
@@ -789,8 +819,8 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 	if (cmnext & 0x8) { P64(0); rx |= 0x8; }                                             // PRIVATESIZE
 	if (cmnext & 0x10) { P64(s->st_ino); rx |= 0x10; }                                   // LINKID
 	if (cmnext & 0x20) { nofirm_ref = n; n += 8; rx |= 0x20; }                         // NOFIRMLINKPATH
-	if (cmnext & 0x40) { P32((major(s->st_dev) << 24) | (minor(s->st_dev) & 0xffffff)); rx |= 0x40; }   // REALDEVID
-	if (cmnext & 0x80) { P32((uint32_t)s->st_dev); P32(0x18); rx |= 0x80; }             // REALFSID
+	if (cmnext & 0x40) { P32(guest_dev(s->st_dev)); rx |= 0x40; }   // REALDEVID
+	if (cmnext & 0x80) { P32(guest_dev(s->st_dev)); P32(0x18); rx |= 0x80; }             // REALFSID
 	if (cmnext & 0x100) { P64(s->st_ino); rx |= 0x100; }                                 // CLONEID
 	if (cmnext & 0x200) { P64(0); rx |= 0x200; }                                         // EXT_FLAGS
 	if (cmnext & 0x400) { P64(0); rx |= 0x400; }                                         // RECURSIVE_GENCOUNT

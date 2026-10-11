@@ -338,6 +338,8 @@ static void io_disks(int bus) {
 	if (!size) size = 64ULL << 30;
 	size &= ~4095ULL;
 	int dev = ent_add(bus, "Tahoe Virtual Disk", "IOBlockStorageDevice", "IORegistryEntry IOService", "1f,2", PL_SERVICE, 0);
+	// "Virtual Interface": en una Recovery real el sistema base (BaseSystem.dmg) es una imagen de disco y diskutil la presenta
+	// así. Con "PCI-Express" (un disco interno) apfs_boot_util exige el volumen VM y launchd entra en pánico.
 	struct val* pc = v_new(V_DICT); d_str(pc, "Physical Interconnect", "Virtual Interface"); d_str(pc, "Physical Interconnect Location", "Internal");
 	v_set(io_e[dev].props, "Protocol Characteristics", pc);
 	struct val* dc = v_new(V_DICT); d_str(dc, "Product Name", "Tahoe Virtual Disk"); d_str(dc, "Vendor Name", "tahoe-run");
