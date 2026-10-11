@@ -481,8 +481,12 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 		memcpy(&dc, m + 24, 4);
 		for (uint32_t i = 0; i < dc && off + 12 <= size; i++) {
 			uint8_t type = m[off + 11];
-			if (trace_all && type == 0) { uint32_t nm; memcpy(&nm, m + off, 4); logf_("    mach_msg: <%d> descriptor de puerto 0x%x disposición %u\n", (int)getpid(), nm, m[off + 10]); }
-			if (type == 0 && m[off + 10] == 16) { uint32_t nm; memcpy(&nm, m + off, 4); port_move_receive(nm); }   // MOVE_RECEIVE: el receptor pasa a ser dueño
+			if ((trace_all || mach_trace()) && (type == 0 || type == 4)) { uint32_t nm; memcpy(&nm, m + off + (type == 4 ? 12 : 0), 4); logf_("    mach_msg: <%d> descriptor de puerto%s 0x%x disposición %u\n", (int)getpid(), type == 4 ? " con guarda" : "", nm, m[off + 10]); }
+			if ((type == 0 || type == 4) && m[off + 10] == 16) {     // MOVE_RECEIVE: el receptor pasa a ser dueño
+				// también en un descriptor de puerto con guarda (mach_msg_guarded_port_descriptor64_t: contexto, flags,
+				// disposición, tipo y el nombre en +12), que es como launchd entrega los puertos de servicio
+				uint32_t nm; memcpy(&nm, m + off + (type == 4 ? 12 : 0), 4); port_move_receive(nm);
+			}
 			if (type == 0 || type == 2) m[off + 10] = (uint8_t)rx_disp(m[off + 10]);       // puerto / puertos OOL: disposición
 			off += (type == 0) ? 12 : 16;
 		}

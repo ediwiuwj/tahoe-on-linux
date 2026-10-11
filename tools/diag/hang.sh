@@ -3,12 +3,14 @@
 # vuelca cada hilo del proceso de macOS llamado <proceso> (estado, llamada de Linux en curso, wchan y la instrucción,
 # simbolizada con sym.py si está en la caché de macOS o con addr2line si es código de tahoe-run). Siempre limpia.
 # Admite las variables de diagnóstico de msh.sh (el registro queda en msh.log). Con STACKS=<proceso> (el mismo), además
-# las pilas de macOS de cada hilo, simbolizadas.
+# las pilas de macOS de cada hilo, simbolizadas. ESPERA: segundos de arranque antes de la orden (12; el macOS completo
+# necesita más, p. ej. 60).
 DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
 RUN="${TAHOE_RUN:-$DIAG/../../tahoe-run/tahoe-run}"
-( "$DIAG/msh.sh" "$1" 12 $(( ${3:-20} + 40 )) > "$D/hang.out" 2>&1 & )
-sleep $(( 12 + 4 + ${3:-20} ))
+E=${ESPERA:-12}
+( "$DIAG/msh.sh" "$1" $E $(( E + ${3:-20} + 40 )) > "$D/hang.out" 2>&1 & )
+sleep $(( E + 4 + ${3:-20} ))
 # Línea de órdenes desde un hilo vivo: si el hilo principal terminó, /proc/<pid>/cmdline sale vacío
 # (y no vale [ -s ]: los archivos de /proc dicen tener tamaño 0).
 cmdl() { local t c; for t in /proc/$1/task/*; do c=$(tr '\0' ' ' < $t/cmdline 2>/dev/null); [ -n "$c" ] && { echo "$c"; return; }; done; }
