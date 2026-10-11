@@ -426,6 +426,25 @@ static void io_init(void) {
 	p_str(lifs, "IOMatchCategory", "com_apple_filesystems_lifs");
 	p_str(lifs, "IOProviderClass", "IOResources");
 	p_str(lifs, "IOUserClientClass", "AppleLIFSUserClient");
+	// Controlador de imágenes de disco (IOHDIXController.kext, com.apple.driver.DiskImages): hdiutil lo busca para leer la
+	// versión del driver y las imágenes conectadas (sus hijos). Sin imágenes no tiene hijos, como en un Mac sin nada montado.
+	int hdix = ent_add(res, "IOHDIXController", "IOHDIXController", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	p_str(hdix, "IOClass", "IOHDIXController");
+	p_str(hdix, "CFBundleIdentifier", "com.apple.driver.DiskImages");
+	p_str(hdix, "IOMatchCategory", "IOHDIXController");
+	p_str(hdix, "IOProviderClass", "IOResources");
+	p_str(hdix, "IOResourceMatch", "IOKit");
+	// "revision" es lo que hdiutil info muestra como versión del driver; en un Mac coincide con la del framework
+	// (DiskImages.framework de este sistema: 683.160.3).
+	p_str(hdix, "revision", "683.160.3");
+	// Y el de DiskImages2 (AppleDiskImages2.kext), con el que se conectan hoy las imágenes; tampoco tiene ninguna.
+	int di2 = ent_add(res, "AppleDiskImagesController", "AppleDiskImagesController", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	p_str(di2, "IOClass", "AppleDiskImagesController");
+	p_str(di2, "CFBundleIdentifier", "com.apple.driver.AppleDiskImages2");
+	p_str(di2, "IOMatchCategory", "AppleDiskImageDevice");
+	p_str(di2, "IOProviderClass", "IOResources");
+	p_str(di2, "IOResourceMatch", "IOKit");
+	p_str(di2, "IOUserClientClass", "DIDeviceCreatorUserClient");
 
 	int opt = ent_add(plat, "options", "IODTNVRAM", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(opt, "name", "options");
