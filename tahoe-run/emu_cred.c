@@ -100,10 +100,32 @@ static long b_setgroups(struct ctx* c) {
 // initgroups(n, lista, uid de gmuid): como setgroups (el núcleo guarda además el uid de pertenencia externa)
 static long b_initgroups(struct ctx* c) { return b_setgroups(c); }
 
+// identitysvc(opcode, mensaje): el resolutor de identidades externas del núcleo (kern_credential.c). opendirectoryd se
+// registra como resolutor (KAUTH_EXTLOOKUP_REGISTER 0) y sus hilos trabajadores esperan en el núcleo peticiones de
+// traducción uid/gid <-> GUID (KAUTH_EXTLOOKUP_WORKER 2, con RESULT 1 para devolver la anterior). Aquí el núcleo nunca
+// pregunta (los permisos los decide Linux), así que el trabajador duerme hasta una señal, como en XNU sin peticiones.
+// Las cachés de identidades (GET/SET_CACHE_SIZES 8/16, CLEAR_CACHES 32) son las de XNU por omisión, sin efecto.
+// Sin esta llamada opendirectoryd reintentaba el registro sin parar (CPU al 100%).
+#include <unistd.h>
+static long b_identitysvc(struct ctx* c) {
+	uint32_t op = (uint32_t)c->a[0];
+	if (op == 0) return euid == 0 ? 0 : -D_EPERM;                          // REGISTER: solo root
+	if (op & 4) return 0;                                                   // DEREGISTER
+	if (op & 8) {                                                           // GET_CACHE_SIZES: struct kauth_cache_sizes
+		uint32_t sz[2] = { 100, 100 };                                      // kcs_group_size, kcs_id_size (XNU por omisión)
+		return safe_write(c->a[1], sz, sizeof sz) == (ssize_t)sizeof sz ? 0 : -D_EFAULT;
+	}
+	if (op & (16 | 32)) return euid == 0 ? 0 : -D_EPERM;                     // SET_CACHE_SIZES / CLEAR_CACHES
+	if (op & 2) { pause(); return -4; }                                     // WORKER: sin peticiones; EINTR al llegar una señal
+	if (op & 1) return 0;                                                   // RESULT suelto: nada pendiente
+	return -D_EINVAL;
+}
+
 void emu_cred_init(void) {
 	cred_load();
 	reg_bsd(24, b_getuid); reg_bsd(25, b_geteuid); reg_bsd(47, b_getgid); reg_bsd(43, b_getegid);
 	reg_bsd(23, b_setuid); reg_bsd(183, b_seteuid); reg_bsd(181, b_setgid); reg_bsd(182, b_setegid);
 	reg_bsd(126, b_setreuid); reg_bsd(127, b_setregid);
 	reg_bsd(79, b_getgroups); reg_bsd(80, b_setgroups); reg_bsd(243, b_initgroups);
+	reg_bsd(293, b_identitysvc);
 }

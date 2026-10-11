@@ -11,6 +11,7 @@ para una GPU Intel Haswell). [Darling](https://github.com/darlinghq/darling) se 
 |---|---|
 | Arranque | El `launchd` real de macOS 26 corre como **PID 1** en un espacio de nombres de PID de Linux, sin root. `launchctl list` registra **169 servicios**, en un arranque se cargan unos **155-170 procesos**, y es estable (sin reinicios). Funcionan los dominios de proceso de launchd (servicios XPC de los frameworks, como `authd`), las fases de montaje del arranque (`mount -P`) y las señales de `launchctl kill`/`kickstart -k`. Entre los servicios: `syslogd`, `notifyd`, `cfprefsd`, `configd`, `powerd`, `securityd`, `opendirectoryd`, `diskarbitrationd`, `storagekitd`, `fskitd`, `authd`, `trustd`, `coreservicesd`, `WindowServer`. |
 | Shell de macOS | `tools/macos-shell.sh` abre el `bash` de macOS en la terminal. Con `--launchd` se une a launchd y funcionan las órdenes que usan servicios. Inventario (`tools/shell_survey.sh`, 79 órdenes, arranque normal): **56 funcionan**, 17 no existen en la imagen de Recovery y 6 dan el mismo error que en un Mac real (entre ellas `bless --info`: el contenedor APFS no tiene volumen Preboot). |
+| macOS completo | El **macOS 26.7.1 completo** (del instalador oficial, extraído con las herramientas de `tools/`) arranca: launchd carga **~400 servicios**, ~90 procesos, y se lanzan `WindowServer` y `loginwindow` (sistema recién instalado: toca el Asistente de configuración). Ver «macOS 26 completo» al final. |
 | Interfaz gráfica | `WindowServer` arranca y pasa `CA::Render::Server::start`; recoveryosd crea el llavero de root y prepara la sesión Aqua (`SLSPackagesInitializeSessionPreferences`), pero **todavía no hay imagen en pantalla**. |
 | Metal | Un kernel de Metal (AIR) traducido a SPIR-V con `metal2vulkan` se ejecuta en la GPU (Intel HD 4400) por Vulkan (`test/run_add_arrays.c`). Aún no está conectado a `tahoe-run`. |
 
@@ -543,3 +544,42 @@ Herramientas usadas para encontrar estos fallos: `tools/diag/` (ver «Probarlo»
   todos los discos nada más crearlos) y que arranque `fskitd`, que busca el servicio `com_apple_filesystems_lifs` (LiveFS).
   Con la jerarquía, las fases `mount -P` del arranque se ejecutan de verdad.
 
+
+### macOS 26 completo (11 de octubre de 2026, tarde)
+Además de la Recovery, `tahoe-run` arranca ya el **macOS 26.7.1 completo** (25G241, del `InstallAssistant.pkg` oficial).
+Instalación sin Mac, con herramientas de este repositorio:
+
+```sh
+tools/xar.py saca InstallAssistant.pkg SharedSupport.dmg SharedSupport.dmg   # el paquete del instalador (xar)
+# de SharedSupport.dmg (HFS+) se saca el zip de actualización (com_apple_MobileAsset_MacSoftwareUpdate/*.zip)
+tools/yaa.py <actualización.zip> <raíz>       # payloads del sistema (pbzx + Apple Archive) y enlaces duros de links.txt
+# el cryptex del sistema (caché de dyld x86_64h) va en <raíz>/System/Volumes/Preboot/Cryptexes/OS
+tools/datos_macos.py <raíz>                   # volumen de datos desde la plantilla y firmlinks, como el instalador
+TAHOE_ROOT=<raíz> tools/macos-shell.sh --launchd
+```
+
+Con un disco virtual ext4 con *casefold* (insensible a mayúsculas, como APFS) de 60 GB, el sistema extraído ocupa 30 GB.
+En el primer arranque (sistema recién instalado, sin `/var/db/.AppleSetupDone`) launchd carga **~400 servicios**, corren
+**~90 procesos** y se lanzan `WindowServer` y `loginwindow`, que es quien abre el Asistente de configuración. Lo que hizo falta:
+
+- **Caché de dyld del cryptex** (`dyld_shared_cache_x86_64h`, la variante Haswell, 7 archivos): llena casi toda la región
+  compartida, así que dyld se carga en 0x7ff000000000; la región dinámica anota la raíz del cryptex (`_osCryptexPathOffset`).
+- **EBADARCH**: un Mach-O sin parte x86_64 (p. ej. `seputil`, la tarea de arranque `data-protection`, que en un Mac Intel no
+  existe) falla en `exec`/`posix_spawn` sin crear el proceso, como en XNU; launchd lo salta.
+- **Volúmenes Data y Preboot**: en un Mac son volúmenes APFS aparte. Aquí son carpetas montadas sobre sí mismas (bind) en el
+  espacio de montajes del arranque; `stat` distingue el volumen por el id de montaje (`statx`) y `mount`/`df` muestran
+  `/dev/disk1s2 on /System/Volumes/Data` y `/dev/disk1s3 on /System/Volumes/Preboot`. CarbonCore abortaba al ver el
+  Preboot (donde está la caché) con el dispositivo de la raíz.
+- **Trampas y llamadas nuevas**: `macx_triggers`, `setpriority`/`getpriority`, `mach_vm_remap` (trampolines de bloques de
+  libobjc), `identitysvc` (opendirectoryd giraba al 100% de CPU reintentando registrarse como resolutor de identidades).
+- **IOKit**: servicio `IOWatchdog` (watchdogd abortaba sin él).
+- **Número de CPU**: esta caché lee la CPU con `sidt [rbp-0x10]` además de `sidt [rsp-0x10]`; sin sustituirla, una veintena
+  de servicios caían en libdispatch.
+- **Programas protegidos** («Apple Protect»: loginwindow, Finder, Dock...): su `__TEXT` está cifrado (Blowfish, página a
+  página) y en un Mac lo descifra el núcleo con la clave OSK del SMC. `tahoe-run` lo descifra al cargar el ejecutable
+  (`emu_dsmos.c`). **La clave no está en el repositorio**: se lee de `~/.config/tahoe-run/osk` (64 bytes) o de
+  `TAHOE_OSK_FILE`; es la misma que dan VirtualSMC o FakeSMC a un Hackintosh.
+
+Siguiente: que `loginwindow` abra el Asistente de configuración y, para verlo, una pantalla: un `IOFramebuffer` emulado
+(como un Mac o una máquina virtual sin aceleración, que macOS 26 dibuja por software) mostrado en una ventana de Linux, y
+después la aceleración real (Metal sobre Vulkan).

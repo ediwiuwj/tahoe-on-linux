@@ -44,9 +44,13 @@ while [ "$1" = --launchd ] || [ "$1" = --depurar ]; do
 done
 [ $# -eq 0 ] && set -- -l
 
+# Clave OSK del SMC (64 bytes) para descifrar los programas protegidos de macOS (loginwindow, Finder, Dock...): no va en el
+# repositorio; si existe ~/.config/tahoe-run/osk (o TAHOE_OSK_FILE), tahoe-run la usa (ver tahoe-run/emu_dsmos.c).
+OSK="${TAHOE_OSK_FILE:-$HOME/.config/tahoe-run/osk}"
+OSK_ENV=(); [ -r "$OSK" ] && OSK_ENV=(TAHOE_OSK_FILE="$(readlink -f "$OSK")")
 MACOS_ENV=(PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root USER=root LOGNAME=root SHELL=/bin/bash
 	TERM="${TERM:-xterm-256color}" LANG="${LANG:-es_ES.UTF-8}"
-	TAHOE_ROOT="$ROOT" TAHOE_CACHE_DIR="$CACHE" TAHOE_LOGFILE="$LOG" "${DEBUG_ENV[@]}")
+	TAHOE_ROOT="$ROOT" TAHOE_CACHE_DIR="$CACHE" TAHOE_LOGFILE="$LOG" "${DEBUG_ENV[@]}" "${OSK_ENV[@]}")
 SHELL_ARGS=("$DYLD_CACHE" "$ROOT/usr/lib/dyld" "$ROOT/bin/bash" "$@")
 
 if [ -z "$WITH_LAUNCHD" ]; then

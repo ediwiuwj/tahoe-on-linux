@@ -35,6 +35,7 @@ void diag_crash(ucontext_t* uc);
 extern const char* tahoe_root;
 extern char cache_guest_path[1024];   // ruta de la caché vista desde macOS (sin la raíz del host)
 extern uint64_t cache_ino;
+void dsmos_unprotect(uint8_t* seg, uint64_t fileoff, uint64_t filesize, const char* path);   // emu_dsmos.c
 void sys_volumes_mount(void);       // emu_fs.c: volúmenes Data y Preboot de un macOS completo (en el PID 1)
 extern const char *g_cache_path, *g_dyld_path, *g_self_exe;   // para relanzar tahoe-run en execve   // raíz del sistema de archivos de macOS 26 (TAHOE_ROOT)
 extern int trace_all;

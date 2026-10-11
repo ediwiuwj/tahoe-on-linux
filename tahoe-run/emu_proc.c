@@ -750,7 +750,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	nargv[k++] = (char*)g_dyld_path;
 	nargv[k++] = hpath;
 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
-	char** nenv = calloc(ec + 12 + 8 + 9, sizeof(char*));
+	char** nenv = calloc(ec + 13 + 8 + 9, sizeof(char*));
 	int e = 0;
 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
 	char b1[4300], b2[4300];
@@ -764,6 +764,8 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (getenv("TAHOE_LOGFILE")) { snprintf(b3, sizeof b3, "TAHOE_LOGFILE=%s", getenv("TAHOE_LOGFILE")); nenv[e++] = b3; }
 	static char b6[600];
 	if (getenv("TAHOE_CACHE_DIR")) { snprintf(b6, sizeof b6, "TAHOE_CACHE_DIR=%s", getenv("TAHOE_CACHE_DIR")); nenv[e++] = b6; }
+	static char b8[600];
+	if (getenv("TAHOE_OSK_FILE")) { snprintf(b8, sizeof b8, "TAHOE_OSK_FILE=%s", getenv("TAHOE_OSK_FILE")); nenv[e++] = b8; }
 	if (getenv("TAHOE_FD2LOG")) nenv[e++] = (char*)"TAHOE_FD2LOG=1";
 	if (getenv("TAHOE_DEBUG_NOREBOOT")) nenv[e++] = (char*)"TAHOE_DEBUG_NOREBOOT=1";   // modo depuración (ver emu_iokit.inc)
 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";

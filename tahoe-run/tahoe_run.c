@@ -429,6 +429,7 @@ static void load_macho(const char* path, uint64_t slide, struct image* out) {
 				void* p = mmap((void*)addr, maplen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, base_off + s->fileoff);
 				if (p == MAP_FAILED) DIE("%s: mmap de %s en 0x%lx falló: %s", path, s->segname, addr, strerror(errno));
 				if (s->vmsize > s->filesize && maplen > s->filesize) memset((void*)(addr + s->filesize), 0, maplen - s->filesize);
+				if (s->flags & 0x8) dsmos_unprotect((uint8_t*)addr, s->fileoff, s->filesize, path);   // SG_PROTECTED_VERSION_1
 				mprotect((void*)addr, maplen, prot);
 			}
 			if (round_up(s->vmsize) > maplen) {
@@ -1023,7 +1024,11 @@ void __attribute__((noreturn)) enter_guest_thread(uint64_t rip, uint64_t rsp, ui
 static void on_sigill(int sig, siginfo_t* si, void* v) {
 	(void)sig; (void)si;
 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
-	logf_("    SIGILL <%d>\n", getpid());
+	{
+		const uint8_t* ip = (const uint8_t*)((ucontext_t*)v)->uc_mcontext.gregs[REG_RIP]; uint8_t b[4] = { 0 };
+		safe_read((uint64_t)ip, b, 4);
+		logf_("    SIGILL <%d> hilo %ld rip=%p (%02x %02x %02x %02x)\n", getpid(), (long)syscall(SYS_gettid), (void*)ip, b[0], b[1], b[2], b[3]);
+	}
 	diag_crash(v);
 	diag_dump_threads();
 	_exit(132);
