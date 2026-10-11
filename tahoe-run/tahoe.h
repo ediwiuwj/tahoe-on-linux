@@ -42,6 +42,7 @@ extern int trace_all;
 void emu_sysctl_init(void);
 void emu_fileport_init(void);
 int exe_host_path(int pid, char* out, size_t cap);
+void data_log_storage(const char* data_root);   // almacén de logd en un volumen de datos (emu_fs.c)
 int proc_dir(int pid, char* out, size_t cap);
 int exe_uuid(int pid, uint8_t out[16]);          // LC_UUID del ejecutable de macOS del proceso   // /proc/<pid>, o el de un hilo vivo si el líder es zombi
 int darwin_sig_to_linux(int s);                         // número de señal de Darwin -> Linux (0 si no hay)   // ruta en el anfitrión del ejecutable de macOS de un proceso

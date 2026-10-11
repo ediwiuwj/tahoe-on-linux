@@ -527,6 +527,7 @@ static long do_mount(const char* type, const char* path, uint32_t flags) {
 		char b[4200]; const char* hp = resolve(path, b, sizeof b);
 		unsigned long lf = ((flags & MNT_RDONLY) ? 1 : 0) | ((flags & MNT_NOSUID) ? 2 : 0) | ((flags & MNT_NODEV) ? 4 : 0);
 		if (syscall(SYS_mount, "tmpfs", hp, "tmpfs", lf, "mode=0755") != 0) return err();
+		if (!strcmp(path, "/System/Volumes/Data")) data_log_storage(hp);   // el /private nuevo, con el almacén de registros
 		vfs_event_signal(0x8);                          // VQ_MOUNT
 		return 0;
 	}
@@ -1112,18 +1113,25 @@ void populate_data_volume(void) {
 	struct stat st;
 	if (stat(tmpl_root, &st) != 0) return;
 	nftw(tmpl_root, tmpl_copy, 32, FTW_PHYS);
-	// Almacén de registros de logd. En un BaseSystem, libsystem_trace (_os_trace_basesystem_storage_available) solo da por
+	data_log_storage(tahoe_root);
+}
+// Almacén de registros de logd. En un BaseSystem, libsystem_trace (_os_trace_basesystem_storage_available) solo da por
 	// disponible el almacenamiento si /private/var/db/diagnostics es un enlace simbólico (el arranque lo apunta a un volumen
 	// escribible) o si los boot-args lo indican; si no, launchd decide que no hay registro completo (HasFullLogging = NO) y
 	// no carga logd. Aquí la raíz es una carpeta escribible de Linux: se presenta como lo haría un arranque con almacenamiento.
-	char p[4400], q[4400];
-	snprintf(p, sizeof p, "%s/private/var/db/diagnostics", tahoe_root);
+// Se hace sobre el volumen de datos: al arrancar launchd (populate_data_volume) y otra vez cuando la Recovery monta su
+// tmpfs en /System/Volumes/Data (do_mount), que tapa lo anterior; si no, logd queda cargado sin almacén y `log` no conecta.
+void data_log_storage(const char* data_root) {
+	char p[4400], q[4400]; struct stat st;
+	snprintf(p, sizeof p, "%s/private/var/db", data_root);
+	if (stat(p, &st) != 0) { char a[4400]; snprintf(a, sizeof a, "%s/private", data_root); mkdir(a, 0755); snprintf(a, sizeof a, "%s/private/var", data_root); mkdir(a, 0755); mkdir(p, 0755); }
+	snprintf(p, sizeof p, "%s/private/var/db/diagnostics", data_root);
 	if (lstat(p, &st) != 0) {
-		snprintf(q, sizeof q, "%s/private/var/db/diagnostics.storage", tahoe_root);
+		snprintf(q, sizeof q, "%s/private/var/db/diagnostics.storage", data_root);
 		mkdir(q, 0755);
 		if (symlink("diagnostics.storage", p) != 0) {}
 	}
-	snprintf(p, sizeof p, "%s/private/var/db/uuidtext", tahoe_root);
+	snprintf(p, sizeof p, "%s/private/var/db/uuidtext", data_root);
 	if (lstat(p, &st) != 0) mkdir(p, 0755);
 }
 
