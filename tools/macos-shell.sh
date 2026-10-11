@@ -24,7 +24,15 @@ ROOT="${TAHOE_ROOT:-$HOME/macos26/base/macOS Base System}"
 TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 RUN="${TAHOE_RUN:-$(cd "$TOOLS/../tahoe-run" && pwd)/tahoe-run}"   # TAHOE_RUN: otro binario (comparar versiones)
 if [ ! -x "$RUN" ]; then echo "falta $RUN: compila con tahoe-run/build.sh" >&2; exit 1; fi
-if [ ! -f "$ROOT/System/Library/dyld/dyld_shared_cache_x86_64" ]; then echo "no encuentro el sistema base de macOS en: $ROOT (define TAHOE_ROOT)" >&2; exit 1; fi
+# Caché de dyld: en la Recovery está en el propio sistema; en un macOS completo viene en el cryptex del sistema (Preboot), y en
+# un procesador Haswell o posterior dyld usa la variante x86_64h, como en un Mac.
+DYLD_CACHE=
+for c in "$ROOT/System/Library/dyld/dyld_shared_cache_x86_64" \
+	"$ROOT/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h" \
+	"$ROOT/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64"; do
+	[ -f "$c" ] && { DYLD_CACHE="$c"; break; }
+done
+if [ -z "$DYLD_CACHE" ]; then echo "no encuentro el sistema de macOS en: $ROOT (define TAHOE_ROOT)" >&2; exit 1; fi
 CACHE="${TAHOE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tahoe-run}"   # el slide de la caché de dyld se calcula una vez
 LOG="${TAHOE_LOGFILE:-/tmp/tahoe-shell-$USER.log}"
 
@@ -39,7 +47,7 @@ done
 MACOS_ENV=(PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root USER=root LOGNAME=root SHELL=/bin/bash
 	TERM="${TERM:-xterm-256color}" LANG="${LANG:-es_ES.UTF-8}"
 	TAHOE_ROOT="$ROOT" TAHOE_CACHE_DIR="$CACHE" TAHOE_LOGFILE="$LOG" "${DEBUG_ENV[@]}")
-SHELL_ARGS=("$ROOT/System/Library/dyld/dyld_shared_cache_x86_64" "$ROOT/usr/lib/dyld" "$ROOT/bin/bash" "$@")
+SHELL_ARGS=("$DYLD_CACHE" "$ROOT/usr/lib/dyld" "$ROOT/bin/bash" "$@")
 
 if [ -z "$WITH_LAUNCHD" ]; then
 	exec env -i "${MACOS_ENV[@]}" "$RUN" "${SHELL_ARGS[@]}"
@@ -71,7 +79,7 @@ if [ -z "$L" ]; then
 	"$TOOLS/mem_guard.sh" & GUARD=$!
 	setsid env -i "${MACOS_ENV[@]}" TAHOE_FD2LOG=1 \
 		unshare --pid --fork --user --map-root-user --mount-proc \
-		nice -n 10 "$RUN" "$ROOT/System/Library/dyld/dyld_shared_cache_x86_64" "$ROOT/usr/lib/dyld" "$ROOT/sbin/launchd" \
+		nice -n 10 "$RUN" "$DYLD_CACHE" "$ROOT/usr/lib/dyld" "$ROOT/sbin/launchd" \
 		< /dev/null > /dev/null 2>&1 &
 	U=$! STARTED=1
 	for _ in $(seq 50); do L=$(find_launchd); [ -n "$L" ] && [ -n "$(find_region "$L")" ] && break; sleep 0.2; done

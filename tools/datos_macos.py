@@ -7,12 +7,18 @@
 #      el de datos. Linux no los tiene: cada uno se presenta como un enlace simbólico relativo hacia
 #      System/Volumes/Data/<destino>. Si en el lado del sistema había contenido, se mueve antes al lado de datos.
 # Es idempotente: se puede repetir sin estropear nada.
+# Algunas carpetas de la plantilla son solo de root en macOS (p. ej. private/var/db/dslocal/nodes/Default, sin permiso de
+# paso para nadie más): sin ser root, el script se vuelve a ejecutar en un espacio de usuario donde el usuario es root
+# (unshare -r), igual que tahoe-run, y así puede leerlas; los archivos siguen siendo del usuario.
 import os, shutil, sys
 
 def copia(src, dst):
     if os.path.lexists(dst): return
-    shutil.copytree(src, dst, symlinks=True, copy_function=shutil.copy2)
-    shutil.copystat(src, dst)
+    tmp = dst + ".copiando"                                # a medias no cuenta: se copia aparte y se renombra al final
+    if os.path.lexists(tmp): shutil.rmtree(tmp)
+    shutil.copytree(src, tmp, symlinks=True, copy_function=shutil.copy2)
+    shutil.copystat(src, tmp)
+    os.rename(tmp, dst)
 
 def mezcla(src, dst):
     """Mueve el contenido de src (lado del sistema) a dst (lado de datos) sin pisar lo que ya haya en dst."""
@@ -24,6 +30,8 @@ def mezcla(src, dst):
     shutil.rmtree(src)
 
 def main():
+    if os.getuid() != 0:
+        os.execvp("unshare", ["unshare", "-r", sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
     root = os.path.abspath(sys.argv[1])
     data = os.path.join(root, "System/Volumes/Data")
     tmpl = os.path.join(root, "System/Library/Templates/Data")

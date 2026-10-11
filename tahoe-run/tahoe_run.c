@@ -46,7 +46,9 @@
 #endif
 
 #define COMMPAGE     0x00007fffffe00000UL
-#define DYLD_SLIDE   0x00007ffc00000000UL
+// dyld se carga por debajo de la región compartida (0x7ff800000000-0x7ffffe600000 en XNU): la caché de un macOS completo
+// (principal + 6 subcachés) la llena casi entera.
+#define DYLD_SLIDE   0x00007ff000000000UL
 #define STACK_SIZE   (8UL << 20)
 
 int trace_all;
@@ -316,9 +318,17 @@ static void map_dynamic_region(const char* main_path) {
 	memcpy(p, "dyld_data    v3", 16);
 	*(uint64_t*)(p + 16) = (uint64_t)st.st_dev;                   // fsid
 	*(uint64_t*)(p + 24) = (uint64_t)st.st_ino;                   // fsobjid
-	*(uint32_t*)(p + 32) = 0;                                     // _osCryptexPathOffset: sin cryptex
 	*(uint32_t*)(p + 36) = 80;                                    // _cachePathOffset = sizeof(DynamicRegion)
 	strlcpy_((char*)p + 80, main_path, maxsize - 80);
+	// En un macOS completo la caché viene en el cryptex del sistema (montado en Preboot): launchd anota también su raíz
+	// (_osCryptexPathOffset), que dyld antepone a las rutas que busca fuera de la caché. En la Recovery no hay cryptex: 0.
+	static const char cryptex[] = "/System/Volumes/Preboot/Cryptexes/OS";
+	uint32_t coff = 0;
+	if (!strncmp(cache_guest_path, cryptex, sizeof cryptex - 1) && cache_guest_path[sizeof cryptex - 1] == '/') {
+		coff = 80 + (uint32_t)strlen(main_path) + 1;
+		if (coff + sizeof cryptex <= maxsize) memcpy(p + coff, cryptex, sizeof cryptex); else coff = 0;
+	}
+	*(uint32_t*)(p + 32) = coff;                                  // _osCryptexPathOffset
 	mprotect(p, maxsize, PROT_READ);
 }
 

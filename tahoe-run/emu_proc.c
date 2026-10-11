@@ -321,7 +321,7 @@ void diag_crash(ucontext_t* uc) {
 			int shown = 0;
 			for (int k = 0; k < (int)(got / 8) && shown < 24; k++) {
 				uint64_t a = sk[k];
-				if (!((a >= 0x7ff800000000UL && a < 0x7ff820000000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;   // caché o ejecutable
+				if (!((a >= 0x7ff800000000UL && a < 0x7ffffe600000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;   // caché o ejecutable
 				uint8_t pre[6];
 				if (safe_read(a - 6, pre, 6) != 6) continue;
 				if (pre[1] == 0xe8 || pre[3] == 0xff || pre[4] == 0xff || pre[2] == 0xff) { logf_(" 0x%lx", a); shown++; }
@@ -341,7 +341,7 @@ static void plausible_returns(uint64_t rsp, int max) {
 	int shown = 0;
 	for (int k = 0; k < (int)(got / 8) && shown < max; k++) {
 		uint64_t a = sk[k];
-		if (!((a >= 0x7ff800000000UL && a < 0x7ff820000000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;
+		if (!((a >= 0x7ff800000000UL && a < 0x7ffffe600000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;
 		uint8_t pre[6];
 		if (safe_read(a - 6, pre, 6) != 6) continue;
 		if (pre[1] == 0xe8 || pre[3] == 0xff || pre[4] == 0xff || pre[2] == 0xff) { logf_(" 0x%lx", a); shown++; }
