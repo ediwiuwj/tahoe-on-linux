@@ -5,6 +5,7 @@
 #   tools/macos-shell.sh -c 'sw_vers'             # una orden
 #   tools/macos-shell.sh --launchd                # shell unida a launchd (launchctl, defaults... hablan con sus servicios)
 #   tools/macos-shell.sh --launchd -c 'launchctl list'
+#   tools/macos-shell.sh --launchd --depurar      # modo depuración (ver abajo)
 #
 # TAHOE_RUN: binario de tahoe-run a usar (por omisión, el del repo).
 # TAHOE_ROOT: carpeta con el sistema base de macOS extraído (por omisión ~/macos26/base/macOS Base System).
@@ -15,6 +16,10 @@
 # salir. La shell entra en ese espacio de PID con nsenter y comparte la región de puertos Mach (TAHOE_PORTS): como no
 # tiene puerto bootstrap propio usa el que launchd registró (mach_ports_register), igual que un proceso de macOS
 # encuentra a launchd. TAHOE_BOOT_WAIT: segundos de espera para que arranquen los servicios (por omisión 10).
+#
+# --depurar: modo depuración. Pone en la NVRAM emulada ROS_SLEEP_ON_FAILURE, el ajuste de recoveryosd para que, si algo le
+# obliga a reiniciar (hoy: el llavero de root), se quede dormido en vez de ejecutar /sbin/reboot y apagar todo el arranque.
+# Sin la opción, el arranque es el normal, como en un Mac.
 ROOT="${TAHOE_ROOT:-$HOME/macos26/base/macOS Base System}"
 TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 RUN="${TAHOE_RUN:-$(cd "$TOOLS/../tahoe-run" && pwd)/tahoe-run}"   # TAHOE_RUN: otro binario (comparar versiones)
@@ -23,13 +28,17 @@ if [ ! -f "$ROOT/System/Library/dyld/dyld_shared_cache_x86_64" ]; then echo "no 
 CACHE="${TAHOE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tahoe-run}"   # el slide de la caché de dyld se calcula una vez
 LOG="${TAHOE_LOGFILE:-/tmp/tahoe-shell-$USER.log}"
 
-WITH_LAUNCHD=
-if [ "$1" = --launchd ]; then WITH_LAUNCHD=1; shift; fi
+WITH_LAUNCHD= DEBUG_ENV=()
+while [ "$1" = --launchd ] || [ "$1" = --depurar ]; do
+	[ "$1" = --launchd ] && WITH_LAUNCHD=1
+	[ "$1" = --depurar ] && DEBUG_ENV=(TAHOE_DEBUG_NOREBOOT=1)
+	shift
+done
 [ $# -eq 0 ] && set -- -l
 
 MACOS_ENV=(PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root USER=root LOGNAME=root SHELL=/bin/bash
 	TERM="${TERM:-xterm-256color}" LANG="${LANG:-es_ES.UTF-8}"
-	TAHOE_ROOT="$ROOT" TAHOE_CACHE_DIR="$CACHE" TAHOE_LOGFILE="$LOG")
+	TAHOE_ROOT="$ROOT" TAHOE_CACHE_DIR="$CACHE" TAHOE_LOGFILE="$LOG" "${DEBUG_ENV[@]}")
 SHELL_ARGS=("$ROOT/System/Library/dyld/dyld_shared_cache_x86_64" "$ROOT/usr/lib/dyld" "$ROOT/bin/bash" "$@")
 
 if [ -z "$WITH_LAUNCHD" ]; then

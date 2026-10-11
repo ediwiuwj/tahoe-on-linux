@@ -365,6 +365,10 @@ static void io_init(void) {
 	int opt = ent_add(plat, "options", "IODTNVRAM", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(opt, "name", "options");
 	p_str(opt, "boot-args", "");                              // OSString, como IONVRAMCHRPHandler (las variables de texto son cadenas)
+	// Modo depuración (tools/macos-shell.sh --depurar): la variable de NVRAM con la que recoveryosd, cuando algo le obliga a
+	// reiniciar, se queda dormido en vez de ejecutar /sbin/reboot (ros_sleep_on_failure_set de RecoveryOS.framework: OSData
+	// cuyo texto UTF-8 da boolValue verdadero). Sin el modo, la NVRAM no la tiene, como en un Mac.
+	if (getenv("TAHOE_DEBUG_NOREBOOT")) p_data(opt, "ROS_SLEEP_ON_FAILURE", "1", 1);
 	int chosen = ent_add(plat, "chosen", "IOService", "IORegistryEntry", "", PL_SERVICE | PL_DT, 0);
 	p_cstr(chosen, "name", "chosen");
 	p_data(chosen, "boot-uuid", "00000000-0000-1000-8000-000000000002", 37);

@@ -12,6 +12,8 @@
 #   BRK='dir dir...'  int3 en esas direcciones (hex) del proceso de STACKS: registra los registros al pasar (BRK)
 #   PEEK='expr...'    con BRK: lee 8 bytes en cada dirección o registro+desplazamiento (p. ej. rdi+0x50)
 #   TAHOE_RUN=<bin>   otro binario de tahoe-run (comparar versiones)
+#   TAHOE_DEPURAR=0   arranque normal; por omisión se usa el modo depuración (macos-shell.sh --depurar), en el que
+#                     recoveryosd no reinicia si falla, para poder seguir mirando)
 DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
 rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stacks /dev/shm/tahoe-stacks-all /dev/shm/tahoe-mach-trace /dev/shm/tahoe-iokit-trace
@@ -22,6 +24,6 @@ rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stack
 [ -n "$BRK" ] && printf "%s\n" $BRK > /dev/shm/tahoe-break
 [ -n "$PEEK" ] && printf "%s\n" $PEEK > /dev/shm/tahoe-peek
 TAHOE_RUN="${TAHOE_RUN:-}" TAHOE_LOGFILE="$D/msh.log" TAHOE_BOOT_WAIT="${2:-12}" timeout -s TERM -k 5 "${3:-60}" nice -n 10 \
-	"$DIAG/../macos-shell.sh" --launchd -c "$1" < /dev/null 2>&1
+	"$DIAG/../macos-shell.sh" --launchd $([ "${TAHOE_DEPURAR:-1}" = 0 ] || echo --depurar) -c "$1" < /dev/null 2>&1
 echo "[salida=$?]"
 "$DIAG/clean.sh"
