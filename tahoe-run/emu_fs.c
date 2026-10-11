@@ -934,6 +934,19 @@ void populate_data_volume(void) {
 	struct stat st;
 	if (stat(tmpl_root, &st) != 0) return;
 	nftw(tmpl_root, tmpl_copy, 32, FTW_PHYS);
+	// Almacén de registros de logd. En un BaseSystem, libsystem_trace (_os_trace_basesystem_storage_available) solo da por
+	// disponible el almacenamiento si /private/var/db/diagnostics es un enlace simbólico (el arranque lo apunta a un volumen
+	// escribible) o si los boot-args lo indican; si no, launchd decide que no hay registro completo (HasFullLogging = NO) y
+	// no carga logd. Aquí la raíz es una carpeta escribible de Linux: se presenta como lo haría un arranque con almacenamiento.
+	char p[4400], q[4400];
+	snprintf(p, sizeof p, "%s/private/var/db/diagnostics", tahoe_root);
+	if (lstat(p, &st) != 0) {
+		snprintf(q, sizeof q, "%s/private/var/db/diagnostics.storage", tahoe_root);
+		mkdir(q, 0755);
+		if (symlink("diagnostics.storage", p) != 0) {}
+	}
+	snprintf(p, sizeof p, "%s/private/var/db/uuidtext", tahoe_root);
+	if (lstat(p, &st) != 0) mkdir(p, 0755);
 }
 
 // ---- map_with_linking_np(regiones[], n, info, tamaño): como vm_dyld_pager de XNU. dyld pide al núcleo que proyecte las

@@ -452,6 +452,17 @@ long bsd_sysctl(struct ctx* c) {
 		if (trace_all || 1) logf_("    sysctl: nombre desconocido \"%s\"\n", name);
 		return -D_ENOENT;
 	}
+	if (n == 2 && mib[0] == CTL_KERN && mib[1] == 0x7005) {   // kern.osvariant_status: lectura y escritura como XNU
+		if (c->a[4]) {
+			uint64_t v = 0;
+			if (c->a[5] != 8 || safe_read(c->a[4], &v, 8) != 8) return -D_EINVAL;
+			if (osvariant_status_set(v) != 0) return -D_EPERM;
+			if (trace_all || mach_trace()) logf_("    sysctl kern.osvariant_status <- 0x%lx\n", (unsigned long)v);
+			if (!c->a[2]) return 0;
+		}
+		uint64_t v = osvariant_status_get();
+		return sc_out(c, &v, sizeof v);
+	}
 	if (n == 2) {
 		for (size_t i = 0; i < NENT; i++) {
 			if (table[i].mib[0] != mib[0] || table[i].mib[1] != mib[1]) continue;

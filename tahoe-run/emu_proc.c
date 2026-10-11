@@ -489,7 +489,7 @@ static int darwin_wait_status(int st) {
 static long bsd_fork(struct ctx* c) {
 	long p = syscall(SYS_fork);
 	if (p < 0) return -darwin_errno(errno);
-	if (p == 0) { memfd_reopen(); ports_forked_child(); reenable_dispatch(); }  // el hijo: su propia memoria, no es el creador
+	if (p == 0) { memfd_reopen(); ports_forked_child(); fileport_forked_child(); reenable_dispatch(); }  // el hijo: su propia memoria, no es el creador
 	// Convenio de Darwin: hijo rax=pid del padre, rdx=1; padre rax=pid del hijo, rdx=0. libsyscall devuelve 0 al hijo
 	// al ver rdx != 0, y libc ejecuta entonces los manejadores de hijo (reinicio de puertos Mach, hilo principal...).
 	c->has_ret2 = 1;
@@ -651,7 +651,7 @@ static long bsd_posix_spawn(struct ctx* c) {
 			logf_("    posix_spawn: acción de puerto tipo=%u which=%u puerto=0x%x\n", act[0], act[5], act[2]);
 		}
 	}
-	logf_("    posix_spawn(\"%s\") attr_flags=0x%x ad=%lx,%lx,%lx,%lx,%lx,%lx\n", gp, psa_flags, ad[0], ad[1], ad[2], ad[3], ad[4], ad[5]);
+	logf_("    posix_spawn <%d>(\"%s\") attr_flags=0x%x ad=%lx,%lx,%lx,%lx,%lx,%lx\n", (int)getpid(), gp, psa_flags, ad[0], ad[1], ad[2], ad[3], ad[4], ad[5]);
 	if (psa_flags & 0x40) return exec_common(c->a[1], c->a[3], c->a[4], 0, NULL);
 	pid_t pid = 0;
 	long r = exec_common(c->a[1], c->a[3], c->a[4], 1, &pid);

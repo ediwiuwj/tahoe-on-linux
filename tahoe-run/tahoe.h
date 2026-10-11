@@ -39,6 +39,7 @@ extern int trace_all;
 
 // Módulos
 void emu_sysctl_init(void);
+void emu_fileport_init(void);
 void emu_fs_init(void);
 void emu_mach_init(void);
 void emu_proc_init(void);
@@ -79,6 +80,7 @@ const char* tahoe_dev_alias(const char* p, char* buf, size_t cap);
 void memfd_reopen(void);
 int fsevents_open(void);
 void ports_forked_child(void);
+void fileport_forked_child(void);
 uint32_t guest_uid(uint32_t u);
 uint32_t darwin_dev(unsigned ma, unsigned mi);
 uint32_t guest_gid(uint32_t g);
@@ -100,8 +102,10 @@ int port_release_send_once(uint32_t name);
 int port_assert_guard(uint32_t name, uint64_t guard);
 int port_swap_guard(uint32_t name, uint64_t old, uint64_t nw);
 int port_get_refs(uint32_t name, uint32_t right, uint32_t* refs);
-enum { KO_TASK = 1, KO_TASK_NAME = 2, KO_IDENTITY_TOKEN = 3 };
+enum { KO_TASK = 1, KO_TASK_NAME = 2, KO_IDENTITY_TOKEN = 3, KO_FILEPORT = 4 };
 uint32_t kobj_make(int type, int32_t pid);
+uint32_t kobj_new(int type, int32_t pid);
+void kobj_free(uint32_t name);
 int kobj_lookup(uint32_t name, int* type, int32_t* pid);
 uint64_t rmap_add(int32_t pid, const char* path, uint64_t off, uint64_t len, int prot, uint64_t align);
 int rmap_fault(uint64_t addr);
@@ -111,6 +115,8 @@ int port_request_notification(uint32_t name, int variant, uint32_t notify, uint3
 long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total);
 uint32_t special_port_get(int which);
 void registered_ports_set(const uint32_t* p, int n);
+uint64_t osvariant_status_get(void);
+int osvariant_status_set(uint64_t v);
 void special_port_set(int which, uint32_t name);
 void reenable_dispatch(void);   // el kernel no hereda la interceptación de syscalls en el hijo de un fork
 

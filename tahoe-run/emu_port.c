@@ -66,6 +66,7 @@ struct shm {
 	struct skobj kobjs[MAXKOBJ];
 	struct srmap rmaps[MAXRMAP];
 	uint64_t rmap_next;
+	uint64_t osvariant_status;            // kern.osvariant_status: lo fija launchd (PID 1) una vez y lo leen todos
 };
 static struct shm* shm;
 static char shm_path[128], tag[32];
@@ -568,6 +569,14 @@ static void sp_init(void) {
 }
 // mach_ports_register(ports[3]): se guardan en la región compartida; los hijos los heredan (en XNU, task_create copia
 // itk_registered) y, mientras no tengan puerto bootstrap propio, usan el primero: así encuentran a launchd.
+// kern.osvariant_status (kern_sysctl.c de XNU): un valor por arranque, compartido por todos los procesos. Solo el PID 1 lo
+// fija, y una sola vez; si no, EPERM (devuelve 0 si se fijó).
+uint64_t osvariant_status_get(void) { lock(); uint64_t v = shm->osvariant_status; unlock(); return v; }
+int osvariant_status_set(uint64_t v) {
+	if (getpid() != 1) return -1;
+	lock(); int ok = shm->osvariant_status == 0; if (ok) shm->osvariant_status = v; unlock();
+	return ok ? 0 : -1;
+}
 void registered_ports_set(const uint32_t* p, int n) { lock(); for (int i = 0; i < 3; i++) shm->special[i] = i < n ? p[i] : 0; unlock(); }
 static uint32_t registered_port(int i) { lock(); uint32_t v = shm->special[i]; unlock(); return v; }
 uint32_t special_port_get(int which) {
@@ -932,6 +941,20 @@ uint32_t kobj_make(int type, int32_t pid) {
 	}
 	unlock();
 	return r;
+}
+// Objeto del núcleo con nombre propio cada vez (p. ej. un fileport por cada fileport_makeport). 0 si la tabla está llena.
+uint32_t kobj_new(int type, int32_t pid) {
+	lock();
+	uint32_t r = 0;
+	for (int i = 0; i < MAXKOBJ; i++) if (!shm->kobjs[i].name) { r = shm->next_name; shm->next_name += 0x100; shm->kobjs[i] = (struct skobj){ r, (uint16_t)type, pid }; break; }
+	unlock();
+	if (!r) logf_("    kobj: tabla llena\n");
+	return r;
+}
+void kobj_free(uint32_t name) {
+	lock();
+	for (int i = 0; i < MAXKOBJ; i++) if (shm->kobjs[i].name == name) { shm->kobjs[i].name = 0; break; }
+	unlock();
 }
 int kobj_lookup(uint32_t name, int* type, int32_t* pid) {
 	if (name == 0x103) { *type = KO_TASK; *pid = (int32_t)getpid(); return 1; }   // mach_task_self
