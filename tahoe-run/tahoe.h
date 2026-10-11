@@ -69,6 +69,10 @@ int diag_target(void);
 int diag_all(void);
 void diag_dump_threads(void);
 void diag_breakpoints(void);
+uint32_t cred_euid(void);
+uint32_t cred_egid(void);
+void cred_env(char* out, size_t cap);
+void emu_cred_init(void);
 #include <signal.h>
 int tahoe_sigaction(int sig, void (*h)(int, siginfo_t*, void*));
 int port_eventfd(uint32_t name);

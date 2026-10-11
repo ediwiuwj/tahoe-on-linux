@@ -840,6 +840,10 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 		else if (diag_target() && ((r < 0 && r > -4096 && !c.raw_ret) || diag_all())) {   // diagnóstico: errores (o todo) del proceso indicado
 			char v[24]; if (r < 0 && r > -4096 && !c.raw_ret) snprintf(v, sizeof v, "E%-4ld", -r); else snprintf(v, sizeof v, "=%lx", r);
 			log_call("bsd", num, name, &c, v);
+			int pa = -1;                                         // argumento con ruta: open, access, readlink, stat, lstat, getattrlist...
+			if (num == 5 || num == 398 || num == 33 || num == 58 || num == 338 || num == 340 || num == 220 || num == 136 || num == 10 || num == 128) pa = 0;
+			else if (num == 463 || num == 464 || num == 469 || num == 470 || num == 466) pa = 1;
+			if (pa >= 0) { char path[200] = ""; if (safe_read(c.a[pa], path, sizeof path - 1) > 0) { path[199] = 0; logf_("        ruta: \"%s\"\n", path); } }
 		}
 		if (c.raw_ret) { g[REG_RAX] = (uint64_t)r; g[REG_EFL] &= ~1UL; }
 		else if (r < 0 && r > -4096) { g[REG_RAX] = -r; g[REG_EFL] |= 1; }   // error: rax = errno, CF = 1
@@ -1099,6 +1103,7 @@ int main(int argc, char** argv, char** envp) {
 	emu_sem_init();
 	emu_psynch_init();
 	emu_cs_init();
+	emu_cred_init();                                             // al final: sustituye los get/set*id provisionales
 	// Las variantes *_nocancel de Darwin son iguales a las normales salvo por el punto de cancelación de hilos.
 	static const struct { unsigned nocancel, normal; } alias[] = {
 		// todas las variantes *_nocancel de syscalls.master (sin puntos de cancelación, mismo efecto)

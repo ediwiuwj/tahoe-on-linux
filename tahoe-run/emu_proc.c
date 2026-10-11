@@ -582,7 +582,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	nargv[k++] = (char*)g_dyld_path;
 	nargv[k++] = hpath;
 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
-	char** nenv = calloc(ec + 10 + 8, sizeof(char*));
+	char** nenv = calloc(ec + 12 + 8, sizeof(char*));
 	int e = 0;
 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
 	char b1[4300], b2[4300];
@@ -598,6 +598,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (getenv("TAHOE_CACHE_DIR")) { snprintf(b6, sizeof b6, "TAHOE_CACHE_DIR=%s", getenv("TAHOE_CACHE_DIR")); nenv[e++] = b6; }
 	if (getenv("TAHOE_FD2LOG")) nenv[e++] = (char*)"TAHOE_FD2LOG=1";
 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
+	static char b7[300]; cred_env(b7, sizeof b7); nenv[e++] = b7;   // credenciales emuladas (uid/gid) para el hijo
 	for (int i = 0; i < spawn_special_n; i++) nenv[e++] = spawn_special_env[i];
 	if (trace_all) logf_("    execve(\"%s\") -> relanzando tahoe-run\n", gpath);
 	if (spawn) {

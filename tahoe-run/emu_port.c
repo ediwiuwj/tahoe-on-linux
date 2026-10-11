@@ -435,7 +435,7 @@ static int port_send_k(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 	struct mslot* q = &shm->msgs[idx - 1];
 	shm->free_head = q->next;
 	q->next = 0; q->size = size; q->total = (uint32_t)total;
-	q->spid = kernel ? 0 : (uint32_t)getpid(); q->suid = kernel ? 0 : geteuid(); q->sgid = kernel ? 0 : getegid();   // para el trailer de auditoría del receptor
+	q->spid = kernel ? 0 : (uint32_t)getpid(); q->suid = kernel ? 0 : cred_euid(); q->sgid = kernel ? 0 : cred_egid();   // para el trailer de auditoría del receptor
 	if (!kernel) msg_rights_locked(msg, size, RIGHTS_SEND, dest);
 	memcpy(q->data, msg, size);
 	uint32_t pos = size;
