@@ -331,12 +331,14 @@ static void disk_media(int e, const char* bsd, int unit, int minor, uint64_t siz
 	p_bool(e, "Whole", whole); p_bool(e, "Leaf", leaf); p_bool(e, "Writable", 1); p_bool(e, "Ejectable", 0);
 	p_bool(e, "Removable", 0); p_bool(e, "Open", 1); p_str(e, "IOClass", io_e[e].cls);
 }
+static uint64_t io_disk_size;                                  // bytes del disco virtual (io_disks), para la ruta EFI de arranque
 static void io_disks(int bus) {
 	struct statfs sf;
 	uint64_t size = 0, used = 0;
 	if (tahoe_root && statfs(tahoe_root, &sf) == 0) { size = (uint64_t)sf.f_blocks * sf.f_bsize; used = (uint64_t)(sf.f_blocks - sf.f_bfree) * sf.f_bsize; }
 	if (!size) size = 64ULL << 30;
 	size &= ~4095ULL;
+	io_disk_size = size;
 	int dev = ent_add(bus, "Tahoe Virtual Disk", "IOBlockStorageDevice", "IORegistryEntry IOService", "1f,2", PL_SERVICE, 0);
 	// "Virtual Interface": en una Recovery real el sistema base (BaseSystem.dmg) es una imagen de disco y diskutil la presenta
 	// así. Con "PCI-Express" (un disco interno) apfs_boot_util exige el volumen VM y launchd entra en pánico.
@@ -368,6 +370,49 @@ static void io_disks(int bus) {
 	disk_media(vol, "disk1s1", 1, 3, size, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
 	p_str(vol, "UUID", BOOT_VOLUME_UUID); p_str(vol, "VolGroupUUID", BOOT_VOLUME_UUID);
 	p_num(vol, "Partition ID", 1, 32); p_str(vol, "FullName", "macOS Base System");
+}
+
+// GUID de texto -> 16 bytes en el orden de EFI (los tres primeros campos en little endian)
+static void efi_guid(const char* s, uint8_t g[16]) {
+	unsigned v[16]; unsigned a, b, c;
+	sscanf(s, "%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x", &a, &b, &c, &v[8], &v[9], &v[10], &v[11], &v[12], &v[13], &v[14], &v[15]);
+	memcpy(g, &a, 4); g[4] = b & 0xff; g[5] = b >> 8; g[6] = c & 0xff; g[7] = c >> 8;
+	for (int i = 8; i < 16; i++) g[i] = (uint8_t)v[i];
+}
+// Disco de arranque en la NVRAM, como lo deja bless en un Mac Intel: BootOrder → Boot0080 (EFI_LOAD_OPTION con la ruta de
+// dispositivo EFI del cargador), efi-boot-device-data (la misma ruta) y efi-boot-device (su versión XML, que bless resuelve
+// a un disco con IOMatch). Arranca el volumen del sistema (disk1s1) con boot.efi, en la partición del contenedor (disk0s1).
+#define EFI_GLOBAL_GUID "8BE4DF61-93CA-11D2-AA0D-00E098032B8C"
+static void io_nvram_boot(int opt) {
+	static const char file[] = "\\System\\Library\\CoreServices\\boot.efi";
+	uint8_t dp[256]; size_t n = 0;
+	// HD(1, GPT, UUID de la partición, inicio, tamaño en sectores de 512)
+	dp[n++] = 4; dp[n++] = 1; dp[n++] = 42; dp[n++] = 0;
+	uint32_t part = 1; uint64_t start = 0, len = io_disk_size / 512;
+	memcpy(dp + n, &part, 4); n += 4; memcpy(dp + n, &start, 8); n += 8; memcpy(dp + n, &len, 8); n += 8;
+	efi_guid("B0070000-0000-4000-8000-0000000000D1", dp + n); n += 16;
+	dp[n++] = 2; dp[n++] = 2;                                // MBRType GPT, SignatureType GUID
+	// File(\System\Library\CoreServices\boot.efi) en UTF-16 con NUL
+	size_t fl = 4 + (sizeof file) * 2;
+	dp[n++] = 4; dp[n++] = 4; dp[n++] = fl & 0xff; dp[n++] = fl >> 8;
+	for (size_t i = 0; i < sizeof file; i++) { dp[n++] = (uint8_t)file[i]; dp[n++] = 0; }
+	dp[n++] = 0x7f; dp[n++] = 0xff; dp[n++] = 4; dp[n++] = 0;   // fin
+	uint8_t lo[512]; size_t m = 0;
+	uint32_t attr = 1; uint16_t dpl = (uint16_t)n;           // LOAD_OPTION_ACTIVE
+	memcpy(lo + m, &attr, 4); m += 4; memcpy(lo + m, &dpl, 2); m += 2;
+	static const char desc[] = "Mac OS X";
+	for (size_t i = 0; i < sizeof desc; i++) { lo[m++] = (uint8_t)desc[i]; lo[m++] = 0; }
+	memcpy(lo + m, dp, n); m += n;
+	static const uint8_t order[2] = { 0x80, 0x00 };
+	p_data(opt, EFI_GLOBAL_GUID ":BootOrder", order, 2);
+	p_data(opt, EFI_GLOBAL_GUID ":Boot0080", lo, m);
+	p_data(opt, "efi-boot-device-data", dp, n);
+	char xml[1024];
+	snprintf(xml, sizeof xml, "<array><dict><key>IOMatch</key><dict><key>IOProviderClass</key><string>IOMedia</string>"
+		"<key>IOPropertyMatch</key><dict><key>UUID</key><string>%s</string></dict></dict><key>BLLastBSDName</key>"
+		"<string>disk1s1</string></dict><dict><key>IOEFIDevicePathType</key><string>MediaFilePath</string><key>Path</key>"
+		"<string>%s</string></dict></array>", BOOT_VOLUME_UUID, file);
+	p_str(opt, "efi-boot-device", xml);
 }
 
 static void io_init(void) {
@@ -453,6 +498,12 @@ static void io_init(void) {
 	// reiniciar, se queda dormido en vez de ejecutar /sbin/reboot (ros_sleep_on_failure_set de RecoveryOS.framework: OSData
 	// cuyo texto UTF-8 da boolValue verdadero). Sin el modo, la NVRAM no la tiene, como en un Mac.
 	if (getenv("TAHOE_DEBUG_NOREBOOT")) p_data(opt, "ROS_SLEEP_ON_FAILURE", "1", 1);
+	// /efi: el firmware EFI de un Mac Intel (bless y otros lo buscan para saber que el arranque es EFI y no iBoot).
+	int efi = ent_add(plat, "efi", "IOService", "IORegistryEntry", "", PL_DT, 0);
+	p_cstr(efi, "name", "efi");
+	p_data(efi, "firmware-vendor", "A\0p\0p\0l\0e\0\0", 12);   // UTF-16 con NUL
+	p_cstr(efi, "firmware-abi", "EFI64");
+	{ uint32_t rev = 0x0001000a; p_data(efi, "firmware-revision", &rev, 4); }
 	int chosen = ent_add(plat, "chosen", "IOService", "IORegistryEntry", "", PL_SERVICE | PL_DT, 0);
 	p_cstr(chosen, "name", "chosen");
 	p_data(chosen, "boot-uuid", "00000000-0000-1000-8000-000000000002", 37);
@@ -512,6 +563,7 @@ static void io_init(void) {
 	int smc = ent_add(acpi, "AppleSMC", "AppleSMC", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(smc, "IOClass", "AppleSMC");
 	io_disks(pci);
+	io_nvram_boot(opt);
 	int cred = ent_add(res, "AppleCredentialManager", "AppleCredentialManager", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(cred, "IOClass", "AppleCredentialManager");
 	int usbc = ent_add(pci, "XHC1", "IOPCIDevice", "IORegistryEntry IOService", "140000", PL_SERVICE | PL_DT, 0);
