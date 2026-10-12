@@ -1037,6 +1037,7 @@ static int32_t uc_hid(struct uc_call* c) {
 		return hid_map() ? 0 : kIOReturnNoMemory;
 	}
 	case 1: case 2: return 0;                                          // setEventsEnable / setCursorEnable
+	case 3: return 0;                                                  // extPostEvent (loginwindow): aceptado sin efecto
 	case 4: {                                                          // setMouseLocation(x, y)
 		uint8_t* m = hid_map(); if (!m || c->nsin < 2) return kIOReturnBadArgument;
 		int16_t xy[2] = { (int16_t)c->sin[0], (int16_t)c->sin[1] }; memcpy(m + 8 + G_CURSORLOC, xy, 4);
