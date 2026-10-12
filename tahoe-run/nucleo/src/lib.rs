@@ -6,6 +6,7 @@
 //! biblioteca estándar ni memoria dinámica: trabaja sobre los búferes que le pasa el C y comprueba siempre los límites.
 #![cfg_attr(not(test), no_std)]
 
+pub mod candado;
 pub mod desborde;
 pub mod mensaje;
 pub mod rwlock;

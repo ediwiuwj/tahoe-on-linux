@@ -36,7 +36,7 @@
 #define NBUCKET 16384                // índice por nombre: cubeta = (nombre >> 8) % NBUCKET, cadenas por hnext
 #define MAXMSG   4096                    // ranuras de mensaje (archivo disperso: solo ocupan RAM las usadas)
 #define MSGSZ    (64 * 1024)
-struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; uint32_t spn; };   // spn: peticiones MACH_NOTIFY_SEND_POSSIBLE pendientes en shm->sp (para no recorrer la tabla si no hay)   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
+struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; uint32_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; uint32_t spn; };   // spn: peticiones MACH_NOTIFY_SEND_POSSIBLE pendientes en shm->sp (para no recorrer la tabla si no hay)   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
 struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint64_t spill; uint8_t data[MSGSZ - 40]; };   // sauid/sasid: sesión de auditoría del remitente   // spill: datos fuera de línea en un archivo aparte (nucleo_desborde_*), 0 = en la ranura
 // Derechos que el núcleo tiene que vigilar para avisar cuando muere su dueño (ver "notificaciones" más abajo):
 //  sonce: un proceso tiene un derecho send-once (normalmente, la respuesta que debe a quien le pidió algo);
@@ -64,7 +64,7 @@ struct sexecw { int32_t target, watcher; uint32_t port; };   // NOTE_EXEC: quié
 #define RMAP_SIZE 0x100000000ULL
 struct srmap { int32_t pid; int32_t prot; uint64_t addr, len, off; char path[96]; };
 struct shm {
-	pthread_mutex_t lk; pthread_cond_t cv;
+	uint32_t lk, cv;                      // candado y espera compartidos (nucleo/src/candado.rs)
 	uint32_t next_name, free_head, magic, special[8];
 	struct sport ports[MAXPORTS];
 	int32_t bucket[NBUCKET];              // índice+1 del primer puerto de cada cubeta (0 = vacía)
@@ -115,11 +115,7 @@ static void shm_init(void) {
 		is_creator = 1;
 		populate_data_volume();                       // plantilla del volumen de datos (dslocal, /private/var/...)
 		start_syslog_listener();
-		pthread_mutexattr_t ma; pthread_mutexattr_init(&ma); pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED); pthread_mutexattr_setrobust(&ma, PTHREAD_MUTEX_ROBUST);
-		pthread_mutex_init(&shm->lk, &ma);
-		pthread_condattr_t ca; pthread_condattr_init(&ca); pthread_condattr_setpshared(&ca, PTHREAD_PROCESS_SHARED); pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
-		pthread_cond_init(&shm->cv, &ca);
-		for (int i = 0; i < MAXPORTS; i++) pthread_cond_init(&shm->ports[i].cv, &ca);
+		// El candado (shm->lk) y las esperas por puerto (ports[i].cv) empiezan a cero: libres (ftruncate rellena con ceros).
 		shm->next_name = 0x2503;
 		for (int i = 0; i < MAXMSG; i++) shm->msgs[i].next = i + 1 < MAXMSG ? (uint32_t)(i + 2) : 0;   // índices desde 1; 0 = fin
 		shm->free_head = 1;
@@ -138,13 +134,19 @@ static void start_reaper(void);
 static void init_all(void) {
 	shm_init();
 	int me = (int)getpid();
-	pthread_mutex_lock(&shm->lk);
+	nucleo_candado_tomar(&shm->lk);
 	shm->procs[me % MAXPROC] = (struct sproc){ me, proc_start(me) };
-	pthread_mutex_unlock(&shm->lk);
+	nucleo_candado_soltar(&shm->lk);
 	if (is_creator) start_reaper();
 }
-static void lock(void) { pthread_once(&once, init_all); int r = pthread_mutex_lock(&shm->lk); if (r == EOWNERDEAD) pthread_mutex_consistent(&shm->lk); }
-static void unlock(void) { pthread_mutex_unlock(&shm->lk); }
+// Candado de toda la región, entre procesos. Es de nucleo/src/candado.rs y no un mutex robusto de glibc: glibc identifica
+// al dueño por el TID que guarda en su descriptor de hilo, y nuestro fork (llamada directa, emu_proc.c) no lo actualiza en
+// el hijo; un hijo se creía dueño del candado del padre, entraba sin esperar y se perdían despertares (cuelgues).
+static void lock(void) {
+	pthread_once(&once, init_all);
+	if (nucleo_candado_tomar(&shm->lk) == EOWNERDEAD) logf_("    puertos: <%d> el dueño del candado murió con él tomado; se sigue\n", (int)getpid());
+}
+static void unlock(void) { nucleo_candado_soltar(&shm->lk); }
 
 enum { KERN_OK = 0, KERN_INVALID_NAME_ = 15, KERN_INVALID_RIGHT_ = 17, KERN_INVALID_VALUE_ = 18 };
 #define MACH_RCV_TIMED_OUT 0x10004003
@@ -247,7 +249,7 @@ uint32_t port_create(int is_set) {
 		logf_("    puertos: tabla llena\n");
 		return 0;
 	}
-	{ pthread_cond_t keep = p->cv; memset(p, 0, sizeof *p); p->cv = keep; }   // la variable de condición se inicializó al crear la región
+	{ uint32_t keep = p->cv; memset(p, 0, sizeof *p); p->cv = keep; }   // la secuencia de espera sigue (quien esperase vuelve a mirar)
 	p->used = 1; p->is_set = (uint8_t)is_set; p->name = name; p->owner = (int32_t)getpid(); p->rpid = (int32_t)getpid();
 	bucket_add_locked(p);
 	local_sock[port_index(p)] = make_wake_socket(name, p->rpid);
@@ -430,7 +432,7 @@ static void destroy_locked(struct sport* p) {
 	p->spn = 0;
 	for (int k = 0; k < MAXSO; k++) if (shm->so[k].port == name) shm->so[k].port = 0;     // ya no hay a quién responder
 	if (local_sock[i] >= 0) { close(local_sock[i]); local_sock[i] = -1; }
-	pthread_cond_broadcast(&p->cv);   // quien espere en este puerto debe enterarse de que murió
+	nucleo_avisar(&p->cv);   // quien espere en este puerto debe enterarse de que murió
 }
 static void destroy(uint32_t name) {
 	lock();
@@ -589,8 +591,7 @@ static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 		if (timeout_ms > 0) { clock_gettime(CLOCK_MONOTONIC, &dl); dl.tv_sec += timeout_ms / 1000; dl.tv_nsec += (timeout_ms % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; } }
 		while (p && p->count >= (p->qlimit ? p->qlimit : 5)) {
 			if (timeout_ms == 0) { unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return 0x10000004; }   // MACH_SEND_TIMED_OUT
-			int r = timeout_ms > 0 ? pthread_cond_timedwait(&p->cv, &shm->lk, &dl) : pthread_cond_wait(&p->cv, &shm->lk);
-			if (r == EOWNERDEAD) pthread_mutex_consistent(&shm->lk);
+			int r = nucleo_esperar(&p->cv, &shm->lk, timeout_ms > 0 ? &dl : NULL);
 			p = find_locked(dest);                                    // el puerto pudo morir mientras se esperaba
 			if (r == ETIMEDOUT && p && p->count >= (p->qlimit ? p->qlimit : 5)) { unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return 0x10000004; }
 		}
@@ -619,8 +620,8 @@ static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 	uint32_t setname = p->set;
 	int32_t rp_dest = p->rpid, rp_set = 0;
 	if (setname) { struct sport* s = find_locked(setname); if (s) { s->count++; rp_set = s->rpid; } }
-	pthread_cond_broadcast(&p->cv);
-	if (setname) { struct sport* st2 = find_locked(setname); if (st2) pthread_cond_broadcast(&st2->cv); }
+	nucleo_avisar(&p->cv);
+	if (setname) { struct sport* st2 = find_locked(setname); if (st2) nucleo_avisar(&st2->cv); }
 	unlock();
 	poke(dest, rp_dest);
 	if (setname) poke(setname, rp_set);
@@ -652,7 +653,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			}
 			src->head = q->next; if (!src->head) src->tail = 0;
 			src->count--;
-			pthread_cond_broadcast(&src->cv);                     // hay sitio: remitentes esperando por el límite de cola
+			nucleo_avisar(&src->cv);                     // hay sitio: remitentes esperando por el límite de cola
 			if (src->spn && src->count < (src->qlimit ? src->qlimit : 5)) {   // y las peticiones SEND_POSSIBLE armadas (ipc_port_spnotify);
 				for (int k = 0; k < MAXSP; k++)                                   // las no armadas siguen esperando
 					if (shm->sp[k].port == src->name && shm->sp[k].armado) { note_locked(shm->sp[k].notify, 66, src->name); shm->sp[k].port = 0; src->spn--; }
@@ -692,9 +693,8 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 		}
 		waited = 1;
 		if (trace_all) logf_("    mach_msg: <%d> espera mensaje en 0x%x (plazo %d ms)\n", (int)getpid(), name, timeout_ms);
-		int r = timeout_ms >= 0 ? pthread_cond_timedwait(&p->cv, &shm->lk, &dl) : pthread_cond_wait(&p->cv, &shm->lk);
-		if (r == EOWNERDEAD) pthread_mutex_consistent(&shm->lk);
-		else if (r) { unlock(); return MACH_RCV_TIMED_OUT; }
+		int r = nucleo_esperar(&p->cv, &shm->lk, timeout_ms >= 0 ? &dl : NULL);
+		if (r == ETIMEDOUT) { unlock(); return MACH_RCV_TIMED_OUT; }
 	}
 }
 

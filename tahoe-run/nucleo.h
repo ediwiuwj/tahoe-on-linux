@@ -39,3 +39,13 @@ void nucleo_rw_fin_espera(uint32_t ranura, uint64_t ahora);
 // 0 y *valor, o errno.
 int nucleo_rw_unlock(uint64_t addr, uint32_t l, uint32_t u, uint32_t s, uint32_t flags, uint64_t ahora,
 	nucleo_rw_despertar despertar, void* ctx, uint32_t* valor);
+
+// Candado y esperas de la región de puertos, entre procesos (nucleo/src/candado.rs). El candado es una palabra a cero
+// (libre); tomar devuelve 0 o EOWNERDEAD (el dueño murió con él tomado). esperar: con el candado tomado, lo suelta,
+// duerme hasta un aviso en *e (o el plazo absoluto hasta, CLOCK_MONOTONIC; NULL = sin plazo) y lo vuelve a tomar;
+// devuelve 0 (también en despertares espurios: hay que volver a mirar), ETIMEDOUT o EOWNERDEAD.
+struct timespec;
+int nucleo_candado_tomar(uint32_t* c);
+void nucleo_candado_soltar(uint32_t* c);
+int nucleo_esperar(uint32_t* e, uint32_t* c, const struct timespec* hasta);
+void nucleo_avisar(uint32_t* e);
