@@ -36,7 +36,7 @@
 #define NBUCKET 16384                // índice por nombre: cubeta = (nombre >> 8) % NBUCKET, cadenas por hnext
 #define MAXMSG   4096                    // ranuras de mensaje (archivo disperso: solo ocupan RAM las usadas)
 #define MSGSZ    (64 * 1024)
-struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; uint32_t spreq; };   // spreq: puerto que pidió MACH_NOTIFY_SEND_POSSIBLE   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
+struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; uint32_t spn; };   // spn: peticiones MACH_NOTIFY_SEND_POSSIBLE pendientes en shm->sp (para no recorrer la tabla si no hay)   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
 struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint64_t spill; uint8_t data[MSGSZ - 40]; };   // sauid/sasid: sesión de auditoría del remitente   // spill: datos fuera de línea en un archivo aparte (nucleo_desborde_*), 0 = en la ranura
 // Derechos que el núcleo tiene que vigilar para avisar cuando muere su dueño (ver "notificaciones" más abajo):
 //  sonce: un proceso tiene un derecho send-once (normalmente, la respuesta que debe a quien le pidió algo);
@@ -44,6 +44,7 @@ struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint6
 //  sproc: hora de arranque de cada proceso, para no confundir un pid reutilizado con el que murió.
 #define MAXSO 4096
 #define MAXDN 4096
+#define MAXSP 1024                     // peticiones SEND_POSSIBLE: una por proceso y puerto, como los derechos de XNU
 #define MAXPROC 1024
 struct sonce { uint32_t port; int32_t holder; };
 struct dnreq { uint32_t port, notify; int32_t pid; };
@@ -70,6 +71,7 @@ struct shm {
 	struct mslot msgs[MAXMSG];
 	struct sonce so[MAXSO];
 	struct dnreq dn[MAXDN];
+	struct dnreq sp[MAXSP];
 	struct sproc procs[MAXPROC];
 	struct shold sh[MAXSH];
 	struct skobj kobjs[MAXKOBJ];
@@ -424,7 +426,8 @@ static void destroy_locked(struct sport* p) {
 	}
 	p->tail = 0; p->count = 0;
 	for (int k = 0; k < MAXDN; k++) if (shm->dn[k].port == name) { note_locked(shm->dn[k].notify, 72, name); shm->dn[k].port = 0; }
-	if (p->spreq) { note_locked(p->spreq, 72, name); p->spreq = 0; }    // SEND_POSSIBLE pendiente: el puerto murió
+	if (p->spn) for (int k = 0; k < MAXSP; k++) if (shm->sp[k].port == name) { note_locked(shm->sp[k].notify, 72, name); shm->sp[k].port = 0; }   // SEND_POSSIBLE pendientes: el puerto murió
+	p->spn = 0;
 	for (int k = 0; k < MAXSO; k++) if (shm->so[k].port == name) shm->so[k].port = 0;     // ya no hay a quién responder
 	if (local_sock[i] >= 0) { close(local_sock[i]); local_sock[i] = -1; }
 	pthread_cond_broadcast(&p->cv);   // quien espere en este puerto debe enterarse de que murió
@@ -487,6 +490,7 @@ static void* reaper_thread(void* arg) {
 			int nso = 0, nrecv = 0;
 			for (int i = 0; i < MAXSO; i++) if (shm->so[i].port && shm->so[i].holder == pid) { note_locked(shm->so[i].port, 71, 0); shm->so[i].port = 0; nso++; }
 			for (int i = 0; i < MAXDN; i++) if (shm->dn[i].port && shm->dn[i].pid == pid) shm->dn[i].port = 0;
+			for (int i = 0; i < MAXSP; i++) if (shm->sp[i].port && shm->sp[i].pid == pid) { struct sport* q = find_locked(shm->sp[i].port); if (q && q->spn) q->spn--; shm->sp[i].port = 0; }
 			for (int i = 0; i < MAXSH; i++) {                     // sus derechos de envío desaparecen: ¿queda alguien más?
 				if (!shm->sh[i].port || shm->sh[i].holder != pid) continue;
 				uint32_t port = shm->sh[i].port; shm->sh[i].port = 0;
@@ -643,7 +647,10 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			src->head = q->next; if (!src->head) src->tail = 0;
 			src->count--;
 			pthread_cond_broadcast(&src->cv);                     // hay sitio: remitentes esperando por el límite de cola
-			if (src->spreq && src->count < (src->qlimit ? src->qlimit : 5)) { note_locked(src->spreq, 66, src->name); src->spreq = 0; }   // y quien pidió SEND_POSSIBLE (libdispatch tras MACH_SEND_TIMED_OUT)
+			if (src->spn && src->count < (src->qlimit ? src->qlimit : 5)) {   // y todos los que pidieron SEND_POSSIBLE (libdispatch tras MACH_SEND_TIMED_OUT)
+				for (int k = 0; k < MAXSP; k++) if (shm->sp[k].port == src->name) { note_locked(shm->sp[k].notify, 66, src->name); shm->sp[k].port = 0; }
+				src->spn = 0;
+			}
 			msg_rights_locked(q->data, q->size, RIGHTS_RECV, src->name);
 			if (src->set) { struct sport* s = find_locked(src->set); if (s && s->count) s->count--; }
 			uint32_t sz = q->size, tot = q->total; uint64_t spill = q->spill;
@@ -1287,10 +1294,15 @@ int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_
 			logf_("    send-possible <%d>: 0x%x no existe -> DEAD_NAME\n", (int)getpid(), name);
 			if (notify && name && name < shm->next_name) note_locked(notify, 72, name); else r = KERN_INVALID_NAME_;
 		}
-		else {
-			*previous = p->spreq; p->spreq = 0;
+		else {                                                     // una petición por proceso: la nueva sustituye a la anterior
+			int32_t me = (int32_t)getpid();
+			for (int k = 0; k < MAXSP; k++) if (shm->sp[k].port == name && shm->sp[k].pid == me) { *previous = shm->sp[k].notify; shm->sp[k].port = 0; if (p->spn) p->spn--; break; }
 			if (notify && sync && p->count < (p->qlimit ? p->qlimit : 5)) note_locked(notify, 66, name);
-			else p->spreq = notify;
+			else if (notify) {
+				int ok = 0;
+				for (int k = 0; k < MAXSP; k++) if (!shm->sp[k].port) { shm->sp[k] = (struct dnreq){ name, notify, me }; p->spn++; ok = 1; break; }
+				if (!ok) logf_("    send-possible: tabla llena\n");
+			}
 		}
 	} else if (variant == 72) {
 		int32_t me = (int32_t)getpid();
