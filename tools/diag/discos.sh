@@ -6,6 +6,10 @@
 #   3. muestra los procesos de discos vivos (diskutil, storagekitd, diskarbitrationd, fskitd, diskmanagementd) y el
 #      resumen del registro con da_log.py: qué discos se anunciaron y qué avisos «idle» quedaron sin enviar.
 # TAHOE_ROOT: sistema de macOS (por omisión la Recovery). ESPERA: segundos de arranque antes de empezar (15).
+# PREP: órdenes de macOS que se ejecutan antes de relanzar diskarbitrationd (para pruebas A/B: restaurar estado de
+# arranques antiguos, relanzar otro servicio...). Ejemplo, con una copia de /private/var del volumen de datos en disco
+# hecha en la raíz como /.datos-viejos:
+#   PREP='cp -Rp /.datos-viejos/folders/. /var/folders/; launchctl kickstart -k system/com.apple.fskitd' discos.sh
 # Todo queda en ~/.cache/tahoe-diag/discos.out (la salida entera de macOS) y siempre se limpia el arranque.
 DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
@@ -14,7 +18,8 @@ export TAHOE_ROOT="${TAHOE_ROOT:-$HOME/macos26/base/macOS Base System}"
 DA=system/com.apple.diskarbitrationd
 # Dentro de macOS: la orden va en segundo plano y su código de salida se apunta al terminar; si sigue viva al vencer
 # el plazo se dice («COLGADA»). Las secciones van marcadas con @@ para separarlas aquí.
-SCRIPT="touch /var/log/diskarbitrationd.log
+SCRIPT="${PREP:+$PREP
+}touch /var/log/diskarbitrationd.log
 launchctl debug $DA -- /usr/libexec/diskarbitrationd -d >/dev/null 2>&1
 launchctl kickstart -k $DA >/dev/null 2>&1
 sleep 8
@@ -31,6 +36,7 @@ sec() { awk -v s="@@$1" '$0 == s {on=1; next} /^@@(procesos|orden|registro)$/ {o
 if ! grep -q '^@@registro$' "$D/discos.out"; then
 	echo "el arranque no llegó a la orden (código $r):"; tail -5 "$D/discos.out"; exit 1
 fi
+[ -n "$PREP" ] && echo "== preparación: $PREP"
 echo "== $ORDEN: $(grep -o '^@@salida .*' "$D/discos.out" | sed 's/@@salida /salida /')"
 sec orden | grep -v '^@@salida' | head -15 | sed 's/^/   /'
 echo "== procesos de discos vivos al final"
