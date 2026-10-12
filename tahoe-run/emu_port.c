@@ -1280,7 +1280,13 @@ int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_
 		if (!p) r = KERN_INVALID_RIGHT_;
 		else { *previous = p->nsreq; p->nsreq = notify; p->nsmscount = sync; }
 	} else if (variant == 66) {
-		if (!p) { if (notify && name && name < shm->next_name) note_locked(notify, 72, name); else r = KERN_INVALID_NAME_; }
+		int ko = name == 0x103;                                   // objetos del núcleo (tarea, hilo, IOKit...): fuera de la
+		for (int i = 0; i < MAXKOBJ && !ko; i++) ko = shm->kobjs[i].name == name;   // tabla de puertos pero vivos, y su cola nunca se llena
+		if (!p && ko) { if (notify && sync) note_locked(notify, 66, name); }
+		else if (!p) {
+			logf_("    send-possible <%d>: 0x%x no existe -> DEAD_NAME\n", (int)getpid(), name);
+			if (notify && name && name < shm->next_name) note_locked(notify, 72, name); else r = KERN_INVALID_NAME_;
+		}
 		else {
 			*previous = p->spreq; p->spreq = 0;
 			if (notify && sync && p->count < (p->qlimit ? p->qlimit : 5)) note_locked(notify, 66, name);
