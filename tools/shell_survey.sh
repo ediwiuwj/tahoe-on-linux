@@ -11,6 +11,8 @@
 #
 # Usa tools/macos-shell.sh --launchd (arranca launchd y lo detiene al terminar). PLAZO: segundos por orden (6).
 # DEPURAR=1: arranque con --depurar (recoveryosd no reinicia la máquina si falla).
+# ANTES: órdenes de macOS que se ejecutan antes de la lista, sin contarlas (p. ej. quitar un servicio que estorba:
+#   ANTES='launchctl bootout system/com.apple.WindowServer' tools/shell_survey.sh).
 TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 PLAZO="${PLAZO:-6}"
 if [ $# -eq 0 ]; then
@@ -36,6 +38,8 @@ SCRIPT="t() { c=\"\$1\"; f=/tmp/.survey.\$\$; /bin/bash -c \"\$c\" > \$f 2>&1 < 
  l=\$(head -1 \$f | cut -c1-90); rm -f \$f
  if [ \$r = 0 ]; then e=OK; elif [ \$r = 999 ]; then e=COLGADA; elif [ \$r -gt 128 ]; then e=\"SEÑAL \$((r-128))\"; else e=\"ERR \$r\"; fi
  printf '%-9s %-40s %s\\n' \"\$e\" \"\$c\" \"\$( [ \$r = 0 ] || echo \"\$l\")\"; }
+"
+[ -n "$ANTES" ] && SCRIPT+="$ANTES >/dev/null 2>&1
 "
 for c in "$@"; do SCRIPT+="t $(printf '%q' "$c")
 "; done
