@@ -17,4 +17,4 @@ tahoe-run/bf_pi.h
 
 # Volcados de diagnóstico locales
 tahoe-run/ss.out
-capturas/
+/capturas/
