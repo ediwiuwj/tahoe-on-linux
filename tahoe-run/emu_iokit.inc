@@ -621,9 +621,9 @@ static void io_init(void) {
 	p_str(accel, "IOClass", "AppleIntelFramebuffer");
 	p_str(accel, "IOProviderClass", "IOPCIDevice");
 	fb_props(accel);
-	int accl = ent_add(gpu, "IOAccelerator", "IOAccelerator", "IORegistryEntry IOService", "", PL_SERVICE, 1);
-	p_str(accl, "IOClass", "IOAccelerator");
-	p_str(accl, "IOVARendererID", "0x00000000");
+	// Sin IOAccelerator: no hay driver Metal para esta GPU (la HD 4400 no tiene driver en macOS 26), y un acelerador sin
+	// "MetalPluginName" deja a CoreDisplay sin dispositivo Metal y a WindowServer cayendo al iniciar las pantallas. Sin
+	// acelerador, como en una máquina virtual sin GPU, WindowServer compone por software en el framebuffer.
 	int dcon = ent_add(accel, "display0", "IODisplayConnect", "IORegistryEntry IOService", "", PL_SERVICE, 0);
 	p_str(dcon, "IOClass", "IODisplayConnect");
 	int disp = ent_add(dcon, "AppleDisplay", "IODisplay", "IORegistryEntry IOService", "", PL_SERVICE, 1);
