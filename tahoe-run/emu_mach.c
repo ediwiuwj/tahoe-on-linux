@@ -604,7 +604,10 @@ static long mach_msg2(struct ctx* c) {
 	if (!kobject && port_exists(h.remote)) {                    // envío a un puerto de usuario: se encola tal cual
 		memcpy(req, &h, sizeof h);
 		int sr = port_send_timeout(h.remote, req, ssize, (options & 0x10) ? (int)ctx_arg(c, 7) : -1);   // MACH_SEND_TIMEOUT
-		if (sr > 0) return sr;                                    // plazo agotado con la cola llena, o el destino murió
+		if (sr > 0) {                                             // plazo agotado con la cola llena, o el destino murió
+			if (msg_trace()) logf_("    MSG <%d.%ld> envío a 0x%x id=%d falló 0x%x\n", (int)getpid(), (long)syscall(SYS_gettid), h.remote, h.id, sr);
+			return sr;
+		}
 		if (sr != 0) {                                            // el mensaje no se pudo encolar: decirlo, no perderlo en silencio
 			logf_("    mach_msg2: <%d> envío a 0x%x (id=%d, %u bytes) no encolado\n", (int)getpid(), h.remote, h.id, ssize);
 			return port_exists(h.remote) ? 0x1000000d /* MACH_SEND_NO_BUFFER */ : MACH_SEND_INVALID_DEST_;

@@ -31,6 +31,7 @@ path = rest[0] if rest else os.path.expanduser(os.environ.get("TAHOE_DIAG_DIR", 
 
 snd_re = re.compile(r"MSG <(\d+)\.(\d+)> envía dest=(0x[0-9a-f]+)\(->(-?\d+)\) resp=(0x[0-9a-f]+) id=(-?\d+) tam=(\d+) bits=(0x[0-9a-f]+)( y espera)?(?: \| (.*))?")
 rcv_re = re.compile(r"MSG <(\d+)\.(\d+)> recibe en=(0x[0-9a-f]+) dest=(0x[0-9a-f]+) resp=(0x[0-9a-f]+) id=(-?\d+) tam=(\d+) de=(-?\d+) -> (0x[0-9a-f]+)")
+fail_re = re.compile(r"MSG <(\d+)\.(\d+)> envío a (0x[0-9a-f]+) id=(-?\d+) falló (0x[0-9a-f]+)")
 prog_re = re.compile(r"<(\d+)> cargado (\S+) .*tipo=2")
 
 progs = {}
@@ -48,6 +49,12 @@ with open(path, "rb") as f:
             sends.append(dict(n=n, pid=pid, tid=tid, dest=dest, to=to, resp=resp, id=int(mid), size=int(size),
                               bits=bits, wait=bool(wait), txt=(txt or "")[:90], prog=progs.get(pid, "?"), recv=None, reply=None))
             continue
+        m = fail_re.search(l)
+        if m:                             # el envío anterior de ese hilo no entró en la cola (llena con plazo 0, destino muerto)
+            pid, tid, dest, mid, kr = m.groups()
+            for x in reversed(sends[-50:]):
+                if x["pid"] == pid and x["tid"] == tid and x["dest"] == dest and x["id"] == int(mid): x["fail"] = kr; break
+            continue
         m = rcv_re.search(l)
         if m:
             pid, tid, en, dest, resp, mid, size, de, res = m.groups()
@@ -63,6 +70,7 @@ def name(pid): return f"{progs.get(pid, '?')}[{pid}]"
 by_key = defaultdict(list)
 for r in recvs: by_key[(r["de"], r["dest"], r["id"])].append(r)
 for s in sends:
+    if s.get("fail"): continue
     for r in by_key.get((s["pid"], s["dest"], s["id"]), []):
         if not r["used"] and r["n"] > s["n"]: r["used"] = True; s["recv"] = r; break
 # respuesta: un envío posterior cuyo destino es el puerto de respuesta de la petición
@@ -89,7 +97,12 @@ def kind(mid):
         if base <= mid < base + 100: return f"MIG {MIG[base]}#{mid - base}"
     return f"MIG {mid}" if mid >= 100 else f"id {mid}"
 
+# 0x10000004 MACH_SEND_TIMED_OUT: cola llena con plazo (en los puertos de despertar de CFRunLoop/dispatch, de cola 1,
+# es lo normal: ya hay un despertar pendiente). 0x10000003 INVALID_DEST: el destino ya no existe.
+FALLOS = {"0x10000004": "cola llena (plazo agotado)", "0x10000003": "destino inválido"}
+
 def state(s):
+    if s.get("fail"): return "no enviado: " + FALLOS.get(s["fail"], s["fail"])
     if s["to"] not in traced: llegada = "(sin traza)"
     elif s["recv"]: llegada = "recibido" if s["recv"]["res"] == "0x0" else f"recibido con error {s['recv']['res']}"
     else: llegada = "NO RECIBIDO"
@@ -130,14 +143,14 @@ for s in sends:
     if not interesa(s): continue
     k = (name(s["pid"]), name(s["to"]))
     pairs[k] += 1
-    if s["to"] in traced and not s["recv"]: lost[k] += 1
+    if s["to"] in traced and not s["recv"] and not s.get("fail"): lost[k] += 1
     if s["resp"] != "0x0" and not s["reply"]: unans[k] += 1
 for k, v in pairs.most_common(30):
     print(f"   {k[0]:>26} -> {k[1]:<26} {v:>5} {lost[k]:>5} {unans[k]:>5}")
 
 print("== a medias (lo que puede colgar una cadena)")
 malos = [s for s in sends if interesa(s) and s["pid"] != s["to"] and
-         ((s["to"] in traced and not s["recv"]) or (espera_respuesta(s) and not s["reply"]))]
+         not s.get("fail") and ((s["to"] in traced and not s["recv"]) or (espera_respuesta(s) and not s["reply"]))]
 for s in malos[-40:]:
     print(f"   línea {s['n']}: {name(s['pid'])} -> {name(s['to'])} {kind(s['id'])} (id {s['id']}): {state(s)}"
           + (f"   «{s['txt']}»" if s["txt"] else ""))
