@@ -97,13 +97,18 @@ if [ -z "$L" ]; then
 		nice -n "${TAHOE_NICE:-0}" "$RUN" "$DYLD_CACHE" "$ROOT/usr/lib/dyld" "$ROOT/sbin/launchd" \
 		< /dev/null > /dev/null 2>&1 &
 	U=$! STARTED=1
-	for _ in $(seq 300); do L=$(find_launchd); [ -n "$L" ] && [ -n "$(find_region "$L")" ] && break; sleep 0.2; done
-	if [ -z "$L" ]; then echo "launchd no arrancó (registro: $LOG)" >&2; touch /dev/shm/tahoe-guard-stop; exit 1; fi
+	for _ in $(seq 300); do L=$(find_launchd); [ -n "$L" ] && REGION=$(find_region "$L") && [ -n "$REGION" ] && break; sleep 0.2; done
+	if [ -z "$L" ] || [ -z "$REGION" ]; then echo "launchd no arrancó (registro: $LOG)" >&2; touch /dev/shm/tahoe-guard-stop; exit 1; fi
 	echo "launchd arrancado (pid $L en Linux); esperando ${TAHOE_BOOT_WAIT:-10} s a los servicios..." >&2
 	sleep "${TAHOE_BOOT_WAIT:-10}"
+	# la región se apunta antes de esperar: si launchd muere en la espera (un abort suyo), se dice eso y se limpia igual
+	if [ -z "$(find_region "$L")" ]; then
+		echo "launchd (pid $L) terminó durante la espera; mira el final de $LOG (abort, assertion)" >&2; exit 1
+	fi
+else
+	REGION=$(find_region "$L")
+	if [ -z "$REGION" ]; then echo "no encuentro la región de puertos de launchd (pid $L)" >&2; exit 1; fi
 fi
-REGION=$(find_region "$L")
-if [ -z "$REGION" ]; then echo "no encuentro la región de puertos de launchd (pid $L)" >&2; exit 1; fi
 
 if [ -n "$WITH_VIEW" ]; then
 	VIEWER="$TOOLS/tahoe-view/target/release/tahoe-view"
