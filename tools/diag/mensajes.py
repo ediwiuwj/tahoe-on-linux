@@ -64,15 +64,19 @@ for s in sends:
 # respuesta: un envío posterior cuyo destino es el puerto de respuesta de la petición
 by_dest = defaultdict(list)
 for s in sends: by_dest[s["dest"]].append(s)
+# o, aunque quien responde no tenga traza, una recepción posterior del que preguntó en ese puerto de respuesta
+rx_by_port = defaultdict(list)
+for r in recvs: rx_by_port[(r["pid"], r["dest"])].append(r)
 for s in sends:
     if s["resp"] != "0x0":
-        s["reply"] = next((x for x in by_dest.get(s["resp"], []) if x["n"] > s["n"]), None)
+        s["reply"] = next((x for x in by_dest.get(s["resp"], []) if x["n"] > s["n"]), None) or \
+                     next((r for r in rx_by_port.get((s["pid"], s["resp"]), []) if r["n"] > s["n"] and r["res"] == "0x0"), None)
 
 def kind(mid):
     if mid in (64, 65, 66, 69, 70, 71, 72):
         return {64: "aviso", 65: "aviso PORT_DELETED", 66: "aviso", 69: "aviso PORT_DESTROYED", 70: "aviso NO_SENDERS",
                 71: "aviso SEND_ONCE", 72: "aviso DEAD_NAME"}[mid]
-    if mid & 0x10000000 or mid & 0x40000000: return "XPC" + (" respuesta" if mid & 0x40000000 and not mid & 0x10000000 else "")
+    if mid & 0x10000000 or mid & 0x40000000: return "XPC"
     return f"MIG {mid // 100}:{mid % 100}" if mid > 1000 else f"id {mid}"
 
 def state(s):
