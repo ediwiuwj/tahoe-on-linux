@@ -26,3 +26,16 @@ int nucleo_descriptores(const uint8_t* m, uint32_t tam, struct nucleo_desc* out,
 int nucleo_desborde_guardar(const char* etiqueta, uint64_t id, const uint8_t* datos, uint64_t len);
 int nucleo_desborde_leer(const char* etiqueta, uint64_t id, uint8_t* dst, uint64_t len);
 void nucleo_desborde_borrar(const char* etiqueta, uint64_t id);
+
+// pthread_rwlock en el núcleo (nucleo/src/rwlock.rs, traducción de kern_synch.c). Se llama con el candado de
+// emu_psynch.c tomado. despertar(ctx, espera, valor) despierta a un hilo dormido (devuelve 1 si esperaba).
+enum { NUCLEO_RW_LECTURA = 0x01, NUCLEO_RW_ESCRITURA = 0x04 };
+typedef int (*nucleo_rw_despertar)(void* ctx, uint64_t espera, uint32_t valor);
+// 0: concedido (*valor); 1: a dormir hasta que despertar llame con «espera», y luego nucleo_rw_fin_espera(*ranura);
+// otro: errno.
+int nucleo_rw_lock(uint32_t tipo, uint64_t addr, uint32_t l, uint32_t u, uint32_t s, uint32_t flags, uint64_t espera,
+	uint64_t ahora, nucleo_rw_despertar despertar, void* ctx, uint32_t* valor, uint32_t* ranura);
+void nucleo_rw_fin_espera(uint32_t ranura, uint64_t ahora);
+// 0 y *valor, o errno.
+int nucleo_rw_unlock(uint64_t addr, uint32_t l, uint32_t u, uint32_t s, uint32_t flags, uint64_t ahora,
+	nucleo_rw_despertar despertar, void* ctx, uint32_t* valor);

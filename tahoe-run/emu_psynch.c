@@ -12,6 +12,7 @@
 #include <time.h>
 
 #include "tahoe.h"
+#include "nucleo.h"
 
 #define PS_SLOTS 4096
 struct ps_obj { uint64_t addr; int waiters, grants; uint64_t gen; int signals; pthread_cond_t cv; };
@@ -105,6 +106,63 @@ static long bsd_psynch_cvbroad(struct ctx* c) {
 	pthread_mutex_unlock(&ps_lock);
 	return 0;
 }
+// ---- pthread_rwlock (306-308): las decisiones las toma nucleo/src/rwlock.rs; aquí solo se duerme y se despierta ----
+struct rw_espera { int listo; uint32_t valor; pthread_cond_t cv; };
+static uint64_t rw_ahora(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec; }
+static int rw_despertar(void* ctx, uint64_t espera, uint32_t valor) {
+	(void)ctx;
+	struct rw_espera* e = (struct rw_espera*)(uintptr_t)espera;
+	e->valor = valor; e->listo = 1;
+	pthread_cond_signal(&e->cv);
+	return 1;
+}
+static void rw_aviso(const char* que, uint64_t addr, uint32_t l, uint32_t u, uint32_t s, uint32_t flags, int r) {
+	logf_("    psynch: <%d> %s 0x%lx L=0x%x U=0x%x S=0x%x flags=0x%x -> error %d\n", (int)getpid(), que, (unsigned long)addr, l, u, s, flags, r);
+}
+// Una línea en el registro la primera vez que un proceso entra aquí (para saber que los rwlock se usan). Con ps_lock.
+static void rw_primera_vez(void) {
+	static int visto;
+	if (!visto) { visto = 1; logf_("    psynch: <%d> primer rwlock con contención (psynch_rw_*)\n", (int)getpid()); }
+}
+// psynch_rw_rdlock / psynch_rw_wrlock(rwlock, lgenval, ugenval, rw_wc, flags) -> bits para libpthread
+static long rw_lock(struct ctx* c, uint32_t tipo) {
+	uint64_t addr = c->a[0];
+	uint32_t l = (uint32_t)c->a[1], u = (uint32_t)c->a[2], s = (uint32_t)c->a[3], flags = (uint32_t)c->a[4];
+	if (flags & 0x10) rw_aviso("rwlock compartido entre procesos (se trata como privado)", addr, l, u, s, flags, 0);
+	struct rw_espera e = { 0 };
+	pthread_cond_init(&e.cv, NULL);
+	uint32_t valor = 0, ranura = 0;
+	pthread_mutex_lock(&ps_lock);
+	rw_primera_vez();
+	int r = nucleo_rw_lock(tipo, addr, l, u, s, flags, (uint64_t)(uintptr_t)&e, rw_ahora(), rw_despertar, NULL, &valor, &ranura);
+	if (r == 1) {
+		while (!e.listo) pthread_cond_wait(&e.cv, &ps_lock);
+		valor = e.valor;
+		nucleo_rw_fin_espera(ranura, rw_ahora());
+		r = 0;
+	}
+	pthread_mutex_unlock(&ps_lock);
+	pthread_cond_destroy(&e.cv);
+	if (r) { rw_aviso(tipo == NUCLEO_RW_LECTURA ? "rw_rdlock" : "rw_wrlock", addr, l, u, s, flags, r); return -r; }
+	return (long)valor;
+}
+static long bsd_psynch_rw_rdlock(struct ctx* c) { return rw_lock(c, NUCLEO_RW_LECTURA); }
+static long bsd_psynch_rw_wrlock(struct ctx* c) { return rw_lock(c, NUCLEO_RW_ESCRITURA); }
+// psynch_rw_unlock(rwlock, lgenval, ugenval, rw_wc, flags): reparte el cerrojo a los que esperan
+static long bsd_psynch_rw_unlock(struct ctx* c) {
+	uint64_t addr = c->a[0];
+	uint32_t l = (uint32_t)c->a[1], u = (uint32_t)c->a[2], s = (uint32_t)c->a[3], flags = (uint32_t)c->a[4];
+	uint32_t valor = 0;
+	pthread_mutex_lock(&ps_lock);
+	rw_primera_vez();
+	int r = nucleo_rw_unlock(addr, l, u, s, flags, rw_ahora(), rw_despertar, NULL, &valor);
+	pthread_mutex_unlock(&ps_lock);
+	if (r) { rw_aviso("rw_unlock", addr, l, u, s, flags, r); return -r; }
+	return (long)valor;
+}
+// psynch_rw_longrdlock / psynch_rw_yieldwrlock: XNU tampoco los tiene (ESRCH)
+static long bsd_psynch_esrch(struct ctx* c) { (void)c; return -D_ESRCH; }
+
 // psynch_cvclrprepost: sin estado previo que limpiar
 static long bsd_psynch_ret0(struct ctx* c) { (void)c; return 0; }
 
@@ -112,4 +170,6 @@ void emu_psynch_init(void) {
 	reg_bsd(301, bsd_psynch_mutexwait); reg_bsd(302, bsd_psynch_mutexdrop);
 	reg_bsd(303, bsd_psynch_cvbroad); reg_bsd(304, bsd_psynch_cvsignal); reg_bsd(305, bsd_psynch_cvwait);
 	reg_bsd(312, bsd_psynch_ret0);
+	reg_bsd(297, bsd_psynch_esrch); reg_bsd(298, bsd_psynch_esrch);
+	reg_bsd(306, bsd_psynch_rw_rdlock); reg_bsd(307, bsd_psynch_rw_wrlock); reg_bsd(308, bsd_psynch_rw_unlock);
 }

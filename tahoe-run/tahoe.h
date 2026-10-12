@@ -145,4 +145,4 @@ void special_port_set(int which, uint32_t name);
 void reenable_dispatch(void);   // el kernel no hereda la interceptación de syscalls en el hijo de un fork
 
 // Códigos de error de Darwin
-enum { D_EPERM = 1, D_ENOENT = 2, D_EBADF = 9, D_ENOMEM = 12, D_EFAULT = 14, D_EINVAL = 22, D_ENOSYS = 78 };
+enum { D_EPERM = 1, D_ENOENT = 2, D_ESRCH = 3, D_EBADF = 9, D_ENOMEM = 12, D_EFAULT = 14, D_EINVAL = 22, D_ENOSYS = 78 };
