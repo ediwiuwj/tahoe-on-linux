@@ -852,4 +852,8 @@ static long mach_msg2(struct ctx* c) {
 	return MACH_MSG_SUCCESS;
 }
 
-void emu_mach_init(void) { reg_mach(47, mach_msg2); }
+static long t_iokit_user_client_trap(struct ctx* c) {
+	uint64_t p[6]; for (int i = 0; i < 6; i++) p[i] = ctx_arg(c, 2 + i);
+	return io_user_client_trap((uint32_t)c->a[0], (uint32_t)c->a[1], p);
+}
+void emu_mach_init(void) { reg_mach(47, mach_msg2); reg_mach(100, t_iokit_user_client_trap); }

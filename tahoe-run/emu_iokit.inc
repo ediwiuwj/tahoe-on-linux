@@ -557,6 +557,16 @@ static void io_init(void) {
 	p_str(wd, "IOProviderClass", "IOResources");
 	p_str(wd, "IOUserClientClass", "IOWatchdogUserClient");
 
+	// Raíz de IOSurface (IOSurface.kext): la memoria compartida de imágenes (ventanas, capas, pantalla) entre procesos.
+	// IOSurface.framework la busca por nombre (IOServiceNameMatching("IOSurfaceRoot")) y abre su user client; sin ella,
+	// Metal y CoreDisplay se quedan reintentando (WindowServer, al crear el dispositivo Metal de la pantalla).
+	int sroot = ent_add(res, "IOSurfaceRoot", "IOSurfaceRoot", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	p_str(sroot, "IOClass", "IOSurfaceRoot");
+	p_str(sroot, "CFBundleIdentifier", "com.apple.iokit.IOSurface");
+	p_str(sroot, "IOMatchCategory", "IOSurfaceRoot");
+	p_str(sroot, "IOProviderClass", "IOResources");
+	p_str(sroot, "IOUserClientClass", "IOSurfaceRootUserClient");
+
 	int opt = ent_add(plat, "options", "IODTNVRAM", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(opt, "name", "options");
 	p_str(opt, "boot-args", "");                              // OSString, como IONVRAMCHRPHandler (las variables de texto son cadenas)
@@ -1255,9 +1265,59 @@ static int32_t uc_fb(struct uc_call* c) {
 		return kIOReturnUnsupported;
 	}
 }
+// IOSurfaceRootUserClient (interfaz deducida de IOSurface.framework, que es quien la usa):
+//   0xd información de la conexión: sin entradas, sale una estructura de 0x28 bytes; la conexión solo vale si el u16 en
+//       +0x22 es 1 (ioSurfaceConnectInternal la cierra si no).
+// Trampas rápidas (iokit_user_client_trap, ver io_user_client_trap): 0/1 contadores de uso, 2 bloquear, 3 desbloquear,
+// 4 liberar, 5 tras crear o buscar, 6 eventos compartidos, 8/9 quitar valores.
+static int32_t uc_iosurface(struct uc_call* c) {
+	uint32_t want = *c->noutband;
+	*c->noutband = 0; *c->nsout = 0;
+	switch (c->selector) {
+	case 0xd: {
+		uint8_t info[0x28] = { 0 };
+		uint16_t one = 1; memcpy(info + 0x22, &one, 2);
+		uint32_t n = want < sizeof info ? want : sizeof info;
+		memcpy(c->outband, info, n); *c->noutband = n;
+		return 0;
+	}
+	default: {
+		static uint64_t seen;
+		if (c->selector < 64 && !(seen & (1ull << c->selector))) {
+			seen |= 1ull << c->selector;
+			logf_("    iokit: <%d> IOSurface selector 0x%x sin implementar (%u escalares, %u bytes, +%lu fuera; pide %u bytes, +%lu fuera)\n", (int)getpid(), c->selector, c->nsin, c->ninband, (unsigned long)c->ool_in_size, want, (unsigned long)c->ool_out_size);
+		}
+		return kIOReturnUnsupported;
+	}
+	}
+}
+static int32_t trap_iosurface(int ent, uint32_t idx, const uint64_t* p) {
+	(void)ent;
+	static uint64_t seen;
+	if (idx < 64 && !(seen & (1ull << idx))) {
+		seen |= 1ull << idx;
+		logf_("    iokit: <%d> IOSurface trampa %u (0x%lx, 0x%lx, 0x%lx) sin implementar\n", (int)getpid(), idx, p[0], p[1], p[2]);
+	}
+	return kIOReturnUnsupported;
+}
+typedef int32_t (*uc_trap_fn)(int ent, uint32_t idx, const uint64_t* p);
+static uc_trap_fn uc_trap_for(const char* cls) {
+	if (!strcmp(cls, "IOSurfaceRoot")) return trap_iosurface;
+	return NULL;
+}
+// iokit_user_client_trap (trampa Mach 100): IOConnectTrap0..6(conexión, índice, p1..p6), la vía rápida de algunos user
+// clients (IOSurface: bloquear, desbloquear, liberar...). Se resuelve en este proceso, como los mensajes a la conexión.
+long io_user_client_trap(uint32_t port, uint32_t idx, const uint64_t* p) {
+	struct ioobj* o = obj_by_port(port);
+	if (!o || o->kind != K_CONNECT || o->closed || o->ent < 0) return kIOReturnBadArgument;
+	uc_trap_fn fn = uc_trap_for(io_e[o->ent].cls);
+	if (!fn) { logf_("    iokit: trampa %u de %s sin gancho\n", idx, io_e[o->ent].cls); return kIOReturnUnsupported; }
+	return fn(o->ent, idx, p);
+}
 static uc_method_fn uc_hook_for(const char* cls) {
 	if (!strcmp(cls, "AppleGPUWrangler")) return uc_gpuwrangler;
 	if (!strcmp(cls, "AppleIntelFramebuffer")) return uc_fb;
+	if (!strcmp(cls, "IOSurfaceRoot")) return uc_iosurface;
 	if (!strcmp(cls, "IOWatchdog")) return uc_watchdog;
 	if (!strcmp(cls, "AppleSMC")) return uc_smc;
 	if (!strcmp(cls, "com_apple_filesystems_lifs")) return uc_lifs;
