@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include "tahoe.h"
+#include "nucleo.h"
 
 #define MACH_MSG_SUCCESS     0
 #define MACH_RCV_TOO_LARGE   0x10004004
@@ -477,19 +478,16 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	uint32_t remote = h.local, local = h.remote;
 	h.bits = nb; h.remote = remote; h.local = local;
 	memcpy(m, &h, sizeof h);
-	if (size >= 28 && (m[3] & 0x80)) {                        // complejo: el receptor ve los derechos de los descriptores ya convertidos
-		uint32_t dc, off = 28;
-		memcpy(&dc, m + 24, 4);
-		for (uint32_t i = 0; i < dc && off + 12 <= size; i++) {
-			uint8_t type = m[off + 11];
-			if ((trace_all || mach_trace()) && (type == 0 || type == 4)) { uint32_t nm; memcpy(&nm, m + off + (type == 4 ? 12 : 0), 4); logf_("    mach_msg: <%d> descriptor de puerto%s 0x%x disposición %u\n", (int)getpid(), type == 4 ? " con guarda" : "", nm, m[off + 10]); }
-			if ((type == 0 || type == 4) && m[off + 10] == 16) {     // MOVE_RECEIVE: el receptor pasa a ser dueño
-				// también en un descriptor de puerto con guarda (mach_msg_guarded_port_descriptor64_t: contexto, flags,
-				// disposición, tipo y el nombre en +12), que es como launchd entrega los puertos de servicio
-				uint32_t nm; memcpy(&nm, m + off + (type == 4 ? 12 : 0), 4); port_move_receive(nm);
-			}
-			if (type == 0 || type == 2) m[off + 10] = (uint8_t)rx_disp(m[off + 10]);       // puerto / puertos OOL: disposición
-			off += (type == 0) ? 12 : 16;
+	{                                                          // complejo: el receptor ve los derechos de los descriptores ya convertidos
+		struct nucleo_desc d[64];
+		int nd = nucleo_descriptores(m, size, d, 64);
+		for (int i = 0; i < nd && i < 64; i++) {
+			uint8_t cl = d[i].clase;
+			if ((trace_all || mach_trace()) && (cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTO_GUARDA)) logf_("    mach_msg: <%d> descriptor de puerto%s 0x%x disposición %u\n", (int)getpid(), cl == NUCLEO_PUERTO_GUARDA ? " con guarda" : "", d[i].nombre, d[i].disp);
+			// MOVE_RECEIVE: el receptor pasa a ser dueño (también en un puerto con guarda, que es como launchd entrega los
+			// puertos de servicio)
+			if ((cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTO_GUARDA) && d[i].disp == 16) port_move_receive(d[i].nombre);
+			if (cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTOS) m[d[i].off + 10] = (uint8_t)rx_disp(d[i].disp);   // disposición vista por el receptor
 		}
 	}
 	uint8_t tr[68] = { 0 };

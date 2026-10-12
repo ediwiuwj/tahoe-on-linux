@@ -17,6 +17,7 @@
 #include <sys/syscall.h>
 #include <time.h>
 #include "tahoe.h"
+#include "nucleo.h"
 
 #include <fcntl.h>
 #include <stdatomic.h>
@@ -368,33 +369,29 @@ static void msg_rights_locked(const uint8_t* m, uint32_t size, int mode, uint32_
 		else if (mode == RIGHTS_DESTROY) note_locked(local, 71, 0);
 	}
 	if (mode == RIGHTS_RECV && local && (ld == 17 || ld == 19 || ld == 20)) sh_add_locked(local, me);   // MOVE/COPY/MAKE_SEND
-	if (size < 28 || !(bits & 0x80000000u)) return;
-	uint32_t cnt, off = 28; memcpy(&cnt, m + 24, 4);
-	for (uint32_t i = 0; i < cnt && off + 12 <= size; i++) {
-		uint8_t type = m[off + 11], disp = m[off + 10];
-		uint32_t nm = 0;
-		if (type == 0) memcpy(&nm, m + off, 4);
-		else if (type == 4 && off + 16 <= size) memcpy(&nm, m + off + 12, 4);  // descriptor de puerto con guarda
-		if (nm && (type == 0 || type == 4)) {
-			if (disp == 18 || disp == 21) {
-				if (mode == RIGHTS_SEND && disp == 18) so_take_locked(nm, me);
-				else if (mode == RIGHTS_RECV) so_add_locked(nm, me);
-				else if (mode == RIGHTS_DESTROY) note_locked(nm, 71, 0);
-			} else if (mode == RIGHTS_RECV && (disp == 17 || disp == 19 || disp == 20)) {
-				sh_add_locked(nm, me);
-			} else if (disp == 16) {                                       // MOVE_RECEIVE
-				struct sport* q = find_locked(nm);
-				if (q && mode == RIGHTS_SEND) {
-					q->owner = 0; q->ctx = 0; q->guarded = q->strict_guard = 0;   // en tránsito (ipc_port_clear_receive)
-					// Quien traspasa el derecho de recepción suele quedarse con derechos de envío hechos por él (así crea
-					// libxpc las conexiones: el cliente hace el puerto y entrega la recepción al servidor). Se anota como
-					// usuario; si no los tenía, el aviso NO_SENDERS solo llega más tarde (al terminar), nunca antes.
-					sh_put_locked(nm, me);
-				}
-				else if (q && mode == RIGHTS_DESTROY) destroy_locked(q);      // nadie lo recibirá
+	struct nucleo_desc d[64];
+	int nd = nucleo_descriptores(m, size, d, 64);
+	if (nd > 64) { logf_("    puertos: mensaje con %d descriptores, solo se siguen 64\n", nd); nd = 64; }
+	for (int i = 0; i < nd; i++) {
+		uint32_t nm = d[i].nombre; uint8_t disp = d[i].disp;
+		if (!nm || (d[i].clase != NUCLEO_PUERTO && d[i].clase != NUCLEO_PUERTO_GUARDA)) continue;
+		if (disp == 18 || disp == 21) {
+			if (mode == RIGHTS_SEND && disp == 18) so_take_locked(nm, me);
+			else if (mode == RIGHTS_RECV) so_add_locked(nm, me);
+			else if (mode == RIGHTS_DESTROY) note_locked(nm, 71, 0);
+		} else if (mode == RIGHTS_RECV && (disp == 17 || disp == 19 || disp == 20)) {
+			sh_add_locked(nm, me);
+		} else if (disp == 16) {                                       // MOVE_RECEIVE
+			struct sport* q = find_locked(nm);
+			if (q && mode == RIGHTS_SEND) {
+				q->owner = 0; q->ctx = 0; q->guarded = q->strict_guard = 0;   // en tránsito (ipc_port_clear_receive)
+				// Quien traspasa el derecho de recepción suele quedarse con derechos de envío hechos por él (así crea
+				// libxpc las conexiones: el cliente hace el puerto y entrega la recepción al servidor). Se anota como
+				// usuario; si no los tenía, el aviso NO_SENDERS solo llega más tarde (al terminar), nunca antes.
+				sh_put_locked(nm, me);
 			}
+			else if (q && mode == RIGHTS_DESTROY) destroy_locked(q);      // nadie lo recibirá
 		}
-		off += (type == 0) ? 12 : 16;
 	}
 }
 
@@ -512,24 +509,18 @@ static void start_reaper(void) {
 	pthread_attr_destroy(&a);
 }
 
-// Descriptores OOL (tipos 1 y 3 = memoria, 2 = puertos): el contenido se copia dentro del mensaje porque la
-// dirección del emisor no vale en el proceso receptor.
+// Descriptores fuera de línea (memoria, memoria volátil y listas de puertos): el contenido se copia dentro del mensaje
+// porque la dirección del emisor no vale en el proceso receptor. El recorrido lo hace nucleo_descriptores (Rust): los
+// descriptores de puerto con guarda (tipo 4, 16 bytes) son puertos, no datos; la versión anterior en C los copiaba como
+// memoria (de la «dirección» que es la guarda, con el nombre del puerto como tamaño).
 static int ool_scan(const uint8_t* m, uint32_t size, uint32_t* out_off, uint32_t* out_len, int max) {
-	if (size < 28 || !(m[3] & 0x80)) return 0;
-	uint32_t cnt; memcpy(&cnt, m + 24, 4);
-	uint32_t off = 28;
+	struct nucleo_desc d[64];
+	int nd = nucleo_descriptores(m, size, d, 64);
+	if (nd < 0) { logf_("    puertos: mensaje mal formado (id=%d)\n", size >= 24 ? (int)(m[20] | m[21] << 8 | m[22] << 16 | (uint32_t)m[23] << 24) : -1); return 0; }
+	if (nd > 64) nd = 64;
 	int n = 0;
-	for (uint32_t i = 0; i < cnt && off + 12 <= size; i++) {
-		uint8_t type = m[off + 11];
-		if (type == 0) { off += 12; continue; }
-		if (off + 16 > size) break;
-		if (n < max) {
-			out_off[n] = off; memcpy(&out_len[n], m + off + 12, 4);
-			if (type == 2) out_len[n] *= 4;                  // OOL de puertos: el campo es el número de puertos (4 bytes cada uno)
-			n++;
-		}
-		off += 16;
-	}
+	for (int i = 0; i < nd && n < max; i++)
+		if (nucleo_fuera_de_linea(d[i].clase)) { out_off[n] = d[i].off; out_len[n] = d[i].bytes; n++; }
 	return n;
 }
 
