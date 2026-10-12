@@ -849,7 +849,7 @@ void port_move_receive(uint32_t name) { lock(); struct sport* p = find_locked(na
 static long t_ret0(struct ctx* c) { (void)c; return KERN_OK; }   // extract_member: sin efecto
 extern void diag_crash(ucontext_t* uc);
 static long t_destruct(struct ctx* c) {
-	if (diag_target()) { logf_("    destruct 0x%x (hilo %ld):\n", (uint32_t)c->a[1], (long)syscall(SYS_gettid)); diag_crash(c->uc); }
+	if (diag_target()) { logf_("    destruct 0x%x (hilo %ld):\n", (uint32_t)c->a[1], (long)syscall(SYS_gettid)); diag_stack(c->uc, "traza"); }
 	if (owns((uint32_t)c->a[1])) destroy((uint32_t)c->a[1]);
 	return KERN_OK;
 }
@@ -870,7 +870,7 @@ static long t_mod_refs(struct ctx* c) {
 	int32_t delta = (int32_t)c->a[3];
 	if (c->a[2] == 2 /* SEND_ONCE */ && delta < 0) port_release_send_once((uint32_t)c->a[1]);
 	if (c->a[2] == 1 /* RECEIVE */ && delta < 0 && owns((uint32_t)c->a[1])) {
-		if (diag_target()) { logf_("    mod_refs RECEIVE -1 0x%x (hilo %ld):\n", (uint32_t)c->a[1], (long)syscall(SYS_gettid)); diag_crash(c->uc); }
+		if (diag_target()) { logf_("    mod_refs RECEIVE -1 0x%x (hilo %ld):\n", (uint32_t)c->a[1], (long)syscall(SYS_gettid)); diag_stack(c->uc, "traza"); }
 		destroy((uint32_t)c->a[1]);
 	}
 	return KERN_OK;

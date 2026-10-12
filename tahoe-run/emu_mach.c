@@ -517,14 +517,14 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 
 static long user_receive(struct ctx* c, uint64_t options, uint64_t buf, uint32_t rcv_name, uint32_t rcvsize) {
 	int timeout = (options & 0x100) ? (int)ctx_arg(c, 7) : -1;
-	if (trace_all && timeout < 0 && getenv("TAHOE_STACKS")) diag_crash(c->uc);   // quién se bloquea esperando
+	if (trace_all && timeout < 0 && getenv("TAHOE_STACKS")) diag_stack(c->uc, "espera");   // quién se bloquea esperando
 	if (g_watch) logf_("    WATCH recv espera puerto 0x%x plazo=%d opciones=0x%lx\n", rcv_name, timeout, options);
 	long r = mach_rx_message(rcv_name, timeout, options, buf, rcvsize, NULL);
 	if (access("/dev/shm/tahoe-mach-trace", F_OK) == 0) {
 		uint32_t hh[6] = { 0 }; if (r == 0) safe_read(buf, hh, 24);
 		logf_("    MT pid=%d.%ld recv port=0x%x r=0x%lx id=%d size=%u\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, r, (int32_t)hh[5], hh[1]);
 		if (r == 0 && hh[1] <= 192 && hh[1] >= 24) { uint32_t w[48] = { 0 }; safe_read(buf, w, hh[1]); char line[480]; int k = 0; for (uint32_t q = 0; q < hh[1] / 4; q++) k += snprintf(line + k, sizeof line - (size_t)k, " %08x", w[q]); logf_("      MT bytes <%d>:%s\n", (int)getpid(), line); }
-		if (r == 0x10004003 && access("/dev/shm/tahoe-stacks", F_OK) == 0) diag_crash(c->uc);
+		if (r == 0x10004003 && access("/dev/shm/tahoe-stacks", F_OK) == 0) diag_stack(c->uc, "espera");
 	}
 	return r;
 }

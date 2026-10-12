@@ -243,14 +243,16 @@ static long bsd_kill(struct ctx* c) {
 	long r = syscall(SYS_kill, (int)c->a[0], ls);
 	return r < 0 ? -darwin_errno(errno) : 0;
 }
-// Diagnóstico dirigido: 1 si este proceso es el indicado en /dev/shm/tahoe-stacks (subcadena de su línea de órdenes).
+// Diagnóstico dirigido: 1 si este proceso es uno de los indicados en /dev/shm/tahoe-stacks (nombres separados por espacios;
+// cada uno, subcadena de su línea de órdenes: así también vale el xpcproxy que va a lanzar ese servicio).
 int diag_target(void) {
 	static int want = -1;
 	if (want < 0) {
-		char nm[64] = "", cl[512] = "";
+		char nm[256] = "", cl[1024] = "";
 		FILE* f = fopen("/dev/shm/tahoe-stacks", "r"); if (f) { if (fgets(nm, sizeof nm, f)) nm[strcspn(nm, "\n")] = 0; fclose(f); }
-		f = fopen("/proc/self/cmdline", "r"); if (f) { size_t n = fread(cl, 1, 511, f); for (size_t i = 0; i < n; i++) if (!cl[i]) cl[i] = ' '; fclose(f); }
-		want = nm[0] && strstr(cl, nm) != NULL;
+		f = fopen("/proc/self/cmdline", "r"); if (f) { size_t n = fread(cl, 1, sizeof cl - 1, f); for (size_t i = 0; i < n; i++) if (!cl[i]) cl[i] = ' '; fclose(f); }
+		want = 0;
+		for (char* t = strtok(nm, " \t"); t && !want; t = strtok(NULL, " \t")) want = strstr(cl, t) != NULL;
 	}
 	return want;
 }
@@ -294,21 +296,23 @@ static void crash_messages(void) {
 		}
 	}
 }
-void diag_crash(ucontext_t* uc) {
+// Pila del hilo actual en el registro. "abort" para caídas (con el motivo que dejó la librería); "espera" para los
+// diagnósticos de bloqueo (STACKS), que no son caídas.
+void diag_stack(ucontext_t* uc, const char* what) {
 		// Motivo del aborto: cada librería que llama a abort/CRASH deja su texto en gCRAnnotations, en su sección
 		// __DATA*,__crash_info (message en +8, message2 en +32). Se recorren las imágenes de la caché compartida.
-		crash_messages();
+		if (!strcmp(what, "abort")) crash_messages();
 		{
 			// Retornos plausibles: valores de la pila dentro de la caché cuya instrucción anterior es un "call".
 			static __thread uint64_t sk[2048]; memset(sk, 0, sizeof sk);
 			ssize_t got = safe_read((uint64_t)uc->uc_mcontext.gregs[REG_RSP], sk, sizeof sk);
-			logf_("    abort <%d>: rip=0x%llx rsp=0x%llx rbp=0x%llx pila:", (int)getpid(), (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], (unsigned long long)uc->uc_mcontext.gregs[REG_RSP], (unsigned long long)uc->uc_mcontext.gregs[REG_RBP]);
+			logf_("    %s <%d>: rip=0x%llx rsp=0x%llx rbp=0x%llx pila:", what, (int)getpid(), (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], (unsigned long long)uc->uc_mcontext.gregs[REG_RSP], (unsigned long long)uc->uc_mcontext.gregs[REG_RBP]);
 			for (int k = 0; k < 14 && k < (int)(got / 8); k++) logf_(" %lx", sk[k]);
 			greg_t* g = uc->uc_mcontext.gregs;
-			logf_("\n    abort <%d>: rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r12=%llx r13=%llx r14=%llx r15=%llx", (int)getpid(),
+			logf_("\n    %s <%d>: rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r12=%llx r13=%llx r14=%llx r15=%llx", what, (int)getpid(),
 				(unsigned long long)g[REG_RAX], (unsigned long long)g[REG_RBX], (unsigned long long)g[REG_RCX], (unsigned long long)g[REG_RDX], (unsigned long long)g[REG_RSI],
 				(unsigned long long)g[REG_RDI], (unsigned long long)g[REG_R8], (unsigned long long)g[REG_R12], (unsigned long long)g[REG_R13], (unsigned long long)g[REG_R14], (unsigned long long)g[REG_R15]);
-			logf_("\n    abort <%d>: marcos (rbp):", (int)getpid());          // pila exacta: macOS conserva el puntero de marco
+			logf_("\n    %s <%d>: marcos (rbp):", what, (int)getpid());          // pila exacta: macOS conserva el puntero de marco
 			uint64_t fp = (uint64_t)g[REG_RBP];
 			for (int k = 0; k < 32 && fp; k++) {
 				uint64_t fr[2];
@@ -317,7 +321,7 @@ void diag_crash(ucontext_t* uc) {
 				if (fr[0] <= fp) break;
 				fp = fr[0];
 			}
-			logf_("\n    abort: llamadas plausibles:");
+			logf_("\n    %s <%d>: llamadas plausibles:", what, (int)getpid());
 			int shown = 0;
 			for (int k = 0; k < (int)(got / 8) && shown < 24; k++) {
 				uint64_t a = sk[k];
@@ -329,6 +333,8 @@ void diag_crash(ucontext_t* uc) {
 			logf_("\n");
 		}
 	}
+
+void diag_crash(ucontext_t* uc) { diag_stack(uc, "abort"); }
 
 // ---- Volcado de todos los hilos (diagnóstico de cuelgues): con /dev/shm/tahoe-stacks, cuando el proceso indicado cae,
 // cada hilo dice qué llamada al núcleo emulada tiene en curso (t_cur, puesto por el manejador de SIGSYS) o, si estaba
@@ -1379,7 +1385,7 @@ static long ulock_wait_impl(struct ctx* c, uint64_t timeout_ns) {
 	if (c->a[0] & 0x1000000) c->raw_ret = 1;     // ULF_NO_ERRNO
 	if (mach_trace()) {                          // diagnóstico: pila de cada hilo que se bloquea sin plazo en el proceso indicado por /dev/shm/tahoe-stacks
 		int want = diag_target();
-		if (want && (!timeout_ns || syscall(SYS_gettid) == getpid())) { logf_("    ULW <%d:%ld> %p esperado=0x%x plazo=%lu op=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), (void*)addr, expect, (unsigned long)timeout_ns, c->a[0]); { uint64_t m[8] = { 0 }; safe_read((uint64_t)addr - 24, m, 64); logf_("    ULW mem[-24..+40]: %lx %lx %lx %lx %lx %lx %lx %lx\n", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]); } diag_crash(c->uc); }
+		if (want && (!timeout_ns || syscall(SYS_gettid) == getpid())) { logf_("    ULW <%d:%ld> %p esperado=0x%x plazo=%lu op=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), (void*)addr, expect, (unsigned long)timeout_ns, c->a[0]); { uint64_t m[8] = { 0 }; safe_read((uint64_t)addr - 24, m, 64); logf_("    ULW mem[-24..+40]: %lx %lx %lx %lx %lx %lx %lx %lx\n", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]); } diag_stack(c->uc, "espera"); }
 	}
 	if (trace_all) logf_("    ulock_wait(op=0x%lx, %p, esperado=0x%x, plazo=%luns)\n", c->a[0], (void*)addr, expect, (unsigned long)timeout_ns);
 	int wslot = -1;
