@@ -505,6 +505,9 @@ static long bsd_pthread_kill(struct ctx* c) {
 	if (s == 0) return 0;
 	if (s == 6) {
 		diag_crash(c->uc);
+		// abort() de un programa de macOS: el proceso muere por SIGABRT de verdad (launchd lo ve como en un Mac), pero sin
+		// volcado de memoria de Linux: systemd-coredump guardaría ~10 MB y avisaría en el escritorio en cada caída.
+		syscall(SYS_prctl, 4 /* PR_SET_DUMPABLE */, 0, 0, 0, 0);
 	}
 	int ls = darwin_to_linux_sig(s);
 	if (ls <= 0) return -D_EINVAL;
