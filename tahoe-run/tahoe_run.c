@@ -264,7 +264,9 @@ static void map_one(const char* path) {
 				// algo del proceso ya ocupa esa dirección (ASLR): reintentar sin aleatorización
 				setenv("TAHOE_REEXEC", "1", 1);
 				personality(personality(0xffffffff) | ADDR_NO_RANDOMIZE);
-				execve("/proc/self/exe", g_argv, environ);
+				// por su ruta y no por /proc/self/exe: si no, Linux llama al proceso "exe" y las herramientas que buscan
+				// tahoe-run (limpieza, guardián de memoria, diagnóstico) dejan de verlo
+				execve(g_self_exe ? g_self_exe : "/proc/self/exe", g_argv, environ);
 			}
 			DIE("mmap de la caché falló en 0x%lx (+0x%lx): %s", m[i].addr, m[i].size, strerror(errno));
 		}
@@ -394,6 +396,7 @@ struct seg64 { uint32_t cmd, cmdsize; char segname[16]; uint64_t vmaddr, vmsize,
 
 struct image { uint64_t mh; uint64_t entry; uint32_t filetype; uint64_t hi; };
 
+static char prog_name[64] = "?";                      // programa de macOS de este proceso (para el registro)
 static void load_macho(const char* path, uint64_t slide, struct image* out) {
 	int fd = open(path, O_RDONLY);
 	if (fd < 0) DIE("no puedo abrir %s: %s", path, strerror(errno));
@@ -452,6 +455,7 @@ static void load_macho(const char* path, uint64_t slide, struct image* out) {
 	close(fd);
 	if (!out->mh) DIE("%s: no se encontró el segmento __TEXT", path);
 	LOG("<%d> cargado %-28s mh=0x%lx entrada=0x%lx tipo=%u\n", (int)getpid(), strrchr(path, '/') ? strrchr(path, '/') + 1 : path, out->mh, out->entry, out->filetype);
+	if (out->filetype == 2) snprintf(prog_name, sizeof prog_name, "%s", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
 }
 
 // ---------------------------------------------------------------- pila inicial
@@ -502,7 +506,8 @@ typedef emu_fn bsd_fn;
 
 // BSD: devuelven >= 0 o -errno_de_Darwin
 extern void ports_cleanup(void);
-static long bsd_exit(struct ctx* c)  { if (trace_all || getpid() == 1) logf_("    exit(%d) <%d>\n", (int)c->a[0], getpid()); ports_cleanup(); _exit((int)c->a[0]); }
+// Cada salida queda en el registro (una línea): sin ella, un servicio que termina por su cuenta desaparece sin rastro.
+static long bsd_exit(struct ctx* c)  { logf_("    fin <%d> [%s] exit(%d)\n", getpid(), prog_name, (int)c->a[0]); ports_cleanup(); _exit((int)c->a[0]); }
 static long bsd_getpid(struct ctx* c) { (void)c; return getpid(); }
 static long bsd_issetugid(struct ctx* c) { (void)c; return 0; }
 static long bsd_write(struct ctx* c) {

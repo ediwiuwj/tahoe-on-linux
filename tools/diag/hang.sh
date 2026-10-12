@@ -20,12 +20,15 @@ sleep $(( E + 4 + ${3:-20} ))
 cmdl() { local t c; for t in /proc/$1/task/*; do c=$(tr '\0' ' ' < $t/cmdline 2>/dev/null); [ -n "$c" ] && { echo "$c"; return; }; done; }
 # Pid de macOS -> programa que tiene cargado ahora (el último ejecutable, tipo=2, que cargó ese pid).
 progs() { LC_ALL=C grep -ao "<[0-9]*> cargado [^ ]* .* tipo=2" "$D/msh.log" | awk '{gsub(/[<>]/,"",$1); p[$1]=$3} END{for (k in p) print k, p[k]}'; }
-# Procesos de tahoe-run (pid de Linux) cuyo programa de macOS es $1.
+# Procesos (pid de Linux) cuyo programa de macOS es $1: se buscan por su pid de macOS (último campo de NSpid, en un
+# espacio de PID hijo: el del arranque) y no por el nombre de Linux, que no siempre es tahoe-run.
+NS=; for p in $(pgrep -x tahoe-run); do NS=$(readlink /proc/$p/ns/pid 2>/dev/null) && [ -n "$NS" ] && break; done
 pids_of() {
-	local p n
-	for p in $(pgrep -x tahoe-run); do
-		n=$(awk '/^NSpid/{print $NF}' /proc/$p/status 2>/dev/null)
-		[ -n "$n" ] && [ "$(echo "$PROGS" | awk -v n="$n" '$1==n{print $2}')" = "$1" ] && echo $p
+	local s n
+	for s in /proc/[0-9]*/status; do
+		[ "$(readlink ${s%/status}/ns/pid 2>/dev/null)" = "$NS" ] || continue
+		n=$(awk '/^NSpid/{if (NF > 2) print $NF}' "$s" 2>/dev/null)
+		[ -n "$n" ] && [ "$(echo "$PROGS" | awk -v n="$n" '$1==n{print $2}')" = "$1" ] && { s=${s#/proc/}; echo "${s%/status}"; }
 	done
 }
 # Lo que dice el registro de un proceso que no está vivo.
@@ -35,7 +38,7 @@ gone() {
 	if [ -z "$m" ]; then echo "== $n: no llegó a cargarse"; return; fi
 	echo "== $n: no está vivo (pid de macOS $m)"
 	for p in $m; do
-		LC_ALL=C grep -a "abort <$p>: \[" "$D/msh.log" | sort -u | head -5 | sed 's/^ */   /'
+		LC_ALL=C grep -a "abort <$p>: \[\|fin <$p> \|SIG[A-Z]* <$p>\|recolector: pid $p " "$D/msh.log" | sort -u | head -5 | sed 's/^ */   /'
 		LC_ALL=C grep -a "<$p>" "$D/msh.log" | grep -av "IOKIT" | tail -3 | cut -c1-200 | sed 's/^ */   último: /'
 	done
 }
@@ -44,11 +47,12 @@ for NAME in $2; do
 	PIDS=$(pids_of "$NAME")
 	[ -z "$PIDS" ] && { gone "$NAME"; continue; }
 	for P in $PIDS; do
-	echo "== $NAME: pid $P (en macOS $(awk '/^NSpid/{print $NF}' /proc/$P/status)): $(cmdl $P | sed 's/.*dyld //' | cut -c1-100)"
+	echo "== $NAME: pid $P, \"$(cat /proc/$P/comm 2>/dev/null)\" en Linux (en macOS $(awk '/^NSpid/{print $NF}' /proc/$P/status)): $(cmdl $P | sed 's/.*dyld //' | cut -c1-100)"
 	# Hilos iguales (mismo estado, llamada y sitio: p. ej. los de reserva de las colas, parados en poll) en una sola línea.
 	for t in /proc/$P/task/*; do
 		s=$(cat $t/syscall 2>/dev/null); pc=$(echo "$s" | awk '{print $NF}'); nr=$(echo "$s" | awk '{print $1}')
-		w=$(cat $t/wchan 2>/dev/null); st=$(awk '{print $3}' $t/stat)
+		[ -r $t/stat ] || continue                              # el hilo terminó mientras se miraba
+		w=$(cat $t/wchan 2>/dev/null); st=$(awk '{print $3}' $t/stat 2>/dev/null)
 		case "$pc" in 0x7ff8*|0x7ff9*|0x7ffa*|0x7ffb*|0x7ffc*|0x7ffd*|0x7ffe*) where=$(python3 "$DIAG/sym.py" ${pc#0x} 2>/dev/null | cut -d' ' -f2-);;
 			0x*) where=$(addr2line -f -s -e "$RUN" "$pc" 2>/dev/null | paste -sd' ');; *) where=;; esac
 		echo "$(basename $t) $st nr=$nr wchan=$w pc=$pc $where"
