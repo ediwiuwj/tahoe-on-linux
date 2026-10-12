@@ -23,7 +23,7 @@
 # obliga a reiniciar (hoy: el llavero de root), se quede dormido en vez de ejecutar /sbin/reboot y apagar todo el arranque.
 # Sin la opción, el arranque es el normal, como en un Mac.
 #
-# --pantalla: abre tools/tahoe-view/tahoe-view (compílalo con su build.sh; necesita SDL3), que muestra en una ventana la
+# --pantalla: abre el visor tools/tahoe-view (Rust; compílalo con `cargo build --release` en esa carpeta), que muestra en una ventana la
 # memoria de vídeo emulada en la que dibuja WindowServer (/dev/shm/tahoe-fb-<id>). Implica --launchd.
 ROOT="${TAHOE_ROOT:-$HOME/macos26/base/macOS Base System}"
 TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -106,10 +106,11 @@ REGION=$(find_region "$L")
 if [ -z "$REGION" ]; then echo "no encuentro la región de puertos de launchd (pid $L)" >&2; exit 1; fi
 
 if [ -n "$WITH_VIEW" ]; then
-	if [ -x "$TOOLS/tahoe-view/tahoe-view" ]; then
-		"$TOOLS/tahoe-view/tahoe-view" "/dev/shm/tahoe-fb-${REGION#/dev/shm/tahoe-ports-}" < /dev/null > /dev/null 2>&1 & VIEW=$!
+	VIEWER="$TOOLS/tahoe-view/target/release/tahoe-view"
+	if [ -x "$VIEWER" ]; then
+		"$VIEWER" "/dev/shm/tahoe-fb-${REGION#/dev/shm/tahoe-ports-}" < /dev/null > /dev/null 2>&1 & VIEW=$!
 	else
-		echo "falta el visor: compila con tools/tahoe-view/build.sh" >&2
+		echo "falta el visor: compílalo con «cargo build --release» en tools/tahoe-view" >&2
 	fi
 fi
 
