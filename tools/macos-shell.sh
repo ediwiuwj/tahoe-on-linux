@@ -9,6 +9,7 @@
 #   tools/macos-shell.sh --launchd --pantalla     # además abre el visor de la pantalla de macOS (tools/tahoe-view)
 #
 # TAHOE_RUN: binario de tahoe-run a usar (por omisión, el del repo).
+# TAHOE_NICE: prioridad de macOS en Linux (nice, por omisión 0, la normal; p. ej. 10 para que moleste menos al escritorio).
 # TAHOE_ROOT: carpeta con el sistema base de macOS extraído (por omisión ~/macos26/base/macOS Base System).
 # El entorno se limpia: el programa ve un entorno de macOS (PATH, HOME=/var/root, usuario root), no el de Linux.
 #
@@ -93,7 +94,7 @@ if [ -z "$L" ]; then
 	"$TOOLS/mem_guard.sh" & GUARD=$!
 	setsid env -i "${MACOS_ENV[@]}" TAHOE_FD2LOG=1 \
 		unshare --pid --fork --user --map-root-user --mount-proc \
-		nice -n 10 "$RUN" "$DYLD_CACHE" "$ROOT/usr/lib/dyld" "$ROOT/sbin/launchd" \
+		nice -n "${TAHOE_NICE:-0}" "$RUN" "$DYLD_CACHE" "$ROOT/usr/lib/dyld" "$ROOT/sbin/launchd" \
 		< /dev/null > /dev/null 2>&1 &
 	U=$! STARTED=1
 	for _ in $(seq 300); do L=$(find_launchd); [ -n "$L" ] && [ -n "$(find_region "$L")" ] && break; sleep 0.2; done

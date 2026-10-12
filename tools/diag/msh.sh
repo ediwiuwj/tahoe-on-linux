@@ -29,7 +29,7 @@ rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stack
 [ -n "$BRK" ] && printf "%s\n" $BRK > /dev/shm/tahoe-break
 [ -n "$PEEK" ] && printf "%s\n" $PEEK > /dev/shm/tahoe-peek
 G="${TMPDIR:-/tmp}/tahoe-guard.log"; g0=$(wc -l < "$G" 2>/dev/null || echo 0)
-TAHOE_RUN="${TAHOE_RUN:-}" TAHOE_LOGFILE="$D/msh.log" TAHOE_BOOT_WAIT="${2:-12}" timeout -s TERM -k 5 "${3:-60}" nice -n 10 \
+TAHOE_RUN="${TAHOE_RUN:-}" TAHOE_LOGFILE="$D/msh.log" TAHOE_BOOT_WAIT="${2:-12}" timeout -s TERM -k 5 "${3:-60}" \
 	"$DIAG/../macos-shell.sh" --launchd $([ "${TAHOE_DEPURAR:-1}" = 0 ] || echo --depurar) -c "$1" < /dev/null 2>&1
 echo "[salida=$?]"
 # si el guardián de memoria cortó el arranque, decirlo (si no, parece que los procesos desaparecen sin más)
