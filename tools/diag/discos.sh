@@ -13,20 +13,22 @@
 # MSGS: programas cuyos mensajes Mach se trazan (/dev/shm/tahoe-msg-trace); al final, mensajes.py dice qué envíos no
 # llegaron y qué peticiones se quedaron sin respuesta. Ejemplo:
 #   MSGS='diskutil storagekitd diskarbitrationd fskitd extensionkitservice' discos.sh
+# SIN_REINICIO=1: no relanza diskarbitrationd (se queda el del arranque, sin su registro -d; relanzarlo cambia el
+# escenario). PAUSA: segundos entre relanzarlo y lanzar la orden (8).
 # El registro de este arranque queda en ~/.cache/tahoe-diag/discos.log.
 # Todo queda en ~/.cache/tahoe-diag/discos.out (la salida entera de macOS) y siempre se limpia el arranque.
 DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
-ORDEN="${1:-diskutil list}"; PLAZO="${PLAZO:-40}"; E="${ESPERA:-15}"
+ORDEN="${1:-diskutil list}"; PLAZO="${PLAZO:-40}"; E="${ESPERA:-15}"; PAUSA="${PAUSA:-8}"
 export TAHOE_ROOT="${TAHOE_ROOT:-$HOME/macos26/base/macOS Base System}"
 DA=system/com.apple.diskarbitrationd
 # Dentro de macOS: la orden va en segundo plano y su código de salida se apunta al terminar; si sigue viva al vencer
 # el plazo se dice («COLGADA»). Las secciones van marcadas con @@ para separarlas aquí.
 SCRIPT="${PREP:+$PREP
-}touch /var/log/diskarbitrationd.log
-launchctl debug $DA -- /usr/libexec/diskarbitrationd -d >/dev/null 2>&1
-launchctl kickstart -k $DA >/dev/null 2>&1
-sleep 8
+}${SIN_REINICIO:+: }touch /var/log/diskarbitrationd.log
+${SIN_REINICIO:+: }launchctl debug $DA -- /usr/libexec/diskarbitrationd -d >/dev/null 2>&1
+${SIN_REINICIO:+: }launchctl kickstart -k $DA >/dev/null 2>&1
+sleep $PAUSA
 ( $ORDEN > /tmp/.discos.out 2>&1; echo \"@@salida \$?\" >> /tmp/.discos.out ) &
 i=0; while [ \$i -lt $PLAZO ] && ! grep -q '^@@salida' /tmp/.discos.out 2>/dev/null; do sleep 1; i=\$((i+1)); done
 grep -q '^@@salida' /tmp/.discos.out || echo '@@salida COLGADA' >> /tmp/.discos.out
@@ -50,6 +52,8 @@ echo "== $ORDEN: $(grep -o '^@@salida .*' "$D/discos.out" | sed 's/@@salida /sal
 sec orden | grep -v '^@@salida' | head -15 | sed 's/^/   /'
 echo "== procesos de discos vivos al final"
 sec procesos | sed 's/^/   /'
-sec registro | python3 "$DIAG/da_log.py"
+if [ -n "$SIN_REINICIO" ]; then echo "== (SIN_REINICIO: diskarbitrationd sin registro -d)"
+elif [ -z "$(sec registro)" ]; then echo "== el registro -d de diskarbitrationd salió vacío (¿no llegó a relanzarse?)"
+else sec registro | python3 "$DIAG/da_log.py"; fi
 [ -n "$MSGS" ] && python3 "$DIAG/mensajes.py" "$D/discos.log"
 echo "(salida completa: $D/discos.out; registro: $D/discos.log)"

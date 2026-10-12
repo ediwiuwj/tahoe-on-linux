@@ -9,6 +9,8 @@
 # cadena (diskutil -> storagekitd -> diskarbitrationd -> fskitd...).
 #   -t           además, la conversación completa en orden (una línea por mensaje)
 #   -s prog      solo los mensajes en los que participa ese programa (puede repetirse)
+#   -p pid|prog  sigue un proceso: todos sus envíos y recepciones en orden (con un nombre, todos los pid con ese programa,
+#                p. ej. el diskarbitrationd de arranque y el relanzado)
 # Un destino sin traza (no está en la lista) sale como «(sin traza)»: se sabe que se envió, no si llegó.
 import os, re, sys
 from collections import Counter, defaultdict
@@ -16,11 +18,13 @@ from collections import Counter, defaultdict
 args = sys.argv[1:]
 full = "-t" in args
 solo = set()
+follow = set()
 rest = []
 i = 0
 while i < len(args):
     if args[i] == "-t": pass
     elif args[i] == "-s" and i + 1 < len(args): solo.add(args[i + 1]); i += 1
+    elif args[i] == "-p" and i + 1 < len(args): follow.add(args[i + 1]); i += 1
     else: rest.append(args[i])
     i += 1
 path = rest[0] if rest else os.path.expanduser(os.environ.get("TAHOE_DIAG_DIR", "~/.cache/tahoe-diag") + "/discos.log")
@@ -48,7 +52,7 @@ with open(path, "rb") as f:
         if m:
             pid, tid, en, dest, resp, mid, size, de, res = m.groups()
             traced.add(pid)
-            recvs.append(dict(n=n, pid=pid, dest=dest, resp=resp, id=int(mid), de=de, res=res, used=False))
+            recvs.append(dict(n=n, pid=pid, tid=tid, dest=dest, resp=resp, id=int(mid), size=int(size), de=de, res=res, used=False))
 
 if not sends and not recvs:
     sys.exit(f"sin líneas MSG en {path} (¿se activó /dev/shm/tahoe-msg-trace con los nombres?)")
@@ -72,12 +76,18 @@ for s in sends:
         s["reply"] = next((x for x in by_dest.get(s["resp"], []) if x["n"] > s["n"]), None) or \
                      next((r for r in rx_by_port.get((s["pid"], s["resp"]), []) if r["n"] > s["n"] and r["res"] == "0x0"), None)
 
+# Subsistemas MIG que aparecen en estas trazas (id = base del subsistema + número de rutina).
+MIG = {1000: "notifyd", 11600: "logd", 20000: "configd", 400: "bootstrap", 3200: "mach_port", 3400: "host_priv",
+       200: "host", 3800: "thread_act", 4800: "mach_vm", 2400: "clock", 6100: "DiskArbitration"}
+
 def kind(mid):
     if mid in (64, 65, 66, 69, 70, 71, 72):
         return {64: "aviso", 65: "aviso PORT_DELETED", 66: "aviso", 69: "aviso PORT_DESTROYED", 70: "aviso NO_SENDERS",
                 71: "aviso SEND_ONCE", 72: "aviso DEAD_NAME"}[mid]
     if mid & 0x10000000 or mid & 0x40000000: return "XPC"
-    return f"MIG {mid // 100}:{mid % 100}" if mid > 1000 else f"id {mid}"
+    for base in sorted(MIG, reverse=True):
+        if base <= mid < base + 100: return f"MIG {MIG[base]}#{mid - base}"
+    return f"MIG {mid}" if mid >= 100 else f"id {mid}"
 
 def state(s):
     if s["to"] not in traced: llegada = "(sin traza)"
@@ -101,6 +111,18 @@ if full:
         if interesa(s):
             print(f"   {s['n']:>7} {name(s['pid']):>26} -> {name(s['to']):<26} {kind(s['id']):<16} {state(s)}"
                   + (f"   «{s['txt']}»" if s["txt"] else ""))
+
+if follow:
+    pids = {p for p in traced if p in follow or progs.get(p) in follow}
+    print(f"== seguimiento de {', '.join(sorted(name(p) for p in pids)) or '(nadie con traza)'}")
+    ev = [("->", x) for x in sends if x["pid"] in pids] + [("<-", r) for r in recvs if r["pid"] in pids]
+    for d, x in sorted(ev, key=lambda e: e[1]["n"]):
+        if d == "->":
+            print(f"   {x['n']:>7} {name(x['pid'])}.{x['tid']} envía a {name(x['to'])} {kind(x['id'])} tam={x['size']}: {state(x)}"
+                  + (f"   «{x['txt']}»" if x["txt"] else ""))
+        else:
+            err = "" if x["res"] == "0x0" else f" ERROR {x['res']}"
+            print(f"   {x['n']:>7} {name(x['pid'])}.{x['tid']} recibe de {name(x['de'])} {kind(x['id'])} tam={x['size']} en {x['dest']}{err}")
 
 print("== por pareja (mensajes, sin recibir, sin respuesta)")
 pairs = Counter(); lost = Counter(); unans = Counter()
