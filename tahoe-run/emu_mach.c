@@ -520,6 +520,11 @@ static long user_receive(struct ctx* c, uint64_t options, uint64_t buf, uint32_t
 	if (trace_all && timeout < 0 && getenv("TAHOE_STACKS")) diag_stack(c->uc, "espera");   // quién se bloquea esperando
 	if (g_watch) logf_("    WATCH recv espera puerto 0x%x plazo=%d opciones=0x%lx\n", rcv_name, timeout, options);
 	long r = mach_rx_message(rcv_name, timeout, options, buf, rcvsize, NULL);
+	// Errores de recepción que los clientes no esperan (libdispatch aborta con "Unexpected error from
+	// mach_msg_receive"): siempre al registro, son raros. TIMED_OUT (0x10004003), INTERRUPTED (0x10004005) y
+	// TOO_LARGE (0x10004004, se reintenta con un búfer mayor) son normales.
+	if (r && r != 0x10004003 && r != 0x10004005 && r != 0x10004004)
+		logf_("    mach_msg <%d:%ld>: recepción en 0x%x -> 0x%lx (opciones=0x%lx)\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, r, options);
 	if (access("/dev/shm/tahoe-mach-trace", F_OK) == 0) {
 		uint32_t hh[6] = { 0 }; if (r == 0) safe_read(buf, hh, 24);
 		logf_("    MT pid=%d.%ld recv port=0x%x r=0x%lx id=%d size=%u\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, r, (int32_t)hh[5], hh[1]);
