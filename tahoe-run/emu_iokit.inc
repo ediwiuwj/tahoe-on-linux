@@ -1125,6 +1125,18 @@ static int32_t uc_gpuwrangler(struct uc_call* c) {
 	case 0xa0000004:
 		*c->noutband = 0;
 		return 0;
+	case 0xc0000001: {
+		// estructura de 0x26 bytes de ida y vuelta (función interna tras GPUWranglerGPUByID, después de leer el ID de
+		// registro del framebuffer): se devuelve tal cual y se anota para estudiarla
+		uint32_t n = c->ninband < *c->noutband ? c->ninband : *c->noutband;
+		memcpy(c->outband, c->inband, n); *c->noutband = n;
+		static int shown;
+		if (!shown++) {
+			char hex[3 * 64 + 1] = ""; for (uint32_t i = 0; i < c->ninband && i < 64; i++) snprintf(hex + 3 * i, 4, " %02x", c->inband[i]);
+			logf_("    iokit: <%d> GPUWrangler 0xc0000001 entrada:%s\n", (int)getpid(), hex);
+		}
+		return 0;
+	}
 	default:
 		logf_("    iokit: <%d> GPUWrangler selector 0x%x sin implementar\n", (int)getpid(), c->selector);
 		*c->noutband = 0;
@@ -1255,6 +1267,8 @@ static int32_t uc_fb(struct uc_call* c) {
 		return 0;
 	case 3: case 4: case 9: case 10: case 11: case 12: case 14: case 15: case 16: case 19: case 20:
 		return 0;                                                      // cambios de modo, cursor, gamma, CLUT, atributos: aceptados
+	case 21:                                                           // CoreDisplay::Framebuffer registra un búfer suyo de 0x20
+		return 0;                                                      // bytes (1, 0, dirección, tamaño): se acepta, queda a cero
 	case 18: {                                                         // getAttribute(atributo)
 		uint32_t a = c->nsin ? (uint32_t)c->sin[0] : 0;
 		c->sout[0] = 0; *c->nsout = 1;
