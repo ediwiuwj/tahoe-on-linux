@@ -72,10 +72,12 @@ Objetivo: macOS 26 completo, configurado y usable, con aceleración gráfica. La
 2. **Teclado y ratón**: eventos de la ventana de Linux (SDL) hacia la cola de IOHIDSystem / los servicios HID de macOS.
 3. **Asistente de configuración** hasta crear la cuenta; plan B si algún paso se bloquea: crear el usuario con
    `sysadminctl` desde la shell de macOS y marcar `/private/var/db/.AppleSetupDone`.
-4. **Aceleración gráfica**: volver a publicar el IOAccelerator, esta vez con un driver Metal propio
+4. **Aceleración gráfica (en Rust)**: volver a publicar el IOAccelerator, esta vez con un driver Metal propio
    (`MetalPluginName`) sobre Vulkan; primero la composición de WindowServer y CoreAnimation (Liquid Glass: desenfoque,
    refracción, brillos), después Metal 2 completo y Metal 3 de cara a macOS, emulando lo que el hardware no tenga y
-   añadiendo a `hasvk` (Mesa) las extensiones que falten.
+   añadiendo a `hasvk` (Mesa) las extensiones que falten. Todo lo de Metal y Vulkan se escribe en **Rust** (driver
+   Metal, traducción de órdenes a Vulkan con `ash`, shaders AIR→SPIR-V como `metal2vulkan`): es código complejo de
+   alto nivel donde la seguridad de memoria importa. `tahoe-run` (el «núcleo», muy de bajo nivel) sigue en C.
 5. **Bluetooth, audio y red** sobre los servicios de Linux (BlueZ, PipeWire/ALSA, la red del anfitrión).
 6. **Estabilidad del arranque**: caídas sueltas de servicios (AirPlayXPCHelper, mediaremoted, locationd, kmutil
    «failed to get platform node»), la carrera de workloops que queda, señales reales (`sigreturn`) y perfil de
