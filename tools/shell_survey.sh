@@ -10,6 +10,7 @@
 #   tools/shell_survey.sh 'orden 1' 'orden 2' ...
 #
 # Usa tools/macos-shell.sh --launchd (arranca launchd y lo detiene al terminar). PLAZO: segundos por orden (6).
+# DEPURAR=1: arranque con --depurar (recoveryosd no reinicia la máquina si falla).
 TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 PLAZO="${PLAZO:-6}"
 if [ $# -eq 0 ]; then
@@ -39,4 +40,4 @@ SCRIPT="t() { c=\"\$1\"; f=/tmp/.survey.\$\$; /bin/bash -c \"\$c\" > \$f 2>&1 < 
 for c in "$@"; do SCRIPT+="t $(printf '%q' "$c")
 "; done
 [ -n "$TAHOE_LOGFILE" ] && rm -f "$TAHOE_LOGFILE"          # un registro por inventario (tahoe-run añade al final)
-"$TOOLS/macos-shell.sh" --launchd -c "$SCRIPT"
+"$TOOLS/macos-shell.sh" ${DEPURAR:+--depurar} --launchd -c "$SCRIPT"
