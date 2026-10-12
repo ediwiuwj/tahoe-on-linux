@@ -1,9 +1,12 @@
 # tahoe-on-linux — macOS 26 (Tahoe) sobre el kernel de Linux, sin XNU
 
 Capa de compatibilidad propia (`tahoe-run`, en C) que ejecuta binarios x86_64 de **macOS 26** directamente sobre Linux:
-traduce las syscalls BSD y las trampas Mach de XNU en espacio de usuario, y arranca el `launchd` real de la Recovery.
-Objetivo final: que la imagen de la Recovery se vea en pantalla y tener Metal (vía Vulkan, con Indium y `metal2vulkan`
-para una GPU Intel Haswell). [Darling](https://github.com/darlinghq/darling) se usa solo como referencia.
+traduce las syscalls BSD y las trampas Mach de XNU en espacio de usuario, y arranca el `launchd` real de macOS.
+Objetivo: el **macOS 26 completo** en la PC, más rápido que un Hackintosh: llegar al Asistente de configuración y al
+escritorio en una ventana de Linux, con aceleración gráfica (Metal sobre Vulkan en la Intel HD 4400: Metal 2 nativo y
+Metal 3 de cara a macOS, emulando lo que falte, ampliando `hasvk` de Mesa si hace falta) y con lo que el Hackintosh no
+tenía, como Bluetooth (a través de BlueZ). La Recovery fue el primer paso y sigue sirviendo de prueba de regresiones.
+[Darling](https://github.com/darlinghq/darling) se usa solo como referencia.
 
 **Estado actual (11 de octubre de 2026)**, medido en la PC de pruebas (i5-4210U Haswell, 5,8 GB de RAM, Arch/Omarchy, kernel 7.2):
 
@@ -61,18 +64,22 @@ Diagnóstico con `tools/diag/` (registro y salidas en `$TAHOE_DIAG_DIR`, por omi
 
 ## Hoja de ruta, por orden
 
-1. **Terminar la shell**: lo que falla en el inventario ya da lo mismo que en un Mac. Quedan detalles:
-   - `log show` a veces responde «Could not open local log store» (1 de cada 3 inventarios); repetirlo funciona.
-   - `bless --info` necesita un volumen Preboot, que el contenedor de la Recovery no tiene (como en un Mac sin él).
-   - El disco sale como «disk image», igual que el sistema base de una Recovery real (con «PCI-Express» apfs_boot_util
-     exige el volumen VM y launchd entra en pánico).
-2. **Caídas de servicios**: el arranque ya hace lo de una Recovery real (rc.cdrom monta `/System/Volumes/Data` y `/Volumes`
-   en tmpfs y copia la plantilla), así que `/var` empieza vacío y locationd ya no entra en bucle de caídas. Queda una carrera
-   en los workloops («BUG IN LIBDISPATCH: Invalid wlh state», ~1 de cada 6 arranques, en locationd o mobileassetd; se
-   estudia con `msh.sh WL=1`), y caídas sueltas de `coreservicesd`. Antes anotadas: `opendirectoryd` (espera al abrir
-   `/Search`), CarbonCore (`FileIDTreeStorage` no registrado en `coreservicesd`), `displaypolicyd` (PF238), `apsd`.
-3. **Señales reales** (`sigreturn`). (`fileport_makeport` ya está.)
-4. **Interfaz gráfica**: servicio HID, pantalla por DRM/KMS, entrada por evdev y Metal sobre Vulkan para WindowServer.
+Objetivo: macOS 26 completo, configurado y usable, con aceleración gráfica. La Recovery queda como prueba de regresiones.
+
+1. **Escritorio en pantalla (en curso)**: WindowServer ya dibuja el cursor en el framebuffer emulado; falta que componga
+   el escritorio sin caerse (CoreDisplay considera la pantalla principal «offline» y crea una virtual; errores de recepción
+   Mach en libdispatch). Visor: `tools/tahoe-view`.
+2. **Teclado y ratón**: eventos de la ventana de Linux (SDL) hacia la cola de IOHIDSystem / los servicios HID de macOS.
+3. **Asistente de configuración** hasta crear la cuenta; plan B si algún paso se bloquea: crear el usuario con
+   `sysadminctl` desde la shell de macOS y marcar `/private/var/db/.AppleSetupDone`.
+4. **Aceleración gráfica**: volver a publicar el IOAccelerator, esta vez con un driver Metal propio
+   (`MetalPluginName`) sobre Vulkan; primero la composición de WindowServer y CoreAnimation (Liquid Glass: desenfoque,
+   refracción, brillos), después Metal 2 completo y Metal 3 de cara a macOS, emulando lo que el hardware no tenga y
+   añadiendo a `hasvk` (Mesa) las extensiones que falten.
+5. **Bluetooth, audio y red** sobre los servicios de Linux (BlueZ, PipeWire/ALSA, la red del anfitrión).
+6. **Estabilidad del arranque**: caídas sueltas de servicios (AirPlayXPCHelper, mediaremoted, locationd, kmutil
+   «failed to get platform node»), la carrera de workloops que queda, señales reales (`sigreturn`) y perfil de
+   servicios prescindibles para la PC de 5,8 GB.
 
 ## Qué hay en este repositorio
 
