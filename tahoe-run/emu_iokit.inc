@@ -629,8 +629,17 @@ static void io_init(void) {
 	int disp = ent_add(dcon, "AppleDisplay", "IODisplay", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(disp, "IOClass", "AppleDisplay");
 	display_props(disp);
-	int wr = ent_add(plat, "IODisplayWrangler", "IODisplayWrangler", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	// IODisplayWrangler cuelga de IOResources (CoreDisplay lo busca por la ruta IOService:/IOResources/IODisplayWrangler):
+	// lleva el estado de energía de las pantallas; encendidas (4 de 4).
+	int wr = ent_add(res, "IODisplayWrangler", "IODisplayWrangler", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(wr, "IOClass", "IODisplayWrangler");
+	p_str(wr, "IOProviderClass", "IOResources");
+	{
+		struct val* pm = v_new(V_DICT);
+		v_set(pm, "CurrentPowerState", v_num(4, 32)); v_set(pm, "MaxPowerState", v_num(4, 32));
+		v_set(pm, "DevicePowerState", v_num(4, 32)); v_set(pm, "DesiredPowerState", v_num(4, 32));
+		v_set(io_e[wr].props, "IOPowerManagement", pm);
+	}
 
 	int hid = ent_add(res, "IOHIDSystem", "IOHIDSystem", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(hid, "IOClass", "IOHIDSystem");
