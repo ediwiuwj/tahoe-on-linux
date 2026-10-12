@@ -491,11 +491,15 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	uint32_t remote = h.local, local = h.remote;
 	h.bits = nb; h.remote = remote; h.local = local;
 	memcpy(m, &h, sizeof h);
+	char rxports[96] = "";                                    // para la traza MSG: puertos que trae el mensaje
 	{                                                          // complejo: el receptor ve los derechos de los descriptores ya convertidos
 		struct nucleo_desc d[64];
 		int nd = nucleo_descriptores(m, size, d, 64);
+		size_t rk = 0;
 		for (int i = 0; i < nd && i < 64; i++) {
 			uint8_t cl = d[i].clase;
+			if ((cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTO_GUARDA) && rk < sizeof rxports - 24)
+				rk += (size_t)snprintf(rxports + rk, sizeof rxports - rk, "%s0x%x%s", rk ? "," : " puertos=", d[i].nombre, port_exists(d[i].nombre) ? "" : "(muerto)");
 			if ((trace_all || mach_trace()) && (cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTO_GUARDA)) logf_("    mach_msg: <%d> descriptor de puerto%s 0x%x disposición %u\n", (int)getpid(), cl == NUCLEO_PUERTO_GUARDA ? " con guarda" : "", d[i].nombre, d[i].disp);
 			// MOVE_RECEIVE: el receptor pasa a ser dueño (también en un puerto con guarda, que es como launchd entrega los
 			// puertos de servicio)
@@ -521,7 +525,7 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	else if (safe_write(buf, m, size) != (ssize_t)size || safe_write(buf + size, tr, tsize) != (ssize_t)tsize) res = MACH_RCV_INVALID_DATA_;
 	else if (total) *total = size + tsize;
 	if (trace_all) logf_("    mach_msg: recibe en 0x%x id=%d (%u bytes) -> 0x%lx\n", rcv_name, h.id, size, res);
-	if (msg_trace()) logf_("    MSG <%d.%ld> recibe en=0x%x dest=0x%x resp=0x%x id=%d tam=%u de=%d -> 0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, local, remote, h.id, size, (int)snd[0], res);
+	if (msg_trace()) logf_("    MSG <%d.%ld> recibe en=0x%x dest=0x%x resp=0x%x id=%d tam=%u de=%d -> 0x%lx%s\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, local, remote, h.id, size, (int)snd[0], res, rxports);
 	if (mach_trace()) { uint64_t cx; memcpy(&cx, tr + 52, 8); logf_("    MT pid=%d.%ld rx destino=0x%x id=%d trailer=%u ctx=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), local, h.id, tsize, tsize >= 60 ? cx : 0); }
 	free(m);
 	return res;
