@@ -29,6 +29,7 @@
 #define kIOReturnBadMedia     IOKIT_RET(0x2d0)
 
 static size_t reply_port(uint8_t* r, const struct hdr* req, uint32_t name, uint8_t disposition);
+static int io_trace_on(void);                               // traza de IOKit (más abajo)
 
 // ------------------------------------------------------------------ valores (plist en memoria)
 enum { V_DICT = 1, V_ARRAY, V_STR, V_NUM, V_BOOL, V_DATA, V_SYM };
@@ -979,7 +980,8 @@ static void notif_send(struct ioobj* o, int type) {
 	memcpy(m, &h, sizeof h);
 	uint32_t sz = 0, ty = (uint32_t)type; memcpy(m + 24, &sz, 4); memcpy(m + 28, &ty, 4);
 	for (int i = 0; i < 8; i++) { uint64_t v = i < o->nref ? o->ref[i] : 0; memcpy(m + 32 + i * 8, &v, 8); }
-	port_send(o->wake, m, sizeof m);
+	int r = port_send(o->wake, m, sizeof m);
+	if (io_trace_on()) logf_("    IOKIT <%d> aviso tipo=%d al puerto 0x%x (notificación 0x%x) -> %d\n", (int)getpid(), type, o->wake, o->port, r);
 }
 
 // ------------------------------------------------------------------ user clients: ganchos por clase
@@ -1527,10 +1529,15 @@ static const struct { int id; const char* name; } io_names[] = {
 	{ 2889, "registry_entry_get_property_bin_buf" },
 	{ 2890, "service_wait_quiet_with_options" },
 };
+// Traza de IOKit: TAHOE_IOKIT, o /dev/shm/tahoe-iokit-trace (launchd no propaga el entorno): vacío, todos los procesos;
+// con nombres de programas, solo esos (tools/diag/discos.sh IOKS='...'; tools/diag/iokit.py lo resume).
+static int io_trace_on(void) {
+	if (io_trace < 0) io_trace = getenv("TAHOE_IOKIT") != NULL || trace_file_on("/dev/shm/tahoe-iokit-trace");
+	return io_trace;
+}
 static const char* io_name_of(int id) { for (unsigned i = 0; i < sizeof io_names / sizeof *io_names; i++) if (io_names[i].id == id) return io_names[i].name; return "?"; }
 static void io_log_req(const struct hdr* h, const uint8_t* req) {
-	if (io_trace < 0) io_trace = getenv("TAHOE_IOKIT") != NULL || access("/dev/shm/tahoe-iokit-trace", F_OK) == 0;   // el archivo sirve porque launchd no propaga el entorno
-	if (!io_trace) return;
+	if (!io_trace_on()) return;
 	struct rq q; rq_init(&q, h, req);
 	char who[200] = ""; int ent = obj_ent(h->remote);
 	if (ent >= 0) snprintf(who, sizeof who, " [%s:%s]", io_e[ent].cls, io_e[ent].name);
@@ -1564,8 +1571,30 @@ static void io_log_req(const struct hdr* h, const uint8_t* req) {
 	logf_("    IOKIT <%d> %s(%d)%s%s\n", (int)getpid(), io_name_of(h->id), h->id, who, arg);
 }
 
+// Respuesta de una petición, para la traza: el código de retorno o, si devuelve un puerto, a qué objeto corresponde.
+static void io_log_rep(const struct hdr* h, const uint8_t* rep, size_t n) {
+	if (!io_trace_on() || n < 36) return;
+	uint32_t bits; memcpy(&bits, rep, 4);
+	if (bits & 0x80000000u) {
+		uint32_t name; memcpy(&name, rep + 28, 4);
+		int e = name ? obj_ent(name) : -1;
+		if (e >= 0) logf_("    IOKIT <%d>   -> %s: puerto 0x%x [%s:%s]\n", (int)getpid(), io_name_of(h->id), name, io_e[e].cls, io_e[e].name);
+		else logf_("    IOKIT <%d>   -> %s: puerto 0x%x\n", (int)getpid(), io_name_of(h->id), name);
+	} else {
+		int32_t kr; memcpy(&kr, rep + 32, 4);
+		if (h->id == 2831 && n >= 40) { uint32_t b; memcpy(&b, rep + 36, 4); logf_("    IOKIT <%d>   -> %s: kr=0x%x ocupado=%u\n", (int)getpid(), io_name_of(h->id), kr, b); }
+		else logf_("    IOKIT <%d>   -> %s: kr=0x%x tam=%zu\n", (int)getpid(), io_name_of(h->id), kr, n);
+	}
+}
+
 // ------------------------------------------------------------------ el servidor
+static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* rep, int* handled);
 static size_t mig_iokit(const struct hdr* h, const uint8_t* req, uint8_t* rep, int* handled) {
+	size_t n = mig_iokit_req(h, req, rep, handled);
+	if (*handled) io_log_rep(h, rep, n);
+	return n;
+}
+static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* rep, int* handled) {
 	*handled = 1;
 	io_init();
 	io_log_req(h, req);

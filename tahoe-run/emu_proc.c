@@ -256,6 +256,12 @@ static int names_match(const char* file) {
 	for (char* t = strtok_r(nm, " \t", &sv); t; t = strtok_r(NULL, " \t", &sv)) if (strstr(cl, t)) return 1;
 	return 0;
 }
+// Traza activada por un archivo de /dev/shm: si está vacío vale para todos los procesos; si tiene nombres, solo para esos.
+int trace_file_on(const char* file) {
+	struct stat st;
+	if (stat(file, &st) != 0) return 0;
+	return st.st_size == 0 ? 1 : names_match(file);
+}
 int diag_target(void) { static int want = -1; if (want < 0) want = names_match("/dev/shm/tahoe-stacks"); return want; }
 // Traza de mensajes Mach (líneas «MSG»: envíos y recepciones) solo de los procesos nombrados en /dev/shm/tahoe-msg-trace;
 // tools/diag/mensajes.py la convierte en una conversación. Mucho más ligera que la traza MT de todos los procesos.

@@ -13,6 +13,8 @@
 # MSGS: programas cuyos mensajes Mach se trazan (/dev/shm/tahoe-msg-trace); al final, mensajes.py dice qué envíos no
 # llegaron y qué peticiones se quedaron sin respuesta. Ejemplo:
 #   MSGS='diskutil storagekitd diskarbitrationd fskitd extensionkitservice' discos.sh
+# IOKS: programas cuya actividad IOKit se traza (/dev/shm/tahoe-iokit-trace: peticiones, respuestas y avisos de
+# notificación); al final, iokit.py la resume por proceso. Ejemplo: IOKS=diskarbitrationd SIN_REINICIO=1 discos.sh
 # SIN_REINICIO=1: no relanza diskarbitrationd (se queda el del arranque, sin su registro -d; relanzarlo cambia el
 # escenario). PAUSA: segundos entre relanzarlo y lanzar la orden (8).
 # El registro de este arranque queda en ~/.cache/tahoe-diag/discos.log.
@@ -38,9 +40,10 @@ echo @@registro; cat /var/log/diskarbitrationd.log"
 LOG="${TAHOE_LOGFILE:-/tmp/tahoe-shell-$USER.log}"
 desde=$(( $( [ -f "$LOG" ] && wc -l < "$LOG" || echo 0) + 1 ))      # el registro es común: se toma solo lo de este arranque
 if [ -n "$MSGS" ]; then echo "$MSGS" > /dev/shm/tahoe-msg-trace; else rm -f /dev/shm/tahoe-msg-trace; fi
+if [ -n "$IOKS" ]; then echo "$IOKS" > /dev/shm/tahoe-iokit-trace; else rm -f /dev/shm/tahoe-iokit-trace; fi
 TAHOE_BOOT_WAIT=$E timeout $(( E + PLAZO + 90 )) "$DIAG/../macos-shell.sh" --launchd -c "$SCRIPT" > "$D/discos.out" 2>&1
 r=$?
-rm -f /dev/shm/tahoe-msg-trace
+rm -f /dev/shm/tahoe-msg-trace /dev/shm/tahoe-iokit-trace
 tail -n +"$desde" "$LOG" > "$D/discos.log" 2>/dev/null
 "$DIAG/clean.sh" > /dev/null 2>&1
 sec() { awk -v s="@@$1" '$0 == s {on=1; next} /^@@(procesos|orden|registro)$/ {on=0} on' "$D/discos.out"; }
@@ -56,4 +59,5 @@ if [ -n "$SIN_REINICIO" ]; then echo "== (SIN_REINICIO: diskarbitrationd sin reg
 elif [ -z "$(sec registro)" ]; then echo "== el registro -d de diskarbitrationd salió vacío (¿no llegó a relanzarse?)"
 else sec registro | python3 "$DIAG/da_log.py"; fi
 [ -n "$MSGS" ] && python3 "$DIAG/mensajes.py" "$D/discos.log"
+[ -n "$IOKS" ] && python3 "$DIAG/iokit.py" "$D/discos.log"
 echo "(salida completa: $D/discos.out; registro: $D/discos.log)"
