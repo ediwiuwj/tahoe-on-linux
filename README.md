@@ -66,6 +66,10 @@ Diagnóstico con `tools/diag/` (registro y salidas en `$TAHOE_DIAG_DIR`, por omi
 
 Objetivo: macOS 26 completo, configurado y usable, con aceleración gráfica. La Recovery queda como prueba de regresiones.
 
+Criterio de lenguaje: todo lo que toca la parte gráfica de Linux y la capa Metal↔Vulkan va en **Rust**. `tahoe-run` sigue en
+C, pero la parte que falle una y otra vez se reescribe en Rust (biblioteca estática enlazada en `tahoe-run`) en vez de
+seguir parcheándola; lo de muy bajo nivel (señales, cambios de pila) se queda en C.
+
 1. **Escritorio en pantalla (en curso)**: WindowServer ya dibuja el cursor en el framebuffer emulado; falta que componga
    el escritorio sin caerse (CoreDisplay considera la pantalla principal «offline» y crea una virtual; errores de recepción
    Mach en libdispatch). Visor: `tools/tahoe-view`.
