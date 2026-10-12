@@ -119,7 +119,7 @@ int port_release_send_once(uint32_t name);
 int port_assert_guard(uint32_t name, uint64_t guard);
 int port_swap_guard(uint32_t name, uint64_t old, uint64_t nw);
 int port_get_refs(uint32_t name, uint32_t right, uint32_t* refs);
-enum { KO_TASK = 1, KO_TASK_NAME = 2, KO_IDENTITY_TOKEN = 3, KO_FILEPORT = 4, KO_THREAD = 5 };   // KO_THREAD: pid = tid de Linux
+enum { KO_TASK = 1, KO_TASK_NAME = 2, KO_IDENTITY_TOKEN = 3, KO_FILEPORT = 4, KO_THREAD = 5, KO_AUDIT_SESSION = 6 };   // KO_THREAD: pid = tid de Linux   // KO_AUDIT_SESSION: pid = asid
 uint32_t kobj_make(int type, int32_t pid);
 uint32_t kobj_new(int type, int32_t pid);
 void kobj_free(uint32_t name);

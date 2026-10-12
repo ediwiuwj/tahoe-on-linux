@@ -69,6 +69,26 @@ static long b_setaudit_addr(struct ctx* c) {
 	safe_write(c->a[0], a, sizeof a);                               // como XNU: devuelve el asid asignado
 	return 0;
 }
+// Puertos de sesión de auditoría (como audit_session.c de XNU): un objeto del núcleo por asid, el mismo nombre para todos
+// los procesos de la sesión. launchd los usa para la sesión gráfica de un usuario: recoveryosd o loginwindow crean una
+// sesión nueva (setaudit_addr con AU_ASSIGN_ASID) y le pasan su puerto; launchd se une a ella (audit_session_join) para
+// montar el dominio gui/<uid> y arrancar ahí los LaunchAgents de tipo Aqua.
+// audit_session_self(): puerto de la sesión propia.
+static long b_audit_session_self(struct ctx* c) { (void)c; return kobj_make(KO_AUDIT_SESSION, (int32_t)au_asid); }
+// audit_session_join(puerto): pasa a esa sesión y devuelve su asid. La sesión conserva el auid de este proceso (aquí la
+// sesión es solo el asid; el auid lo fija quien la crea con setaudit_addr).
+static long b_audit_session_join(struct ctx* c) {
+	int type; int32_t asid;
+	if (!kobj_lookup((uint32_t)c->a[0], &type, &asid) || type != KO_AUDIT_SESSION) return -D_EINVAL;
+	au_asid = (uint32_t)asid;
+	return asid;
+}
+// audit_session_port(asid, *puerto): puerto de la sesión asid.
+static long b_audit_session_port(struct ctx* c) {
+	uint32_t name = kobj_make(KO_AUDIT_SESSION, (int32_t)(uint32_t)c->a[0]);
+	if (!name) return -D_ENOMEM;
+	return safe_write(c->a[1], &name, 4) == 4 ? 0 : -D_EFAULT;
+}
 static long b_getauid(struct ctx* c) { return safe_write(c->a[0], &au_auid, 4) == 4 ? 0 : -D_EFAULT; }
 static long b_setauid(struct ctx* c) {
 	uint32_t v; if (safe_read(c->a[0], &v, 4) != 4) return -D_EFAULT;
@@ -168,4 +188,5 @@ void emu_cred_init(void) {
 	reg_bsd(79, b_getgroups); reg_bsd(80, b_setgroups); reg_bsd(243, b_initgroups);
 	reg_bsd(293, b_identitysvc);
 	reg_bsd(357, b_getaudit_addr); reg_bsd(358, b_setaudit_addr); reg_bsd(353, b_getauid); reg_bsd(354, b_setauid);
+	reg_bsd(428, b_audit_session_self); reg_bsd(429, b_audit_session_join); reg_bsd(432, b_audit_session_port);
 }

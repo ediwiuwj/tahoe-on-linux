@@ -1348,7 +1348,6 @@ static long bsd_workq_kernreturn(struct ctx* c) {
 
 static long bsd_proc_rlimit_control(struct ctx* c) { (void)c; return 0; }   // límites de monitorización: sin efecto
 
-static long bsd_audit_session_self(struct ctx* c) { (void)c; return 0x1503; }   // puerto ficticio de la sesión de auditoría
 
 // sigsuspend(mask): aquí no hay señales de Darwin reales todavía; el hilo se duerme hasta que Linux lo interrumpa.
 static long bsd_sigsuspend(struct ctx* c) { (void)c; syscall(SYS_pause); return -4; /* EINTR */ }
@@ -1437,7 +1436,6 @@ void emu_proc_init(void) {
 	reg_bsd(322, bsd_proc_rlimit_control);   // iopolicysys: sin efecto
 	reg_bsd(331, bsd_proc_rlimit_control);   // __disable_threadsignal: sin efecto
 	reg_bsd(111, bsd_sigsuspend); reg_bsd(410, bsd_sigsuspend);
-	reg_bsd(428, bsd_audit_session_self);
 	reg_bsd(446, bsd_proc_rlimit_control);
 	reg_bsd(243, bsd_proc_rlimit_control);   // initgroups: sin efecto
 	reg_bsd(499, bsd_work_interval_ctl);
