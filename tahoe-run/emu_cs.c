@@ -75,6 +75,7 @@ static int64_t slice_offset(int fd) {
 		if (be32(h + 8 + i * 20) == 0x01000007) return be32(h + 8 + i * 20 + 8);
 	return -1;
 }
+#define CS_WHOLE 0xffffffffu                                    // «ranura» especial: la firma completa
 // Busca en la firma del ejecutable el blob de la ranura indicada. Devuelve malloc() con el blob (cabecera incluida).
 static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
 	char path[4096];
@@ -104,6 +105,11 @@ static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
 					uint8_t* sb = malloc(dsz);
 					if (sb && dsz >= 12 && pread(fd, sb, dsz, (off_t)(base + doff)) == (ssize_t)dsz && be32(sb) == 0xfade0cc0) {
 						uint32_t count = be32(sb + 8);
+						if (slot == CS_WHOLE) {                          // la firma entera (SuperBlob), para CS_OPS_BLOB
+							uint32_t tl = be32(sb + 4);
+							if (tl >= 12 && tl <= dsz && (out = malloc(tl))) { memcpy(out, sb, tl); *len = tl; }
+							count = 0;
+						}
 						for (uint32_t k = 0; k < count && 12 + (k + 1) * 8 <= dsz; k++) {
 							uint32_t type = be32(sb + 12 + k * 8), bo = be32(sb + 12 + k * 8 + 4);
 							if (type != slot || bo + 8 > dsz) continue;
@@ -247,6 +253,14 @@ static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
 	case 7: case 16: {                                           // ENTITLEMENTS_BLOB (XML, ranura 5) / DER_ENTITLEMENTS_BLOB (ranura 7)
 		uint32_t len = 0;
 		uint8_t* b = cs_blob(pid, op == 7 ? 5 : 7, &len);
+		long r = copy_token(b, len, uaddr, usize);
+		free(b);
+		return r;
+	}
+	case 10: {                                                   // BLOB: la firma entera (SuperBlob embebido), como cs_blob_get
+		uint32_t len = 0;
+		uint8_t* b = cs_blob(pid, CS_WHOLE, &len);
+		if (!b) return -D_EINVAL;                                 // sin firma
 		long r = copy_token(b, len, uaddr, usize);
 		free(b);
 		return r;
