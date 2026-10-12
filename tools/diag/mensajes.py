@@ -36,6 +36,7 @@ snd_re = re.compile(r"MSG <(\d+)\.(\d+)> envía dest=(0x[0-9a-f]+)\(->(-?\d+)\) 
 rcv_re = re.compile(r"MSG <(\d+)\.(\d+)> recibe en=(0x[0-9a-f]+) dest=(0x[0-9a-f]+) resp=(0x[0-9a-f]+) id=(-?\d+) tam=(\d+) de=(-?\d+) -> (0x[0-9a-f]+)")
 fail_re = re.compile(r"MSG <(\d+)\.(\d+)> envío a (0x[0-9a-f]+) id=(-?\d+) falló (0x[0-9a-f]+)")
 body_re = re.compile(r"MSG cuerpo <(\d+)\.(\d+)>: ([0-9a-f]+)")
+rbody_re = re.compile(r"MSG recibido <(\d+)\.(\d+)>: ([0-9a-f]+)")
 prog_re = re.compile(r"<(\d+)> cargado (\S+) .*tipo=2")
 
 progs = {}
@@ -58,6 +59,11 @@ with open(path, "rb") as f:
             for x in reversed(sends[-50:]):
                 if x["pid"] == m.group(1) and x["tid"] == m.group(2): x["body"] = bytes.fromhex(m.group(3)); break
             continue
+        m = rbody_re.search(l)
+        if m:                             # cuerpo de la recepción anterior de ese hilo
+            for r in reversed(recvs[-50:]):
+                if r["pid"] == m.group(1) and r["tid"] == m.group(2): r["body"] = bytes.fromhex(m.group(3)); break
+            continue
         m = fail_re.search(l)
         if m:                             # el envío anterior de ese hilo no entró en la cola (llena con plazo 0, destino muerto)
             pid, tid, dest, mid, kr = m.groups()
@@ -73,11 +79,11 @@ with open(path, "rb") as f:
 if not sends and not recvs:
     sys.exit(f"sin líneas MSG en {path} (¿se activó /dev/shm/tahoe-msg-trace con los nombres?)")
 
-# Formato de libxpc en el cable: «@XPC», versión, y el objeto raíz (normalmente un diccionario). Cada objeto: tipo (u32)
+# Formato de libxpc en el cable: «CPX@» (0x40585043), versión, y el objeto raíz (normalmente un diccionario). Cada objeto: tipo (u32)
 # y su contenido; los puertos van en descriptores aparte («puerto»).
 def xpc_decode(b):
     import struct
-    k = b.find(b"@XPC")
+    k = b.find(b"CPX@")                                     # número mágico 0x40585043 en little endian
     if k < 0 or k + 8 > len(b): return None
     pos = [k + 8]
     def u32():
@@ -185,9 +191,16 @@ if follow:
             if xpc and x.get("body"):
                 d = xpc_decode(x["body"])
                 if d: print(f"              {d[:600]}")
+            rp = x.get("reply")
+            if xpc and rp and rp.get("body"):                 # la respuesta, si quien responde también tiene traza
+                d = xpc_decode(rp["body"])
+                if d: print(f"              respuesta (línea {rp['n']}): {d[:600]}")
         else:
             err = "" if x["res"] == "0x0" else f" ERROR {x['res']}"
             print(f"   {x['n']:>7} {name(x['pid'])}.{x['tid']} recibe de {name(x['de'])} {kind(x['id'])} tam={x['size']} en {x['dest']}{err}")
+            if xpc and x.get("body"):
+                d = xpc_decode(x["body"])
+                if d: print(f"              {d[:600]}")
 
 print("== por pareja (mensajes, sin recibir, sin respuesta)")
 pairs = Counter(); lost = Counter(); unans = Counter()

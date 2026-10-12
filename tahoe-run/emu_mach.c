@@ -525,7 +525,15 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	else if (safe_write(buf, m, size) != (ssize_t)size || safe_write(buf + size, tr, tsize) != (ssize_t)tsize) res = MACH_RCV_INVALID_DATA_;
 	else if (total) *total = size + tsize;
 	if (trace_all) logf_("    mach_msg: recibe en 0x%x id=%d (%u bytes) -> 0x%lx\n", rcv_name, h.id, size, res);
-	if (msg_trace()) logf_("    MSG <%d.%ld> recibe en=0x%x dest=0x%x resp=0x%x id=%d tam=%u de=%d -> 0x%lx%s\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, local, remote, h.id, size, (int)snd[0], res, rxports);
+	if (msg_trace()) {
+		logf_("    MSG <%d.%ld> recibe en=0x%x dest=0x%x resp=0x%x id=%d tam=%u de=%d -> 0x%lx%s\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, local, remote, h.id, size, (int)snd[0], res, rxports);
+		if (size > 24 && size <= 1024) {                        // cuerpo recibido (respuestas de procesos sin traza, p. ej. launchd)
+			static __thread char hx[2100];
+			for (uint32_t q = 24; q < size; q++) { static const char d[] = "0123456789abcdef"; hx[(q - 24) * 2] = d[m[q] >> 4]; hx[(q - 24) * 2 + 1] = d[m[q] & 15]; }
+			hx[(size - 24) * 2] = 0;
+			logf_("      MSG recibido <%d.%ld>: %s\n", (int)getpid(), (long)syscall(SYS_gettid), hx);
+		}
+	}
 	if (mach_trace()) { uint64_t cx; memcpy(&cx, tr + 52, 8); logf_("    MT pid=%d.%ld rx destino=0x%x id=%d trailer=%u ctx=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), local, h.id, tsize, tsize >= 60 ? cx : 0); }
 	free(m);
 	return res;
