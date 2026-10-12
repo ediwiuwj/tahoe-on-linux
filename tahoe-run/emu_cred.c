@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "tahoe.h"
 
@@ -52,6 +54,46 @@ static void cred_load(void) {
 // getaudit_addr / setaudit_addr (auditinfo_addr_t, 0x30 bytes): auid, máscara (2×u32), terminal (24 bytes), asid (+36)
 // y banderas (+40). AU_ASSIGN_ASID (-1) en asid pide una sesión nueva: se le da un número propio (sesión base + pid, único
 // mientras viva quien la creó). Solo root cambia la sesión.
+// Registro de sesiones compartido por todo el arranque (como la tabla de sesiones de XNU): asid -> auditinfo_addr (0x30
+// bytes) del que la creó o la cambió. launchd pregunta por una sesión ajena con auditon(A_GETSINFO_ADDR) para montar el
+// dominio de la sesión gráfica (comprueba su auid y que tenga AU_SESSION_FLAG_HAS_GRAPHIC_ACCESS). Archivo en /dev/shm
+// con huecos fijos: hueco = asid % SES_N, sondeo lineal.
+#define SES_N 512
+static int ses_fd(void) {
+	static int fd = -2;
+	if (fd == -2) {
+		char p[160];
+		snprintf(p, sizeof p, "/dev/shm/tahoe.%s.sesiones", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
+		fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+		if (fd >= 0 && ftruncate(fd, SES_N * 0x30) != 0) { close(fd); fd = -1; }
+	}
+	return fd;
+}
+static void ses_put(const uint8_t a[0x30]) {
+	int fd = ses_fd(); if (fd < 0) return;
+	uint32_t asid; memcpy(&asid, a + 36, 4);
+	for (uint32_t k = 0; k < SES_N; k++) {
+		uint32_t slot = (asid + k) % SES_N, cur = 0; uint8_t e[0x30];
+		if (pread(fd, e, sizeof e, slot * 0x30) == (ssize_t)sizeof e) memcpy(&cur, e + 36, 4);
+		if (cur == 0 || cur == asid) { if (pwrite(fd, a, 0x30, slot * 0x30) != 0x30) {} return; }
+	}
+}
+static int ses_get(uint32_t asid, uint8_t out[0x30]) {
+	int fd = ses_fd(); if (fd < 0 || !asid) return -1;
+	for (uint32_t k = 0; k < SES_N; k++) {
+		uint32_t slot = (asid + k) % SES_N, cur = 0;
+		if (pread(fd, out, 0x30, slot * 0x30) != 0x30) return -1;
+		memcpy(&cur, out + 36, 4);
+		if (cur == asid) return 0;
+		if (cur == 0) return -1;
+	}
+	return -1;
+}
+static uint8_t au_tid[24];                                       // terminal de la sesión (solo para el registro)
+static void ses_mine(uint8_t a[0x30]) {
+	memset(a, 0, 0x30);
+	memcpy(a, &au_auid, 4); memcpy(a + 4, au_mask, 8); memcpy(a + 12, au_tid, 24); memcpy(a + 36, &au_asid, 4); memcpy(a + 40, &au_flags, 8);
+}
 static long b_getaudit_addr(struct ctx* c) {
 	uint8_t a[0x30] = { 0 };
 	memcpy(a, &au_auid, 4); memcpy(a + 4, au_mask, 8); memcpy(a + 36, &au_asid, 4); memcpy(a + 40, &au_flags, 8);
@@ -66,6 +108,8 @@ static long b_setaudit_addr(struct ctx* c) {
 	au_auid = auid; memcpy(au_mask, a + 4, 8); au_flags = fl;
 	au_asid = asid == (uint32_t)-1 ? AU_DEFAULT_ASID + (uint32_t)getpid() : asid;
 	memcpy(a + 36, &au_asid, 4);
+	memcpy(au_tid, a + 12, 24);
+	ses_put(a);                                                     // la sesión queda registrada para auditon
 	safe_write(c->a[0], a, sizeof a);                               // como XNU: devuelve el asid asignado
 	return 0;
 }
@@ -88,6 +132,36 @@ static long b_audit_session_port(struct ctx* c) {
 	uint32_t name = kobj_make(KO_AUDIT_SESSION, (int32_t)(uint32_t)c->a[0]);
 	if (!name) return -D_ENOMEM;
 	return safe_write(c->a[1], &name, 4) == 4 ? 0 : -D_EFAULT;
+}
+// auditon(orden, datos, tamaño): consultas sobre sesiones. A_GETSINFO_ADDR (32): datos de la sesión ai_asid (de este
+// proceso o del registro); A_GETPINFO_ADDR (28): auditpinfo_addr del propio proceso; A_GETSFLAGS/A_SETSFLAGS (39/40):
+// banderas de la sesión propia. El resto (política, condición, colas...) responde 0 sin efecto, como antes.
+static long b_auditon(struct ctx* c) {
+	int cmd = (int)c->a[0]; uint64_t data = c->a[1]; uint32_t len = (uint32_t)c->a[2];
+	uint8_t a[0x30];
+	switch (cmd) {
+	case 32: {
+		uint32_t asid;
+		if (len < 0x30 || safe_read(data + 36, &asid, 4) != 4) return -D_EINVAL;
+		if (asid == au_asid || asid == (uint32_t)-1 || asid == 0) ses_mine(a);
+		else if (ses_get(asid, a) != 0) return -D_EINVAL;
+		return safe_write(data, a, 0x30) == 0x30 ? 0 : -D_EFAULT;
+	}
+	case 28: {                                                      // auditpinfo_addr: pid (4) + auditinfo_addr
+		int32_t pid;
+		if (len < 0x34 || safe_read(data, &pid, 4) != 4) return -D_EINVAL;
+		if (pid != (int32_t)getpid()) return -D_EINVAL;
+		ses_mine(a);
+		return safe_write(data + 4, a, 0x30) == 0x30 ? 0 : -D_EFAULT;
+	}
+	case 39: return len >= 8 && safe_write(data, &au_flags, 8) == 8 ? 0 : -D_EINVAL;
+	case 40: {
+		uint64_t f; if (len < 8 || safe_read(data, &f, 8) != 8) return -D_EINVAL;
+		au_flags = f; ses_mine(a); ses_put(a);
+		return 0;
+	}
+	default: return 0;
+	}
 }
 static long b_getauid(struct ctx* c) { return safe_write(c->a[0], &au_auid, 4) == 4 ? 0 : -D_EFAULT; }
 static long b_setauid(struct ctx* c) {
@@ -188,5 +262,6 @@ void emu_cred_init(void) {
 	reg_bsd(79, b_getgroups); reg_bsd(80, b_setgroups); reg_bsd(243, b_initgroups);
 	reg_bsd(293, b_identitysvc);
 	reg_bsd(357, b_getaudit_addr); reg_bsd(358, b_setaudit_addr); reg_bsd(353, b_getauid); reg_bsd(354, b_setauid);
+	reg_bsd(351, b_auditon);
 	reg_bsd(428, b_audit_session_self); reg_bsd(429, b_audit_session_join); reg_bsd(432, b_audit_session_port);
 }

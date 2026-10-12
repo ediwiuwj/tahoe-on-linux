@@ -36,7 +36,6 @@ static long bsd_chmod(struct ctx* c)  { PATH1(p, 0); RET(chmod(p, (mode_t)c->a[1
 // daría EINVAL/EPERM. launchd lo hace con sus sockets y servicios; se acepta sin efecto.
 static long chown_result(long r) { if (r < 0 && (errno == EINVAL || errno == EPERM)) return 0; return r < 0 ? err() : 0; }
 static long bsd_chown(struct ctx* c)  { PATH1(p, 0); return chown_result(chown(p, (uid_t)c->a[1], (gid_t)c->a[2])); }
-static long bsd_ret0(struct ctx* c) { (void)c; return 0; }
 #include <sys/xattr.h>
 static long bsd_fchflags(struct ctx* c) { uint32_t v = (uint32_t)c->a[1]; fsetxattr((int)c->a[0], "user.tahoe.flags", &v, 4, 0); return 0; }   // sin soporte de xattr: se acepta igual
 static long bsd_chflags(struct ctx* c) { PATH1(p, 0); uint32_t v = (uint32_t)c->a[1]; lsetxattr(p, "user.tahoe.flags", &v, 4, 0); return 0; }
@@ -257,7 +256,7 @@ void emu_fs2_init(void) {
 	reg_bsd(221, bsd_setattrlist); reg_bsd(228, bsd_fsetattrlist); reg_bsd(524, bsd_setattrlistat);
 	reg_bsd(474, bsd_symlinkat); reg_bsd(467, bsd_fchmodat); reg_bsd(468, bsd_fchownat); reg_bsd(471, bsd_linkat);
 	reg_bsd(136, bsd_mkdir); reg_bsd(137, bsd_rmdir); reg_bsd(10, bsd_unlink); reg_bsd(15, bsd_chmod);
-	reg_bsd(364, bsd_lchown); reg_bsd(34, bsd_chflags); reg_bsd(35, bsd_fchflags); reg_bsd(351, bsd_ret0);   // lchown; chflags/fchflags/auditon sin efecto
+	reg_bsd(364, bsd_lchown); reg_bsd(34, bsd_chflags); reg_bsd(35, bsd_fchflags);   // lchown; chflags/fchflags (auditon está en emu_cred.c)
 	reg_bsd(234, bsd_no_xattr); reg_bsd(142, bsd_gethostuuid);
 	reg_bsd(16, bsd_chown); reg_bsd(254, bsd_lchown); reg_bsd(200, bsd_truncate); reg_bsd(132, bsd_mkfifo);
 	reg_bsd(128, bsd_rename); reg_bsd(9, bsd_link); reg_bsd(57, bsd_symlink);
