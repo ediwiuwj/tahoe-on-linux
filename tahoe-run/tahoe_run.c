@@ -609,7 +609,15 @@ static long bsd_getlogin(struct ctx* c) {
 	return safe_write(c->a[0], u, sizeof u) == (ssize_t)sizeof u ? 0 : -14;
 }
 static long bsd_enotsup(struct ctx* c) { (void)c; return -45; }   // ENOTSUP: funciones que este sistema no ofrece (personas)
-static long bsd_eperm(struct ctx* c) { (void)c; return -1; }      // EPERM: reboot desde dentro no apaga el anfitrión
+// reboot(howto): solo launchd (pid 1 del espacio de procesos del arranque) apaga o reinicia. Aquí eso es terminar el
+// arranque: al salir el pid 1, Linux termina todos los procesos de su espacio (el anfitrión no se toca). launchd aborta si
+// reboot() vuelve con error (assertion en launchd + 284047), así que no vuelve. Los demás reciben EPERM, como un no-root.
+static long bsd_reboot(struct ctx* c) {
+	if (getpid() != 1) return -1;
+	logf_("    reinicio pedido (reboot howto=0x%lx) por <%d> [%s]: fin del arranque\n", (unsigned long)c->a[0], getpid(), prog_name);
+	ports_cleanup();
+	_exit(0);
+}
 // guarded_open_np(ruta, guard*, guardflags, oflags, mode): como open; la guarda se ignora.
 static long bsd_guarded_open(struct ctx* c) {
 	struct ctx c2 = *c;
@@ -820,7 +828,7 @@ static long bsd_shared_region_check_np(struct ctx* c) {
 static bsd_fn bsd_table[BSD_NAMES_N] = {
 	[1] = bsd_exit, [3] = bsd_read, [4] = bsd_write, [6] = bsd_close, [20] = bsd_getpid,
 	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [454] = bsd_system_override, [336] = bsd_proc_info,
-	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_eperm, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
+	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_reboot, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
 };
 
 
