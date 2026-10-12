@@ -30,7 +30,7 @@ avi_re = re.compile(r"IOKIT <(\d+)> aviso tipo=(\d+) al puerto (0x[0-9a-f]+) \(n
 prog_re = re.compile(r"<(\d+)> cargado (\S+) .*tipo=2")
 
 progs, reqs, avisos = {}, defaultdict(list), defaultdict(list)
-pending = {}                                  # pid -> última petición sin respuesta anotada
+pending = defaultdict(list)                   # (pid, llamada) -> peticiones aún sin respuesta (varios hilos se entremezclan)
 with open(path, "rb") as f:
     for n, raw in enumerate(f, 1):
         l = raw.decode("utf-8", "replace").rstrip("\n")
@@ -38,8 +38,8 @@ with open(path, "rb") as f:
         if m and m.group(2) != "dyld": progs[m.group(1)] = m.group(2)
         m = rep_re.search(l)
         if m:
-            pid = m.group(1)
-            if pid in pending: pending.pop(pid)["rep"] = m.group(3)
+            k = (m.group(1), m.group(2))
+            if pending[k]: pending[k].pop(0)["rep"] = m.group(3)
             continue
         m = avi_re.search(l)
         if m:
@@ -50,7 +50,7 @@ with open(path, "rb") as f:
         if m:
             pid, call, cid, obj, arg = m.groups()
             q = dict(n=n, pid=pid, call=call, id=int(cid), obj=obj or "", arg=arg.strip(), rep=None)
-            reqs[pid].append(q); pending[pid] = q
+            reqs[pid].append(q); pending[(pid, call)].append(q)
 
 if not reqs:
     sys.exit(f"sin líneas IOKIT en {path} (¿se activó /dev/shm/tahoe-iokit-trace?)")

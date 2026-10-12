@@ -36,7 +36,7 @@
 #define NBUCKET 16384                // índice por nombre: cubeta = (nombre >> 8) % NBUCKET, cadenas por hnext
 #define MAXMSG   4096                    // ranuras de mensaje (archivo disperso: solo ocupan RAM las usadas)
 #define MSGSZ    (64 * 1024)
-struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; };   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
+struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; uint32_t spreq; };   // spreq: puerto que pidió MACH_NOTIFY_SEND_POSSIBLE   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
 struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint64_t spill; uint8_t data[MSGSZ - 40]; };   // sauid/sasid: sesión de auditoría del remitente   // spill: datos fuera de línea en un archivo aparte (nucleo_desborde_*), 0 = en la ranura
 // Derechos que el núcleo tiene que vigilar para avisar cuando muere su dueño (ver "notificaciones" más abajo):
 //  sonce: un proceso tiene un derecho send-once (normalmente, la respuesta que debe a quien le pidió algo);
@@ -305,7 +305,7 @@ static void flush_notes(void) {
 		struct note n = notes[--nnotes];
 		uint8_t m[40] = { 0 };
 		uint32_t bits = 18, size = 24;                       // remoto: MOVE_SEND_ONCE (el aviso usa el send-once de la petición)
-		if (n.id == 72 || n.id == 70) { size = 36; m[24 + 4] = 1; memcpy(m + 32, &n.arg, 4); }      // NDR (little endian) + nombre muerto
+		if (n.id == 72 || n.id == 70 || n.id == 66) { size = 36; m[24 + 4] = 1; memcpy(m + 32, &n.arg, 4); }      // NDR (little endian) + nombre muerto
 		else if (n.id == 69) {                               // complejo: un descriptor de puerto con el derecho de recepción
 			bits |= 0x80000000u; size = 40;
 			uint32_t one = 1; memcpy(m + 24, &one, 4); memcpy(m + 28, &n.arg, 4); m[38] = 16; m[39] = 0;
@@ -424,6 +424,7 @@ static void destroy_locked(struct sport* p) {
 	}
 	p->tail = 0; p->count = 0;
 	for (int k = 0; k < MAXDN; k++) if (shm->dn[k].port == name) { note_locked(shm->dn[k].notify, 72, name); shm->dn[k].port = 0; }
+	if (p->spreq) { note_locked(p->spreq, 72, name); p->spreq = 0; }    // SEND_POSSIBLE pendiente: el puerto murió
 	for (int k = 0; k < MAXSO; k++) if (shm->so[k].port == name) shm->so[k].port = 0;     // ya no hay a quién responder
 	if (local_sock[i] >= 0) { close(local_sock[i]); local_sock[i] = -1; }
 	pthread_cond_broadcast(&p->cv);   // quien espere en este puerto debe enterarse de que murió
@@ -642,6 +643,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			src->head = q->next; if (!src->head) src->tail = 0;
 			src->count--;
 			pthread_cond_broadcast(&src->cv);                     // hay sitio: remitentes esperando por el límite de cola
+			if (src->spreq && src->count < (src->qlimit ? src->qlimit : 5)) { note_locked(src->spreq, 66, src->name); src->spreq = 0; }   // y quien pidió SEND_POSSIBLE (libdispatch tras MACH_SEND_TIMED_OUT)
 			msg_rights_locked(q->data, q->size, RIGHTS_RECV, src->name);
 			if (src->set) { struct sport* s = find_locked(src->set); if (s && s->count) s->count--; }
 			uint32_t sz = q->size, tot = q->total; uint64_t spill = q->spill;
@@ -655,6 +657,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			uint32_t rname1 = src->name, rname2 = 0;
 			if (src->set) { struct sport* s = find_locked(src->set); if (s) { fd2 = local_sock[port_index(s)]; rname2 = s->name; } }
 			unlock();
+			flush_notes();
 			if (spill && nucleo_desborde_leer(tag, spill, m + sz, tot - sz) != 0) logf_("    puertos: datos desbordados %lu perdidos\n", (unsigned long)spill);
 			drain_recheck(rname1, fd1);                         // si aún quedan mensajes (o llegó uno), se renueva el aviso
 			if (rname2) drain_recheck(rname2, fd2);
@@ -1262,7 +1265,9 @@ static long t_pid_for_task(struct ctx* c) {
 // mach_port_request_notification_trap(task, nombre, variante, sync, aviso, polí, *anterior)
 // Se guardan PORT_DESTROYED (69, sobre un derecho de recepción) y DEAD_NAME (72, sobre un derecho de envío). Si el puerto
 // ya murió, DEAD_NAME avisa en el acto (como un nombre muerto en XNU). NO_SENDERS (70) se guarda en el puerto y avisa al
-// morir el último proceso con derecho de envío (ver «notificaciones»). SEND_POSSIBLE se acepta sin avisos.
+// morir el último proceso con derecho de envío (ver «notificaciones»). SEND_POSSIBLE (66): libdispatch la pide cuando un
+// envío con plazo 0 da MACH_SEND_TIMED_OUT (cola llena) y reintenta al recibir el aviso; se envía en cuanto se saca un
+// mensaje y queda sitio, o en el acto si ya lo hay y la petición es síncrona (sync != 0), como en XNU.
 int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_t notify, uint32_t* previous) {
 	*previous = 0;
 	int r = KERN_OK;
@@ -1274,6 +1279,13 @@ int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_
 	} else if (variant == 70) {                                // NO_SENDERS: sobre un derecho de recepción; sync = make-send count
 		if (!p) r = KERN_INVALID_RIGHT_;
 		else { *previous = p->nsreq; p->nsreq = notify; p->nsmscount = sync; }
+	} else if (variant == 66) {
+		if (!p) { if (notify && name && name < shm->next_name) note_locked(notify, 72, name); else r = KERN_INVALID_NAME_; }
+		else {
+			*previous = p->spreq; p->spreq = 0;
+			if (notify && sync && p->count < (p->qlimit ? p->qlimit : 5)) note_locked(notify, 66, name);
+			else p->spreq = notify;
+		}
 	} else if (variant == 72) {
 		int32_t me = (int32_t)getpid();
 		for (int i = 0; i < MAXDN; i++) if (shm->dn[i].port == name && shm->dn[i].pid == me) { *previous = shm->dn[i].notify; shm->dn[i].port = 0; break; }
