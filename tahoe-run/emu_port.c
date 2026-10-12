@@ -47,7 +47,7 @@ struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint6
 #define MAXSP 1024                     // peticiones SEND_POSSIBLE: una por proceso y puerto, como los derechos de XNU
 #define MAXPROC 1024
 struct sonce { uint32_t port; int32_t holder; };
-struct dnreq { uint32_t port, notify; int32_t pid; };
+struct dnreq { uint32_t port, notify; int32_t pid; uint32_t armado; };   // armado: solo SEND_POSSIBLE (ver port_request_notification)
 struct sproc { int32_t pid; uint64_t start; };
 // shold: un proceso que no es el dueño tiene un derecho de envío a un puerto (para MACH_NOTIFY_NO_SENDERS, ver más abajo).
 #define MAXSH 8192
@@ -539,17 +539,17 @@ static int ool_scan(const uint8_t* m, uint32_t size, uint32_t* out_off, uint32_t
 
 // Encola un mensaje completo (cabecera con los campos reales). 0 si el puerto existe.
 int port_send(uint32_t dest, const uint8_t* msg, uint32_t size) { return port_send_k(dest, msg, size, 0); }
-static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel, int timeout_ms);
-static int port_send_k(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel) { return port_send_t(dest, msg, size, kernel, -1); }
+static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel, int timeout_ms, int notify);
+static int port_send_k(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel) { return port_send_t(dest, msg, size, kernel, -1, 0); }
 // Envío desde mach_msg con su plazo (MACH_SEND_TIMEOUT): 0 si se encola, -1 si no se puede, o un código mach_msg
 // (MACH_SEND_TIMED_OUT, MACH_SEND_INVALID_DEST).
-int port_send_timeout(uint32_t dest, const uint8_t* msg, uint32_t size, int timeout_ms) { return port_send_t(dest, msg, size, 0, timeout_ms); }
+int port_send_timeout(uint32_t dest, const uint8_t* msg, uint32_t size, int timeout_ms, int notify) { return port_send_t(dest, msg, size, 0, timeout_ms, notify); }
 // kernel = 1: mensaje del "núcleo" (notificaciones): remitente pid 0 en el trailer de auditoría y sin derechos que ceder.
 // Límite de cola (como ipc_mqueue_send de XNU): con la cola del puerto llena (qlimit, 5 por omisión), el remitente espera a
 // que el receptor saque mensajes, o hasta su plazo. No cuentan los mensajes del núcleo ni los que van a un derecho
 // send-once (respuestas): XNU siempre los encola. Sin esto, un puerto que nadie vacía agota la reserva común de ranuras y
 // todos los envíos fallan (libxpc aborta: "MACH_SEND_NO_BUFFER returned for reliable message size").
-static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel, int timeout_ms) {
+static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel, int timeout_ms, int notify) {
 	uint32_t ooff[32], olen[32];
 	uint8_t desc_fix[32 * 16];
 	int nool = ool_scan(msg, size, ooff, olen, 32);
@@ -580,6 +580,12 @@ static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 	uint32_t rbits = 0; memcpy(&rbits, msg, 4); rbits &= 0x1f;      // disposición del destino
 	if (p && !p->is_set && !kernel && rbits != 18 && rbits != 21) {   // MOVE_SEND_ONCE / MAKE_SEND_ONCE: sin límite
 		struct timespec dl;
+		// MACH_SEND_NOTIFY con la cola llena: se arma la petición SEND_POSSIBLE de este proceso sobre el destino, si la hay
+		// (ipc_kmsg_copyin_header -> ipc_port_request_sparm). Solo las armadas avisan cuando se saca un mensaje.
+		if (notify && p->spn && p->count >= (p->qlimit ? p->qlimit : 5)) {
+			int32_t me = (int32_t)getpid();
+			for (int k = 0; k < MAXSP; k++) if (shm->sp[k].port == dest && shm->sp[k].pid == me) shm->sp[k].armado = 1;
+		}
 		if (timeout_ms > 0) { clock_gettime(CLOCK_MONOTONIC, &dl); dl.tv_sec += timeout_ms / 1000; dl.tv_nsec += (timeout_ms % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; } }
 		while (p && p->count >= (p->qlimit ? p->qlimit : 5)) {
 			if (timeout_ms == 0) { unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return 0x10000004; }   // MACH_SEND_TIMED_OUT
@@ -647,9 +653,9 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			src->head = q->next; if (!src->head) src->tail = 0;
 			src->count--;
 			pthread_cond_broadcast(&src->cv);                     // hay sitio: remitentes esperando por el límite de cola
-			if (src->spn && src->count < (src->qlimit ? src->qlimit : 5)) {   // y todos los que pidieron SEND_POSSIBLE (libdispatch tras MACH_SEND_TIMED_OUT)
-				for (int k = 0; k < MAXSP; k++) if (shm->sp[k].port == src->name) { note_locked(shm->sp[k].notify, 66, src->name); shm->sp[k].port = 0; }
-				src->spn = 0;
+			if (src->spn && src->count < (src->qlimit ? src->qlimit : 5)) {   // y las peticiones SEND_POSSIBLE armadas (ipc_port_spnotify);
+				for (int k = 0; k < MAXSP; k++)                                   // las no armadas siguen esperando
+					if (shm->sp[k].port == src->name && shm->sp[k].armado) { note_locked(shm->sp[k].notify, 66, src->name); shm->sp[k].port = 0; src->spn--; }
 			}
 			msg_rights_locked(q->data, q->size, RIGHTS_RECV, src->name);
 			if (src->set) { struct sport* s = find_locked(src->set); if (s && s->count) s->count--; }
@@ -1274,7 +1280,10 @@ static long t_pid_for_task(struct ctx* c) {
 // ya murió, DEAD_NAME avisa en el acto (como un nombre muerto en XNU). NO_SENDERS (70) se guarda en el puerto y avisa al
 // morir el último proceso con derecho de envío (ver «notificaciones»). SEND_POSSIBLE (66): libdispatch la pide cuando un
 // envío con plazo 0 da MACH_SEND_TIMED_OUT (cola llena) y reintenta al recibir el aviso; se envía en cuanto se saca un
-// mensaje y queda sitio, o en el acto si ya lo hay y la petición es síncrona (sync != 0), como en XNU.
+// mensaje y queda sitio, o en el acto si ya lo hay y la petición es síncrona (sync != 0), como en XNU. Como en XNU, solo
+// avisan las peticiones armadas: las síncronas que encontraron la cola llena y las que arma después un envío con
+// MACH_SEND_NOTIFY que la encuentra llena. Una petición sin sync y sin armar no avisa nunca (antes avisaba en cada
+// mensaje que se sacaba: WindowServer y powerd entraban en un bucle de miles de mensajes por segundo).
 int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_t notify, uint32_t* previous) {
 	*previous = 0;
 	int r = KERN_OK;
@@ -1300,7 +1309,7 @@ int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_
 			if (notify && sync && p->count < (p->qlimit ? p->qlimit : 5)) note_locked(notify, 66, name);
 			else if (notify) {
 				int ok = 0;
-				for (int k = 0; k < MAXSP; k++) if (!shm->sp[k].port) { shm->sp[k] = (struct dnreq){ name, notify, me }; p->spn++; ok = 1; break; }
+				for (int k = 0; k < MAXSP; k++) if (!shm->sp[k].port) { shm->sp[k] = (struct dnreq){ name, notify, me, sync != 0 }; p->spn++; ok = 1; break; }
 				if (!ok) logf_("    send-possible: tabla llena\n");
 			}
 		}
@@ -1311,7 +1320,7 @@ int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_
 			if (!p) { if (name && name < shm->next_name) note_locked(notify, 72, name); else r = KERN_INVALID_NAME_; }
 			else {
 				int ok = 0;
-				for (int i = 0; i < MAXDN; i++) if (!shm->dn[i].port) { shm->dn[i] = (struct dnreq){ name, notify, me }; ok = 1; break; }
+				for (int i = 0; i < MAXDN; i++) if (!shm->dn[i].port) { shm->dn[i] = (struct dnreq){ name, notify, me, 0 }; ok = 1; break; }
 				if (!ok) logf_("    dead-name: tabla llena\n");
 			}
 		}
