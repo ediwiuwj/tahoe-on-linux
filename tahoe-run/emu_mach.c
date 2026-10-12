@@ -457,6 +457,19 @@ static uint32_t rx_disp(uint32_t tx) {
 }
 // Recibe un mensaje de `rcv_name` en `buf` (capacidad `cap`) con el trailer que piden las opciones (bits 24-27).
 // Devuelve 0 o un código mach_msg; *total = bytes escritos (mensaje + trailer).
+// Cadenas legibles de un mensaje (de 6 caracteres o más, separadas por «|»), para las trazas: en XPC llevan las claves
+// y valores del diccionario (nombres de rutinas, de servicios...). Devuelve su longitud.
+static int msg_texts(const uint8_t* req, uint32_t size, char* s, size_t cap) {
+	size_t k = 0, run = 0;
+	for (uint32_t q = 24; q < size && k < cap - 2; q++) {
+		uint8_t ch = req[q];
+		if (ch >= 0x20 && ch < 0x7f) { s[k++] = (char)ch; run++; }
+		else { if (run >= 6) s[k++] = 0x7c; else k -= run; run = 0; }
+	}
+	if (run < 6) k -= run;
+	s[k] = 0;
+	return (int)k;
+}
 long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total) {
 	uint32_t elems = (uint32_t)(options >> 24) & 0xf, tsize = elems == 0 ? 8 : elems == 1 ? 12 : elems == 2 ? 20 : elems == 3 ? 52 : 68;
 	uint8_t* m; uint32_t size, snd[5] = { 0, 0, 0, (uint32_t)-1, 0 };
@@ -508,6 +521,7 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	else if (safe_write(buf, m, size) != (ssize_t)size || safe_write(buf + size, tr, tsize) != (ssize_t)tsize) res = MACH_RCV_INVALID_DATA_;
 	else if (total) *total = size + tsize;
 	if (trace_all) logf_("    mach_msg: recibe en 0x%x id=%d (%u bytes) -> 0x%lx\n", rcv_name, h.id, size, res);
+	if (msg_trace()) logf_("    MSG <%d.%ld> recibe en=0x%x dest=0x%x resp=0x%x id=%d tam=%u de=%d -> 0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, local, remote, h.id, size, (int)snd[0], res);
 	if (mach_trace()) { uint64_t cx; memcpy(&cx, tr + 52, 8); logf_("    MT pid=%d.%ld rx destino=0x%x id=%d trailer=%u ctx=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), local, h.id, tsize, tsize >= 60 ? cx : 0); }
 	free(m);
 	return res;
@@ -577,7 +591,11 @@ static long mach_msg2(struct ctx* c) {
 	h.voucher = (uint32_t)vi; h.id = (int32_t)(vi >> 32);
 	int kobject = (options & 0x200000000ULL) != 0;
 	if (mtr) logf_("    MT pid=%d.%ld %s dest=0x%x(->%d) resp=0x%x id=%d size=%u rcv=%d\n", (int)getpid(), (long)syscall(SYS_gettid), kobject ? "kobj" : "send", h.remote, kobject ? 0 : port_rpid(h.remote), h.local, h.id, ssize, (options & 2) != 0);
-	if (mtr && !kobject) { char s[200] = ""; size_t k = 0, run = 0; for (uint32_t q = 24; q < ssize && k < sizeof s - 2; q++) { uint8_t ch = req[q]; if (ch >= 0x20 && ch < 0x7f) { s[k++] = (char)ch; run++; } else { if (run >= 6) s[k++] = 0x7c; else k -= run; run = 0; } } if (run < 6) k -= run; s[k] = 0; if (k) logf_("      MT textos: %s\n", s); }
+	if (mtr && !kobject) { char s[200]; if (msg_texts(req, ssize, s, sizeof s)) logf_("      MT textos: %s\n", s); }
+	if (!kobject && msg_trace()) {
+		char s[200]; int t = msg_texts(req, ssize, s, sizeof s);
+		logf_("    MSG <%d.%ld> envía dest=0x%x(->%d) resp=0x%x id=%d tam=%u bits=0x%x%s%s%s\n", (int)getpid(), (long)syscall(SYS_gettid), h.remote, port_rpid(h.remote), h.local, h.id, ssize, h.bits, (options & 2) ? " y espera" : "", t ? " | " : "", t ? s : "");
+	}
 	if (!kobject && h.remote == 0) { if (trace_all) logf_("    mach_msg2: envío al puerto nulo (id=%d) -> MACH_SEND_INVALID_DEST\n", h.id); return 0x10000003; }   // el núcleo rechaza el destino nulo
 	if (!kobject && (h.bits & 0x1f) == 18 && !port_exists(h.remote)) {   // respuesta (MOVE_SEND_ONCE) a un puerto que ya murió
 		if (mtr) logf_("    MT pid=%d respuesta id=%d a 0x%x, que ya no existe -> MACH_SEND_INVALID_DEST\n", (int)getpid(), h.id, h.remote);

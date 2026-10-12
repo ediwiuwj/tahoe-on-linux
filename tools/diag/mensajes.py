@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+# mensajes.py [-t] [-s programa] [registro]: conversación de mensajes Mach a partir de la traza «MSG» de tahoe-run
+# (procesos nombrados en /dev/shm/tahoe-msg-trace; tools/diag/discos.sh la activa con MSGS='prog1 prog2...').
+# Por omisión lee ~/.cache/tahoe-diag/discos.log.
+#
+# Para cada envío dice si llegó a su destino (hay una recepción de ese remitente con el mismo puerto e id) y, si pedía
+# respuesta (puerto de respuesta), si alguien la envió a ese puerto. Al final, el resumen por pareja de programas y la
+# lista de lo que se quedó a medias: envíos que nadie recibió y peticiones sin respuesta, que es donde se cuelga una
+# cadena (diskutil -> storagekitd -> diskarbitrationd -> fskitd...).
+#   -t           además, la conversación completa en orden (una línea por mensaje)
+#   -s prog      solo los mensajes en los que participa ese programa (puede repetirse)
+# Un destino sin traza (no está en la lista) sale como «(sin traza)»: se sabe que se envió, no si llegó.
+import os, re, sys
+from collections import Counter, defaultdict
+
+args = sys.argv[1:]
+full = "-t" in args
+solo = set()
+rest = []
+i = 0
+while i < len(args):
+    if args[i] == "-t": pass
+    elif args[i] == "-s" and i + 1 < len(args): solo.add(args[i + 1]); i += 1
+    else: rest.append(args[i])
+    i += 1
+path = rest[0] if rest else os.path.expanduser(os.environ.get("TAHOE_DIAG_DIR", "~/.cache/tahoe-diag") + "/discos.log")
+
+snd_re = re.compile(r"MSG <(\d+)\.(\d+)> envía dest=(0x[0-9a-f]+)\(->(-?\d+)\) resp=(0x[0-9a-f]+) id=(-?\d+) tam=(\d+) bits=(0x[0-9a-f]+)( y espera)?(?: \| (.*))?")
+rcv_re = re.compile(r"MSG <(\d+)\.(\d+)> recibe en=(0x[0-9a-f]+) dest=(0x[0-9a-f]+) resp=(0x[0-9a-f]+) id=(-?\d+) tam=(\d+) de=(-?\d+) -> (0x[0-9a-f]+)")
+prog_re = re.compile(r"<(\d+)> cargado (\S+) .*tipo=2")
+
+progs = {}
+sends, recvs = [], []
+traced = set()
+with open(path, "rb") as f:
+    for n, raw in enumerate(f, 1):
+        l = raw.decode("utf-8", "replace")
+        m = prog_re.search(l)
+        if m and m.group(2) != "dyld": progs[m.group(1)] = m.group(2)
+        m = snd_re.search(l)
+        if m:
+            pid, tid, dest, to, resp, mid, size, bits, wait, txt = m.groups()
+            traced.add(pid)
+            sends.append(dict(n=n, pid=pid, tid=tid, dest=dest, to=to, resp=resp, id=int(mid), size=int(size),
+                              bits=bits, wait=bool(wait), txt=(txt or "")[:90], prog=progs.get(pid, "?"), recv=None, reply=None))
+            continue
+        m = rcv_re.search(l)
+        if m:
+            pid, tid, en, dest, resp, mid, size, de, res = m.groups()
+            traced.add(pid)
+            recvs.append(dict(n=n, pid=pid, dest=dest, resp=resp, id=int(mid), de=de, res=res, used=False))
+
+if not sends and not recvs:
+    sys.exit(f"sin líneas MSG en {path} (¿se activó /dev/shm/tahoe-msg-trace con los nombres?)")
+
+def name(pid): return f"{progs.get(pid, '?')}[{pid}]"
+
+# llegada: la primera recepción posterior, del mismo remitente, al mismo puerto y con el mismo id
+by_key = defaultdict(list)
+for r in recvs: by_key[(r["de"], r["dest"], r["id"])].append(r)
+for s in sends:
+    for r in by_key.get((s["pid"], s["dest"], s["id"]), []):
+        if not r["used"] and r["n"] > s["n"]: r["used"] = True; s["recv"] = r; break
+# respuesta: un envío posterior cuyo destino es el puerto de respuesta de la petición
+by_dest = defaultdict(list)
+for s in sends: by_dest[s["dest"]].append(s)
+for s in sends:
+    if s["resp"] != "0x0":
+        s["reply"] = next((x for x in by_dest.get(s["resp"], []) if x["n"] > s["n"]), None)
+
+def kind(mid):
+    if mid in (64, 65, 66, 69, 70, 71, 72):
+        return {64: "aviso", 65: "aviso PORT_DELETED", 66: "aviso", 69: "aviso PORT_DESTROYED", 70: "aviso NO_SENDERS",
+                71: "aviso SEND_ONCE", 72: "aviso DEAD_NAME"}[mid]
+    if mid & 0x10000000 or mid & 0x40000000: return "XPC" + (" respuesta" if mid & 0x40000000 and not mid & 0x10000000 else "")
+    return f"MIG {mid // 100}:{mid % 100}" if mid > 1000 else f"id {mid}"
+
+def state(s):
+    if s["to"] not in traced: llegada = "(sin traza)"
+    elif s["recv"]: llegada = "recibido" if s["recv"]["res"] == "0x0" else f"recibido con error {s['recv']['res']}"
+    else: llegada = "NO RECIBIDO"
+    if s["resp"] == "0x0": return llegada
+    return llegada + (", respondido" if s["reply"] else ", SIN RESPUESTA")
+
+# Petición que espera respuesta: el puerto de respuesta va como derecho de envío único (MAKE/MOVE_SEND_ONCE, 21/18),
+# o el remitente se queda esperando en la misma llamada. Los avisos que se registran (puerto de respuesta con derecho de
+# envío normal) no cuentan: se contestan cuando pasa algo, si pasa.
+def espera_respuesta(s):
+    return s["resp"] != "0x0" and (s["wait"] or ((int(s["bits"], 16) >> 8) & 0x1f) in (18, 21))
+
+def interesa(s): return not solo or progs.get(s["pid"]) in solo or progs.get(s["to"]) in solo
+
+print(f"== procesos con traza: {', '.join(sorted({name(p) for p in traced}))}")
+if full:
+    print("== conversación")
+    for s in sends:
+        if interesa(s):
+            print(f"   {s['n']:>7} {name(s['pid']):>26} -> {name(s['to']):<26} {kind(s['id']):<16} {state(s)}"
+                  + (f"   «{s['txt']}»" if s["txt"] else ""))
+
+print("== por pareja (mensajes, sin recibir, sin respuesta)")
+pairs = Counter(); lost = Counter(); unans = Counter()
+for s in sends:
+    if not interesa(s): continue
+    k = (name(s["pid"]), name(s["to"]))
+    pairs[k] += 1
+    if s["to"] in traced and not s["recv"]: lost[k] += 1
+    if s["resp"] != "0x0" and not s["reply"]: unans[k] += 1
+for k, v in pairs.most_common(30):
+    print(f"   {k[0]:>26} -> {k[1]:<26} {v:>5} {lost[k]:>5} {unans[k]:>5}")
+
+print("== a medias (lo que puede colgar una cadena)")
+malos = [s for s in sends if interesa(s) and s["pid"] != s["to"] and
+         ((s["to"] in traced and not s["recv"]) or (espera_respuesta(s) and not s["reply"]))]
+for s in malos[-40:]:
+    print(f"   línea {s['n']}: {name(s['pid'])} -> {name(s['to'])} {kind(s['id'])} (id {s['id']}): {state(s)}"
+          + (f"   «{s['txt']}»" if s["txt"] else ""))
+if not malos: print("   nada: todo lo enviado llegó y las peticiones que esperaban tuvieron respuesta")

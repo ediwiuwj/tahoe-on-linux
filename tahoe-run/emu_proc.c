@@ -245,17 +245,21 @@ static long bsd_kill(struct ctx* c) {
 }
 // Diagnóstico dirigido: 1 si este proceso es uno de los indicados en /dev/shm/tahoe-stacks (nombres separados por espacios;
 // cada uno, subcadena de su línea de órdenes: así también vale el xpcproxy que va a lanzar ese servicio).
-int diag_target(void) {
-	static int want = -1;
-	if (want < 0) {
-		char nm[256] = "", cl[1024] = "";
-		FILE* f = fopen("/dev/shm/tahoe-stacks", "r"); if (f) { if (fgets(nm, sizeof nm, f)) nm[strcspn(nm, "\n")] = 0; fclose(f); }
-		f = fopen("/proc/self/cmdline", "r"); if (f) { size_t n = fread(cl, 1, sizeof cl - 1, f); for (size_t i = 0; i < n; i++) if (!cl[i]) cl[i] = ' '; fclose(f); }
-		want = 0;
-		for (char* t = strtok(nm, " \t"); t && !want; t = strtok(NULL, " \t")) want = strstr(cl, t) != NULL;
-	}
-	return want;
+// 1 si alguno de los nombres del archivo (separados por espacios) está en la línea de órdenes de este proceso.
+static int names_match(const char* file) {
+	char nm[256] = "", cl[1024] = "";
+	FILE* f = fopen(file, "r"); if (!f) return 0;
+	if (fgets(nm, sizeof nm, f)) nm[strcspn(nm, "\n")] = 0;
+	fclose(f);
+	f = fopen("/proc/self/cmdline", "r"); if (f) { size_t n = fread(cl, 1, sizeof cl - 1, f); for (size_t i = 0; i < n; i++) if (!cl[i]) cl[i] = ' '; fclose(f); }
+	char* sv = NULL;
+	for (char* t = strtok_r(nm, " \t", &sv); t; t = strtok_r(NULL, " \t", &sv)) if (strstr(cl, t)) return 1;
+	return 0;
 }
+int diag_target(void) { static int want = -1; if (want < 0) want = names_match("/dev/shm/tahoe-stacks"); return want; }
+// Traza de mensajes Mach (líneas «MSG»: envíos y recepciones) solo de los procesos nombrados en /dev/shm/tahoe-msg-trace;
+// tools/diag/mensajes.py la convierte en una conversación. Mucho más ligera que la traza MT de todos los procesos.
+int msg_trace(void) { static int want = -1; if (want < 0) want = names_match("/dev/shm/tahoe-msg-trace"); return want; }
 // Con /dev/shm/tahoe-stacks-all, el proceso indicado registra todas sus syscalls BSD (no solo las que fallan).
 int diag_all(void) { static int v = -1; if (v < 0) v = access("/dev/shm/tahoe-stacks-all", F_OK) == 0; return v; }
 // Lee los mensajes de aborto del ejecutable principal (cargado en 0x100000000) y de todas las imágenes de la caché
