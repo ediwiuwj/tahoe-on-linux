@@ -792,6 +792,22 @@ static long mach_msg2(struct ctx* c) {
 		n = reply_begin(rep, &h, KERN_SUCCESS_); memcpy(rep + n, &size, 8); n += 8;
 		break;
 	}
+	case 4804: {                                                  // mach_vm_read(task, addr, size) -> data (OOL), dataCnt
+		uint64_t src, size; memcpy(&src, req + 32, 8); memcpy(&size, req + 40, 8);
+		if (size > (1ull << 30)) { n = reply_begin(rep, &h, 4 /* KERN_INVALID_ARGUMENT */); break; }
+		void* mm = size ? mmap(NULL, (size + 4095) & ~4095ul, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) : NULL;
+		if (mm == MAP_FAILED) { n = reply_begin(rep, &h, 6 /* KERN_RESOURCE_SHORTAGE */); break; }
+		if (size && safe_read(src, mm, size) != (ssize_t)size) { munmap(mm, (size + 4095) & ~4095ul); n = reply_begin(rep, &h, 1 /* KERN_INVALID_ADDRESS */); break; }
+		struct hdr nh = { .bits = 0x80000000u, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = h.id + 100 };
+		memcpy(rep, &nh, sizeof nh);
+		uint32_t one = 1; memcpy(rep + 24, &one, 4);
+		uint64_t addr = (uint64_t)mm; uint32_t l32 = (uint32_t)size;
+		uint8_t dsc[16] = { 0 }; memcpy(dsc, &addr, 8); dsc[8] = 1; dsc[9] = 1; dsc[11] = 1; memcpy(dsc + 12, &l32, 4);
+		memcpy(rep + 28, dsc, 16);
+		memcpy(rep + 44, NDR_LE, 8); memcpy(rep + 52, &l32, 4);
+		n = 56;
+		break;
+	}
 	case 4803: case 4809: case 4810: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // inherit / msync / behavior_set: sin efecto
 	case 200:  n = mig_host_info(&h, req, rep); break;
 	case 206:  n = mig_host_get_clock_service(&h, req, rep); break;

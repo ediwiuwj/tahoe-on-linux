@@ -9,7 +9,7 @@
 //     padres, con entrar/salir);
 //   - propiedades serializadas en el formato binario de OSSerialize (el que lee IOKit.framework) y en XML;
 //   - diccionarios de coincidencia (XML, binario o de la ruta OOL) y su evaluación: IOProviderClass con herencia,
-//     IONameMatch, IOPropertyMatch, IOResourceMatch, IOPathMatch y claves sueltas;
+//     IONameMatch, IOPropertyMatch, IOResourceMatch, IOPathMatch, IORegistryEntryID y claves sueltas;
 //   - notificaciones (add_notification / interest): mensaje de despertar id 53 al puerto del cliente;
 //   - conexiones (user clients): ganchos por clase para que el puente a DRM/Metal los atienda; sin gancho,
 //     los métodos devuelven kIOReturnUnsupported.
@@ -809,6 +809,7 @@ static int name_matches(int i, const char* want) {
 static int match_entry(int i, const struct val* m);
 static int match_one(int i, const char* key, const struct val* v) {
 	if (!strcmp(key, "IOProviderClass")) return v->t == V_STR ? ent_conforms(i, v->s) : 0;
+	if (!strcmp(key, "IORegistryEntryID")) return v->t == V_NUM && io_e[i].id == v->n;   // IORegistryEntryIDMatching
 	if (!strcmp(key, "IONameMatch")) {
 		if (v->t == V_STR) return name_matches(i, v->s);
 		if (v->t == V_ARRAY) { for (int k = 0; k < v->cnt; k++) if (v->kid[k]->t == V_STR && name_matches(i, v->kid[k]->s)) return 1; return 0; }
