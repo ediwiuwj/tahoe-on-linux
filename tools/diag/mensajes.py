@@ -57,12 +57,12 @@ with open(path, "rb") as f:
         m = body_re.search(l)
         if m:                             # cuerpo del envío anterior de ese hilo
             for x in reversed(sends[-50:]):
-                if x["pid"] == m.group(1) and x["tid"] == m.group(2): x["body"] = bytes.fromhex(m.group(3)); break
+                if x["pid"] == m.group(1) and x["tid"] == m.group(2): x["body"] = bytes.fromhex(m.group(3)[:len(m.group(3)) // 2 * 2]); break
             continue
         m = rbody_re.search(l)
         if m:                             # cuerpo de la recepción anterior de ese hilo
             for r in reversed(recvs[-50:]):
-                if r["pid"] == m.group(1) and r["tid"] == m.group(2): r["body"] = bytes.fromhex(m.group(3)); break
+                if r["pid"] == m.group(1) and r["tid"] == m.group(2): r["body"] = bytes.fromhex(m.group(3)[:len(m.group(3)) // 2 * 2]); break
             continue
         m = fail_re.search(l)
         if m:                             # el envío anterior de ese hilo no entró en la cola (llena con plazo 0, destino muerto)
@@ -80,7 +80,8 @@ if not sends and not recvs:
     sys.exit(f"sin líneas MSG en {path} (¿se activó /dev/shm/tahoe-msg-trace con los nombres?)")
 
 # Formato de libxpc en el cable: «CPX@» (0x40585043), versión, y el objeto raíz (normalmente un diccionario). Cada objeto: tipo (u32)
-# y su contenido; los puertos van en descriptores aparte («puerto»).
+# y su contenido; los puertos van en descriptores aparte («puerto»). La traza guarda como mucho 400 bytes: lo que no
+# quepa sale como «(no descodificable ...)».
 def xpc_decode(b):
     import struct
     k = b.find(b"CPX@")                                     # número mágico 0x40585043 en little endian

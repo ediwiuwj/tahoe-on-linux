@@ -527,10 +527,11 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	if (trace_all) logf_("    mach_msg: recibe en 0x%x id=%d (%u bytes) -> 0x%lx\n", rcv_name, h.id, size, res);
 	if (msg_trace()) {
 		logf_("    MSG <%d.%ld> recibe en=0x%x dest=0x%x resp=0x%x id=%d tam=%u de=%d -> 0x%lx%s\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, local, remote, h.id, size, (int)snd[0], res, rxports);
-		if (size > 24 && size <= 1024) {                        // cuerpo recibido (respuestas de procesos sin traza, p. ej. launchd)
+		if (size > 24) {                                        // cuerpo recibido, hasta 400 bytes (respuestas de procesos sin traza)
 			static __thread char hx[2100];
-			for (uint32_t q = 24; q < size; q++) { static const char d[] = "0123456789abcdef"; hx[(q - 24) * 2] = d[m[q] >> 4]; hx[(q - 24) * 2 + 1] = d[m[q] & 15]; }
-			hx[(size - 24) * 2] = 0;
+			uint32_t end = size < 24 + 400 ? size : 24 + 400;
+			for (uint32_t q = 24; q < end; q++) { static const char d[] = "0123456789abcdef"; hx[(q - 24) * 2] = d[m[q] >> 4]; hx[(q - 24) * 2 + 1] = d[m[q] & 15]; }
+			hx[(end - 24) * 2] = 0;
 			logf_("      MSG recibido <%d.%ld>: %s\n", (int)getpid(), (long)syscall(SYS_gettid), hx);
 		}
 	}
@@ -607,10 +608,11 @@ static long mach_msg2(struct ctx* c) {
 	if (!kobject && msg_trace()) {
 		char s[200]; int t = msg_texts(req, ssize, s, sizeof s);
 		logf_("    MSG <%d.%ld> envía dest=0x%x(->%d) resp=0x%x id=%d tam=%u bits=0x%x%s%s%s\n", (int)getpid(), (long)syscall(SYS_gettid), h.remote, port_rpid(h.remote), h.local, h.id, ssize, h.bits, (options & 2) ? " y espera" : "", t ? " | " : "", t ? s : "");
-		if (ssize > 24 && ssize <= 1024) {                      // el cuerpo en hexadecimal (mensajes.py descodifica los diccionarios XPC)
+		if (ssize > 24) {                                       // el cuerpo en hexadecimal, hasta 400 bytes (mensajes.py descodifica XPC)
 			static __thread char hx[2100];
-			for (uint32_t q = 24; q < ssize; q++) { static const char d[] = "0123456789abcdef"; hx[(q - 24) * 2] = d[req[q] >> 4]; hx[(q - 24) * 2 + 1] = d[req[q] & 15]; }
-			hx[(ssize - 24) * 2] = 0;
+			uint32_t end = ssize < 24 + 400 ? ssize : 24 + 400;
+			for (uint32_t q = 24; q < end; q++) { static const char d[] = "0123456789abcdef"; hx[(q - 24) * 2] = d[req[q] >> 4]; hx[(q - 24) * 2 + 1] = d[req[q] & 15]; }
+			hx[(end - 24) * 2] = 0;
 			logf_("      MSG cuerpo <%d.%ld>: %s\n", (int)getpid(), (long)syscall(SYS_gettid), hx);
 		}
 	}
