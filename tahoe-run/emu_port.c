@@ -521,8 +521,14 @@ static int ool_scan(const uint8_t* m, uint32_t size, uint32_t* out_off, uint32_t
 	if (nd < 0) { logf_("    puertos: mensaje mal formado (id=%d)\n", size >= 24 ? (int)(m[20] | m[21] << 8 | m[22] << 16 | (uint32_t)m[23] << 24) : -1); return 0; }
 	if (nd > 64) nd = 64;
 	int n = 0;
-	for (int i = 0; i < nd && n < max; i++)
+	for (int i = 0; i < nd && n < max; i++) {
 		if (nucleo_fuera_de_linea(d[i].clase)) { out_off[n] = d[i].off; out_len[n] = d[i].bytes; n++; }
+		// COMPATIBILIDAD (temporal): la versión en C trataba también el puerto con guarda como datos fuera de línea (la
+		// guarda como dirección y el nombre como tamaño). Es un fallo, pero al corregirlo diskutil deja de funcionar
+		// (storagekitd no responde): se mantiene hasta entender qué depende de él. La fase 1 del núcleo en Rust es una
+		// traducción fiel; las correcciones de comportamiento van aparte, de una en una.
+		else if (d[i].clase == NUCLEO_PUERTO_GUARDA) { out_off[n] = d[i].off; out_len[n] = d[i].nombre; n++; }
+	}
 	return n;
 }
 
