@@ -599,6 +599,12 @@ static long mach_msg2(struct ctx* c) {
 	if (!kobject && msg_trace()) {
 		char s[200]; int t = msg_texts(req, ssize, s, sizeof s);
 		logf_("    MSG <%d.%ld> envía dest=0x%x(->%d) resp=0x%x id=%d tam=%u bits=0x%x%s%s%s\n", (int)getpid(), (long)syscall(SYS_gettid), h.remote, port_rpid(h.remote), h.local, h.id, ssize, h.bits, (options & 2) ? " y espera" : "", t ? " | " : "", t ? s : "");
+		if (ssize > 24 && ssize <= 1024) {                      // el cuerpo en hexadecimal (mensajes.py descodifica los diccionarios XPC)
+			static __thread char hx[2100];
+			for (uint32_t q = 24; q < ssize; q++) { static const char d[] = "0123456789abcdef"; hx[(q - 24) * 2] = d[req[q] >> 4]; hx[(q - 24) * 2 + 1] = d[req[q] & 15]; }
+			hx[(ssize - 24) * 2] = 0;
+			logf_("      MSG cuerpo <%d.%ld>: %s\n", (int)getpid(), (long)syscall(SYS_gettid), hx);
+		}
 	}
 	if (!kobject && h.remote == 0) { if (trace_all) logf_("    mach_msg2: envío al puerto nulo (id=%d) -> MACH_SEND_INVALID_DEST\n", h.id); return 0x10000003; }   // el núcleo rechaza el destino nulo
 	if (!kobject && (h.bits & 0x1f) == 18 && !port_exists(h.remote)) {   // respuesta (MOVE_SEND_ONCE) a un puerto que ya murió
