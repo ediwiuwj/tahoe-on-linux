@@ -37,7 +37,7 @@
 #define MAXMSG   4096                    // ranuras de mensaje (archivo disperso: solo ocupan RAM las usadas)
 #define MSGSZ    (64 * 1024)
 struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; };   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
-struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint8_t data[MSGSZ - 32]; };   // sauid/sasid: sesión de auditoría del remitente
+struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint64_t spill; uint8_t data[MSGSZ - 40]; };   // sauid/sasid: sesión de auditoría del remitente   // spill: datos fuera de línea en un archivo aparte (nucleo_desborde_*), 0 = en la ranura
 // Derechos que el núcleo tiene que vigilar para avisar cuando muere su dueño (ver "notificaciones" más abajo):
 //  sonce: un proceso tiene un derecho send-once (normalmente, la respuesta que debe a quien le pidió algo);
 //  dnreq: un proceso pidió MACH_NOTIFY_DEAD_NAME sobre un puerto (aviso al puerto `notify` cuando muera);
@@ -76,6 +76,7 @@ struct shm {
 	struct srmap rmaps[MAXRMAP];
 	uint64_t rmap_next;
 	uint64_t osvariant_status;            // kern.osvariant_status: lo fija launchd (PID 1) una vez y lo leen todos
+	uint64_t spill_next;                  // número del siguiente archivo de desbordamiento (mensajes grandes)
 	struct sexecw execw[MAXEXECW];
 };
 static struct shm* shm;
@@ -418,6 +419,7 @@ static void destroy_locked(struct sport* p) {
 	while (p->head) {                                         // mensajes encolados: sus derechos se destruyen con ellos
 		struct mslot* q = &shm->msgs[p->head - 1]; uint32_t nx = q->next;
 		msg_rights_locked(q->data, q->size, RIGHTS_DESTROY, name);
+		if (q->spill) { nucleo_desborde_borrar(tag, q->spill); q->spill = 0; }
 		q->next = shm->free_head; shm->free_head = p->head; p->head = nx;
 	}
 	p->tail = 0; p->count = 0;
@@ -543,7 +545,25 @@ static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 	uint64_t total = size;
 	for (int i = 0; i < nool; i++) total += olen[i];
 	(void)desc_fix;
-	if (total > sizeof(((struct mslot*)0)->data)) { logf_("    puertos: mensaje de %lu bytes demasiado grande\n", (unsigned long)total); return -1; }
+	// Mensaje grande: si con sus datos fuera de línea no cabe en una ranura, esos datos van a un archivo de desbordamiento
+	// (el mensaje en sí siempre debe caber). Se escribe antes de tomar el cerrojo: puede ser lento.
+	uint64_t spill = 0;
+	if (total > sizeof(((struct mslot*)0)->data)) {
+		if (size > sizeof(((struct mslot*)0)->data)) { logf_("    puertos: mensaje de %u bytes demasiado grande\n", size); return -1; }
+		uint8_t* buf = malloc(total - size ? total - size : 1);
+		if (!buf) return -1;
+		uint64_t pos = 0;
+		for (int i = 0; i < nool; i++) {
+			uint64_t addr; memcpy(&addr, msg + ooff[i], 8);
+			if (olen[i] && safe_read(addr, buf + pos, olen[i]) != (ssize_t)olen[i]) memset(buf + pos, 0, olen[i]);
+			pos += olen[i];
+		}
+		pthread_once(&once, init_all);
+		spill = __atomic_add_fetch(&shm->spill_next, 1, __ATOMIC_SEQ_CST);
+		int w = nucleo_desborde_guardar(tag, spill, buf, total - size);
+		free(buf);
+		if (w != 0) { logf_("    puertos: no se pudo desbordar un mensaje de %lu bytes\n", (unsigned long)total); return -1; }
+	}
 	lock();
 	struct sport* p = find_locked(dest);
 	uint32_t rbits = 0; memcpy(&rbits, msg, 4); rbits &= 0x1f;      // disposición del destino
@@ -551,28 +571,28 @@ static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 		struct timespec dl;
 		if (timeout_ms > 0) { clock_gettime(CLOCK_MONOTONIC, &dl); dl.tv_sec += timeout_ms / 1000; dl.tv_nsec += (timeout_ms % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; } }
 		while (p && p->count >= (p->qlimit ? p->qlimit : 5)) {
-			if (timeout_ms == 0) { unlock(); return 0x10000004; }                      // MACH_SEND_TIMED_OUT
+			if (timeout_ms == 0) { unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return 0x10000004; }   // MACH_SEND_TIMED_OUT
 			int r = timeout_ms > 0 ? pthread_cond_timedwait(&p->cv, &shm->lk, &dl) : pthread_cond_wait(&p->cv, &shm->lk);
 			if (r == EOWNERDEAD) pthread_mutex_consistent(&shm->lk);
 			p = find_locked(dest);                                    // el puerto pudo morir mientras se esperaba
-			if (r == ETIMEDOUT && p && p->count >= (p->qlimit ? p->qlimit : 5)) { unlock(); return 0x10000004; }
+			if (r == ETIMEDOUT && p && p->count >= (p->qlimit ? p->qlimit : 5)) { unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return 0x10000004; }
 		}
-		if (!p) { unlock(); return 0x10000003; }                          // MACH_SEND_INVALID_DEST
+		if (!p) { unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return 0x10000003; }   // MACH_SEND_INVALID_DEST
 	}
 	if (!p || p->is_set || !shm->free_head) {
 		if (p && !shm->free_head) logf_("    puertos: reserva de mensajes agotada (envío a 0x%x)\n", dest);
-		unlock(); return -1;
+		unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return -1;
 	}
 	uint32_t idx = shm->free_head;
 	struct mslot* q = &shm->msgs[idx - 1];
 	shm->free_head = q->next;
-	q->next = 0; q->size = size; q->total = (uint32_t)total;
+	q->next = 0; q->size = size; q->total = (uint32_t)total; q->spill = spill;
 	q->spid = kernel ? 0 : (uint32_t)getpid(); q->suid = kernel ? 0 : cred_euid(); q->sgid = kernel ? 0 : cred_egid();
 	q->sauid = kernel ? (uint32_t)-1 : cred_auid(); q->sasid = kernel ? 0 : cred_asid();   // para el trailer de auditoría del receptor
 	if (!kernel) msg_rights_locked(msg, size, RIGHTS_SEND, dest);
 	memcpy(q->data, msg, size);
 	uint32_t pos = size;
-	for (int i = 0; i < nool; i++) {                       // copiar los bytes de cada descriptor OOL tras el mensaje
+	for (int i = 0; i < nool && !spill; i++) {             // copiar los bytes de cada descriptor OOL tras el mensaje
 		uint64_t addr; memcpy(&addr, msg + ooff[i], 8);
 		if (olen[i] && safe_read(addr, q->data + pos, olen[i]) != (ssize_t)olen[i]) memset(q->data + pos, 0, olen[i]);
 		pos += olen[i];
@@ -618,16 +638,18 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			pthread_cond_broadcast(&src->cv);                     // hay sitio: remitentes esperando por el límite de cola
 			msg_rights_locked(q->data, q->size, RIGHTS_RECV, src->name);
 			if (src->set) { struct sport* s = find_locked(src->set); if (s && s->count) s->count--; }
-			uint32_t sz = q->size, tot = q->total;
+			uint32_t sz = q->size, tot = q->total; uint64_t spill = q->spill;
 			if (sender) { sender[0] = q->spid; sender[1] = q->suid; sender[2] = q->sgid; sender[3] = q->sauid; sender[4] = q->sasid; }
 			uint8_t* m = malloc(tot ? tot : 1);
-			memcpy(m, q->data, tot);
+			memcpy(m, q->data, spill ? sz : tot);
+			q->spill = 0;
 			q->next = shm->free_head; shm->free_head = idx;
 			int si = port_index(src);
 			int fd1 = local_sock[si], fd2 = -1;
 			uint32_t rname1 = src->name, rname2 = 0;
 			if (src->set) { struct sport* s = find_locked(src->set); if (s) { fd2 = local_sock[port_index(s)]; rname2 = s->name; } }
 			unlock();
+			if (spill && nucleo_desborde_leer(tag, spill, m + sz, tot - sz) != 0) logf_("    puertos: datos desbordados %lu perdidos\n", (unsigned long)spill);
 			drain_recheck(rname1, fd1);                         // si aún quedan mensajes (o llegó uno), se renueva el aviso
 			if (rname2) drain_recheck(rname2, fd2);
 			// materializar los descriptores OOL en memoria nueva de este proceso

@@ -6,6 +6,7 @@
 //! biblioteca estándar ni memoria dinámica: trabaja sobre los búferes que le pasa el C y comprueba siempre los límites.
 #![cfg_attr(not(test), no_std)]
 
+pub mod desborde;
 pub mod mensaje;
 
 /// Un pánico en el núcleo es un error de programación: se anota y se aborta el proceso, como haría un fallo en C, pero
