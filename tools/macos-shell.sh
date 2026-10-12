@@ -79,7 +79,10 @@ stop_launchd() {
 	[ -n "$STARTED" ] || return
 	kill -9 "$L" $(pgrep -P "$U" 2>/dev/null) 2>/dev/null   # al morir el PID 1 del espacio, el núcleo termina a todos sus procesos
 	[ -n "$VIEW" ] && kill "$VIEW" 2>/dev/null
-	[ -n "$REGION" ] && rm -f "/dev/shm/tahoe-fb-${REGION#/dev/shm/tahoe-ports-}" "/dev/shm/tahoe-fbcursor-${REGION#/dev/shm/tahoe-ports-}"
+	if [ -n "$REGION" ]; then                         # memoria de vídeo y superficies de este arranque (RAM en /dev/shm)
+		local id=${REGION#/dev/shm/tahoe-ports-}
+		rm -f "/dev/shm/tahoe-fb-$id" "/dev/shm/tahoe-fbcursor-$id" "/dev/shm/tahoe-surfaces-$id" /dev/shm/tahoe-surf-*-"$id"
+	fi
 	touch /dev/shm/tahoe-guard-stop; wait "$GUARD" 2>/dev/null
 	rm -f /dev/shm/tahoe-guard-stop
 }

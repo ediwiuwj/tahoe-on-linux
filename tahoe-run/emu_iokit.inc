@@ -1265,15 +1265,101 @@ static int32_t uc_fb(struct uc_call* c) {
 		return kIOReturnUnsupported;
 	}
 }
-// IOSurfaceRootUserClient (interfaz deducida de IOSurface.framework, que es quien la usa):
+// IOSurfaceRootUserClient (interfaz deducida de IOSurface.framework, que es quien la usa; tools/diag/llamadas.py):
+//   0   crear: 1 escalar (superficie madre o 0) y las propiedades serializadas (binario, como los diccionarios de IOKit);
+//       sale una estructura de 0xc68 bytes (ver struct sf_result).
+//   4   buscar por ID: 1 escalar (el ID); sale la misma estructura.
 //   0xd información de la conexión: sin entradas, sale una estructura de 0x28 bytes; la conexión solo vale si el u16 en
 //       +0x22 es 1 (ioSurfaceConnectInternal la cierra si no).
 // Trampas rápidas (iokit_user_client_trap, ver io_user_client_trap): 0/1 contadores de uso, 2 bloquear, 3 desbloquear,
 // 4 liberar, 5 tras crear o buscar, 6 eventos compartidos, 8/9 quitar valores.
+//
+// Las superficies son de todo el arranque (WindowServer y las apps se las pasan por ID): una tabla en
+// /dev/shm/tahoe-surfaces-<id del arranque> y la memoria de cada una en /dev/shm/tahoe-surf-<id del arranque>-<ID>, que
+// cada proceso proyecta al crearla o buscarla. Tras la imagen va una página con la información que el núcleo comparte
+// con los clientes (el sello, "seed", en +0xc: lo lee IOSurfaceGetSeed y cambia al desbloquear para escribir).
+struct sf_result {                                       // lo que IOSurface copia en su objeto (+0x70)
+	uint64_t base;                                       // +0x00 dirección de la memoria en este proceso
+	uint64_t shared;                                     // +0x08 página compartida (sello en +0xc)
+	uint64_t r10;
+	uint32_t id, r1c;                                    // +0x18 IOSurfaceID
+	uint64_t alloc, width, height, bpr, offset;          // +0x20 tamaño, +0x28/+0x30, +0x38 bytes por fila, +0x40 base
+	uint32_t format, r4c;                                // +0x48 formato de píxel (FourCC)
+	uint64_t r50;
+	uint32_t planes, r5c;                                // +0x58 número de planos (0: uno implícito)
+	uint16_t bpe; uint8_t ew, eh;                        // +0x60 bytes por elemento, ancho/alto del elemento
+	uint8_t r64[0x88 - 0x64];
+	uint8_t plane[20][0x98];                             // +0x88 planos
+};
+_Static_assert(offsetof(struct sf_result, id) == 0x18 && offsetof(struct sf_result, bpr) == 0x38 &&
+               offsetof(struct sf_result, format) == 0x48 && offsetof(struct sf_result, planes) == 0x58 &&
+               offsetof(struct sf_result, bpe) == 0x60 && sizeof(struct sf_result) == 0xc68, "resultado de IOSurface");
+#define SF_MAX 4096
+struct sf_ent { uint32_t id, used; uint64_t alloc, width, height, bpr; uint32_t format; uint16_t bpe; uint8_t ew, eh; };
+struct sf_table { uint32_t next_id, pad; struct sf_ent e[SF_MAX]; };
+static struct sf_table* sf_tab;
+static struct { uint32_t id; uint8_t* m; size_t size; } sf_maps[SF_MAX];   // proyecciones de este proceso
+static struct sf_table* sf_table(void) {
+	if (!sf_tab) { sf_tab = (struct sf_table*)shm_file("surfaces", sizeof(struct sf_table), 0); if (sf_tab && !sf_tab->next_id) sf_tab->next_id = 1; }
+	return sf_tab;
+}
+static uint8_t* sf_map(const struct sf_ent* e) {
+	uint32_t k = e->id % SF_MAX;
+	if (sf_maps[k].id == e->id && sf_maps[k].m) return sf_maps[k].m;
+	char what[32]; snprintf(what, sizeof what, "surf-%u", e->id);
+	char p[128]; fb_path(p, sizeof p, what);                         // /dev/shm/tahoe-surf-<ID>-<arranque>
+	int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+	if (fd < 0) return NULL;
+	size_t size = e->alloc + 4096;
+	struct stat st; fstat(fd, &st);
+	if ((size_t)st.st_size < size && ftruncate(fd, size) != 0) { close(fd); return NULL; }
+	uint8_t* m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (m == MAP_FAILED) return NULL;
+	if (sf_maps[k].m) munmap(sf_maps[k].m, sf_maps[k].size);         // otra superficie ocupaba la ranura
+	sf_maps[k].id = e->id; sf_maps[k].m = m; sf_maps[k].size = size;
+	return m;
+}
+static uint64_t sf_num(const struct val* d, const char* k, uint64_t def) { const struct val* v = d ? v_get(d, k) : NULL; return v && v->t == V_NUM ? v->n : def; }
+static int32_t sf_fill(const struct sf_ent* e, uint8_t* out, uint32_t want, uint32_t* nout) {
+	uint8_t* m = sf_map(e);
+	if (!m) return kIOReturnNoMemory;
+	static struct sf_result r; memset(&r, 0, sizeof r);
+	r.base = (uint64_t)m; r.shared = (uint64_t)(m + e->alloc); r.id = e->id;
+	r.alloc = e->alloc; r.width = e->width; r.height = e->height; r.bpr = e->bpr; r.format = e->format;
+	r.bpe = e->bpe; r.ew = e->ew; r.eh = e->eh;
+	uint32_t n = want < sizeof r ? want : sizeof r;
+	memcpy(out, &r, n); *nout = n;
+	return 0;
+}
 static int32_t uc_iosurface(struct uc_call* c) {
 	uint32_t want = *c->noutband;
 	*c->noutband = 0; *c->nsout = 0;
 	switch (c->selector) {
+	case 0: {                                                          // crear
+		struct sf_table* t = sf_table(); if (!t) return kIOReturnNoMemory;
+		struct val* d = c->ninband ? any_parse(c->inband, c->ninband) : NULL;
+		struct sf_ent e = { 0 };
+		e.width = sf_num(d, "IOSurfaceWidth", 0); e.height = sf_num(d, "IOSurfaceHeight", 0);
+		e.bpe = (uint16_t)sf_num(d, "IOSurfaceBytesPerElement", 4); e.ew = (uint8_t)sf_num(d, "IOSurfaceElementWidth", 1); e.eh = (uint8_t)sf_num(d, "IOSurfaceElementHeight", 1);
+		e.format = (uint32_t)sf_num(d, "IOSurfacePixelFormat", 0);
+		e.bpr = sf_num(d, "IOSurfaceBytesPerRow", (e.width * e.bpe + 63) & ~63ull);
+		e.alloc = sf_num(d, "IOSurfaceAllocSize", e.bpr * e.height);
+		if (!e.alloc) e.alloc = 4096;
+		e.alloc = (e.alloc + 4095) & ~4095ull;
+		if (e.alloc > (1ull << 30)) return kIOReturnNoMemory;
+		e.id = __atomic_fetch_add(&t->next_id, 1, __ATOMIC_SEQ_CST); e.used = 1;
+		t->e[e.id % SF_MAX] = e;
+		if (trace_all || io_trace > 0) logf_("    iokit: <%d> IOSurface %u creada: %lux%lu bpe=%u bpr=%lu tamaño=%lu formato=0x%x\n", (int)getpid(), e.id, (unsigned long)e.width, (unsigned long)e.height, e.bpe, (unsigned long)e.bpr, (unsigned long)e.alloc, e.format);
+		return sf_fill(&t->e[e.id % SF_MAX], c->outband, want, c->noutband);
+	}
+	case 4: {                                                          // buscar por ID
+		struct sf_table* t = sf_table(); if (!t || c->nsin < 1) return kIOReturnBadArgument;
+		uint32_t id = (uint32_t)c->sin[0];
+		struct sf_ent* e = &t->e[id % SF_MAX];
+		if (!e->used || e->id != id) return kIOReturnNotFound;
+		return sf_fill(e, c->outband, want, c->noutband);
+	}
 	case 0xd: {
 		uint8_t info[0x28] = { 0 };
 		uint16_t one = 1; memcpy(info + 0x22, &one, 2);
@@ -1293,6 +1379,17 @@ static int32_t uc_iosurface(struct uc_call* c) {
 }
 static int32_t trap_iosurface(int ent, uint32_t idx, const uint64_t* p) {
 	(void)ent;
+	switch (idx) {
+	case 0: case 1: case 2: case 5: return 0;                          // contadores de uso, bloquear, tras crear/buscar
+	case 3: {                                                          // desbloquear: si se escribió, cambia el sello
+		struct sf_table* t = sf_table(); uint32_t id = (uint32_t)p[0];
+		struct sf_ent* e = t ? &t->e[id % SF_MAX] : NULL;
+		uint8_t* m = e && e->used && e->id == id ? sf_map(e) : NULL;
+		if (m) __atomic_fetch_add((uint32_t*)(m + e->alloc + 0xc), 1, __ATOMIC_SEQ_CST);
+		return 0;
+	}
+	case 4: return 0;                                                  // liberar: la memoria se queda (se borra al limpiar)
+	}
 	static uint64_t seen;
 	if (idx < 64 && !(seen & (1ull << idx))) {
 		seen |= 1ull << idx;
