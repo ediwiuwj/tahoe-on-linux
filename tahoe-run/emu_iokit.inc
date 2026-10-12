@@ -1209,7 +1209,8 @@ static int32_t uc_fb(struct uc_call* c) {
 		return 0;
 	}
 	case 1: {                                                          // getPixelInformation(modo, profundidad, apertura)
-		if (c->nsin < 3 || c->sin[0] != FB_MODE || c->sin[1] != 0 || c->sin[2] != 0) return kIOReturnBadArgument;
+		// modo 0: el actual (CoreDisplay lo pide así tras setDisplayMode con 0)
+		if (c->nsin < 3 || (c->sin[0] != FB_MODE && c->sin[0] != 0) || c->sin[1] != 0 || c->sin[2] != 0) return kIOReturnBadArgument;
 		struct fb_pixinfo pi = { .bytesPerRow = FB_BPR, .bitsPerPixel = 32, .pixelType = 2 /* kIORGBDirectPixels */,
 			.componentCount = 3, .bitsPerComponent = 8, .componentMasks = { 0xff0000, 0xff00, 0xff },
 			.pixelFormat = "--------RRRRRRRRGGGGGGGGBBBBBBBB", .activeWidth = FB_W, .activeHeight = FB_H };
@@ -1219,7 +1220,7 @@ static int32_t uc_fb(struct uc_call* c) {
 	}
 	case 2: c->sout[0] = FB_MODE; c->sout[1] = 0; *c->nsout = 2; return 0;   // getCurrentDisplayMode -> (modo, profundidad)
 	case 5: {                                                          // getInformationForDisplayMode(modo)
-		if (c->nsin < 1 || c->sin[0] != FB_MODE || want < sizeof(struct fb_modeinfo)) return kIOReturnBadArgument;
+		if (c->nsin < 1 || (c->sin[0] != FB_MODE && c->sin[0] != 0) || want < sizeof(struct fb_modeinfo)) return kIOReturnBadArgument;
 		struct fb_modedesc d = { 0 };
 		d.info = (struct fb_modeinfo){ FB_W, FB_H, 60u << 16, 0, 0x7 | 0x400 /* seguro, válido, por defecto; integrado */, 286, 179, { 0 } };
 		d.timing.flags = want >= sizeof d ? 0x80000000u : 0;          // kIODetailedTimingValid
@@ -1250,6 +1251,8 @@ static int32_t uc_fb(struct uc_call* c) {
 		switch (a) {
 		case 0x77737570: case 0x77736368: case 0x77736564:            // 'wsup' 'wsch' 'wsed': inicio de WindowServer, cambios de conexión
 		case 0x6d726466:                                               // 'mrdf' kIOMirrorDefaultAttribute: sin espejo
+		case 0x636c616d:                                               // 'clam' estado de la tapa: abierta (0)
+		case 0x77737276:                                               // 'wsrv' WindowServer activo
 			return 0;
 		case 0x706f7772:                                               // 'powr' encendido: máximo
 			c->sout[0] = 2; return 0;
