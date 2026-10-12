@@ -829,15 +829,20 @@ static long bsd_posix_spawn(struct ctx* c) {
 			uint32_t act[6] = { 0 };                                // port_type, mask, new_port, behavior, flavor, which
 			if (safe_read(ad[5] + 8 + i * 24, act, 24) != 24) break;
 			if (act[0] == 1 && spawn_special_n < 8) snprintf(spawn_special_env[spawn_special_n++], 32, "TAHOE_SP%u=%u", act[5], act[2]);
+			if (act[0] == 2) {                                      // PSPA_AU_SESSION: el hijo nace en la sesión de ese puerto
+				int kt; int32_t asid;
+				if (kobj_lookup(act[2], &kt, &asid) && kt == KO_AUDIT_SESSION) cred_spawn_session((uint32_t)asid);
+			}
 			logf_("    posix_spawn: acción de puerto tipo=%u which=%u puerto=0x%x\n", act[0], act[5], act[2]);
 		}
 	}
 	logf_("    posix_spawn <%d>(\"%s\") attr_flags=0x%x ad=%lx,%lx,%lx,%lx,%lx,%lx\n", (int)getpid(), gp, psa_flags, ad[0], ad[1], ad[2], ad[3], ad[4], ad[5]);
 	read_file_actions(ad[3], ad[2]);
 	spawn_cloexec_default = (psa_flags & 0x4000) != 0;              // POSIX_SPAWN_CLOEXEC_DEFAULT
-	if (psa_flags & 0x40) return exec_common(c->a[1], c->a[3], c->a[4], 0, NULL);
+	if (psa_flags & 0x40) { long r0 = exec_common(c->a[1], c->a[3], c->a[4], 0, NULL); cred_spawn_session(0); return r0; }
 	pid_t pid = 0;
 	long r = exec_common(c->a[1], c->a[3], c->a[4], 1, &pid);
+	cred_spawn_session(0);
 	if (r == 0 && c->a[0]) { uint32_t p = (uint32_t)pid; safe_write(c->a[0], &p, 4); }
 	return r;
 }

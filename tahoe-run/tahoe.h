@@ -81,6 +81,7 @@ int port_drain_idle(uint32_t name);
 int diag_target(void);
 int diag_all(void);
 int msg_trace(void);
+void cred_spawn_session(uint32_t asid);
 int trace_file_on(const char* file);
 void diag_dump_threads(void);
 void diag_breakpoints(void);

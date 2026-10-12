@@ -31,11 +31,23 @@ uint32_t cred_asid(void) { return au_asid; }
 uint32_t cred_euid(void) { return euid; }
 uint32_t cred_egid(void) { return egid; }
 
-// TAHOE_CRED=ruid,euid,svuid,rgid,egid,svgid,g1,g2...
+// Sesión para el próximo hijo de posix_spawn (acción de puerto PSPA_AU_SESSION: launchd arranca así los LaunchAgents en
+// la sesión gráfica sin unirse él). 0 = la del padre. La fija bsd_posix_spawn y la quita al terminar.
+static uint32_t spawn_asid;
+static int ses_get(uint32_t asid, uint8_t out[0x30]);
+void cred_spawn_session(uint32_t asid) { spawn_asid = asid; }
+
+// TAHOE_CRED=ruid,euid,svuid,rgid,egid,svgid,g1,g2.../auid,asid,máscara,máscara,banderas
 void cred_env(char* out, size_t cap) {
 	int k = snprintf(out, cap, "TAHOE_CRED=%u,%u,%u,%u,%u,%u", ruid, euid, svuid, rgid, egid, svgid);
 	for (int i = 0; i < ngroups && k > 0 && (size_t)k < cap; i++) k += snprintf(out + k, cap - (size_t)k, ",%u", groups[i]);
-	if (k > 0 && (size_t)k < cap) snprintf(out + k, cap - (size_t)k, "/%u,%u,%u,%u,%llu", au_auid, au_asid, au_mask[0], au_mask[1], (unsigned long long)au_flags);   // /sesión de auditoría
+	uint32_t auid = au_auid, asid = au_asid, m0 = au_mask[0], m1 = au_mask[1]; uint64_t fl = au_flags;
+	uint8_t a[0x30];
+	if (spawn_asid && spawn_asid != au_asid) {                       // el hijo entra en esa sesión con sus datos (como XNU)
+		asid = spawn_asid;
+		if (ses_get(spawn_asid, a) == 0) { memcpy(&auid, a, 4); memcpy(&m0, a + 4, 4); memcpy(&m1, a + 8, 4); memcpy(&fl, a + 40, 8); }
+	}
+	if (k > 0 && (size_t)k < cap) snprintf(out + k, cap - (size_t)k, "/%u,%u,%u,%u,%llu", auid, asid, m0, m1, (unsigned long long)fl);   // /sesión de auditoría
 }
 static void cred_load(void) {
 	const char* v = getenv("TAHOE_CRED");
