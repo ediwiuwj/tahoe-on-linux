@@ -33,7 +33,7 @@
 // a su epoll (EVFILT_MACHPORT) cada puerto tiene un socket de datagramas con nombre abstracto.
 #define MAXPORTS 8192                // para todo el sistema (unos 170 procesos en el arranque)
 #define NBUCKET 16384                // índice por nombre: cubeta = (nombre >> 8) % NBUCKET, cadenas por hnext
-#define MAXMSG   512
+#define MAXMSG   4096                    // ranuras de mensaje (archivo disperso: solo ocupan RAM las usadas)
 #define MSGSZ    (64 * 1024)
 struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; pthread_cond_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; };   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
 struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint8_t data[MSGSZ - 32]; };   // sauid/sasid: sesión de auditoría del remitente
@@ -535,8 +535,17 @@ static int ool_scan(const uint8_t* m, uint32_t size, uint32_t* out_off, uint32_t
 
 // Encola un mensaje completo (cabecera con los campos reales). 0 si el puerto existe.
 int port_send(uint32_t dest, const uint8_t* msg, uint32_t size) { return port_send_k(dest, msg, size, 0); }
+static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel, int timeout_ms);
+static int port_send_k(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel) { return port_send_t(dest, msg, size, kernel, -1); }
+// Envío desde mach_msg con su plazo (MACH_SEND_TIMEOUT): 0 si se encola, -1 si no se puede, o un código mach_msg
+// (MACH_SEND_TIMED_OUT, MACH_SEND_INVALID_DEST).
+int port_send_timeout(uint32_t dest, const uint8_t* msg, uint32_t size, int timeout_ms) { return port_send_t(dest, msg, size, 0, timeout_ms); }
 // kernel = 1: mensaje del "núcleo" (notificaciones): remitente pid 0 en el trailer de auditoría y sin derechos que ceder.
-static int port_send_k(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel) {
+// Límite de cola (como ipc_mqueue_send de XNU): con la cola del puerto llena (qlimit, 5 por omisión), el remitente espera a
+// que el receptor saque mensajes, o hasta su plazo. No cuentan los mensajes del núcleo ni los que van a un derecho
+// send-once (respuestas): XNU siempre los encola. Sin esto, un puerto que nadie vacía agota la reserva común de ranuras y
+// todos los envíos fallan (libxpc aborta: "MACH_SEND_NO_BUFFER returned for reliable message size").
+static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel, int timeout_ms) {
 	uint32_t ooff[32], olen[32];
 	uint8_t desc_fix[32 * 16];
 	int nool = ool_scan(msg, size, ooff, olen, 32);
@@ -546,7 +555,23 @@ static int port_send_k(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 	if (total > sizeof(((struct mslot*)0)->data)) { logf_("    puertos: mensaje de %lu bytes demasiado grande\n", (unsigned long)total); return -1; }
 	lock();
 	struct sport* p = find_locked(dest);
-	if (!p || p->is_set || !shm->free_head) { unlock(); return -1; }
+	uint32_t rbits = 0; memcpy(&rbits, msg, 4); rbits &= 0x1f;      // disposición del destino
+	if (p && !p->is_set && !kernel && rbits != 18 && rbits != 21) {   // MOVE_SEND_ONCE / MAKE_SEND_ONCE: sin límite
+		struct timespec dl;
+		if (timeout_ms > 0) { clock_gettime(CLOCK_MONOTONIC, &dl); dl.tv_sec += timeout_ms / 1000; dl.tv_nsec += (timeout_ms % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; } }
+		while (p && p->count >= (p->qlimit ? p->qlimit : 5)) {
+			if (timeout_ms == 0) { unlock(); return 0x10000004; }                      // MACH_SEND_TIMED_OUT
+			int r = timeout_ms > 0 ? pthread_cond_timedwait(&p->cv, &shm->lk, &dl) : pthread_cond_wait(&p->cv, &shm->lk);
+			if (r == EOWNERDEAD) pthread_mutex_consistent(&shm->lk);
+			p = find_locked(dest);                                    // el puerto pudo morir mientras se esperaba
+			if (r == ETIMEDOUT && p && p->count >= (p->qlimit ? p->qlimit : 5)) { unlock(); return 0x10000004; }
+		}
+		if (!p) { unlock(); return 0x10000003; }                          // MACH_SEND_INVALID_DEST
+	}
+	if (!p || p->is_set || !shm->free_head) {
+		if (p && !shm->free_head) logf_("    puertos: reserva de mensajes agotada (envío a 0x%x)\n", dest);
+		unlock(); return -1;
+	}
 	uint32_t idx = shm->free_head;
 	struct mslot* q = &shm->msgs[idx - 1];
 	shm->free_head = q->next;
@@ -599,6 +624,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			}
 			src->head = q->next; if (!src->head) src->tail = 0;
 			src->count--;
+			pthread_cond_broadcast(&src->cv);                     // hay sitio: remitentes esperando por el límite de cola
 			msg_rights_locked(q->data, q->size, RIGHTS_RECV, src->name);
 			if (src->set) { struct sport* s = find_locked(src->set); if (s && s->count) s->count--; }
 			uint32_t sz = q->size, tot = q->total;
@@ -746,6 +772,10 @@ static long t_construct(struct ctx* c) {
 		if (flags & 0x1) port_guard(n, c->a[2], (flags & 0x20) != 0);
 		else port_set_context(n, c->a[2]);
 		if (flags & 0x400) { lock(); struct sport* p = find_locked(n); if (p) { p->svc = 1; p->svc_ctx = (flags & 0x1) ? c->a[2] : 0; } unlock(); }   // MPO_SERVICE_PORT
+		if (flags & 0x2) {                                   // MPO_QLIMIT: mach_port_options_t.mpl.mpl_qlimit (+4)
+			uint32_t ql = 0; safe_read(c->a[1] + 4, &ql, 4);
+			lock(); struct sport* p = find_locked(n); if (p) p->qlimit = ql > 2048 ? 2048 : ql; unlock();
+		}
 	}
 	if (mach_trace()) { uint32_t o[6] = { 0 }; if (c->a[1]) safe_read(c->a[1], o, 24); logf_("    MT pid=%d.%ld construct 0x%x contexto=0x%lx flags=0x%x opt=%x %x %x %x\n", (int)getpid(), (long)syscall(SYS_gettid), n, c->a[2], o[0], o[2], o[3], o[4], o[5]); }
 	if (trace_all) { uint32_t opt[6] = { 0 }; if (c->a[1]) safe_read(c->a[1], opt, 24); logf_("    construct 0x%x: flags=0x%x qlimit=%u opt2=0x%x opt3=0x%x contexto=0x%lx\n", n, opt[0], opt[1], opt[2], opt[3], c->a[2]); }

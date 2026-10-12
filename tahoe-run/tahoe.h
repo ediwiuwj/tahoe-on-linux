@@ -102,6 +102,7 @@ uint32_t guest_gid(uint32_t g);
 int tahoe_sigaction(int sig, void (*h)(int, siginfo_t*, void*));
 int port_eventfd(uint32_t name);
 int port_send(uint32_t dest, const uint8_t* msg, uint32_t size);
+int port_send_timeout(uint32_t dest, const uint8_t* msg, uint32_t size, int timeout_ms);   // mach_msg con MACH_SEND_TIMEOUT
 int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, uint32_t* sender, uint32_t limit, int large);
 void emu_sem_init(void);
 void emu_psynch_init(void);

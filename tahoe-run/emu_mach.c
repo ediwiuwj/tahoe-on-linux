@@ -587,7 +587,9 @@ static long mach_msg2(struct ctx* c) {
 	}
 	if (!kobject && port_exists(h.remote)) {                    // envío a un puerto de usuario: se encola tal cual
 		memcpy(req, &h, sizeof h);
-		if (port_send(h.remote, req, ssize) != 0) {               // el mensaje no se pudo encolar: decirlo, no perderlo en silencio
+		int sr = port_send_timeout(h.remote, req, ssize, (options & 0x10) ? (int)ctx_arg(c, 7) : -1);   // MACH_SEND_TIMEOUT
+		if (sr > 0) return sr;                                    // plazo agotado con la cola llena, o el destino murió
+		if (sr != 0) {                                            // el mensaje no se pudo encolar: decirlo, no perderlo en silencio
 			logf_("    mach_msg2: <%d> envío a 0x%x (id=%d, %u bytes) no encolado\n", (int)getpid(), h.remote, h.id, ssize);
 			return port_exists(h.remote) ? 0x1000000d /* MACH_SEND_NO_BUFFER */ : MACH_SEND_INVALID_DEST_;
 		}
