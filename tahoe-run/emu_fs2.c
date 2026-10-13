@@ -82,7 +82,21 @@ static long bsd_flock(struct ctx* c) {        // LOCK_SH 1, LOCK_EX 2, LOCK_NB 4
 }
 static long bsd_getdtablesize(struct ctx* c) { (void)c; return 10240; }
 static long bsd_readv(struct ctx* c)  { RET(readv((int)c->a[0], (const struct iovec*)c->a[1], (int)c->a[2])); }
-static long bsd_writev(struct ctx* c) { RET(writev((int)c->a[0], (const struct iovec*)c->a[1], (int)c->a[2])); }
+// writev; en un proceso de STACKS, lo que escribe en su salida de errores también va al registro (NSLog y los mensajes de
+// AppKit antes de salir van ahí, y el proceso que lo lanzó suele tenerla en /dev/null).
+static long bsd_writev(struct ctx* c) {
+	if ((int)c->a[0] == 2 && diag_target()) {
+		const struct iovec* v = (const struct iovec*)c->a[1];
+		char t[1024]; size_t k = 0;
+		for (int i = 0; i < (int)c->a[2] && i < 8 && k < sizeof t - 1; i++) {
+			size_t n = v[i].iov_len < sizeof t - 1 - k ? v[i].iov_len : sizeof t - 1 - k;
+			if (safe_read((uint64_t)v[i].iov_base, t + k, n) == (ssize_t)n) k += n;
+		}
+		t[k] = 0;
+		logf_("    stderr <%d>: %s%s", (int)getpid(), t, k && t[k - 1] == '\n' ? "" : "\n");
+	}
+	RET(writev((int)c->a[0], (const struct iovec*)c->a[1], (int)c->a[2]));
+}
 static long bsd_utimes(struct ctx* c) {       // struct timeval de Darwin: {i64 segundos, i32 microsegundos, pad}
 	PATH1(p, 0);
 	struct timespec ts[2];

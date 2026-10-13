@@ -19,6 +19,7 @@
 #include <linux/falloc.h>
 #include <dirent.h>
 #include "tahoe.h"
+#include "nucleo.h"
 
 static long err(void) { return -darwin_errno(errno); }
 #define RET(r) do { long r_ = (r); return r_ < 0 ? err() : r_; } while (0)
@@ -245,28 +246,49 @@ static void put_stat(uint64_t out, const struct stat* s, uint32_t flags) {
 // Rutas por identificador de archivo, para fsgetpath: macOS resuelve así las URL de referencia de archivo
 // (/.file/id=...), que CoreFoundation y AppKit usan para volver a abrir lo que ya consultaron (p. ej. el nib de Language
 // Chooser: sin esto, «MainMenu.nib couldn't be opened» y loginwindow esperaba para siempre). En APFS el núcleo lo sabe
-// por el identificador; aquí se anota cada objeto consultado por ruta absoluta (stat, getattrlist) en una tabla del
-// proceso, con los identificadores que se le dan a macOS (los inodos de Linux).
-#define FID_N 4096
-static struct { uint64_t ino; char* path; } fid_tab[FID_N];
-static pthread_mutex_t fid_lock = PTHREAD_MUTEX_INITIALIZER;
+// por el identificador; aquí se anota cada objeto consultado por ruta absoluta (stat, getattrlist) con los
+// identificadores que se le dan a macOS (los inodos de Linux). La tabla es común a todo el arranque
+// (/dev/shm/tahoe.<arranque>.fid, la borra la limpieza): el identificador suele venir de otro proceso (LaunchServices le
+// da a una aplicación la URL de su propio paquete), y con una tabla por proceso fsgetpath fallaba igual.
+#define FID_N 16384
+#define FID_PATH 248
+struct fid_ent { uint64_t ino; char path[FID_PATH]; };
+struct fid_shm { uint32_t lk, pad; struct fid_ent e[FID_N]; };
+static struct fid_shm* fid_tab;
+static pthread_once_t fid_once = PTHREAD_ONCE_INIT;
+static void fid_open(void) {
+	const char* tag = getenv("TAHOE_PORTS_OWNER");
+	if (!tag || !tag[0] || strchr(tag, '/')) return;
+	char path[128];
+	snprintf(path, sizeof path, "/dev/shm/tahoe.%s.fid", tag);
+	int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+	if (fd < 0) return;
+	struct stat st;
+	if (fstat(fd, &st) != 0 || (st.st_size < (off_t)sizeof(struct fid_shm) && ftruncate(fd, sizeof(struct fid_shm)) != 0)) { close(fd); return; }
+	void* m = mmap(NULL, sizeof(struct fid_shm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (m != MAP_FAILED) fid_tab = m;
+}
+static uint32_t fid_hash(uint64_t ino) { return (uint32_t)((ino * 0x9e3779b97f4a7c15ull) >> 40) % FID_N; }
 static void fid_note(uint64_t ino, const char* gpath) {
-	if (!ino || !gpath || gpath[0] != '/') return;
-	uint32_t h = (uint32_t)((ino * 0x9e3779b97f4a7c15ull) >> 52) % FID_N;
-	pthread_mutex_lock(&fid_lock);
-	if (!fid_tab[h].path || fid_tab[h].ino != ino || strcmp(fid_tab[h].path, gpath)) {
-		free(fid_tab[h].path);
-		fid_tab[h].ino = ino; fid_tab[h].path = strdup(gpath);
-	}
-	pthread_mutex_unlock(&fid_lock);
+	if (!ino || !gpath || gpath[0] != '/' || strlen(gpath) >= FID_PATH) return;
+	pthread_once(&fid_once, fid_open);
+	if (!fid_tab) return;
+	struct fid_ent* e = &fid_tab->e[fid_hash(ino)];
+	if (e->ino == ino && !strcmp(e->path, gpath)) return;       // ya estaba (lo normal): sin candado
+	nucleo_candado_tomar(&fid_tab->lk);
+	e->ino = ino; snprintf(e->path, sizeof e->path, "%s", gpath);
+	nucleo_candado_soltar(&fid_tab->lk);
 }
 // Copia la ruta del identificador en out; 1 si se conoce.
 static int fid_lookup(uint64_t ino, char* out, size_t n) {
-	uint32_t h = (uint32_t)((ino * 0x9e3779b97f4a7c15ull) >> 52) % FID_N;
+	pthread_once(&fid_once, fid_open);
+	if (!fid_tab) return 0;
 	int ok = 0;
-	pthread_mutex_lock(&fid_lock);
-	if (fid_tab[h].path && fid_tab[h].ino == ino) { snprintf(out, n, "%s", fid_tab[h].path); ok = 1; }
-	pthread_mutex_unlock(&fid_lock);
+	nucleo_candado_tomar(&fid_tab->lk);
+	struct fid_ent* e = &fid_tab->e[fid_hash(ino)];
+	if (e->ino == ino && e->path[0]) { snprintf(out, n, "%s", e->path); ok = 1; }
+	nucleo_candado_soltar(&fid_tab->lk);
 	return ok;
 }
 static long do_stat(struct ctx* c, int follow) {
