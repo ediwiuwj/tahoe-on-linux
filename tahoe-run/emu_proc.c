@@ -955,8 +955,9 @@ static __thread uint64_t my_workloop;   // workloop que atiende este hilo
 #define WQ_DATA_SIZE 32768
 // npre/pre/pdata: eventos que el vigilante ya recogió del kqueue (y el búfer donde quedaron los mensajes Mach recibidos).
 struct wq_job { uint64_t kqid; int workloop, has_req, npre; uint32_t prio; uint8_t req[72]; uint8_t pre[16 * 72]; uint8_t* pdata; struct wq_job* next; };
-struct wl_state { uint64_t kqid; int running, pending, watching, has_req, owned; uint8_t req[72]; struct wl_state* next; };   // watching: ya tiene vigilante; owned: petición en espera porque la cola tiene propietario
+struct wl_state { uint64_t kqid; int running, pending, watching, has_req, owned; unsigned gen; uint8_t req[72]; struct wl_state* next; };   // gen: cuántas veces se armó (para no retirar un vigilante que acaban de volver a necesitar)   // watching: ya tiene vigilante; owned: petición en espera porque la cola tiene propietario
 extern int kq_workloop_fd(uint64_t);
+extern int kq_workloop_try_free(uint64_t);
 extern long kq_drain(uint64_t, uint64_t, int, uint64_t, uint64_t);
 static void wl_arm(uint64_t kqid);
 // El kernel solo lanza el hilo si el estado de la cola sigue siendo el que esperaba libdispatch:
@@ -1236,7 +1237,26 @@ static void* wl_watch(void* p) {
 		while (w->running || w->owned) pthread_cond_wait(&wl_cv, &wl_lock);   // con propietario, los eventos son suyos
 		pthread_mutex_unlock(&wl_lock);
 		struct pollfd pf = { .fd = fd, .events = POLLIN };
-		if (poll(&pf, 1, -1) < 0) { if (errno == EINTR) continue; logf_("    wl_watch <%d>: poll falló: %s\n", (int)getpid(), strerror(errno)); break; }
+		int pr = poll(&pf, 1, kqid == ~0ULL ? -1 : 2000);
+		if (pr < 0) { if (errno == EINTR) continue; logf_("    wl_watch <%d>: poll falló: %s\n", (int)getpid(), strerror(errno)); break; }
+		if (pr == 0) {                                              // 2 s sin eventos: ¿se puede liberar el workloop?
+			pthread_mutex_lock(&wl_lock);
+			int idle = !w->running && !w->owned && !w->pending; unsigned g = w->gen;
+			pthread_mutex_unlock(&wl_lock);
+			if (!idle || !kq_workloop_try_free(kqid)) continue;
+			pthread_mutex_lock(&wl_lock);
+			if (!w->running && !w->owned && !w->pending && w->gen == g) {   // nadie lo volvió a usar: fuera el vigilante
+				for (struct wl_state** pp = &wl_states; *pp; pp = &(*pp)->next) if (*pp == w) { *pp = w->next; break; }
+				pthread_mutex_unlock(&wl_lock);
+				if (mach_trace()) logf_("    wl_watch <%d> kqid=0x%lx liberado\n", (int)getpid(), (unsigned long)kqid);
+				free(w);
+				return NULL;
+			}
+			pthread_mutex_unlock(&wl_lock);
+			fd = kq_workloop_fd(kqid);                              // se volvió a usar entretanto: vigilar el nuevo
+			if (fd < 0) break;
+			continue;
+		}
 		if (!(pf.revents & POLLIN)) continue;
 		pthread_mutex_lock(&wl_lock);
 		if (w->running) { pthread_mutex_unlock(&wl_lock); continue; }   // otra petición ya lanzó el hilo
@@ -1304,6 +1324,7 @@ static void wl_arm(uint64_t kqid) {
 	if (!w) { w = calloc(1, sizeof *w); w->kqid = kqid; w->next = wl_states; wl_states = w; }
 	int start = !w->watching;
 	if (start) w->watching = 1;
+	w->gen++;
 	if (mach_trace()) logf_("    wl_arm <%d> kqid=0x%lx start=%d running=%d\n", (int)getpid(), (unsigned long)kqid, start, w->running);
 	pthread_cond_broadcast(&wl_cv);
 	pthread_mutex_unlock(&wl_lock);

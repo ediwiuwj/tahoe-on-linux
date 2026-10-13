@@ -47,7 +47,7 @@ for NAME in $2; do
 	PIDS=$(pids_of "$NAME")
 	[ -z "$PIDS" ] && { gone "$NAME"; continue; }
 	for P in $PIDS; do
-	echo "== $NAME: pid $P, \"$(cat /proc/$P/comm 2>/dev/null)\" en Linux (en macOS $(awk '/^NSpid/{print $NF}' /proc/$P/status)): $(cmdl $P | sed 's/.*dyld //' | cut -c1-100)"
+	echo "== $NAME: pid $P, \"$(cat /proc/$P/comm 2>/dev/null)\" en Linux (en macOS $(for t in /proc/$P/task/*; do awk '/^NSpid/{print $NF; exit}' "$t/status" 2>/dev/null; done | head -1)): $(cmdl $P | sed 's/.*dyld //' | cut -c1-100)"
 	# Hilos iguales (mismo estado, llamada y sitio: p. ej. los de reserva de las colas, parados en poll) en una sola línea.
 	for t in /proc/$P/task/*; do
 		s=$(cat $t/syscall 2>/dev/null); pc=$(echo "$s" | awk '{print $NF}'); nr=$(echo "$s" | awk '{print $1}')
@@ -61,7 +61,8 @@ for NAME in $2; do
 	# Pilas de macOS de cada hilo: si el proceso es el de STACKS, SIGRTMIN+5 hace que cada hilo escriba en el registro sus
 	# marcos (rbp) y la llamada en curso (on_dump_all, emu_proc.c); se simbolizan con sym.py.
 	if [ -n "$STACKS" ]; then
-		N=$(awk '/^NSpid/{print $NF}' /proc/$P/status)
+		# el pid de macOS se lee de un hilo vivo: si el principal ya terminó (zombi), /proc/<pid>/status puede no estar
+		N=$(for t in /proc/$P/task/*; do awk '/^NSpid/{print $NF; exit}' "$t/status" 2>/dev/null; done | head -1)
 		kill -s RTMIN+5 "$P" 2>/dev/null; sleep 1
 		# los hilos que ejecutan código de tahoe-run sin llamada en curso (en reposo) se cuentan, no se listan
 		LC_ALL=C grep -a "HILO <$N:" "$D/msh.log" | sort -s -t: -k2,2n | tail -n 400 > "$D/hilos.tmp"
