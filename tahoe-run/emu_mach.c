@@ -213,6 +213,83 @@ static size_t mig_mach_vm_remap(const struct hdr* req, const uint8_t* m, uint8_t
 	return n + 16;
 }
 
+// host_statistics (216) y host_statistics64 (219): NDR, sabor, capacidad (en enteros de 32 bits). Datos de Linux:
+//   HOST_LOAD_INFO (1):      avenrun[3] (carga × 1000, LOAD_SCALE) y mach_factor[3], de /proc/loadavg.
+//   HOST_VM_INFO (2):        vm_statistics (15 natural_t), solo en host_statistics.
+//   HOST_CPU_LOAD_INFO (3):  cpu_ticks[USER, SYSTEM, IDLE, NICE] de la línea «cpu» de /proc/stat (100 Hz en los dos).
+//   HOST_VM_INFO64 (4):      vm_statistics64 (38 enteros; si caben más, los campos nuevos van a cero), solo en la de 64.
+// Las páginas son de 4096 bytes, como el vm_page_size de macOS x86_64. Otro sabor: KERN_INVALID_ARGUMENT, como XNU.
+// Las piden vm_stat, memory_pressure, iostat y top.
+static uint64_t proc_kv(const char* file, const char* key) {      // valor de «clave: N» o «clave N» en /proc/meminfo o vmstat
+	FILE* f = fopen(file, "r");
+	if (!f) return 0;
+	char l[256]; size_t kl = strlen(key); uint64_t v = 0;
+	while (fgets(l, sizeof l, f))
+		if (!strncmp(l, key, kl) && (l[kl] == ':' || l[kl] == ' ')) { v = strtoull(l + kl + 1, NULL, 10); break; }
+	fclose(f);
+	return v;
+}
+static size_t mig_host_statistics(const struct hdr* req, const uint8_t* m, uint8_t* r, int is64) {
+	int32_t flavor, cap;
+	memcpy(&flavor, m + 32, 4);
+	memcpy(&cap, m + 36, 4);
+	uint32_t out[64] = { 0 }; int cnt = 0;
+	if (flavor == 1) {
+		double l[3] = { 0, 0, 0 };
+		FILE* f = fopen("/proc/loadavg", "r");
+		if (f) { if (fscanf(f, "%lf %lf %lf", &l[0], &l[1], &l[2]) != 3) l[0] = l[1] = l[2] = 0; fclose(f); }
+		long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+		for (int i = 0; i < 3; i++) {
+			out[i] = (uint32_t)(l[i] * 1000);
+			double mf = ncpu > 0 ? (double)ncpu - l[i] : 0;      // mach_factor: CPU libres (también × 1000)
+			out[3 + i] = (uint32_t)(mf > 0 ? mf * 1000 : 0);
+		}
+		cnt = 6;
+	} else if (flavor == 3) {
+		unsigned long long u = 0, n = 0, sy = 0, id = 0, io = 0, irq = 0, sirq = 0;
+		FILE* f = fopen("/proc/stat", "r");
+		if (f) { if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu", &u, &n, &sy, &id, &io, &irq, &sirq) < 4) u = n = sy = id = 0; fclose(f); }
+		out[0] = (uint32_t)u; out[1] = (uint32_t)(sy + irq + sirq); out[2] = (uint32_t)(id + io); out[3] = (uint32_t)n;
+		cnt = 4;
+	} else if (flavor == 2 || flavor == 4) {
+		const uint64_t pg = 4096;
+		uint64_t total = proc_kv("/proc/meminfo", "MemTotal") * 1024 / pg, freep = proc_kv("/proc/meminfo", "MemFree") * 1024 / pg;
+		uint64_t active = proc_kv("/proc/meminfo", "Active") * 1024 / pg, inactive = proc_kv("/proc/meminfo", "Inactive") * 1024 / pg;
+		uint64_t file = (proc_kv("/proc/meminfo", "Active(file)") + proc_kv("/proc/meminfo", "Inactive(file)")) * 1024 / pg;
+		uint64_t anon = (proc_kv("/proc/meminfo", "Active(anon)") + proc_kv("/proc/meminfo", "Inactive(anon)")) * 1024 / pg;
+		uint64_t used = freep + active + inactive;
+		uint64_t wired = total > used ? total - used : 0;              // lo que no es libre ni activo ni inactivo: núcleo, búferes...
+		uint64_t faults = proc_kv("/proc/vmstat", "pgfault"), major = proc_kv("/proc/vmstat", "pgmajfault");
+		uint64_t pin = proc_kv("/proc/vmstat", "pgpgin") * 1024 / pg, pout = proc_kv("/proc/vmstat", "pgpgout") * 1024 / pg;
+		uint64_t swin = proc_kv("/proc/vmstat", "pswpin"), swout = proc_kv("/proc/vmstat", "pswpout");
+		if (flavor == 2) {                                              // vm_statistics: todo natural_t
+			uint32_t v[15] = { (uint32_t)freep, (uint32_t)active, (uint32_t)inactive, (uint32_t)wired, (uint32_t)(faults - major), 0,
+				(uint32_t)pin, (uint32_t)pout, (uint32_t)faults, 0, 0, 0, 0, 0, 0 };
+			memcpy(out, v, sizeof v); cnt = 15;
+		} else {                                                        // vm_statistics64 (mach/vm_statistics.h)
+			uint8_t* o = (uint8_t*)out;
+			uint32_t n4[4] = { (uint32_t)freep, (uint32_t)active, (uint32_t)inactive, (uint32_t)wired };
+			uint64_t n8[9] = { faults - major, 0, pin, pout, faults, 0, 0, 0, 0 };   // zero_fill, reactivations, pageins, pageouts, faults, cow, lookups, hits, purges
+			uint32_t p4[2] = { 0, 0 };                                  // purgeable_count, speculative_count
+			uint64_t c8[4] = { 0, 0, swin, swout };                     // decompressions, compressions, swapins, swapouts
+			uint32_t q4[4] = { 0, 0, (uint32_t)file, (uint32_t)anon };  // compressor_page_count, throttled, external, internal
+			memcpy(o, n4, 16); memcpy(o + 16, n8, 72); memcpy(o + 88, p4, 8); memcpy(o + 96, c8, 32); memcpy(o + 128, q4, 16);
+			cnt = 38;                                                   // + total_uncompressed_pages_in_compressor (0)
+		}
+	}
+	if (!cnt || (flavor == 2 && is64) || (flavor == 4 && !is64) || cap < 1) {
+		logf_("    host_statistics%s: sabor %d (capacidad %d) sin implementar\n", is64 ? "64" : "", flavor, cap);
+		return reply_begin(r, req, KERN_INVALID_ARG);
+	}
+	if (flavor == 4 && cap > cnt) cnt = cap < 64 ? cap : 64;          // macOS 26 pide 62: los campos nuevos van a cero
+	if (cap < cnt) cnt = cap;
+	size_t n = reply_begin(r, req, KERN_SUCCESS_);
+	int32_t c32 = cnt;
+	memcpy(r + n, &c32, 4);
+	memcpy(r + n + 4, out, (size_t)cnt * 4);
+	return n + 4 + (size_t)cnt * 4;
+}
+
 // host_info (id 200): NDR, flavor, capacidad. Solo HOST_BASIC_INFO (1): 12 enteros.
 static size_t mig_host_info(const struct hdr* req, const uint8_t* m, uint8_t* r) {
 	int32_t flavor, cap;
@@ -279,6 +356,71 @@ static size_t reply_port(uint8_t* r, const struct hdr* req, uint32_t name, uint8
 	desc[10] = disposition;                                     // p. ej. 17 = MACH_MSG_TYPE_PORT_SEND
 	memcpy(r + 28, desc, 12);
 	return 40;
+}
+
+// Respuesta compleja con un descriptor OOL: de puertos (names != NULL, derechos de envío) o de memoria (data), seguido de
+// NDR y la cuenta; extra (si no es NULL) va entre el NDR y la cuenta (host_processor_info: out_processor_count).
+static size_t reply_ool(uint8_t* r, const struct hdr* req, const uint32_t* names, const void* data, size_t len, uint32_t cnt, const uint32_t* extra) {
+	void* mm = mmap(NULL, len ? (len + 4095) & ~4095ul : 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (mm == MAP_FAILED) return reply_begin(r, req, 6 /* KERN_RESOURCE_SHORTAGE */);
+	memcpy(mm, names ? (const void*)names : data, len);
+	struct hdr nh = { .bits = 0x80000000u, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = req->id + 100 };
+	memcpy(r, &nh, sizeof nh);
+	uint32_t one = 1; memcpy(r + 24, &one, 4);
+	uint64_t addr = (uint64_t)mm;
+	uint8_t dsc[16] = { 0 }; memcpy(dsc, &addr, 8); dsc[8] = 1;            // deallocate
+	if (names) { dsc[10] = 17; dsc[11] = 2; memcpy(dsc + 12, &cnt, 4); }    // PORT_SEND, OOL_PORTS, cuántos
+	else { uint32_t l32 = (uint32_t)len; dsc[9] = 1; dsc[11] = 1; memcpy(dsc + 12, &l32, 4); }   // VIRTUAL_COPY, OOL, bytes
+	memcpy(r + 28, dsc, 16);
+	memcpy(r + 44, NDR_LE, 8);
+	size_t n = 52;
+	if (extra) { memcpy(r + n, extra, 4); n += 4; }
+	memcpy(r + n, &cnt, 4);
+	return n + 4;
+}
+
+// Conjuntos de procesadores (top, ps): uno solo, como en un Mac. host_processor_sets (419) da su nombre, y
+// host_processor_set_priv (420) el puerto con privilegios, con el que processor_set_tasks (4005) da un puerto de tarea por
+// cada proceso de macOS vivo (los pid del espacio de nombres son los de macOS).
+static int stat_fields(const char* path, long long f[24], char* state);
+static uint32_t pset_name(void) { return kobj_make(KO_PSET, 0); }
+static size_t mig_processor_set_tasks(const struct hdr* req, uint8_t* r) {
+	static uint32_t t[1024]; uint32_t cnt = 0;
+	DIR* d = opendir("/proc"); struct dirent* de;
+	while (d && cnt < 1024 && (de = readdir(d))) {
+		int pid = atoi(de->d_name); if (pid <= 0) continue;
+		char sp[64]; long long f[24]; char st = 0; snprintf(sp, sizeof sp, "/proc/%d/stat", pid);
+		if (!stat_fields(sp, f, &st) || st == 'Z' || st == 'X') continue;
+		t[cnt++] = pid == (int)getpid() ? 0x103 : kobj_make(KO_TASK, pid);
+	}
+	if (d) closedir(d);
+	return reply_ool(r, req, t, NULL, (size_t)cnt * 4, cnt, NULL);
+}
+// host_processor_info (204): PROCESSOR_CPU_LOAD_INFO (2): por CPU, cpu_ticks[USER, SYSTEM, IDLE, NICE] de /proc/stat;
+// PROCESSOR_BASIC_INFO (1): tipo, subtipo, en marcha, ranura, maestra. Lo usan top e iostat.
+static size_t mig_host_processor_info(const struct hdr* req, const uint8_t* m, uint8_t* r) {
+	int32_t flavor; memcpy(&flavor, m + 32, 4);
+	static uint32_t info[256 * 5]; uint32_t ncpu = 0, per = 0;
+	if (flavor == 2) {
+		per = 4;
+		FILE* f = fopen("/proc/stat", "r"); char l[256];
+		while (f && fgets(l, sizeof l, f) && ncpu < 256) {
+			unsigned cpu; unsigned long long u, n, sy, id, io = 0, irq = 0, sirq = 0;
+			if (strncmp(l, "cpu", 3) || l[3] == ' ') continue;
+			if (sscanf(l, "cpu%u %llu %llu %llu %llu %llu %llu %llu", &cpu, &u, &n, &sy, &id, &io, &irq, &sirq) < 5) continue;
+			uint32_t* o = info + ncpu * per;
+			o[0] = (uint32_t)u; o[1] = (uint32_t)(sy + irq + sirq); o[2] = (uint32_t)(id + io); o[3] = (uint32_t)n;
+			ncpu++;
+		}
+		if (f) fclose(f);
+	} else if (flavor == 1) {
+		per = 5; ncpu = (uint32_t)sysconf(_SC_NPROCESSORS_ONLN); if (ncpu > 256) ncpu = 256;
+		for (uint32_t i = 0; i < ncpu; i++) { uint32_t o[5] = { 7, 8, 1, i, i == 0 }; memcpy(info + i * per, o, sizeof o); }
+	} else {
+		logf_("    host_processor_info: sabor %d sin implementar\n", flavor);
+		return reply_begin(r, req, 4 /* KERN_INVALID_ARGUMENT */);
+	}
+	return reply_ool(r, req, NULL, info, (size_t)ncpu * per * 4, ncpu * per, &ncpu);
 }
 
 // semaphore_create (id 3418): NDR, política, valor inicial. Devuelve un puerto de semáforo.
@@ -642,6 +784,7 @@ static long mach_msg2(struct ctx* c) {
 	case 3206: {                                                  // mach_port_deallocate (MIG): soltar un send-once avisa; un derecho de envío no destruye nada
 		uint32_t nm; memcpy(&nm, req + 32, 4);
 		port_release_send_once(nm);
+		kobj_release_thread(nm);                                  // puerto de un hilo de otro proceso (task_threads)
 		n = reply_begin(rep, &h, KERN_SUCCESS_);
 		break;
 	}
@@ -851,6 +994,12 @@ static long mach_msg2(struct ctx* c) {
 	}
 	case 4803: case 4809: case 4810: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // inherit / msync / behavior_set: sin efecto
 	case 200:  n = mig_host_info(&h, req, rep); break;
+	case 216:  n = mig_host_statistics(&h, req, rep, 0); break;
+	case 204:  n = mig_host_processor_info(&h, req, rep); break;
+	case 419: { uint32_t ps = pset_name(); n = reply_ool(rep, &h, &ps, NULL, 4, 1, NULL); break; }   // host_processor_sets
+	case 420:  n = reply_port(rep, &h, pset_name(), 17); break;   // host_processor_set_priv: el mismo conjunto
+	case 4005: case 4010: n = mig_processor_set_tasks(&h, rep); break;   // processor_set_tasks(_with_flavor): el sabor (control, read, inspect, name) da igual aquí
+	case 219:  n = mig_host_statistics(&h, req, rep, 1); break;
 	case 206:  n = mig_host_get_clock_service(&h, req, rep); break;
 	case 222: n = reply_port(rep, &h, alloc_port(), 17); break;   // host_create_mach_voucher: puerto de voucher ficticio
 	case 225: n = reply_begin(rep, &h, KERN_SUCCESS_); break;     // (host, un entero): se acepta sin efecto

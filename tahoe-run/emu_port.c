@@ -1024,7 +1024,7 @@ int port_release_send_once(uint32_t name) {
 	return had;
 }
 // mach_port_deallocate_trap(task, nombre)
-static long t_deallocate(struct ctx* c) { port_release_send_once((uint32_t)c->a[1]); return KERN_OK; }
+static long t_deallocate(struct ctx* c) { port_release_send_once((uint32_t)c->a[1]); kobj_release_thread((uint32_t)c->a[1]); return KERN_OK; }
 static long t_mod_refs(struct ctx* c) {
 	int32_t delta = (int32_t)c->a[3];
 	if (c->a[2] == 2 /* SEND_ONCE */ && delta < 0) port_release_send_once((uint32_t)c->a[1]);
@@ -1299,6 +1299,14 @@ uint32_t kobj_new(int type, int32_t pid) {
 	unlock();
 	if (!r) logf_("    kobj: tabla llena\n");
 	return r;
+}
+// Soltar (mach_port_deallocate) el puerto de un hilo de otro proceso libera su objeto. Esos puertos solo los da
+// task_threads, a ps y top, que los sueltan tras thread_info, como en XNU, donde el último derecho de envío se lleva el
+// puerto. Sin esto se quedaban todos: un top recién arrancado el sistema llenaba la tabla (unos 700 de 1024 eran hilos) y
+// launchctl, defaults, dscl o diskutil fallaban después al no poder obtener los suyos.
+void kobj_release_thread(uint32_t name) {
+	int type; int32_t tid;
+	if (name && name != 0x103 && kobj_lookup(name, &type, &tid) && type == KO_THREAD) kobj_free(name);
 }
 void kobj_free(uint32_t name) {
 	lock();

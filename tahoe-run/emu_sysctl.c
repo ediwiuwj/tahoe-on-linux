@@ -12,7 +12,7 @@
 
 #include "tahoe.h"
 
-enum kind { K_INT, K_QUAD, K_STR, K_BOOT };
+enum kind { K_INT, K_QUAD, K_STR, K_BOOT, K_LOADAVG, K_SWAP };
 struct entry {
 	const char* name;
 	int mib[2];
@@ -40,6 +40,9 @@ static struct entry table[] = {
 	{ "kern.usrstack64", { CTL_KERN, 59 }, K_QUAD, (long long)STACK_TOP, NULL },
 	{ "kern.osversion", { CTL_KERN, 65 }, K_STR, 0, "25G83" },
 	{ "kern.boottime", { CTL_KERN, 21 }, K_BOOT, 0, NULL },
+	{ "vm.loadavg", { 2, 2 }, K_LOADAVG, 0, NULL },                  // CTL_VM, VM_LOADAVG: getloadavg (iostat, uptime, top)
+	{ "vm.swapusage", { 2, 5 }, K_SWAP, 0, NULL },                   // CTL_VM, VM_SWAPUSAGE: struct xsw_usage (top, sysctl)
+	{ "sysctl.proc_cputype", { 0, 0x7300 }, K_INT, 0x01000007, NULL },  // con el pid detrás: tipo de CPU de ese proceso (top)
 	{ "kern.bootargs", { CTL_KERN, 0x7000 }, K_STR, 0, "" },
 	{ "kern.osproductversion", { CTL_KERN, 0x7001 }, K_STR, 0, "26.6.2" },
 	{ "kern.osproductversionextra", { CTL_KERN, 0x7002 }, K_STR, 0, "" },
@@ -393,6 +396,8 @@ static long sysctl_meta(struct ctx* c, int op, const int* oid, uint32_t len) {
 	case K_INT:  kind |= CTLTYPE_INT; fmt = "I"; break;
 	case K_QUAD: kind |= CTLTYPE_QUAD; fmt = "Q"; break;
 	case K_STR:  kind |= CTLTYPE_STRING; fmt = "A"; break;
+	case K_LOADAVG: kind |= CTLTYPE_STRUCT; fmt = "S,loadavg"; break;
+	case K_SWAP: kind |= CTLTYPE_STRUCT; fmt = "S,xsw_usage"; break;
 	default:     kind |= CTLTYPE_STRUCT; fmt = "S,timeval"; break;
 	}
 	memcpy(b, &kind, 4);
@@ -490,6 +495,12 @@ long bsd_sysctl(struct ctx* c) {
 		if (trace_all || 1) logf_("    sysctl: nombre desconocido \"%s\"\n", name);
 		return -D_ENOENT;
 	}
+	if (n == 3 && mib[0] == 0 && mib[1] == 0x7300) {     // sysctl.proc_cputype.<pid>: todos los procesos son x86_64 aquí
+		char pp[32]; snprintf(pp, sizeof pp, "/proc/%d", mib[2]);
+		if (mib[2] < 0 || access(pp, F_OK) != 0) return -D_ESRCH;
+		int v = 0x01000007;                                  // CPU_TYPE_X86_64
+		return sc_out(c, &v, sizeof v);
+	}
 	if (n == 2 && mib[0] == CTL_KERN && mib[1] == 0x7005) {   // kern.osvariant_status: lectura y escritura como XNU
 		if (c->a[4]) {
 			uint64_t v = 0;
@@ -510,6 +521,24 @@ long bsd_sysctl(struct ctx* c) {
 			case K_INT:  { int v = (int)e->ival; return sc_out(c, &v, sizeof v); }
 			case K_QUAD: { long long v = e->ival; return sc_out(c, &v, sizeof v); }
 			case K_STR:  return sc_out(c, e->sval, strlen(e->sval) + 1);
+			case K_LOADAVG: {                                   // struct loadavg { fixpt_t ldavg[3]; long fscale; }, FSCALE = 1 << 11
+				double l[3] = { 0, 0, 0 };
+				FILE* f = fopen("/proc/loadavg", "r");
+				if (f) { if (fscanf(f, "%lf %lf %lf", &l[0], &l[1], &l[2]) != 3) l[0] = l[1] = l[2] = 0; fclose(f); }
+				uint8_t la[24] = { 0 };
+				for (int i = 0; i < 3; i++) { uint32_t v = (uint32_t)(l[i] * 2048); memcpy(la + i * 4, &v, 4); }
+				long long fs = 2048; memcpy(la + 16, &fs, 8);
+				return sc_out(c, la, sizeof la);
+			}
+			case K_SWAP: {                                      // struct xsw_usage { u64 total, avail, used; u32 pagesize; boolean_t encrypted; }
+				unsigned long long tot = 0, fr = 0; char l[128];
+				FILE* f = fopen("/proc/meminfo", "r");
+				if (f) { while (fgets(l, sizeof l, f)) { sscanf(l, "SwapTotal: %llu", &tot); sscanf(l, "SwapFree: %llu", &fr); } fclose(f); }
+				uint8_t x[32] = { 0 };
+				uint64_t v[3] = { tot * 1024, fr * 1024, (tot - fr) * 1024 }; uint32_t pg = 4096, enc = 1;
+				memcpy(x, v, 24); memcpy(x + 24, &pg, 4); memcpy(x + 28, &enc, 4);
+				return sc_out(c, x, sizeof x);
+			}
 			case K_BOOT: {
 				struct timespec up, now;
 				clock_gettime(CLOCK_BOOTTIME, &up);

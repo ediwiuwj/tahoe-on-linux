@@ -173,6 +173,18 @@ static long bsd_getrusage(struct ctx* c) {
 	_Static_assert(sizeof ru == 144, "struct rusage de Linux x86_64");
 	return safe_write(c->a[1], &ru, sizeof ru) == (ssize_t)sizeof ru ? 0 : -D_EFAULT;
 }
+// memorystatus_get_level(int* nivel): porcentaje de memoria disponible (0-100), como el memorystatus_level de XNU. Aquí,
+// MemAvailable / MemTotal de Linux. Lo usa memory_pressure.
+static long bsd_memorystatus_get_level(struct ctx* c) {
+	unsigned long long tot = 0, av = 0; char l[128];
+	FILE* f = fopen("/proc/meminfo", "r");
+	if (f) {
+		while (fgets(l, sizeof l, f)) { sscanf(l, "MemTotal: %llu", &tot); sscanf(l, "MemAvailable: %llu", &av); }
+		fclose(f);
+	}
+	int32_t lvl = tot ? (int32_t)(av * 100 / tot) : 0;
+	return safe_write(c->a[0], &lvl, 4) == 4 ? 0 : -D_EFAULT;
+}
 static long bsd_setrlimit(struct ctx* c) {
 	int r = linux_rlimit((int)c->a[0]);
 	uint64_t in[2];
@@ -1506,7 +1518,7 @@ void emu_proc_init(void) {
 	reg_bsd(31, bsd_getpeername); reg_bsd(59, bsd_execve);
 	reg_bsd(39, bsd_getppid); reg_bsd(81, bsd_getpgrp); reg_bsd(151, bsd_getpgid); reg_bsd(82, bsd_setpgid);
 	reg_bsd(310, bsd_getsid); reg_bsd(147, bsd_setsid); reg_bsd(60, bsd_umask);
-	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit); reg_bsd(117, bsd_getrusage); reg_bsd(184, bsd_sigreturn);
+	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit); reg_bsd(117, bsd_getrusage); reg_bsd(453, bsd_memorystatus_get_level); reg_bsd(184, bsd_sigreturn);
 	reg_bsd(46, bsd_sigaction); reg_bsd(53, bsd_sigaltstack); reg_bsd(329, bsd_pthread_sigmask); reg_bsd(52, bsd_sigpending);
 	reg_bsd(37, bsd_kill); reg_bsd(328, bsd_pthread_kill);
 	reg_bsd(98, bsd_connect);
