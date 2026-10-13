@@ -8,14 +8,14 @@ Metal 3 de cara a macOS, emulando lo que falte, ampliando `hasvk` de Mesa si hac
 tenía, como Bluetooth (a través de BlueZ). La Recovery fue el primer paso y sigue sirviendo de prueba de regresiones.
 [Darling](https://github.com/darlinghq/darling) se usa solo como referencia.
 
-**Estado actual (11 de octubre de 2026)**, medido en la PC de pruebas (i5-4210U Haswell, 5,8 GB de RAM, Arch/Omarchy, kernel 7.2):
+**Estado actual (13 de octubre de 2026)**, medido en la PC de pruebas (i5-4210U Haswell, 5,8 GB de RAM, Arch/Omarchy, kernel 7.2):
 
 | Parte | Estado |
 |---|---|
 | Arranque | El `launchd` real de macOS 26 corre como **PID 1** en un espacio de nombres de PID de Linux, sin root. `launchctl list` registra **169 servicios**, en un arranque se cargan unos **155-170 procesos**, y es estable (sin reinicios). Funcionan los dominios de proceso de launchd (servicios XPC de los frameworks, como `authd`), las fases de montaje del arranque (`mount -P`) y las señales de `launchctl kill`/`kickstart -k`. Entre los servicios: `syslogd`, `notifyd`, `cfprefsd`, `configd`, `powerd`, `securityd`, `opendirectoryd`, `diskarbitrationd`, `storagekitd`, `fskitd`, `authd`, `trustd`, `coreservicesd`, `WindowServer`. |
-| Shell de macOS | `tools/macos-shell.sh` abre el `bash` de macOS en la terminal. Con `--launchd` se une a launchd y funcionan las órdenes que usan servicios. Inventario (`tools/shell_survey.sh`, 79 órdenes, arranque normal): **56 funcionan**, 17 no existen en la imagen de Recovery y 6 dan el mismo error que en un Mac real (entre ellas `bless --info`: el contenedor APFS no tiene volumen Preboot). |
-| macOS completo | El **macOS 26.7.1 completo** (del instalador oficial, extraído con las herramientas de `tools/`) arranca: launchd carga **~400 servicios**, ~90 procesos, y se lanzan `WindowServer` y `loginwindow` (sistema recién instalado: toca el Asistente de configuración). Ver «macOS 26 completo» al final. |
-| Interfaz gráfica | **Primera imagen** (macOS 26 completo): `WindowServer` abre el framebuffer emulado (`AppleIntelFramebuffer`, 1280×800, EDID propio), crea el cursor compartido, proyecta la memoria de vídeo (en `/dev/shm`) y **dibuja el cursor**, por software (sin dispositivo Metal: CoreDisplay registra «MetalDevice ... 0x0»). Hay IOSurface emulado (superficies compartidas entre procesos). Después WindowServer aún cae antes de componer el escritorio. Visor en Linux: `tools/tahoe-view` (`macos-shell.sh --pantalla`); captura: `tools/diag/captura.py`. |
+| Shell de macOS | `tools/macos-shell.sh` abre el `bash` de macOS en la terminal. Con `--launchd` se une a launchd y funcionan las órdenes que usan servicios. En la **Recovery**, `diskutil list` funciona (4 discos, en menos de 40 s). En el **macOS completo**, inventario corto (`tools/shell_survey.sh`, 79 órdenes): **54 funcionan**, 18 dan error (6 de ellos igual que en un Mac real), 3 se cuelgan y 4 se caen; fallan sobre todo las que hablan con launchd y servicios del sistema (`launchctl print`, `defaults`, `diskutil`, `log show`, `caffeinate`) y las que leen la memoria del núcleo (`top`, `vm_stat`, `memory_pressure`). Inventario de **todos** los programas (1.167): `tools/inventario_total.sh`. |
+| macOS completo | El **macOS 26.7.1 completo** (del instalador oficial, extraído con las herramientas de `tools/`) arranca: launchd carga **~400 servicios**, ~110 procesos, y se lanzan `WindowServer` y `loginwindow` (sistema recién instalado: toca el Asistente de configuración). `loginwindow` ya obtiene de opendirectoryd la lista de usuarios y **lanza Language Chooser** (la pantalla de idioma, la primera del Asistente), que se conecta a WindowServer y le pide ventanas, pero a veces no carga su interfaz (`MainMenu.nib`) y se cierra. Queda una fuga de memoria de 1-3 GB en algún proceso (el guardián ya dice cuál). Ver «macOS 26 completo» al final. |
+| Interfaz gráfica | **Primera imagen** (macOS 26 completo): `WindowServer` abre el framebuffer emulado (`AppleIntelFramebuffer`, 1280×800, EDID propio), crea el cursor compartido, proyecta la memoria de vídeo (en `/dev/shm`) y **dibuja el cursor**, por software (sin dispositivo Metal: CoreDisplay registra «MetalDevice ... 0x0»). Hay IOSurface emulado (superficies compartidas entre procesos). Desde el 12 de octubre WindowServer **ya no se cae** (rwlock de libpthread y workloops de libdispatch implementados) ni crece en memoria (avisos «send-possible» como en XNU): se queda estable en ~95 MB, pero aún no compone el escritorio. Visor en Linux: `tools/tahoe-view` (`macos-shell.sh --pantalla`); captura: `tools/diag/captura.py`. |
 | Metal | Un kernel de Metal (AIR) traducido a SPIR-V con `metal2vulkan` se ejecuta en la GPU (Intel HD 4400) por Vulkan (`test/run_add_arrays.c`). Aún no está conectado a `tahoe-run`. |
 
 Primera imagen de macOS 26 en la PC de pruebas (11 de octubre de 2026): la memoria de vídeo emulada con el cursor que dibuja
@@ -23,7 +23,7 @@ WindowServer, arriba a la izquierda; el escritorio aún no se compone.
 
 ![Primera imagen: el cursor de macOS 26 dibujado por WindowServer en el framebuffer emulado](docs/capturas/2026-10-11-primer-cursor.png)
 
-Qué funciona en la shell (con `--launchd`): `ls`, `cp`/`mv`/`rm`, `find`, `grep`, `sed`, `awk`, `sort`, `tar`, `vim`, `less`, `perl`, `curl`,
+Qué funciona en la shell de la Recovery (con `--launchd`): `ls`, `cp`/`mv`/`rm`, `find`, `grep`, `sed`, `awk`, `sort`, `tar`, `vim`, `less`, `perl`, `curl`,
 `ssh -V`, `ps aux` (estado, CPU, memoria, hora de inicio), `log show`, `df`, `mount`, `stat`, `xattr`, `chmod`/`chown`, `sysctl`,
 `sw_vers`, `uname`, `id`, `date`, `ifconfig`, `netstat`, `ping`,
 `scutil`, `launchctl list`/`print`, `defaults read`/`write`, `plutil`, `pmset`, `ioreg`, `nvram`, `csrutil`, `dscl`, `codesign`, `spctl`,
@@ -60,6 +60,16 @@ Diagnóstico con `tools/diag/` (registro y salidas en `$TAHOE_DIAG_DIR`, por omi
 | `ab.sh <N> [binario]` | N arranques con recuento de procesos y caídas: comparar dos versiones antes de dar por bueno un cambio |
 | `clean.sh` | Termina todo `tahoe-run` y limpia `/dev/shm` |
 | `sym.py <dir>…` / `dis.py <dir> [bytes]` | Símbolo (con `ipsw`) o desensamblado de direcciones de la caché de dyld |
+| `discos.sh ['orden']` | `diskutil` (u otra orden) en un arranque, con el registro `-d` de diskarbitrationd resumido por `da_log.py`; `MSGS=`/`IOKS=` trazan mensajes Mach e IOKit de esos programas |
+| `mensajes.py [-x] [-p prog] <registro>` | Mensajes Mach trazados: quién habla con quién, qué no llegó, qué peticiones quedaron sin respuesta; `-x` decodifica XPC |
+| `iokit.py <registro>` | Peticiones IOKit de cada proceso con sus respuestas y avisos |
+| `memoria.sh <programa> [t1] [t2]` | Muestreo de la memoria de un proceso de macOS y comparación de dos fotos de `smaps` (`memoria.py`): qué región crece |
+| `dsmos.py <macho> <salida>` | Descifra el `__TEXT` protegido de un binario de Apple (loginwindow, Finder...) para desensamblarlo, con la clave de la PC |
+| `../inventario_total.sh` + `inventario.py` | Ejecuta todos los programas de la shell del macOS completo y los clasifica (funciona, pide argumentos, error del emulador, se cae, cuelga) |
+
+**Antes de dar por bueno un cambio**, se pasa una batería fija y se compara con el binario anterior (`TAHOE_RUN`): `diskutil list`
+en la Recovery (`discos.sh`), el inventario corto en el macOS completo dos veces (el arranque completo varía de una vez a otra),
+la memoria de WindowServer (`memoria.sh`) y `cargo test --lib` en `tahoe-run/nucleo`. Si algo empeora, no se sube.
 
 
 ## Hoja de ruta, por orden
@@ -70,9 +80,10 @@ Criterio de lenguaje: todo lo que toca la parte gráfica de Linux y la capa Meta
 C, pero la parte que falle una y otra vez se reescribe en Rust (biblioteca estática enlazada en `tahoe-run`) en vez de
 seguir parcheándola; lo de muy bajo nivel (señales, cambios de pila) se queda en C.
 
-1. **Escritorio en pantalla (en curso)**: WindowServer ya dibuja el cursor en el framebuffer emulado; falta que componga
-   el escritorio sin caerse (CoreDisplay considera la pantalla principal «offline» y crea una virtual; errores de recepción
-   Mach en libdispatch). Visor: `tools/tahoe-view`.
+1. **Escritorio en pantalla (en curso)**: WindowServer ya dibuja el cursor y se mantiene estable; loginwindow lanza
+   Language Chooser, que a veces no carga su nib. Falta que Language Chooser y luego el Asistente se dibujen, y que la
+   conexión con launchd y los servicios del sistema sea fiable en el macOS completo (`diskutil`, `defaults`, `launchctl`).
+   Visor: `tools/tahoe-view`.
 2. **Teclado y ratón**: eventos de la ventana de Linux (SDL) hacia la cola de IOHIDSystem / los servicios HID de macOS.
 3. **Asistente de configuración** hasta crear la cuenta; plan B si algún paso se bloquea: crear el usuario con
    `sysadminctl` desde la shell de macOS y marcar `/private/var/db/.AppleSetupDone`.
@@ -83,15 +94,18 @@ seguir parcheándola; lo de muy bajo nivel (señales, cambios de pila) se queda 
    Metal, traducción de órdenes a Vulkan con `ash`, shaders AIR→SPIR-V como `metal2vulkan`): es código complejo de
    alto nivel donde la seguridad de memoria importa. `tahoe-run` (el «núcleo», muy de bajo nivel) sigue en C.
 5. **Bluetooth, audio y red** sobre los servicios de Linux (BlueZ, PipeWire/ALSA, la red del anfitrión).
-6. **Estabilidad del arranque**: caídas sueltas de servicios (AirPlayXPCHelper, mediaremoted, locationd, kmutil
-   «failed to get platform node»), la carrera de workloops que queda, señales reales (`sigreturn`) y perfil de
-   servicios prescindibles para la PC de 5,8 GB.
+6. **Estabilidad del arranque**: la fuga de memoria de 1-3 GB del macOS completo, caídas sueltas de servicios
+   (locationd en una excepción de C++, kmutil «failed to get platform node»), señales reales (`sigreturn`) y perfil de
+   servicios prescindibles para la PC de 5,8 GB. Ya resueltas: AirPlayXPCHelper, mediaremoted y PerfPowerServices
+   (workloops con atributos) y opendirectoryd (workloops que no se liberaban).
 
 ## Qué hay en este repositorio
 
 | Ruta | Contenido |
 |---|---|
 | `tahoe-run/` | La capa de compatibilidad (C): syscalls BSD, trampas Mach, puertos entre procesos, kqueue/workloops, IOKit, XPC... |
+| `tahoe-run/nucleo/` | Las partes del núcleo reescritas en Rust (biblioteca estática): descriptores de mensajes Mach, desbordamiento de mensajes grandes, `pthread_rwlock` (traducción de `kern_synch.c`) y el candado de la región de puertos entre procesos; con pruebas (`cargo test --lib`) |
+| `tools/inventario_total.sh` | Ejecuta todos los programas de la shell del macOS completo y los clasifica con `tools/diag/inventario.py` |
 | `patches/` | Parche para [`darlinghq/indium`](https://github.com/darlinghq/indium) (`git am`) |
 | `tools/extract_air.py` | Saca los módulos AIR de un `.metallib` |
 | `tools/compare_syscalls.py` | Compara las syscalls BSD y trampas Mach de un XNU con las de Darling |
@@ -108,7 +122,7 @@ seguir parcheándola; lo de muy bajo nivel (señales, cambios de pila) se queda 
 | `tools/mem_guard.sh` | Guardián de memoria de las pruebas (RAM disponible y crecimiento del swap) |
 | `tools/dmg2raw.py` | Convierte la imagen UDIF de la Recovery en imagen cruda (para extraerla con `hfsfuse`) |
 | `tools/iokit_trace.py` | Resume la traza de IOKit |
-| `tools/diag/` | Diagnóstico: `msh.sh`, `hang.sh`, `ab.sh`, `clean.sh`, `sym.py`, `dis.py` (ver «Probarlo») |
+| `tools/diag/` | Diagnóstico: `msh.sh`, `hang.sh`, `ab.sh`, `clean.sh`, `sym.py`, `dis.py`, `discos.sh`, `mensajes.py`, `iokit.py`, `memoria.sh`, `dsmos.py`, `inventario.py` (ver «Probarlo») |
 
 ### Estado de los parches
 
@@ -601,3 +615,28 @@ En el primer arranque (sistema recién instalado, sin `/var/db/.AppleSetupDone`)
 Siguiente: que `loginwindow` abra el Asistente de configuración y, para verlo, una pantalla: un `IOFramebuffer` emulado
 (como un Mac o una máquina virtual sin aceleración, que macOS 26 dibuja por software) mostrado en una ventana de Linux, y
 después la aceleración real (Metal sobre Vulkan).
+
+### macOS 26 completo: hacia el Asistente de configuración (12 y 13 de octubre de 2026)
+
+Cada arreglo deja llegar un poco más lejos y destapa el siguiente bloqueo, que ya estaba ahí detrás del anterior:
+
+- **WindowServer se caía por SIGILL**: libpthread aborta si el núcleo no implementa `psynch_rw_rdlock`/`unlock`. Ahora
+  `nucleo/src/rwlock.rs` traduce `kern_synch.c` (colas de lectores y escritores, preposts, solapamiento), con pruebas.
+- **WindowServer crecía 6,5 MB/s**: unos 3000 mensajes por segundo con powerd, porque tahoe-run disparaba en cada mensaje
+  las peticiones `MACH_NOTIFY_SEND_POSSIBLE` sin armar. Como en XNU, solo avisan las armadas (síncronas con la cola llena,
+  o armadas por un envío con `MACH_SEND_NOTIFY`). De paso, `diskutil list` de la Recovery ya cabe en 40 s.
+- **Caídas en `_dispatch_source_invoke`** (WindowServer, mediaremoted, AirPlayXPCHelper, PerfPowerServices): faltaba
+  `kqueue_workloop_ctl`; sin él, libdispatch usaba un camino de reserva.
+- **loginwindow esperando para siempre a opendirectoryd**: los workloops no se liberaban nunca; opendirectoryd llenaba la
+  tabla, `kevent_id` daba ENOMEM y se quedaba con ~500 hilos atascados. Ahora se liberan cuando quedan sin uso.
+- **Language Chooser** (lo lanza loginwindow; con `tools/diag/dsmos.py` se vio que espera `lcaCheckComplete`) no podía
+  abrir su nib: faltaban `fsgetpath` para identificadores que vienen de otro proceso (tabla común del arranque) y
+  atributos comunes en `getattrlist` de volumen (942 ENOTSUP por arranque). Ahora a veces carga y a veces no: sigue
+  pendiente.
+- **Despertares perdidos y cuelgues sueltos**: el candado global de los puertos era un mutex robusto de glibc, que
+  identifica al dueño por un TID que nuestro `fork` directo no actualiza en el hijo. Ahora es `nucleo/src/candado.rs`:
+  TID real, futex compartidos, esperas con plazo y recuperación de dueños muertos (también zombis).
+
+Pendiente: la fuga de memoria de 1-3 GB en algún proceso; las órdenes que fallan al hablar con launchd y servicios del
+sistema en el macOS completo (`diskutil`, `defaults`, `launchctl print`, `log show`); que Language Chooser y el Asistente se
+dibujen; y después, teclado y ratón.
