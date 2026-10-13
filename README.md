@@ -108,12 +108,10 @@ seguir parcheándola; lo de muy bajo nivel (señales, cambios de pila) se queda 
 | `tools/inventario_total.sh` | Ejecuta todos los programas de la shell del macOS completo y los clasifica con `tools/diag/inventario.py` |
 | `patches/` | Parche para [`darlinghq/indium`](https://github.com/darlinghq/indium) (`git am`) |
 | `tools/extract_air.py` | Saca los módulos AIR de un `.metallib` |
-| `tools/compare_syscalls.py` | Compara las syscalls BSD y trampas Mach de un XNU con las de Darling |
 | `tools/map_dyld_cache.py` | Mapea la `dyld_shared_cache` en sus direcciones fijas y lo verifica |
 | `test/sud_syscall_dispatch.c` | Prueba de interceptación de syscalls de macOS con syscall user dispatch |
-| `tools/build_darling_codespace.sh` | Compila `mldr` y `darlingserver` de Darling en un Codespace |
 | `tools/used_syscalls.py` | Lista las syscalls BSD y trampas Mach que invoca un Mach-O x86_64 |
-| `tools/dyld_iterate.py` | Ejecuta un binario de macOS 26 en Darling extrayendo de la caché lo que falte |
+| `tools/historico_darling/` | Herramientas antiguas de cuando se probó Darling (no se usan; ver su `NOTA.md`) |
 | `tools/narrow_int64.py` | Quita `Int64` de un SPIR-V cuando solo se usa para indexar (conservador) |
 | `test/add_arrays.vulkan1.2.spv` | SPIR-V generado por `metal2vulkan` (aún con `Int64`) |
 | `test/run_add_arrays.c` | Programa mínimo de Vulkan que ejecuta el kernel y comprueba `c = a + b` |
@@ -252,7 +250,7 @@ reimplementar las syscalls y trampas Mach que XNU 12377 añadió respecto a Darw
 
 ### Distancia medida entre Darling (Darwin 20) y XNU 12377 (macOS 26)
 
-`tools/compare_syscalls.py` compara las tablas (Darling emula las syscalls en espacio de usuario):
+`tools/historico_darling/compare_syscalls.py` compara las tablas (Darling emula las syscalls en espacio de usuario):
 
 | Interfaz | XNU 26 | Darling | Falta |
 |---|---|---|---|
@@ -376,9 +374,9 @@ herramienta que la soporte (`hfsfuse`, en AUR).
 Siguiente: señales, hilos reales y `launchd`/Mach IPC con puertos de verdad; después, la parte gráfica
 (`SkyLight`, `QuartzCore`), que es la que llevaría al recovery.
 
-### Compilar Darling en un Codespace
+### Compilar Darling en un Codespace (histórico: ya no se usa, ver `tools/historico_darling/NOTA.md`)
 
-`tools/build_darling_codespace.sh` compila `mldr` (el cargador Mach-O) y `darlingserver` en un
+`tools/historico_darling/build_darling_codespace.sh` compilaba `mldr` (el cargador Mach-O) y `darlingserver` en un
 Codespace de 4 núcleos y 16 GB (Ubuntu 24.04): 170 pasos, sin errores, en pocos minutos. Con el árbol
 de Darling en el commit `60ba801d`. Tres cosas que costaron tiempo y quedan anotadas en el script:
 compilar en `/tmp` (disco aparte, ~118 GB; `/workspaces` solo deja ~12 GB), saltarse `git-lfs`
@@ -388,7 +386,7 @@ submódulos vacíos aunque `git submodule status` diga que están bien.
 Esto compila solo las piezas de Linux. Las bibliotecas del lado macOS (`libsystem_kernel` y demás) usan
 el compilador cruzado de Darling y no se han construido todavía.
 
-`tools/dyld_iterate.py` automatiza esta prueba: ejecuta un binario en Darling, extrae la librería que
+`tools/historico_darling/dyld_iterate.py` automatizaba esta prueba: ejecuta un binario en Darling, extrae la librería que
 falta de la caché y reintenta. Sirve para mapear la cadena de dependencias; se detiene en el fallo
 anterior.
 
