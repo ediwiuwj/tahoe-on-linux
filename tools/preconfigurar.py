@@ -13,7 +13,8 @@ aplicar:
   2. Crea un administrador como lo haría sysadminctl: registro en dslocal (uid 501, grupo staff 20, shell zsh, UUID
      propio), contraseña con SALTED-SHA512-PBKDF2 (lo que guarda macOS en ShadowHashData; la contraseña se pide aquí y no
      se guarda en ningún sitio), alta en el grupo admin y carpeta /Users/<usuario> copiada de la plantilla de macOS.
-  3. Idioma y región en /Library/Preferences/.GlobalPreferences.plist (AppleLanguages, AppleLocale).
+  3. Idioma y región en /Library/Preferences/.GlobalPreferences.plist (AppleLanguages, AppleLocale) y en las del
+     usuario (~/Library/Preferences/.GlobalPreferences.plist), como deja el Asistente.
   4. /private/var/db/.AppleSetupDone: el Asistente de configuración se da por hecho. El índice de dslocal (sqlindex) se
      aparta para que opendirectoryd lo rehaga con el usuario nuevo.
   Si algo falla a mitad, se deshace lo hecho.
@@ -140,6 +141,10 @@ def hacer(raiz, usuario, nombre, idioma, clave, indices):
     gp["AppleLanguages"] = [idioma.replace("_", "-"), lengua]
     gp["AppleLocale"] = idioma
     escribir(gp_p, gp)
+    # y en las del propio usuario, como deja el Asistente (defaults read -g lee estas)
+    up = os.path.join(destino, "Library/Preferences")
+    os.makedirs(up, exist_ok=True)
+    escribir(os.path.join(up, ".GlobalPreferences.plist"), {"AppleLanguages": gp["AppleLanguages"], "AppleLocale": idioma})
 
     # 4. Asistente de configuración hecho
     open(os.path.join(raiz, SETUPDONE), "w").close()
