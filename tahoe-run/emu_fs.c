@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -241,6 +242,33 @@ static void put_stat(uint64_t out, const struct stat* s, uint32_t flags) {
 #undef W
 	safe_write(out, d, sizeof d);
 }
+// Rutas por identificador de archivo, para fsgetpath: macOS resuelve así las URL de referencia de archivo
+// (/.file/id=...), que CoreFoundation y AppKit usan para volver a abrir lo que ya consultaron (p. ej. el nib de Language
+// Chooser: sin esto, «MainMenu.nib couldn't be opened» y loginwindow esperaba para siempre). En APFS el núcleo lo sabe
+// por el identificador; aquí se anota cada objeto consultado por ruta absoluta (stat, getattrlist) en una tabla del
+// proceso, con los identificadores que se le dan a macOS (los inodos de Linux).
+#define FID_N 4096
+static struct { uint64_t ino; char* path; } fid_tab[FID_N];
+static pthread_mutex_t fid_lock = PTHREAD_MUTEX_INITIALIZER;
+static void fid_note(uint64_t ino, const char* gpath) {
+	if (!ino || !gpath || gpath[0] != '/') return;
+	uint32_t h = (uint32_t)((ino * 0x9e3779b97f4a7c15ull) >> 52) % FID_N;
+	pthread_mutex_lock(&fid_lock);
+	if (!fid_tab[h].path || fid_tab[h].ino != ino || strcmp(fid_tab[h].path, gpath)) {
+		free(fid_tab[h].path);
+		fid_tab[h].ino = ino; fid_tab[h].path = strdup(gpath);
+	}
+	pthread_mutex_unlock(&fid_lock);
+}
+// Copia la ruta del identificador en out; 1 si se conoce.
+static int fid_lookup(uint64_t ino, char* out, size_t n) {
+	uint32_t h = (uint32_t)((ino * 0x9e3779b97f4a7c15ull) >> 52) % FID_N;
+	int ok = 0;
+	pthread_mutex_lock(&fid_lock);
+	if (fid_tab[h].path && fid_tab[h].ino == ino) { snprintf(out, n, "%s", fid_tab[h].path); ok = 1; }
+	pthread_mutex_unlock(&fid_lock);
+	return ok;
+}
 static long do_stat(struct ctx* c, int follow) {
 	char p[4096], b[4200];
 	struct stat s;
@@ -253,6 +281,7 @@ static long do_stat(struct ctx* c, int follow) {
 		return err();
 	}
 	vol_fix(&s, AT_FDCWD, path, follow ? 0 : AT_SYMLINK_NOFOLLOW);
+	if (p[0] == '/') fid_note(s.st_ino, p);
 	put_stat(c->a[1], &s, follow ? tahoe_flags_path(path) : tahoe_flags_path(path));
 	return 0;
 }
@@ -684,6 +713,7 @@ static long bsd_getattrlist(struct ctx* c) {
 		snprintf(gp2, sizeof gp2, "%s", rp[0] ? rp : "/");
 		const char* base = strrchr(gp2, '/');
 		base = base && base[1] ? base + 1 : gp2;
+		fid_note(st.st_ino, gp2);
 		static uint8_t buf[8192];
 		size_t n = pack_entry(buf, common, al[3], al[4], (c->a[4] & 0x20) ? al[5] : 0, base, gp2, &st, (c->a[4] & 8) != 0);
 		return attr_copyout(c->a[2], c->a[3], c->a[4], buf, n);
@@ -1127,6 +1157,13 @@ static long bsd_fsgetpath(struct ctx* c) {
 		size_t n = strlen(cache_guest_path) + 1;
 		if (n > c->a[1]) return -D_ENOMEM;
 		return safe_write(c->a[0], cache_guest_path, n) == (ssize_t)n ? (long)n : -D_EFAULT;
+	}
+	char gp[4096];
+	if (c->a[3] == 2) snprintf(gp, sizeof gp, "/");          // en APFS el identificador 2 es la raíz del volumen
+	if (c->a[3] == 2 || fid_lookup(c->a[3], gp, sizeof gp)) {
+		size_t n = strlen(gp) + 1;
+		if (n > c->a[1]) return -D_ENOMEM;
+		return safe_write(c->a[0], gp, n) == (ssize_t)n ? (long)n : -D_EFAULT;
 	}
 	logf_("    fsgetpath: identificador desconocido (objid=0x%lx)\n", c->a[3]);
 	return -D_ENOENT;
