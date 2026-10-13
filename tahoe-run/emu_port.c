@@ -341,6 +341,15 @@ static void flush_notes(void) {
 		memcpy(m, &bits, 4); memcpy(m + 4, &size, 4); memcpy(m + 8, &n.dest, 4); memcpy(m + 20, &n.id, 4);
 		int r = port_send_k(n.dest, m, size, 1);
 		if (mach_trace() || n.id != 71) logf_("    aviso %d (0x%x) -> 0x%x%s\n", n.id, n.arg, n.dest, r ? " (sin destino)" : "");
+		if (r && n.id == 69) {
+			// PORT_DESTROYED sin destino (quien pidió el aviso ya no existe): como en XNU, el mensaje no entregado se destruye y
+			// con él el derecho de recepción que llevaba, así que el puerto muere de verdad. Antes se quedaba «en tránsito»
+			// para siempre: cada conexión XPC de un cliente que terminaba dejaba un puerto en cfprefsd, opendirectoryd...
+			lock();
+			struct sport* q = find_locked(n.arg);
+			if (q && q->owner == 0) destroy_locked(q);       // puede añadir avisos (DEAD_NAME...): el bucle los envía
+			unlock();
+		}
 	}
 }
 
