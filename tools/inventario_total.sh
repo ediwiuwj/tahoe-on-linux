@@ -6,7 +6,7 @@
 # retoma con DESDE=<n> sin perder lo hecho. Al final, tools/diag/inventario.py lo clasifica con el registro de tahoe-run.
 #   ESPERA: segundos de arranque antes de empezar (180). PLAZO: segundos por programa (6). DESDE: primer número (1).
 #   TAHOE_RUN: otro binario de tahoe-run. Siempre limpia.
-# Se saltan los que acaban o alteran el arranque (reboot, halt, shutdown...) y los servicios de launchd del propio sistema
+# Se saltan los que acaban o alteran el arranque (reboot, halt, shutdown, killall, pkill...) y los servicios de launchd del propio sistema
 # (su programa está en un plist de LaunchDaemons/LaunchAgents): otra copia sin argumentos estorbaría a la que ya corre.
 TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
@@ -20,7 +20,7 @@ import glob, os, plistlib, sys
 R = sys.argv[1]
 salta = {"/sbin/reboot", "/sbin/halt", "/sbin/shutdown", "/sbin/fastboot", "/sbin/fasthalt", "/sbin/launchd",
          "/sbin/init", "/usr/sbin/sshd", "/usr/sbin/httpd", "/usr/sbin/apachectl", "/usr/sbin/postfix",
-         "/usr/bin/ssh-agent", "/usr/sbin/newsyslog"}
+         "/usr/bin/ssh-agent", "/usr/sbin/newsyslog", "/usr/bin/killall", "/usr/bin/pkill"}
 normales = {"/bin/bash", "/usr/bin/true", "/usr/bin/csrutil", "/sbin/pfctl", "/sbin/mount_nfs", "/usr/sbin/asr",
             "/usr/sbin/vsdbutil"}
 for f in glob.glob(R + "/System/Library/LaunchDaemons/*.plist") + glob.glob(R + "/System/Library/LaunchAgents/*.plist"):
