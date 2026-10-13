@@ -65,7 +65,7 @@ def main():
             cat = "cuelga"
         elif rc == "0":
             cat = "funciona"
-        elif rc.isdigit() and int(rc) > 128:
+        elif rc.isdigit() and 128 < int(rc) <= 128 + 31:          # 128 + señal (255 es exit(-1), no una señal)
             cat = "se cae"
             out = f"{SEÑALES.get(int(rc) - 128, 'señal %d' % (int(rc) - 128))}: {causa.get(pid, out)}"
         elif EMU.search(out) or f:

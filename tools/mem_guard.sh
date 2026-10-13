@@ -13,6 +13,10 @@ while [ ! -e /dev/shm/tahoe-guard-stop ]; do
     pkill -9 -x tahoe-run; pkill -9 unshare
     echo "guardian: disponible=${av}MB swap=${sw}MB -> procesos de tahoe-run terminados" >> ${TMPDIR:-/tmp}/tahoe-guard.log
   fi
-  for p in $(pgrep -x tahoe-run); do a=$(awk '/RssAnon/{print int($2/1024)}' /proc/$p/status 2>/dev/null); if [ "${a:-0}" -gt 700 ]; then echo "guardián: pid $p anon=${a}MB -> procesos de tahoe-run terminados" | tee -a ${TMPDIR:-/tmp}/tahoe-guard.log >&2; pkill -9 -x tahoe-run; pkill -9 unshare; fi; done
+  for p in $(pgrep -x tahoe-run); do a=$(awk '/RssAnon/{print int($2/1024)}' /proc/$p/status 2>/dev/null); if [ "${a:-0}" -gt 700 ]; then
+    # quién es en macOS: su pid allí (último campo de NSpid) y el programa (tahoe-run <caché> <dyld> <programa> ...)
+    ns=$(awk '/^NSpid/{print $NF}' /proc/$p/status 2>/dev/null); prog=$(tr '\0' '\n' < /proc/$p/cmdline 2>/dev/null | sed -n 4p)
+    echo "guardián: pid $p (macOS $ns, ${prog##*/}) anon=${a}MB -> procesos de tahoe-run terminados" | tee -a ${TMPDIR:-/tmp}/tahoe-guard.log >&2
+    pkill -9 -x tahoe-run; pkill -9 unshare; fi; done
   sleep 1
 done
