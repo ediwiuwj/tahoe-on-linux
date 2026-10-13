@@ -10,7 +10,8 @@
 #   tools/shell_survey.sh 'orden 1' 'orden 2' ...
 #
 # Usa tools/macos-shell.sh --launchd (arranca launchd y lo detiene al terminar). PLAZO: segundos por orden (6).
-# DEPURAR=1: arranque con --depurar (recoveryosd no reinicia la máquina si falla).
+# DEPURAR=1: arranque con --depurar (recoveryosd no reinicia la máquina si falla). LISTO: segundos máximos de espera a
+# que launchd responda antes de empezar (180).
 # ANTES: órdenes de macOS que se ejecutan antes de la lista, sin contarlas (p. ej. quitar un servicio que estorba:
 #   ANTES='launchctl bootout system/com.apple.WindowServer' tools/shell_survey.sh).
 TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -38,6 +39,12 @@ SCRIPT="t() { c=\"\$1\"; f=/tmp/.survey.\$\$; /bin/bash -c \"\$c\" > \$f 2>&1 < 
  l=\$(head -1 \$f | cut -c1-90); rm -f \$f
  if [ \$r = 0 ]; then e=OK; elif [ \$r = 999 ]; then e=COLGADA; elif [ \$r -gt 128 ]; then e=\"SEÑAL \$((r-128))\"; else e=\"ERR \$r\"; fi
  printf '%-9s %-40s %s\\n' \"\$e\" \"\$c\" \"\$( [ \$r = 0 ] || echo \"\$l\")\"; }
+"
+# Antes de la lista, esperar a que launchd haya terminado de arrancar (responde a launchctl): con solo TAHOE_BOOT_WAIT (10 s)
+# el inventario empezaba en mitad del arranque y, según lo que tardara (p. ej. si top cargaba la CPU), launchctl, defaults,
+# diskutil... fallaban con «141: Reentrancy avoided» sin que el emulador tuviera la culpa. LISTO: plazo máximo (180 s).
+SCRIPT+="w=0; while ! perl -e 'alarm 8; exec @ARGV' launchctl print system >/dev/null 2>&1 && [ \$w -lt ${LISTO:-180} ]; do sleep 3; w=\$((w+3)); done
+echo \"(launchd listo tras \$w s)\"
 "
 [ -n "$ANTES" ] && SCRIPT+="$ANTES >/dev/null 2>&1
 "
