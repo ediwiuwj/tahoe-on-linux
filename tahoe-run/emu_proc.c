@@ -162,6 +162,17 @@ static long bsd_getrlimit(struct ctx* c) {
 	if (((int)c->a[0] & 0xfff) == 8 && out[0] > 10240 && !(c->a[0] & 0x1000)) out[0] = 10240;   // sin la marca POSIX, macOS limita NOFILE
 	return safe_write(c->a[1], out, 16) == 16 ? 0 : -D_EFAULT;
 }
+// getrusage(who, struct rusage*): RUSAGE_SELF (0) y RUSAGE_CHILDREN (-1) valen lo mismo en Linux, y la struct rusage de
+// Darwin x86_64 ocupa y ordena igual que la de Linux (dos timeval de 16 bytes: en Darwin tv_usec es int32 con relleno y,
+// como es menor que 10^6, sus bytes coinciden; después 14 long). La usan los snmp* (net-snmp) al arrancar.
+static long bsd_getrusage(struct ctx* c) {
+	int who = (int)c->a[0];
+	if (who != 0 && who != -1) return -D_EINVAL;
+	struct rusage ru;
+	if (getrusage(who == 0 ? RUSAGE_SELF : RUSAGE_CHILDREN, &ru) != 0) return -darwin_errno(errno);
+	_Static_assert(sizeof ru == 144, "struct rusage de Linux x86_64");
+	return safe_write(c->a[1], &ru, sizeof ru) == (ssize_t)sizeof ru ? 0 : -D_EFAULT;
+}
 static long bsd_setrlimit(struct ctx* c) {
 	int r = linux_rlimit((int)c->a[0]);
 	uint64_t in[2];
@@ -1495,7 +1506,7 @@ void emu_proc_init(void) {
 	reg_bsd(31, bsd_getpeername); reg_bsd(59, bsd_execve);
 	reg_bsd(39, bsd_getppid); reg_bsd(81, bsd_getpgrp); reg_bsd(151, bsd_getpgid); reg_bsd(82, bsd_setpgid);
 	reg_bsd(310, bsd_getsid); reg_bsd(147, bsd_setsid); reg_bsd(60, bsd_umask);
-	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit); reg_bsd(184, bsd_sigreturn);
+	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit); reg_bsd(117, bsd_getrusage); reg_bsd(184, bsd_sigreturn);
 	reg_bsd(46, bsd_sigaction); reg_bsd(53, bsd_sigaltstack); reg_bsd(329, bsd_pthread_sigmask); reg_bsd(52, bsd_sigpending);
 	reg_bsd(37, bsd_kill); reg_bsd(328, bsd_pthread_kill);
 	reg_bsd(98, bsd_connect);
