@@ -630,7 +630,40 @@ static long bsd_kevent_id(struct ctx* c) {
 	return r;
 }
 
+// kqueue_workloop_ctl(cmd, options, addr, sz): libdispatch crea así los workloops con atributos propios (prioridad,
+// política, porcentaje de CPU); sin esta llamada usaba su camino de reserva («simulator fallback»: una cola raíz de
+// pthread), y WindowServer se caía en _dispatch_source_invoke dentro de un workloop. Como en XNU
+// (kqueue_workloop_ctl_internal): params empaquetado de 36 bytes {version = sz, flags, id, sched_pri, sched_pol,
+// cpu_percent, cpu_refillms, wi_port}; CREATE (1) exige flags válidos y que el workloop no exista (EEXIST); los
+// workloops con hilo propio o grupo de trabajo devuelven ENOTSUP (en XNU dependen de un boot-arg o del hardware, y
+// libdispatch reintenta sin ellos); DESTROY (2) exige que exista. Las prioridades no se aplican: aquí solo importa que
+// el workloop exista como cola del núcleo (kevent_id).
+static int kq_workloop_exists(uint64_t id) {
+	for (int i = 0; i < MAX_WORKLOOPS && workloops[i].kq; i++) if (workloops[i].id == id) return 1;
+	return 0;
+}
+static long bsd_kqueue_workloop_ctl(struct ctx* c) {
+	enum { CREATE = 1, DESTROY = 2, F_PRI = 0x1, F_POL = 0x2, F_CPU = 0x4, F_WI = 0x8, F_BOUND = 0x10 };
+	struct __attribute__((packed)) { int32_t version, flags; uint64_t id; int32_t pri, pol, cpu, refill; uint32_t wi_port; } pa = { 0 };
+	uint64_t sz = c->a[3];
+	if (sz < 4) return -D_EINVAL;
+	if (safe_read(c->a[2], &pa, sz < sizeof pa ? sz : sizeof pa) < 0) return -D_EFAULT;
+	if ((uint64_t)pa.version != sz) return -D_EINVAL;
+	if (c->a[0] == CREATE) {
+		if (!pa.flags) return -D_EINVAL;
+		if ((pa.flags & F_PRI) && (pa.pri < 1 || pa.pri > 63)) return -D_EINVAL;
+		if ((pa.flags & F_CPU) && (pa.cpu <= 0 || pa.cpu > 100 || pa.refill <= 0 || pa.refill > 0xffffff)) return -D_EINVAL;
+		if (pa.flags & (F_BOUND | F_WI)) return -45;              // ENOTSUP de Darwin
+		if (!(pa.flags & (F_PRI | F_POL | F_CPU))) return -D_EINVAL;
+		if (kq_workloop_exists(pa.id)) return -17;               // EEXIST
+		return kq_workloop_fd(pa.id) < 0 ? -D_ENOMEM : 0;
+	}
+	if (c->a[0] == DESTROY) return kq_workloop_exists(pa.id) ? 0 : -D_ENOENT;
+	return -D_EINVAL;
+}
+
 void emu_kqueue_init(void) {
+	reg_bsd(530, bsd_kqueue_workloop_ctl);
 	reg_bsd(375, bsd_kevent_id); reg_bsd(443, bsd_kqueue);   // guarded_kqueue_np(guard*, flags) = kqueue
 	reg_bsd(362, bsd_kqueue); reg_bsd(363, bsd_kevent); reg_bsd(369, bsd_kevent64); reg_bsd(374, bsd_kevent_qos);
 }
