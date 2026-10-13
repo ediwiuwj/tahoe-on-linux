@@ -221,6 +221,20 @@ static long bsd_sigaltstack(struct ctx* c) {
 	}
 	return 0;
 }
+// sigreturn(uctx, infostyle, token). Con uctx NULL es la forma con que siglongjmp/longjmp de libplatform avisan al núcleo
+// de que salen (UC_RESET_ALT_STACK) o entran (UC_SET_ALT_STACK) en la pila alternativa: como XNU (unix_signal.c), solo
+// se cambia SS_ONSTACK en ss_flags. La vuelta de un manejador de verdad no puede darse aún (no se construyen marcos de
+// señal): se anota y EINVAL.
+#define UC_SET_ALT_STACK 0x40000000u
+#define UC_RESET_ALT_STACK 0x80000000u
+static long bsd_sigreturn(struct ctx* c) {
+	uint32_t style = (uint32_t)c->a[1];
+	if (style == UC_SET_ALT_STACK) { alt_flags |= 1; return 0; }        // SS_ONSTACK
+	if (style == UC_RESET_ALT_STACK) { alt_flags &= ~1; return 0; }
+	static int dicho;
+	if (!dicho++) logf_("    sigreturn <%d>: vuelta de un marco de señal (uctx=0x%lx estilo=0x%x) sin implementar\n", (int)getpid(), c->a[0], style);
+	return -D_EINVAL;
+}
 static uint32_t pthread_mask;
 static long bsd_pthread_sigmask(struct ctx* c) {                             // (how, set*, oset*) por valor en Darwin: how, set, oset
 	uint32_t old = pthread_mask;
@@ -1481,7 +1495,7 @@ void emu_proc_init(void) {
 	reg_bsd(31, bsd_getpeername); reg_bsd(59, bsd_execve);
 	reg_bsd(39, bsd_getppid); reg_bsd(81, bsd_getpgrp); reg_bsd(151, bsd_getpgid); reg_bsd(82, bsd_setpgid);
 	reg_bsd(310, bsd_getsid); reg_bsd(147, bsd_setsid); reg_bsd(60, bsd_umask);
-	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit);
+	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit); reg_bsd(184, bsd_sigreturn);
 	reg_bsd(46, bsd_sigaction); reg_bsd(53, bsd_sigaltstack); reg_bsd(329, bsd_pthread_sigmask); reg_bsd(52, bsd_sigpending);
 	reg_bsd(37, bsd_kill); reg_bsd(328, bsd_pthread_kill);
 	reg_bsd(98, bsd_connect);
