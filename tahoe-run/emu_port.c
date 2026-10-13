@@ -1234,13 +1234,15 @@ int rmap_fault(uint64_t addr) {
 	return p != MAP_FAILED;
 }
 // Nombre (estable por tipo y pid) de un objeto del núcleo; se reutiliza si ya existe.
-// Con la tabla llena se reciclan los puertos de tareas e hilos que ya terminaron (el pid o tid ya no existe); los nombres no
-// se reutilizan nunca (next_name solo crece), así que un nombre viejo no puede acabar señalando a otro objeto.
+// Con la tabla llena se reciclan los puertos de tareas e hilos que ya terminaron (el pid o tid ya no existe) y los fileports
+// cuyo dueño terminó: el duplicado del descriptor vivía en ese proceso, así que fileport_makefd ya no podía dar nada (EINVAL,
+// igual que con el nombre reciclado). Sin esto, los fileports de procesos terminados llenaban la tabla en el macOS completo.
+// Los nombres no se reutilizan nunca (next_name solo crece), así que un nombre viejo no puede acabar señalando a otro objeto.
 static int kobj_reclaim_locked(void) {
 	int freed = 0;
 	for (int i = 0; i < MAXKOBJ; i++) {
 		struct skobj* k = &shm->kobjs[i];
-		if (!k->name || (k->type != KO_TASK && k->type != KO_TASK_NAME && k->type != KO_THREAD)) continue;
+		if (!k->name || (k->type != KO_TASK && k->type != KO_TASK_NAME && k->type != KO_THREAD && k->type != KO_FILEPORT)) continue;
 		char p[48]; snprintf(p, sizeof p, "/proc/%d", (int)k->pid);
 		if (access(p, F_OK) != 0) { k->name = 0; freed++; }
 	}
@@ -1283,7 +1285,10 @@ uint32_t kobj_make(int type, int32_t pid) {
 uint32_t kobj_new(int type, int32_t pid) {
 	lock();
 	uint32_t r = 0;
-	for (int i = 0; i < MAXKOBJ; i++) if (!shm->kobjs[i].name) { r = shm->next_name; shm->next_name += 0x100; shm->kobjs[i] = (struct skobj){ r, (uint16_t)type, pid }; break; }
+	for (int pass = 0; pass < 2 && !r; pass++) {
+		if (pass == 1 && !kobj_reclaim_locked()) break;                     // llena: reciclar los de procesos terminados
+		for (int i = 0; i < MAXKOBJ; i++) if (!shm->kobjs[i].name) { r = shm->next_name; shm->next_name += 0x100; shm->kobjs[i] = (struct skobj){ r, (uint16_t)type, pid }; break; }
+	}
 	if (!r) kobj_dump_locked();
 	unlock();
 	if (!r) logf_("    kobj: tabla llena\n");
