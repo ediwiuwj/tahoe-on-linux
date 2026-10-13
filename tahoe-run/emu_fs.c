@@ -743,7 +743,10 @@ static long bsd_getattrlist(struct ctx* c) {
 	// Atributos de volumen (con algunos comunes). Orden de sys/attr.h: longitud, returned_attrs (si se pidió), comunes y de
 	// volumen por orden de bit. Las cadenas van al final y se señalan con attrreference_t {desplazamiento desde la propia
 	// referencia, longitud con el NUL}. El volumen se presenta como el APFS de arranque montado en "/".
-	uint32_t known_c = ATTR_CMN_DEVID | ATTR_CMN_FSID | ATTR_CMN_FULLPATH | 0x80000000u /*RETURNED_ATTRS*/;
+	// comunes que se dan junto a los de volumen: CFURL los pide así (DEVID, OBJTYPE, OBJID, PAROBJID, SCRIPT, ACCESSMASK y
+	// FLAGS con la información del volumen) para resolver cada URL de archivo; sin ellos, ENOTSUP y AppKit no abría el nib de
+	// Language Chooser
+	uint32_t known_c = ATTR_CMN_DEVID | ATTR_CMN_FSID | 0x8 | 0x20 | 0x80 | 0x100 | 0x20000 | 0x40000 | ATTR_CMN_FULLPATH | 0x80000000u /*RETURNED_ATTRS*/;
 	uint32_t known_v = 0xF0FFFFFFu;                               // ATTR_VOL_VALIDMASK
 	if ((common & ~known_c) || (vol & ~known_v) || al[3] || al[4] || al[5]) {
 		logf_("    getattrlist(\"%s\"): atributos sin implementar common=0x%x vol=0x%x dir=0x%x file=0x%x fork=0x%x\n", p, common, vol, al[3], al[4], al[5]);
@@ -767,6 +770,16 @@ static long bsd_getattrlist(struct ctx* c) {
 	char gpath[4096] = "";
 	if (common & ATTR_CMN_DEVID) { uint32_t d = guest_dev(s.st_dev); PUT(&d, 4); }
 	if (common & ATTR_CMN_FSID) { uint32_t f2[2] = { guest_dev(s.st_dev), 0x18 }; PUT(f2, 8); }
+	if (common & 0x8) PUTU32(S_ISDIR(s.st_mode) ? 2 : S_ISLNK(s.st_mode) ? 5 : 1);   // OBJTYPE: VDIR / VLNK / VREG
+	if (common & 0x20) { PUTU32((uint32_t)s.st_ino); PUTU32(0); }                    // OBJID {fid_objno, fid_generation}
+	if (common & 0x80) {                                                             // PAROBJID
+		char par[4300]; struct stat ps;
+		snprintf(par, sizeof par, "%s/..", rpv);
+		PUTU32(stat(par, &ps) == 0 ? (uint32_t)ps.st_ino : 1); PUTU32(0);
+	}
+	if (common & 0x100) PUTU32(0);                                                   // SCRIPT: kTextEncodingMacRoman
+	if (common & 0x20000) PUTU32(s.st_mode & 07777);                                 // ACCESSMASK
+	if (common & 0x40000) PUTU32(tahoe_flags_path(rpv));                             // FLAGS
 	if (common & ATTR_CMN_FULLPATH) {                     // ruta absoluta tal como la ve macOS (sin la raíz del host)
 		char real[4096];
 		const char* rp = realpath(rpv, real) ? real : p;
