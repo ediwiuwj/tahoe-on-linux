@@ -552,7 +552,13 @@ static void* reaper_thread(void* arg) {
 		if (vuelta % 100 == 0) ocupacion();                   // cada 30 s: cuánto se usa cada tabla (fugas)
 		int np = 0;
 		lock();
-		for (int i = 0; i < MAXPORTS + MAXSO && np < 256; i++) {
+		// Se recoge hasta 256 pids distintos por vuelta, empezando donde se quedó la anterior: con más de 256 dueños en la
+		// tabla, los del final nunca se revisaban y sus puertos y derechos no se limpiaban al morir.
+		static int cursor;
+		int j0 = cursor;
+		for (int j = 0; j < MAXPORTS + MAXSO && np < 256; j++) {
+			int i = (j0 + j) % (MAXPORTS + MAXSO);
+			cursor = (i + 1) % (MAXPORTS + MAXSO);
 			int32_t pid = i < MAXPORTS ? (shm->ports[i].used ? shm->ports[i].owner : 0) : (shm->so[i - MAXPORTS].port ? shm->so[i - MAXPORTS].holder : 0);
 			if (pid <= 1) continue;                           // launchd (1) no muere sin llevarse todo
 			int seen = 0; for (int k = 0; k < np; k++) if (pids[k] == pid) { seen = 1; break; }
