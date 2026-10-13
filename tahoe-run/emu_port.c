@@ -848,11 +848,15 @@ void registered_ports_set(const uint32_t* p, int n) {
 	pthread_once(&reg_once, reg_init);
 	for (int i = 0; i < 3; i++) reg_local[i] = i < n ? p[i] : 0;
 	reg_known = 1;
-	if (getpid() == 1) { lock(); for (int i = 0; i < 3; i++) shm->special[i] = reg_local[i]; unlock(); }
+	if (getpid() == 1) { lock(); for (int i = 0; i < 3; i++) shm->special[i] = reg_local[i]; unlock(); logf_("    bootstrap: launchd registra 0x%x 0x%x 0x%x\n", reg_local[0], reg_local[1], reg_local[2]); }
 }
+// Un puerto registrado nulo no cuenta como heredado: la shell se une a launchd con nsenter y, si lo hace antes de que launchd
+// registre su bootstrap, toma ceros y los pasaba a todos sus hijos (TAHOE_REG=0,0,0), que se quedaban sin launchd todo el
+// arranque: launchctl, defaults, diskutil... fallaban con «141: Reentrancy avoided» en la mitad de los arranques. En XNU no
+// puede pasar (todo proceso desciende de launchd); aquí, si no hay uno propio, se mira el que registró launchd.
 static uint32_t registered_port(int i) {
 	pthread_once(&reg_once, reg_init);
-	if (reg_known) return reg_local[i];
+	if (reg_known && reg_local[i]) return reg_local[i];
 	lock(); uint32_t v = shm->special[i]; unlock(); return v;
 }
 // Entorno que hereda un hijo en exec/posix_spawn: sus puertos especiales (el bootstrap, sobre todo) y los registrados, como
@@ -862,14 +866,21 @@ int ports_inherit_env(char out[][40], int max) {
 	pthread_once(&reg_once, reg_init);
 	int k = 0;
 	for (int i = 0; i < 8 && k < max; i++) if (special[i]) snprintf(out[k++], 40, "TAHOE_SP%d=%u", i, special[i]);
-	if (reg_known && k < max) snprintf(out[k++], 40, "TAHOE_REG=%u,%u,%u", reg_local[0], reg_local[1], reg_local[2]);
+	if (reg_known && (reg_local[0] || reg_local[1] || reg_local[2]) && k < max)   // ceros no se heredan (ver registered_port)
+		snprintf(out[k++], 40, "TAHOE_REG=%u,%u,%u", reg_local[0], reg_local[1], reg_local[2]);
 	return k;
 }
 uint32_t special_port_get(int which) {
 	pthread_once(&sp_once, sp_init);
 	if (which < 0 || which >= 8) return 0;
-	if (which == 4 && !special[4]) return registered_port(0);
-	return special[which];
+	uint32_t r = (which == 4 && !special[4]) ? registered_port(0) : special[which];
+	if (which == 4 && getpid() != 1) {                             // diagnóstico: un proceso que se queda sin launchd
+		static int dicho;
+		if ((!r || !port_exists(r)) && !dicho++)
+			logf_("    bootstrap <%d>: %s 0x%x (propio=0x%x registrado=%s, launchd registró 0x%x)\n", (int)getpid(), r ? "puerto muerto" : "nulo", r,
+				special[4], reg_known ? "heredado" : "de la región", shm ? shm->special[0] : 0);
+	}
+	return r;
 }
 void special_port_set(int which, uint32_t name) { pthread_once(&sp_once, sp_init); if (which >= 0 && which < 8) special[which] = name; }
 
