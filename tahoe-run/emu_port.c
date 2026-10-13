@@ -58,7 +58,7 @@ struct skobj { uint32_t name; uint16_t type; int32_t pid; };
 // Mapeos hechos por otro proceso en esta tarea (mach_vm_map con la tarea de otro como destino): Linux no puede mapear en otro
 // proceso, así que se reserva un hueco en una zona común (RMAP_BASE) y el destino lo mapea él mismo al primer acceso.
 #define MAXRMAP 512
-#define MAXEXECW 256
+#define MAXEXECW 1024                  // launchd vigila cada servicio vivo (~190 en el macOS completo): 256 se quedaba corto
 struct sexecw { int32_t target, watcher; uint32_t port; };   // NOTE_EXEC: quién vigila los exec de qué proceso, y su puerto
 #define RMAP_BASE 0x500000000000ULL
 #define RMAP_SIZE 0x100000000ULL
