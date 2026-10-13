@@ -41,6 +41,8 @@ echo @@orden; cat /tmp/.discos.out
 echo @@recovery; tail -12 /var/log/recoveryos.log
 echo @@registro; cat /var/log/diskarbitrationd.log"
 LOG="${TAHOE_LOGFILE:-/tmp/tahoe-shell-$USER.log}"
+# como macos-shell.sh: si el registro pasa de TAHOE_LOG_MAX_MB se vacía ya (si lo vaciara él, «desde» quedaría fuera)
+if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt $(( ${TAHOE_LOG_MAX_MB:-300} * 1024 * 1024 )) ]; then : > "$LOG"; fi
 desde=$(( $( [ -f "$LOG" ] && wc -l < "$LOG" || echo 0) + 1 ))      # el registro es común: se toma solo lo de este arranque
 if [ -n "$MSGS" ]; then echo "$MSGS" > /dev/shm/tahoe-msg-trace; else rm -f /dev/shm/tahoe-msg-trace; fi
 if [ -n "$IOKS" ]; then echo "$IOKS" > /dev/shm/tahoe-iokit-trace; else rm -f /dev/shm/tahoe-iokit-trace; fi

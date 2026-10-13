@@ -12,6 +12,8 @@ D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
 PROG="${1:?indica el programa de macOS (p. ej. WindowServer)}"; T1="${2:-30}"; T2="${3:-60}"
 export TAHOE_ROOT="${TAHOE_ROOT:-$HOME/macos26/base/macOS Base System}"
 LOG="${TAHOE_LOGFILE:-/tmp/tahoe-shell-$USER.log}"
+# como macos-shell.sh: si el registro pasa de TAHOE_LOG_MAX_MB se vacía ya (si lo vaciara él, «desde» quedaría fuera)
+if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt $(( ${TAHOE_LOG_MAX_MB:-300} * 1024 * 1024 )) ]; then : > "$LOG"; fi
 desde=$(( $( [ -f "$LOG" ] && wc -l < "$LOG" || echo 0) + 1 ))
 if [ -n "$MSGS" ]; then echo "$MSGS" > /dev/shm/tahoe-msg-trace; else rm -f /dev/shm/tahoe-msg-trace; fi
 if [ -n "$IOKS" ]; then echo "$IOKS" > /dev/shm/tahoe-iokit-trace; else rm -f /dev/shm/tahoe-iokit-trace; fi

@@ -40,6 +40,9 @@ done
 if [ -z "$DYLD_CACHE" ]; then echo "no encuentro el sistema de macOS en: $ROOT (define TAHOE_ROOT)" >&2; exit 1; fi
 CACHE="${TAHOE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tahoe-run}"   # el slide de la caché de dyld se calcula una vez
 LOG="${TAHOE_LOGFILE:-/tmp/tahoe-shell-$USER.log}"
+# El registro crece con cada arranque (las herramientas toman de él solo el último) y /tmp suele ser tmpfs, es decir, RAM:
+# pasado TAHOE_LOG_MAX_MB (300) se vacía antes de arrancar. Lleno, /tmp daba «Disk quota exceeded» y no arrancaba nada.
+if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt $(( ${TAHOE_LOG_MAX_MB:-300} * 1024 * 1024 )) ]; then : > "$LOG"; fi
 
 WITH_LAUNCHD= DEBUG_ENV=()
 while [ "$1" = --launchd ] || [ "$1" = --depurar ] || [ "$1" = --pantalla ]; do
