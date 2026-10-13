@@ -122,8 +122,16 @@ static long bsd_getgroups(struct ctx* c) {
 	return r;
 }
 static long bsd_ok(struct ctx* c) { (void)c; return 0; }                // setgroups/setuid/setgid...: ya somos el usuario efectivo
-// select(nfds, readfds, writefds, exceptfds, timeval*)
-static long bsd_select(struct ctx* c) {
+// select(nfds, readfds, writefds, exceptfds, timeval*) y pselect(..., timespec*, sigmask*): el fd_set de Darwin es el mismo
+// mapa de bits (int32 por palabra) que el de Linux. pselect se diferencia en el plazo (timespec) y en la máscara de señales
+// durante la espera, que aquí se lee y se ignora: tahoe-run aún no entrega señales al invitado (ver bsd_pthread_sigmask).
+static long do_select(struct ctx* c, int ts);
+static long bsd_select(struct ctx* c) { return do_select(c, 0); }
+static long bsd_pselect(struct ctx* c) {
+	if (c->a[5]) { uint32_t m; if (safe_read(c->a[5], &m, 4) != 4) return -D_EFAULT; }
+	return do_select(c, 1);
+}
+static long do_select(struct ctx* c, int ts) {
 	int n = (int)c->a[0];
 	if (n < 0 || n > 1024) return -D_EINVAL;
 	size_t bytes = ((size_t)n + 7) / 8;
@@ -138,9 +146,10 @@ static long bsd_select(struct ctx* c) {
 	if (c->a[4]) {
 		uint8_t t[16];
 		if (safe_read(c->a[4], t, 16) != 16) return -D_EFAULT;
-		int64_t s; int32_t us;
-		memcpy(&s, t, 8); memcpy(&us, t + 8, 4);
-		tv.tv_sec = s; tv.tv_usec = us; tp = &tv;
+		int64_t s; int32_t us; int64_t ns;
+		memcpy(&s, t, 8); memcpy(&us, t + 8, 4); memcpy(&ns, t + 8, 8);
+		tv.tv_sec = s; tv.tv_usec = ts ? (suseconds_t)(ns / 1000) : us; tp = &tv;   // timespec: {i64 s, i64 ns}
+		if (ts && ns % 1000 && tv.tv_usec < 999999) tv.tv_usec++;                  // no esperar menos de lo pedido
 	}
 	int r = select(n, have[0] ? &sets[0] : NULL, have[1] ? &sets[1] : NULL, have[2] ? &sets[2] : NULL, tp);
 	if (r < 0) return err();
@@ -276,6 +285,6 @@ void emu_fs2_init(void) {
 	reg_bsd(128, bsd_rename); reg_bsd(9, bsd_link); reg_bsd(57, bsd_symlink);
 	reg_bsd(124, bsd_fchmod); reg_bsd(123, bsd_fchown); reg_bsd(201, bsd_ftruncate); reg_bsd(95, bsd_fsync);
 	reg_bsd(131, bsd_flock); reg_bsd(89, bsd_getdtablesize); reg_bsd(120, bsd_readv); reg_bsd(121, bsd_writev);
-	reg_bsd(138, bsd_utimes); reg_bsd(286, bsd_gettid); reg_bsd(79, bsd_getgroups); reg_bsd(93, bsd_select);
+	reg_bsd(138, bsd_utimes); reg_bsd(286, bsd_gettid); reg_bsd(79, bsd_getgroups); reg_bsd(93, bsd_select); reg_bsd(394, bsd_pselect);
 	reg_bsd(80, bsd_ok); reg_bsd(23, bsd_ok); reg_bsd(181, bsd_ok); reg_bsd(182, bsd_ok); reg_bsd(183, bsd_ok);
 }

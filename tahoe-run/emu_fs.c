@@ -179,6 +179,25 @@ static long bsd_access(struct ctx* c) {
 	int raw; if (emu_disk_node(p, &raw) >= 0) return ((int)c->a[1] & 1) ? -13 /* EACCES */ : 0;   // discos emulados: rw para root, no x
 	RET(access(resolve(p, b, sizeof b), (int)c->a[1] & 7));          // R_OK/W_OK/X_OK/F_OK coinciden
 }
+// faccessat(dirfd, ruta, modo, flags): como access, con dirfd (AT_FDCWD de Darwin = -2) para rutas relativas. Flags de
+// Darwin: AT_EACCESS 0x10, AT_SYMLINK_NOFOLLOW 0x20 (y _ANY 0x800); en Linux AT_EACCESS 0x200 y AT_SYMLINK_NOFOLLOW 0x100,
+// que solo admite faccessat2. Lo usan su (PAM) y lwp-request.
+#ifndef SYS_faccessat2
+#define SYS_faccessat2 439
+#endif
+static long bsd_faccessat(struct ctx* c) {
+	char p[4096], b[4200];
+	if (safe_string(c->a[1], p, sizeof p) != 0) return -D_EFAULT;
+	int raw; if (emu_disk_node(p, &raw) >= 0) return ((int)c->a[2] & 1) ? -13 /* EACCES */ : 0;
+	int dir = (int)c->a[0], f = (int)c->a[3], lf = 0, mode = (int)c->a[2] & 7;
+	if (f & 0x10) lf |= AT_EACCESS;
+	if (f & (0x20 | 0x800)) lf |= AT_SYMLINK_NOFOLLOW;
+	const char* hp = (p[0] == '/' || dir == -2) ? resolve(p, b, sizeof b) : p;
+	int hd = (p[0] == '/' || dir == -2) ? AT_FDCWD : dir;
+	long r = syscall(SYS_faccessat2, hd, hp, mode, lf);
+	if (r < 0 && errno == ENOSYS) r = faccessat(hd, hp, mode, lf & AT_EACCESS);
+	return r < 0 ? err() : 0;
+}
 // Destino de un enlace tal como lo ve macOS: los absolutos se guardan dentro de la raíz (el kernel de Linux los sigue), así
 // que se les quita ese prefijo. Devuelve los bytes que caben en cap (readlink no termina en NUL).
 static ssize_t guest_link_target(const char* host, char* out, size_t cap) {
@@ -1370,7 +1389,7 @@ void emu_fs_xattr_init(void) {
 void emu_fs_init(void) {
 	reg_bsd(73, bsd_munmap);   reg_bsd(74, bsd_mprotect); reg_bsd(75, bsd_madvise); reg_bsd(197, bsd_mmap);
 	reg_bsd(199, bsd_lseek);   reg_bsd(153, bsd_pread);   reg_bsd(154, bsd_pwrite);
-	reg_bsd(33, bsd_access);   reg_bsd(58, bsd_readlink); reg_bsd(473, bsd_readlinkat); reg_bsd(92, bsd_fcntl);
+	reg_bsd(33, bsd_access); reg_bsd(466, bsd_faccessat);   reg_bsd(58, bsd_readlink); reg_bsd(473, bsd_readlinkat); reg_bsd(92, bsd_fcntl);
 	reg_bsd(338, bsd_stat64);  reg_bsd(339, bsd_fstat64); reg_bsd(340, bsd_lstat64);
 	reg_bsd(24, bsd_getuid);   reg_bsd(25, bsd_geteuid);  reg_bsd(47, bsd_getgid); reg_bsd(43, bsd_getegid);
 	reg_bsd(381, bsd_mac_syscall);
