@@ -241,6 +241,10 @@ static long bsd_kill(struct ctx* c) {
 	int ls = darwin_to_linux_sig(s);
 	if (ls <= 0) return -D_EINVAL;
 	long r = syscall(SYS_kill, (int)c->a[0], ls);
+	// Señales que terminan a otro proceso: al registro (si no, el proceso desaparece sin dejar rastro: SIGKILL no se
+	// puede interceptar en el destino).
+	if ((int)c->a[0] != getpid() && (s == 9 || s == 15 || s == 6 || s == 3 || s == 2 || s == 1))
+		logf_("    kill: <%d> envía la señal %d a %d%s\n", (int)getpid(), s, (int)c->a[0], r < 0 ? " (falló)" : "");
 	return r < 0 ? -darwin_errno(errno) : 0;
 }
 // Diagnóstico dirigido: 1 si este proceso es uno de los indicados en /dev/shm/tahoe-stacks (nombres separados por espacios;
@@ -558,6 +562,7 @@ static long bsd_wait4(struct ctx* c) {
 	int st = 0;
 	long r = syscall(SYS_wait4, (int)c->a[0], &st, (int)c->a[2], NULL);
 	if (r < 0) return -darwin_errno(errno);
+	if (r > 0 && WIFSIGNALED(st)) logf_("    fin <%ld> por la señal %d de Linux (lo recoge %d)\n", r, WTERMSIG(st), (int)getpid());
 	if (c->a[1] && r > 0) { int ds = darwin_wait_status(st); if (safe_write(c->a[1], &ds, 4) != 4) return -D_EFAULT; }
 	return r;
 }
