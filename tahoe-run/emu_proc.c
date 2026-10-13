@@ -226,6 +226,11 @@ static long bsd_sigaction(struct ctx* c) {
 		memcpy(&sigtab[s].tramp, nw + 8, 8);
 		memcpy(&sigtab[s].mask, nw + 16, 4);
 		memcpy(&sigtab[s].flags, nw + 20, 4);
+		// Señales de control de la terminal (SIGTSTP 18, SIGTTIN 21, SIGTTOU 22): SIG_IGN / SIG_DFL también en Linux. Un bash
+		// interactivo ignora SIGTTOU antes de ponerse en primer plano (tcsetpgrp); si Linux no lo sabía, lo detenía (estado T)
+		// y la shell de tools/macos-shell.sh se quedaba congelada sin prompt. Con un manejador propio se deja la acción
+		// por omisión: aún no se entregan señales al invitado.
+		if ((s == 18 || s == 21 || s == 22) && sigtab[s].handler <= 1) signal(darwin_to_linux_sig(s), sigtab[s].handler == 1 ? SIG_IGN : SIG_DFL);
 	}
 	return 0;
 }
