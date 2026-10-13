@@ -507,7 +507,13 @@ typedef emu_fn bsd_fn;
 // BSD: devuelven >= 0 o -errno_de_Darwin
 extern void ports_cleanup(void);
 // Cada salida queda en el registro (una línea): sin ella, un servicio que termina por su cuenta desaparece sin rastro.
-static long bsd_exit(struct ctx* c)  { logf_("    fin <%d> [%s] exit(%d)\n", getpid(), prog_name, (int)c->a[0]); ports_cleanup(); _exit((int)c->a[0]); }
+static void show_frames(struct ctx* c);
+// exit: con error y en un proceso de STACKS, también los marcos de quien sale (para saber por qué).
+static long bsd_exit(struct ctx* c)  {
+	logf_("    fin <%d> [%s] exit(%d)\n", getpid(), prog_name, (int)c->a[0]);
+	if ((int)c->a[0] != 0 && diag_target()) show_frames(c);
+	ports_cleanup(); _exit((int)c->a[0]);
+}
 static long bsd_getpid(struct ctx* c) { (void)c; return getpid(); }
 static long bsd_issetugid(struct ctx* c) { (void)c; return 0; }
 static long bsd_write(struct ctx* c) {
