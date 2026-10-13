@@ -213,6 +213,31 @@ static int make_wake_socket(uint32_t name, int32_t rpid) {
 	return s;
 }
 
+// Diagnóstico: qué clase de puertos recibe un proceso. «solo muertos»: todos sus usuarios anotados (derechos de envío) son
+// procesos que ya no existen, así que el aviso no-senders se debió dar y no se dio. «con mensajes»: tienen cola sin leer.
+static void puertos_de(int32_t pid) {
+	int n = 0, ns = 0, held = 0, sets = 0, queued = 0, pd = 0, insets = 0, solo_muertos = 0, ns_sin = 0, msgs = 0, sin_ns_ni_usuarios = 0;
+	char ejemplos[120] = "";
+	uint32_t recientes[6] = { 0 };
+	lock();
+	for (int i = 0; i < MAXPORTS; i++) {
+		struct sport* q = &shm->ports[i];
+		if (!q->used || q->rpid != pid) continue;
+		n++;
+		ns += q->nsreq != 0; sets += q->is_set; queued += q->count > 0; msgs += (int)q->count; pd += q->pdreq != 0; insets += q->set != 0;
+		int h = 0, vivos = 0;
+		for (int j = 0; j < MAXSH; j++) if (shm->sh[j].port == q->name) { h++; if (kill(shm->sh[j].holder, 0) == 0 || errno != ESRCH) vivos++; }
+		held += h > 0; solo_muertos += h > 0 && !vivos; ns_sin += q->nsreq && !h;
+		if (!q->nsreq && !h && !q->is_set) {                        // ejemplos: los 6 de nombre más alto (los más recientes)
+			sin_ns_ni_usuarios++;
+			for (int k = 0; k < 6; k++) if (q->name > recientes[k]) { memmove(recientes + k + 1, recientes + k, (5 - k) * sizeof *recientes); recientes[k] = q->name; break; }
+		}
+	}
+	unlock();
+	for (int k = 0; k < 6 && recientes[k]; k++) { char e[16]; snprintf(e, sizeof e, " 0x%x", recientes[k]); strncat(ejemplos, e, sizeof ejemplos - strlen(ejemplos) - 1); }
+	logf_("    puertos de %d (%d): no-senders pedido=%d (sin usuarios anotados %d) con usuarios anotados=%d (solo muertos %d) sin aviso ni usuarios=%d conjuntos=%d en conjunto=%d con mensajes=%d (%d mensajes) port-destroyed=%d; sin aviso ni usuarios:%s\n",
+		(int)pid, n, ns, ns_sin, held, solo_muertos, sin_ns_ni_usuarios, sets, insets, queued, msgs, pd, ejemplos);
+}
 uint32_t port_create(int is_set) {
 	uint32_t name = alloc_port();
 	lock();
@@ -223,28 +248,25 @@ uint32_t port_create(int is_set) {
 		static int dumped;
 		if (!dumped) {
 			dumped = 1;
-			int pid[64] = { 0 }, cnt[64] = { 0 }, np = 0;
+			static int pid[1024], cnt[1024]; int np = 0; memset(cnt, 0, sizeof cnt);
 			for (int i = 0; i < MAXPORTS; i++) {
 				int r = shm->ports[i].rpid, k;
 				for (k = 0; k < np && pid[k] != r; k++) {}
-				if (k == np && np < 64) { pid[np] = r; np++; }
-				if (k < 64) cnt[k]++;
+				if (k == np && np < 1024) { pid[np] = r; np++; }
+				if (k < 1024) cnt[k]++;
 			}
 			unlock();
 			logf_("    puertos: tabla llena; por dueño:");
-			for (int k = 0; k < np; k++) if (cnt[k] >= 20) logf_(" %d:%d%s", pid[k], cnt[k], kill(pid[k], 0) == 0 ? "" : "(muerto)");
-			logf_("\n");
-			int top = 0; for (int k = 1; k < np; k++) if (cnt[k] > cnt[top]) top = k;
-			int ns = 0, held = 0, sets = 0, queued = 0, pd = 0, insets = 0;
-			lock();
-			for (int i = 0; i < MAXPORTS; i++) {
-				struct sport* q = &shm->ports[i];
-				if (!q->used || q->rpid != pid[top]) continue;
-				ns += q->nsreq != 0; sets += q->is_set; queued += q->count > 0; pd += q->pdreq != 0; insets += q->set != 0;
-				for (int j = 0; j < MAXSH; j++) if (shm->sh[j].port == q->name) { held++; break; }
+			int resto = 0, nresto = 0;
+			for (int k = 0; k < np; k++) if (cnt[k] >= 20) logf_(" %d:%d%s", pid[k], cnt[k], kill(pid[k], 0) == 0 ? "" : "(muerto)"); else { resto += cnt[k]; nresto++; }
+			logf_(" | otros %d dueños con %d\n", nresto, resto);
+			// Los 5 dueños con más puertos: qué clase de puertos son (puertos_de).
+			for (int r5 = 0; r5 < 5 && r5 < np; r5++) {
+				int top = -1; for (int k = 0; k < np; k++) if (cnt[k] > 0 && (top < 0 || cnt[k] > cnt[top])) top = k;
+				if (top < 0) break;
+				puertos_de(pid[top]);
+				cnt[top] = -cnt[top];
 			}
-			unlock();
-			logf_("    puertos de %d: no-senders pedido=%d con usuarios anotados=%d conjuntos=%d en conjunto=%d con mensajes=%d port-destroyed=%d\n", pid[top], ns, held, sets, insets, queued, pd);
 		} else unlock();
 		logf_("    puertos: tabla llena\n");
 		return 0;
@@ -254,7 +276,8 @@ uint32_t port_create(int is_set) {
 	bucket_add_locked(p);
 	local_sock[port_index(p)] = make_wake_socket(name, p->rpid);
 	unlock();
-	if (trace_all || mach_trace()) logf_("    puerto 0x%x creado por pid %d.%ld (conjunto=%d)\n", name, (int)getpid(), (long)syscall(SYS_gettid), is_set);
+	if (trace_all || mach_trace() || msg_trace())
+		logf_("    puerto 0x%x creado por pid %d.%ld (conjunto=%d) desde %p\n", name, (int)getpid(), (long)syscall(SYS_gettid), is_set, __builtin_return_address(0));
 	return name;
 }
 
@@ -304,6 +327,7 @@ static void note_locked(uint32_t dest, int id, uint32_t arg) {
 	else logf_("    notificaciones: cola llena, se pierde %d para 0x%x\n", id, dest);
 }
 static int port_send_k(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel);
+static void destroy_locked(struct sport* p);
 static void flush_notes(void) {
 	while (nnotes > 0) {
 		struct note n = notes[--nnotes];
@@ -355,7 +379,6 @@ static int so_take_locked(uint32_t port, int32_t holder) {
 //  RIGHTS_RECV: el receptor pasa a tener los send-once;
 //  RIGHTS_DESTROY: el mensaje se descarta sin entregarse: cada send-once genera MACH_NOTIFY_SEND_ONCE.
 enum { RIGHTS_SEND, RIGHTS_RECV, RIGHTS_DESTROY };
-static void destroy_locked(struct sport* p);
 static void msg_rights_locked(const uint8_t* m, uint32_t size, int mode, uint32_t dest) {
 	if (size < 24) return;
 	uint32_t bits, remote, local; memcpy(&bits, m, 4); memcpy(&remote, m + 8, 4); memcpy(&local, m + 12, 4);
@@ -467,11 +490,57 @@ static int proc_alive_unlocked(int32_t pid, uint64_t want) {
 	uint64_t st = proc_start(pid);
 	return st && (!want || st == want);
 }
+// Ocupación de las tablas compartidas, para ver fugas: puertos (y de cuántos dueños; «dueño muerto» = su proceso ya no
+// existe), derechos de envío anotados (sh) y cuántos son de procesos muertos, objetos del núcleo, vigilancias NOTE_EXEC (y
+// cuántas de procesos vigilados que ya terminaron), avisos dead-name y respuestas send-once pendientes.
+static int muerto(int32_t pid) { return pid > 0 && kill(pid, 0) != 0 && errno == ESRCH; }
+static void ocupacion(void) {
+	int np = 0, npm = 0, nsh = 0, nshm = 0, nk = 0, nkm = 0, nx = 0, nxm = 0, ndn = 0, ndnm = 0, nso = 0, nsom = 0;
+	lock();
+	for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used) { np++; npm += muerto(shm->ports[i].owner); }
+	for (int i = 0; i < MAXSH; i++) if (shm->sh[i].port) { nsh++; nshm += muerto(shm->sh[i].holder); }
+	for (int i = 0; i < MAXKOBJ; i++) if (shm->kobjs[i].name) { nk++; nkm += muerto(shm->kobjs[i].pid); }
+	for (int i = 0; i < MAXEXECW; i++) if (shm->execw[i].port) { nx++; nxm += muerto(shm->execw[i].target); }
+	for (int i = 0; i < MAXDN; i++) if (shm->dn[i].port) { ndn++; ndnm += muerto(shm->dn[i].pid); }
+	for (int i = 0; i < MAXSO; i++) if (shm->so[i].port) { nso++; nsom += muerto(shm->so[i].holder); }
+	// los 6 procesos que más puertos reciben y los 6 que más derechos de envío anotados tienen
+	static int32_t pp[1024], ph[1024]; static int cp[1024], ch[1024]; int npp = 0, nph = 0;
+	for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used) {
+		int k; for (k = 0; k < npp && pp[k] != shm->ports[i].rpid; k++) {}
+		if (k == npp) { if (npp == 1024) continue; pp[npp] = shm->ports[i].rpid; cp[npp++] = 0; }
+		cp[k]++;
+	}
+	for (int i = 0; i < MAXSH; i++) if (shm->sh[i].port) {
+		int k; for (k = 0; k < nph && ph[k] != shm->sh[i].holder; k++) {}
+		if (k == nph) { if (nph == 1024) continue; ph[nph] = shm->sh[i].holder; ch[nph++] = 0; }
+		ch[k]++;
+	}
+	unlock();
+	char top[400]; size_t tl = 0;
+	for (int r = 0; r < 12; r++) {
+		int32_t* pv = r < 6 ? pp : ph; int* cv = r < 6 ? cp : ch; int n = r < 6 ? npp : nph;
+		int b = -1; for (int k = 0; k < n; k++) if (cv[k] > 0 && (b < 0 || cv[k] > cv[b])) b = k;
+		if (r == 6) tl += (size_t)snprintf(top + tl, sizeof top - tl, " | envío:");
+		if (b < 0 || tl >= sizeof top - 20) continue;
+		tl += (size_t)snprintf(top + tl, sizeof top - tl, " %d:%d", (int)pv[b], cv[b]);
+		cv[b] = -cv[b];
+	}
+	logf_("    ocupación, más puertos:%s\n", top);
+	for (int r = 0, hechos = 0; np > MAXPORTS * 3 / 4 && r < npp && hechos < 6; r++) {   // casi llena: detalle de los 6 primeros
+		int b = -1; for (int k = 0; k < npp; k++) if (cp[k] < 0 && (b < 0 || cp[k] < cp[b])) b = k;
+		if (b < 0) break;
+		cp[b] = 0;
+		puertos_de(pp[b]); hechos++;
+	}
+	logf_("    ocupación (usados/de muertos): puertos %d/%d de %d, envío %d/%d de %d, kobj %d/%d de %d, NOTE_EXEC %d/%d de %d, dead-name %d/%d de %d, send-once %d/%d de %d\n",
+		np, npm, MAXPORTS, nsh, nshm, MAXSH, nk, nkm, MAXKOBJ, nx, nxm, MAXEXECW, ndn, ndnm, MAXDN, nso, nsom, MAXSO);
+}
 static void* reaper_thread(void* arg) {
 	(void)arg;
 	int32_t pids[256]; uint64_t starts[256];
-	for (;;) {
+	for (unsigned vuelta = 1;; vuelta++) {
 		struct timespec ts = { 0, 300 * 1000000L }; nanosleep(&ts, NULL);
+		if (vuelta % 100 == 0) ocupacion();                   // cada 30 s: cuánto se usa cada tabla (fugas)
 		int np = 0;
 		lock();
 		for (int i = 0; i < MAXPORTS + MAXSO && np < 256; i++) {
@@ -910,12 +979,22 @@ int port_list_owned(uint32_t* names, uint32_t* types, int max) {
 }
 int port_rpid(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p ? p->rpid : -1; unlock(); return r; }
 static int owns(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p && p->owner == (int32_t)getpid(); unlock(); return r; }
+// Diagnóstico: una destrucción que se ignora porque el puerto consta de otro dueño (las primeras 20 por proceso).
+static void no_es_mio(const char* que, uint32_t name) {
+	static int n;
+	if (n >= 20) return;
+	lock(); struct sport* p = find_locked(name); int32_t o = p ? p->owner : -1, r = p ? p->rpid : -1; unlock();
+	if (o == (int32_t)getpid()) return;
+	n++;
+	logf_("    %s 0x%x ignorado: <%d> no es su dueño (dueño %d, recibe %d%s)\n", que, name, (int)getpid(), (int)o, (int)r, p ? "" : ", no existe");
+}
 void port_move_receive(uint32_t name) { lock(); struct sport* p = find_locked(name); if (p) { p->owner = (int32_t)getpid(); p->rpid = (int32_t)getpid(); } unlock(); }
 static long t_ret0(struct ctx* c) { (void)c; return KERN_OK; }   // extract_member: sin efecto
 extern void diag_crash(ucontext_t* uc);
 static long t_destruct(struct ctx* c) {
 	if (diag_target()) { logf_("    destruct 0x%x (hilo %ld):\n", (uint32_t)c->a[1], (long)syscall(SYS_gettid)); diag_stack(c->uc, "traza"); }
 	if (owns((uint32_t)c->a[1])) destroy((uint32_t)c->a[1]);
+	else no_es_mio("destruct", (uint32_t)c->a[1]);
 	return KERN_OK;
 }
 // mach_port_mod_refs_trap(task, name, right, delta): quitar la última referencia de recepción destruye el puerto
@@ -934,7 +1013,8 @@ static long t_deallocate(struct ctx* c) { port_release_send_once((uint32_t)c->a[
 static long t_mod_refs(struct ctx* c) {
 	int32_t delta = (int32_t)c->a[3];
 	if (c->a[2] == 2 /* SEND_ONCE */ && delta < 0) port_release_send_once((uint32_t)c->a[1]);
-	if (c->a[2] == 1 /* RECEIVE */ && delta < 0 && owns((uint32_t)c->a[1])) {
+	if (c->a[2] == 1 /* RECEIVE */ && delta < 0 && !owns((uint32_t)c->a[1])) no_es_mio("mod_refs RECEIVE", (uint32_t)c->a[1]);
+	else if (c->a[2] == 1 /* RECEIVE */ && delta < 0) {
 		if (diag_target()) { logf_("    mod_refs RECEIVE -1 0x%x (hilo %ld):\n", (uint32_t)c->a[1], (long)syscall(SYS_gettid)); diag_stack(c->uc, "traza"); }
 		destroy((uint32_t)c->a[1]);
 	}
@@ -1157,6 +1237,23 @@ static int kobj_reclaim_locked(void) {
 	}
 	return freed;
 }
+// Diagnóstico (una vez por proceso) de la tabla llena: cuántos objetos hay de cada tipo y cuántos son de procesos que ya no existen.
+static void kobj_dump_locked(void) {
+	static int dumped;
+	if (dumped) return;
+	dumped = 1;
+	int n[8] = { 0 }, muertos[8] = { 0 };
+	for (int i = 0; i < MAXKOBJ; i++) {
+		struct skobj* k = &shm->kobjs[i];
+		if (!k->name) continue;
+		int t = k->type < 8 ? k->type : 0;
+		n[t]++;
+		if (kill(k->pid, 0) != 0 && errno == ESRCH) muertos[t]++;
+	}
+	logf_("    kobj: tabla llena; por tipo (total/de procesos muertos):");
+	for (int t = 0; t < 8; t++) if (n[t]) logf_(" %d:%d/%d", t, n[t], muertos[t]);
+	logf_("\n");
+}
 uint32_t kobj_make(int type, int32_t pid) {
 	lock();
 	uint32_t r = 0;
@@ -1168,7 +1265,7 @@ uint32_t kobj_make(int type, int32_t pid) {
 			if (pass == 1 && !kobj_reclaim_locked()) break;
 			for (int i = 0; i < MAXKOBJ; i++) if (!shm->kobjs[i].name) { shm->kobjs[i] = (struct skobj){ r, (uint16_t)type, pid }; put = 1; break; }
 		}
-		if (!put) logf_("    kobj: tabla llena\n");
+		if (!put) { logf_("    kobj: tabla llena\n"); kobj_dump_locked(); }
 	}
 	unlock();
 	return r;
@@ -1178,6 +1275,7 @@ uint32_t kobj_new(int type, int32_t pid) {
 	lock();
 	uint32_t r = 0;
 	for (int i = 0; i < MAXKOBJ; i++) if (!shm->kobjs[i].name) { r = shm->next_name; shm->next_name += 0x100; shm->kobjs[i] = (struct skobj){ r, (uint16_t)type, pid }; break; }
+	if (!r) kobj_dump_locked();
 	unlock();
 	if (!r) logf_("    kobj: tabla llena\n");
 	return r;
@@ -1209,7 +1307,29 @@ uint32_t execwatch_add(int32_t target) {
 		if (kill(shm->execw[i].watcher, 0) != 0 && errno == ESRCH) slot = i;
 	if (slot >= 0) shm->execw[slot] = (struct sexecw){ target, (int32_t)getpid(), port };
 	unlock();
-	if (slot < 0) { logf_("    NOTE_EXEC: tabla llena\n"); return port; }  // el knote sigue valiendo para la salida
+	if (slot < 0) {                                                               // el knote sigue valiendo para la salida
+		logf_("    NOTE_EXEC: tabla llena\n");
+		static int dumped;
+		if (!dumped) {                                                            // diagnóstico: quién vigila y si el vigilado vive
+			dumped = 1;
+			int w[16] = { 0 }, cnt[16] = { 0 }, vivos[16] = { 0 }, nw = 0;
+			lock();
+			for (int i = 0; i < MAXEXECW; i++) {
+				if (!shm->execw[i].port) continue;
+				int k; for (k = 0; k < nw && w[k] != shm->execw[i].watcher; k++) {}
+				if (k == nw && nw < 16) w[nw++] = shm->execw[i].watcher;
+				if (k == 16) continue;
+				cnt[k]++;
+				int32_t t = shm->execw[i].target;
+				if (t < 0 || kill(t, 0) == 0 || errno != ESRCH) vivos[k]++;
+			}
+			unlock();
+			logf_("    NOTE_EXEC: por vigilante (entradas/vigilados vivos):");
+			for (int k = 0; k < nw; k++) logf_(" %d:%d/%d", w[k], cnt[k], vivos[k]);
+			logf_("\n");
+		}
+		return port;
+	}
 	return port;
 }
 void execwatch_del(uint32_t port) {
@@ -1294,7 +1414,13 @@ int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_
 		else { *previous = p->pdreq; p->pdreq = notify; }
 	} else if (variant == 70) {                                // NO_SENDERS: sobre un derecho de recepción; sync = make-send count
 		if (!p) r = KERN_INVALID_RIGHT_;
-		else { *previous = p->nsreq; p->nsreq = notify; p->nsmscount = sync; }
+		else {
+			*previous = p->nsreq; p->nsreq = notify; p->nsmscount = sync;
+			if (msg_trace()) {
+				int h = 0; for (int j = 0; j < MAXSH; j++) h += shm->sh[j].port == name;
+				logf_("    no-senders <%d>: pedido para 0x%x sync=%u aviso=0x%x usuarios anotados=%d dueño=%d\n", (int)getpid(), name, sync, notify, h, (int)p->owner);
+			}
+		}
 	} else if (variant == 66) {
 		int ko = name == 0x103;                                   // objetos del núcleo (tarea, hilo, IOKit...): fuera de la
 		for (int i = 0; i < MAXKOBJ && !ko; i++) ko = shm->kobjs[i].name == name;   // tabla de puertos pero vivos, y su cola nunca se llena
