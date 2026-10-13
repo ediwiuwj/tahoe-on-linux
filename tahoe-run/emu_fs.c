@@ -1024,6 +1024,10 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 	if (common & A_CMN_ADDEDTIME) { PTS(s->st_ctim); rc |= A_CMN_ADDEDTIME; }
 	if (common & 0x20000000u) { P32(0); rc |= 0x20000000u; }                              // ATTR_CMN_ERROR: sin error
 	if (common & A_CMN_DPFLAGS) { P32(0); rc |= A_CMN_DPFLAGS; }
+	// Como XNU (vfs_attr_pack): los atributos de directorio solo se empaquetan para directorios y los de archivo solo para
+	// lo demás; sin FSOPT_PACK_INVAL_ATTRS los que no valen no ocupan sitio. Antes un archivo llevaba también los 8 bytes de
+	// DIR_LINKCOUNT|MOUNTSTATUS y quien leía DATALENGTH tomaba 0x100000000: universalaccessd pedía 4 GiB para Defaults.plist.
+	if (!pack_inval) { if (isdir) file = 0; else dir = 0; }
 	// directorio: solo valen para directorios
 	if (dir) {
 		if (dir & A_DIR_LINKCOUNT) { P32(isdir ? s->st_nlink : 0); if (isdir) rd |= A_DIR_LINKCOUNT; }
@@ -1057,7 +1061,6 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 	if (cmnext & 0x400) { P64(0); rx |= 0x400; }                                         // RECURSIVE_GENCOUNT
 	if (cmnext & 0x800) { P64(0); rx |= 0x800; }                                         // ATTRIBUTION_TAG
 	if (cmnext & 0x1000) { P32(1); rx |= 0x1000; }                                       // CLONE_REFCNT
-	(void)pack_inval;
 	// cadenas de longitud variable al final, en el orden de sus referencias
 	if (common & A_CMN_NAME) {
 		size_t nl = strlen(name) + 1;
