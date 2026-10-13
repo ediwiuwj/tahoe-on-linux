@@ -94,7 +94,53 @@ fn futex_despertar(p: &AtomicU32, n: c_int) {
 fn vivo(tid: u32) -> bool {
     // SAFETY: la señal 0 no envía nada.
     let r = unsafe { syscall(SYS_KILL, tid as c_int, 0) };
-    !(r != 0 && errno() == ESRCH)
+    if r != 0 && errno() == ESRCH {
+        return false;
+    }
+    // Un proceso muerto que su padre aún no ha recogido (zombi) sigue respondiendo a kill(…, 0): se mira su estado en
+    // /proc/<tid>/stat («pid (nombre) Z …»). Sin esto, un dueño que murió con el candado tomado no se recuperaba nunca y
+    // todo el arranque se quedaba esperando.
+    !zombi(tid)
+}
+extern "C" {
+    fn open(path: *const core::ffi::c_char, flags: c_int, ...) -> c_int;
+    fn read(fd: c_int, buf: *mut u8, n: usize) -> isize;
+    fn close(fd: c_int) -> c_int;
+}
+fn zombi(tid: u32) -> bool {
+    let mut ruta = *b"/proc/0000000000/stat\0";
+    // dígitos del tid en su sitio, y el resto de la ruta detrás
+    let mut dig = [0u8; 10];
+    let (mut v, mut k) = (tid, dig.len());
+    loop {
+        k -= 1;
+        dig[k] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let d = &dig[k..];
+    let mut n = 6;
+    ruta[n..n + d.len()].copy_from_slice(d);
+    n += d.len();
+    ruta[n..n + 6].copy_from_slice(b"/stat\0");
+    let mut buf = [0u8; 256];
+    // SAFETY: ruta termina en NUL; buf es nuestro.
+    let fd = unsafe { open(ruta.as_ptr().cast(), 0) };
+    if fd < 0 {
+        return true; // ya no existe
+    }
+    let got = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
+    unsafe { close(fd) };
+    if got <= 0 {
+        return true;
+    }
+    let s = &buf[..got as usize];
+    match s.iter().rposition(|&c| c == b')') {
+        Some(i) if i + 2 < s.len() => matches!(s[i + 2], b'Z' | b'X' | b'x'),
+        _ => false,
+    }
 }
 /// Toma el candado. 0, o EOWNERDEAD si el dueño anterior había muerto con él tomado (el estado que protege puede estar a
 /// medias).
@@ -246,6 +292,29 @@ mod pruebas {
         assert!(t0.elapsed() < Duration::from_secs(2));
         assert_eq!(c.load(Ordering::Relaxed) & TID, gettid());
         soltar(&c);
+    }
+
+    #[test]
+    fn dueno_zombi_se_recupera() {
+        extern "C" {
+            fn fork() -> c_int;
+            fn _exit(c: c_int) -> !;
+            fn waitpid(p: c_int, st: *mut c_int, o: c_int) -> c_int;
+        }
+        // un hijo que termina y que no se recoge todavía (zombi) es el dueño del candado
+        let hijo = unsafe { fork() };
+        if hijo == 0 {
+            unsafe { _exit(0) };
+        }
+        thread::sleep(Duration::from_millis(100));
+        let c = AtomicU32::new(hijo as u32);
+        assert!(!vivo(hijo as u32));
+        let t0 = Instant::now();
+        assert_eq!(tomar(&c), EOWNERDEAD);
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        soltar(&c);
+        let mut st = 0;
+        unsafe { waitpid(hijo, &mut st, 0) };
     }
 
     #[test]
