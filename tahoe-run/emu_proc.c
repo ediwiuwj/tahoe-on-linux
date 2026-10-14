@@ -832,6 +832,8 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (getenv("TAHOE_CACHE_DIR")) { snprintf(b6, sizeof b6, "TAHOE_CACHE_DIR=%s", getenv("TAHOE_CACHE_DIR")); nenv[e++] = b6; }
 	static char b8[600];
 	if (getenv("TAHOE_OSK_FILE")) { snprintf(b8, sizeof b8, "TAHOE_OSK_FILE=%s", getenv("TAHOE_OSK_FILE")); nenv[e++] = b8; }
+	static char b9[600];
+	if (getenv("TAHOE_SMBIOS_FILE")) { snprintf(b9, sizeof b9, "TAHOE_SMBIOS_FILE=%s", getenv("TAHOE_SMBIOS_FILE")); nenv[e++] = b9; }
 	if (getenv("TAHOE_FD2LOG")) nenv[e++] = (char*)"TAHOE_FD2LOG=1";
 	if (getenv("TAHOE_DEBUG_NOREBOOT")) nenv[e++] = (char*)"TAHOE_DEBUG_NOREBOOT=1";   // modo depuración (ver emu_iokit.inc)
 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";

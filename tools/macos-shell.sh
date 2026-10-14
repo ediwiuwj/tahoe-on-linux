@@ -57,6 +57,10 @@ done
 # repositorio; si existe ~/.config/tahoe-run/osk (o TAHOE_OSK_FILE), tahoe-run la usa (ver tahoe-run/emu_dsmos.c).
 OSK="${TAHOE_OSK_FILE:-$HOME/.config/tahoe-run/osk}"
 OSK_ENV=(); [ -r "$OSK" ] && OSK_ENV=(TAHOE_OSK_FILE="$(readlink -f "$OSK")")
+# Identidad del equipo (modelo, número de serie, MLB, UUID, ROM) generada con macserial por tools/smbios.sh: tampoco va en el
+# repositorio. Sin ella, tahoe-run se presenta como un MacBookPro16,1 ficticio.
+SMBIOS="${TAHOE_SMBIOS_FILE:-$HOME/.config/tahoe-run/smbios.json}"
+[ -r "$SMBIOS" ] && OSK_ENV+=(TAHOE_SMBIOS_FILE="$(readlink -f "$SMBIOS")")
 MACOS_ENV=(PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root USER=root LOGNAME=root SHELL=/bin/bash
 	TERM="${TERM:-xterm-256color}" LANG="${LANG:-es_ES.UTF-8}"
 	TAHOE_ROOT="$ROOT" TAHOE_CACHE_DIR="$CACHE" TAHOE_LOGFILE="$LOG" "${DEBUG_ENV[@]}" "${OSK_ENV[@]}")

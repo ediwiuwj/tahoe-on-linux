@@ -482,25 +482,29 @@ static void io_init(void) {
 	p_num(root, "OSKernelCPUSubtype", 3, 32);                // CPU_SUBTYPE_X86_64_ALL
 	p_str(root, "IOKitBuildVersion", "Darwin Kernel Version 25.6.0: tahoe-run; root:xnu-12377.121.6~1/RELEASE_X86_64");
 	p_str(root, "OS Build Version", "25G83");
-	int plat = ent_add(root, "MacBookPro16,1", "IOPlatformExpertDevice", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
+	// Identidad del equipo: la de smbios.json (macserial, tools/smbios.sh) o, sin archivo, un MacBookPro16,1 ficticio.
+	const char* modelo = smbios("modelo", "MacBookPro16,1");
+	const char* serie = smbios("serie", "C02TAHOE0001");
+	const char* uuidp = smbios("uuid", "00000000-0000-1000-8000-000000000001");
+	int plat = ent_add(root, modelo, "IOPlatformExpertDevice", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(plat, "name", "/");
-	p_cstr(plat, "model", "MacBookPro16,1");
-	p_data(plat, "compatible", "MacBookPro16,1\0J152F\0AppleACPI", 28);
+	p_cstr(plat, "model", modelo);
+	{ char cp[96]; size_t cn = (size_t)snprintf(cp, sizeof cp, "%s%c%s%cAppleACPI", modelo, 0, smbios_target(0), 0) + 1; p_data(plat, "compatible", cp, cn); }
 	p_cstr(plat, "manufacturer", "Apple Inc.");
-	p_cstr(plat, "board-id", "Mac-E1008331FDC96864");
-	p_cstr(plat, "product-name", "MacBookPro16,1");
-	p_cstr(plat, "target-type", "J152F");
+	p_cstr(plat, "board-id", smbios("placa", "Mac-E1008331FDC96864"));
+	p_cstr(plat, "product-name", modelo);
+	p_cstr(plat, "target-type", smbios_target(0));
 	p_cstr(plat, "device_type", "bridge");
-	p_str(plat, "IOPlatformUUID", "00000000-0000-1000-8000-000000000001");
-	p_str(plat, "IOPlatformSerialNumber", "C02TAHOE0001");
-	p_str(plat, "serial-number-string", "C02TAHOE0001");
+	p_str(plat, "IOPlatformUUID", uuidp);
+	p_str(plat, "IOPlatformSerialNumber", serie);
+	p_str(plat, "serial-number-string", serie);
 	p_str(plat, "IOPlatformSystemSleepPolicy", "none");
 	p_str(plat, "IOBusyInterest", "IOCommand is not serializable");
 	p_bool(plat, "IOKitDiagnostics", 0);
 	p_u32(plat, "clock-frequency", 0);
 	p_u32(plat, "#address-cells", 2); p_u32(plat, "#size-cells", 2);
 	p_str(plat, "IOPolledInterface", "none");
-	v_set(io_e[plat].props, "IOPlatformUUID", v_str("00000000-0000-1000-8000-000000000001"));
+	v_set(io_e[plat].props, "IOPlatformUUID", v_str(uuidp));
 	(void)dmi;
 
 	int acpi = ent_add(plat, "AppleACPIPlatformExpert", "AppleACPIPlatformExpert", "IORegistryEntry IOService IOPlatformExpert", "", PL_SERVICE, 1);
@@ -571,6 +575,15 @@ static void io_init(void) {
 	int opt = ent_add(plat, "options", "IODTNVRAM", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(opt, "name", "options");
 	p_str(opt, "boot-args", "");                              // OSString, como IONVRAMCHRPHandler (las variables de texto son cadenas)
+	// MLB y ROM en la NVRAM de Apple (las pone el firmware; OpenCore, en un Hackintosh): los de smbios.json si los hay.
+	{
+		const char* mlb = smbios("mlb", NULL), *rom = smbios("rom", NULL);
+		if (mlb) p_data(opt, "4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38C14:MLB", mlb, strlen(mlb));
+		if (rom && strlen(rom) == 12) {
+			uint8_t r[6]; for (int i = 0; i < 6; i++) { unsigned b; sscanf(rom + 2 * i, "%2x", &b); r[i] = (uint8_t)b; }
+			p_data(opt, "4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38C14:ROM", r, 6);
+		}
+	}
 	// Modo depuración (tools/macos-shell.sh --depurar): la variable de NVRAM con la que recoveryosd, cuando algo le obliga a
 	// reiniciar, se queda dormido en vez de ejecutar /sbin/reboot (ros_sleep_on_failure_set de RecoveryOS.framework: OSData
 	// cuyo texto UTF-8 da boolValue verdadero). Sin el modo, la NVRAM no la tiene, como en un Mac.

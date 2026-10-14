@@ -8,6 +8,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <sys/sysinfo.h>
 
 #include "tahoe.h"
@@ -20,6 +21,39 @@ struct entry {
 	long long ival;
 	const char* sval;
 };
+
+// Identidad del equipo (SMBIOS): modelo, placa, número de serie, MLB, UUID y ROM generados con macserial de OpenCore para
+// esta instalación (tools/smbios.sh) y guardados fuera del repositorio; TAHOE_SMBIOS_FILE apunta al JSON. Sin archivo, los
+// valores de siempre (un MacBookPro16,1 ficticio).
+const char* smbios(const char* key, const char* def) {
+	static char buf[2048]; static int cargado;
+	if (!cargado) {
+		cargado = 1;
+		const char* p = getenv("TAHOE_SMBIOS_FILE");
+		FILE* f = p ? fopen(p, "r") : NULL;
+		if (f) { size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f); }
+	}
+	static char val[8][128]; static int k;
+	char pat[64]; snprintf(pat, sizeof pat, "\"%s\"", key);
+	const char* q = strstr(buf, pat);
+	if (!q) return def;
+	q = strchr(q + strlen(pat), ':'); if (!q) return def;
+	q = strchr(q, '"'); if (!q) return def;
+	const char* e = strchr(q + 1, '"'); if (!e || e - q - 1 >= 127) return def;
+	char* v = val[k++ % 8];
+	memcpy(v, q + 1, (size_t)(e - q - 1)); v[e - q - 1] = 0;
+	return v;
+}
+// Tipo de placa (target-type, hw.target) de cada modelo admitido por macOS 26 en Intel.
+const char* smbios_target(int ap) {
+	const char* m = smbios("modelo", "MacBookPro16,1");
+	static const struct { const char *m, *t, *ap; } t[] = {
+		{ "MacBookPro16,1", "J152F", "J152fAP" }, { "MacBookPro16,4", "J152F", "J152fAP" }, { "MacBookPro16,2", "J214K", "J214kAP" },
+		{ "MacBookPro16,3", "J223", "J223AP" }, { "iMac20,1", "J185", "J185AP" }, { "iMac20,2", "J185F", "J185fAP" }, { "MacPro7,1", "J160", "J160AP" },
+	};
+	for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) if (!strcmp(m, t[i].m)) return ap ? t[i].ap : t[i].t;
+	return ap ? "J152fAP" : "J152F";
+}
 
 #define CTL_KERN 1
 #define CTL_HW 6
@@ -86,14 +120,14 @@ static struct entry table[] = {
 	{ "security.mac.sandbox.sentinel", { 201, 0x721e }, K_STR, 0, sb_sentinel },
 	{ "kern.hostid", { CTL_KERN, 11 }, K_INT, 0, NULL },
 	{ "kern.safeboot", { CTL_KERN, 66 }, K_INT, 0, NULL },
-	{ "hw.target", { 201, 0x721a }, K_STR, 0, "J152fAP" },              // MobileGestalt (HWModelStr) lo usa: el del MacBookPro16,1
+	{ "hw.target", { 201, 0x721a }, K_STR, 0, "J152fAP" },              // MobileGestalt (HWModelStr) lo usa: el del modelo (smbios_target)
 	{ "hw.osenvironment", { 201, 0x721b }, K_STR, 0, "" },
 	{ "hw.use_kernelmanagerd", { 201, 0x721c }, K_INT, 1, NULL },
 	{ "hw.willshutdown", { 201, 0x721d }, K_INT, 0, NULL },
 	{ "kern.netboot", { CTL_KERN, 40 }, K_INT, 0, NULL },
 	{ "security.mac.lockdown_mode_state", { 200, 1 }, K_INT, 0, NULL },
 	{ "hw.machine", { CTL_HW, 1 }, K_STR, 0, "x86_64" },
-	{ "hw.model", { CTL_HW, 2 }, K_STR, 0, "MacBookPro16,1" },
+	{ "hw.model", { CTL_HW, 2 }, K_STR, 0, "MacBookPro16,1" },     // o el de smbios.json
 	{ "hw.ncpu", { CTL_HW, 3 }, K_INT, -1, NULL },            // -1: se rellena al iniciar
 	{ "hw.byteorder", { CTL_HW, 4 }, K_INT, 1234, NULL },
 	{ "hw.physmem", { CTL_HW, 5 }, K_INT, -2, NULL },
@@ -520,7 +554,12 @@ long bsd_sysctl(struct ctx* c) {
 			switch (e->kind) {
 			case K_INT:  { int v = (int)e->ival; return sc_out(c, &v, sizeof v); }
 			case K_QUAD: { long long v = e->ival; return sc_out(c, &v, sizeof v); }
-			case K_STR:  return sc_out(c, e->sval, strlen(e->sval) + 1);
+			case K_STR: {
+				const char* v = e->sval;
+				if (e->mib[0] == CTL_HW && e->mib[1] == 2) v = smbios("modelo", v);   // hw.model
+				else if (!strcmp(e->name, "hw.target")) v = smbios_target(1);
+				return sc_out(c, v, strlen(v) + 1);
+			}
 			case K_LOADAVG: {                                   // struct loadavg { fixpt_t ldavg[3]; long fscale; }, FSCALE = 1 << 11
 				double l[3] = { 0, 0, 0 };
 				FILE* f = fopen("/proc/loadavg", "r");

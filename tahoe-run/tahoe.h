@@ -124,7 +124,9 @@ enum { KO_TASK = 1, KO_TASK_NAME = 2, KO_IDENTITY_TOKEN = 3, KO_FILEPORT = 4, KO
 uint32_t kobj_make(int type, int32_t pid);
 uint32_t kobj_new(int type, int32_t pid);
 void kobj_free(uint32_t name);
-void kobj_release_thread(uint32_t name);   // mach_port_deallocate de un puerto de hilo de otro proceso
+void kobj_release_thread(uint32_t name);
+const char* smbios(const char* key, const char* def);   // identidad del equipo (emu_sysctl.c, TAHOE_SMBIOS_FILE)
+const char* smbios_target(int ap);   // mach_port_deallocate de un puerto de hilo de otro proceso
 int kobj_lookup(uint32_t name, int* type, int32_t* pid);
 uint32_t execwatch_add(int32_t target);   // NOTE_EXEC: puerto que recibe un mensaje cuando target hace exec
 void execwatch_del(uint32_t port);
