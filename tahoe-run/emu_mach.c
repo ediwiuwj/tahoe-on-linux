@@ -19,7 +19,9 @@
 #include <time.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include "tahoe.h"
+#include "nucleo.h"
 
 #define MACH_MSG_SUCCESS     0
 #define MACH_RCV_TOO_LARGE   0x10004004
@@ -144,6 +146,150 @@ done:;
 	return n + 8;
 }
 
+// mach_vm_remap (id 4813): cabecera, 1 descriptor de puerto (tarea origen), NDR, target_address, size, mask, flags,
+// src_address, copy, inheritance -> target_address, cur_protection, max_protection. Mapea en esta tarea las páginas de otra
+// zona suya (libobjc lo usa para sus trampolines de bloques: copia junto a una página de datos la página de código de la
+// caché). Con copy=FALSE XNU comparte las páginas: en Linux solo se puede con mapeos compartidos (mremap con tamaño 0); en
+// los privados (la caché, memoria anónima) se copia el contenido, que para código de solo lectura es lo mismo.
+// La nueva zona lleva la protección del origen; flags: VM_FLAGS_ANYWHERE (1), VM_FLAGS_OVERWRITE (0x4000).
+static int prot_of(uint64_t a) {
+	FILE* f = fopen("/proc/self/maps", "r");
+	if (!f) return -1;
+	char ln[512]; int prot = -1;
+	while (fgets(ln, sizeof ln, f)) {
+		unsigned long lo, hi; char pr[5];
+		if (sscanf(ln, "%lx-%lx %4s", &lo, &hi, pr) != 3 || a < lo || a >= hi) continue;
+		prot = (pr[0] == 'r' ? 1 : 0) | (pr[1] == 'w' ? 2 : 0) | (pr[2] == 'x' ? 4 : 0);
+		break;
+	}
+	fclose(f);
+	return prot;
+}
+static size_t mig_mach_vm_remap(const struct hdr* req, const uint8_t* m, uint8_t* r) {
+	if (req->size < 92) return reply_begin(r, req, KERN_INVALID_ARG);
+	uint32_t srctask; uint64_t addr, size, mask, src; int32_t flags, copy;
+	memcpy(&srctask, m + 28, 4); memcpy(&addr, m + 48, 8); memcpy(&size, m + 56, 8); memcpy(&mask, m + 64, 8);
+	memcpy(&flags, m + 72, 4); memcpy(&src, m + 76, 8); memcpy(&copy, m + 84, 4);
+	int ttype; int32_t tpid;
+	if ((kobj_lookup(req->remote, &ttype, &tpid) && ttype == KO_TASK && tpid != (int32_t)getpid()) ||
+	    (kobj_lookup(srctask, &ttype, &tpid) && ttype == KO_TASK && tpid != (int32_t)getpid())) {
+		logf_("    mach_vm_remap entre tareas distintas: sin implementar\n");
+		return reply_begin(r, req, KERN_INVALID_ARG);
+	}
+	uint64_t s0 = src & ~(uint64_t)(PAGE - 1), len = round_up(src + size) - s0;
+	int prot = prot_of(s0);
+	if (!size || prot < 0) return reply_begin(r, req, 1);       // KERN_INVALID_ADDRESS
+	int32_t kr = KERN_SUCCESS_;
+	void* p = MAP_FAILED;
+	uint64_t want = (flags & 1) ? 0 : (addr & ~(uint64_t)(PAGE - 1));
+	if (!copy) {
+		p = want ? mremap((void*)s0, 0, len, MREMAP_MAYMOVE | MREMAP_FIXED, (void*)want) : mremap((void*)s0, 0, len, MREMAP_MAYMOVE);
+	}
+	if (p == MAP_FAILED) {
+		uint64_t align = mask + 1 > PAGE ? mask + 1 : PAGE;
+		if (want) p = mmap((void*)want, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | ((flags & 0x4000) ? MAP_FIXED : MAP_FIXED_NOREPLACE), -1, 0);
+		else {
+			uint8_t* q = mmap(NULL, len + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (q != MAP_FAILED) {
+				uint64_t a = ((uint64_t)q + align - 1) & ~(align - 1);
+				if (a > (uint64_t)q) munmap(q, a - (uint64_t)q);
+				if ((uint64_t)q + len + align > a + len) munmap((void*)(a + len), (uint64_t)q + len + align - (a + len));
+				p = (void*)a;
+			}
+		}
+		if (p == MAP_FAILED) kr = KERN_NO_SPACE_;
+		else {
+			if (!(prot & 1)) mprotect((void*)s0, len, prot | PROT_READ);      // origen ilegible: leerlo para copiarlo
+			memcpy(p, (void*)s0, len);
+			if (!(prot & 1)) mprotect((void*)s0, len, prot);
+			mprotect(p, len, prot);
+		}
+	}
+	uint64_t out = p == MAP_FAILED ? 0 : (uint64_t)p + (src - s0);
+	if (mach_trace()) logf_("    MT pid=%d vm_remap 0x%lx (0x%lx) copy=%d flags=0x%x -> 0x%lx kr=%d\n", (int)getpid(), src, size, copy, flags, out, kr);
+	size_t n = reply_begin(r, req, kr);
+	int32_t cur = prot, max = 7;
+	memcpy(r + n, &out, 8); memcpy(r + n + 8, &cur, 4); memcpy(r + n + 12, &max, 4);
+	return n + 16;
+}
+
+// host_statistics (216) y host_statistics64 (219): NDR, sabor, capacidad (en enteros de 32 bits). Datos de Linux:
+//   HOST_LOAD_INFO (1):      avenrun[3] (carga × 1000, LOAD_SCALE) y mach_factor[3], de /proc/loadavg.
+//   HOST_VM_INFO (2):        vm_statistics (15 natural_t), solo en host_statistics.
+//   HOST_CPU_LOAD_INFO (3):  cpu_ticks[USER, SYSTEM, IDLE, NICE] de la línea «cpu» de /proc/stat (100 Hz en los dos).
+//   HOST_VM_INFO64 (4):      vm_statistics64 (38 enteros; si caben más, los campos nuevos van a cero), solo en la de 64.
+// Las páginas son de 4096 bytes, como el vm_page_size de macOS x86_64. Otro sabor: KERN_INVALID_ARGUMENT, como XNU.
+// Las piden vm_stat, memory_pressure, iostat y top.
+static uint64_t proc_kv(const char* file, const char* key) {      // valor de «clave: N» o «clave N» en /proc/meminfo o vmstat
+	FILE* f = fopen(file, "r");
+	if (!f) return 0;
+	char l[256]; size_t kl = strlen(key); uint64_t v = 0;
+	while (fgets(l, sizeof l, f))
+		if (!strncmp(l, key, kl) && (l[kl] == ':' || l[kl] == ' ')) { v = strtoull(l + kl + 1, NULL, 10); break; }
+	fclose(f);
+	return v;
+}
+static size_t mig_host_statistics(const struct hdr* req, const uint8_t* m, uint8_t* r, int is64) {
+	int32_t flavor, cap;
+	memcpy(&flavor, m + 32, 4);
+	memcpy(&cap, m + 36, 4);
+	uint32_t out[64] = { 0 }; int cnt = 0;
+	if (flavor == 1) {
+		double l[3] = { 0, 0, 0 };
+		FILE* f = fopen("/proc/loadavg", "r");
+		if (f) { if (fscanf(f, "%lf %lf %lf", &l[0], &l[1], &l[2]) != 3) l[0] = l[1] = l[2] = 0; fclose(f); }
+		long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+		for (int i = 0; i < 3; i++) {
+			out[i] = (uint32_t)(l[i] * 1000);
+			double mf = ncpu > 0 ? (double)ncpu - l[i] : 0;      // mach_factor: CPU libres (también × 1000)
+			out[3 + i] = (uint32_t)(mf > 0 ? mf * 1000 : 0);
+		}
+		cnt = 6;
+	} else if (flavor == 3) {
+		unsigned long long u = 0, n = 0, sy = 0, id = 0, io = 0, irq = 0, sirq = 0;
+		FILE* f = fopen("/proc/stat", "r");
+		if (f) { if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu", &u, &n, &sy, &id, &io, &irq, &sirq) < 4) u = n = sy = id = 0; fclose(f); }
+		out[0] = (uint32_t)u; out[1] = (uint32_t)(sy + irq + sirq); out[2] = (uint32_t)(id + io); out[3] = (uint32_t)n;
+		cnt = 4;
+	} else if (flavor == 2 || flavor == 4) {
+		const uint64_t pg = 4096;
+		uint64_t total = proc_kv("/proc/meminfo", "MemTotal") * 1024 / pg, freep = proc_kv("/proc/meminfo", "MemFree") * 1024 / pg;
+		uint64_t active = proc_kv("/proc/meminfo", "Active") * 1024 / pg, inactive = proc_kv("/proc/meminfo", "Inactive") * 1024 / pg;
+		uint64_t file = (proc_kv("/proc/meminfo", "Active(file)") + proc_kv("/proc/meminfo", "Inactive(file)")) * 1024 / pg;
+		uint64_t anon = (proc_kv("/proc/meminfo", "Active(anon)") + proc_kv("/proc/meminfo", "Inactive(anon)")) * 1024 / pg;
+		uint64_t used = freep + active + inactive;
+		uint64_t wired = total > used ? total - used : 0;              // lo que no es libre ni activo ni inactivo: núcleo, búferes...
+		uint64_t faults = proc_kv("/proc/vmstat", "pgfault"), major = proc_kv("/proc/vmstat", "pgmajfault");
+		uint64_t pin = proc_kv("/proc/vmstat", "pgpgin") * 1024 / pg, pout = proc_kv("/proc/vmstat", "pgpgout") * 1024 / pg;
+		uint64_t swin = proc_kv("/proc/vmstat", "pswpin"), swout = proc_kv("/proc/vmstat", "pswpout");
+		if (flavor == 2) {                                              // vm_statistics: todo natural_t
+			uint32_t v[15] = { (uint32_t)freep, (uint32_t)active, (uint32_t)inactive, (uint32_t)wired, (uint32_t)(faults - major), 0,
+				(uint32_t)pin, (uint32_t)pout, (uint32_t)faults, 0, 0, 0, 0, 0, 0 };
+			memcpy(out, v, sizeof v); cnt = 15;
+		} else {                                                        // vm_statistics64 (mach/vm_statistics.h)
+			uint8_t* o = (uint8_t*)out;
+			uint32_t n4[4] = { (uint32_t)freep, (uint32_t)active, (uint32_t)inactive, (uint32_t)wired };
+			uint64_t n8[9] = { faults - major, 0, pin, pout, faults, 0, 0, 0, 0 };   // zero_fill, reactivations, pageins, pageouts, faults, cow, lookups, hits, purges
+			uint32_t p4[2] = { 0, 0 };                                  // purgeable_count, speculative_count
+			uint64_t c8[4] = { 0, 0, swin, swout };                     // decompressions, compressions, swapins, swapouts
+			uint32_t q4[4] = { 0, 0, (uint32_t)file, (uint32_t)anon };  // compressor_page_count, throttled, external, internal
+			memcpy(o, n4, 16); memcpy(o + 16, n8, 72); memcpy(o + 88, p4, 8); memcpy(o + 96, c8, 32); memcpy(o + 128, q4, 16);
+			cnt = 38;                                                   // + total_uncompressed_pages_in_compressor (0)
+		}
+	}
+	if (!cnt || (flavor == 2 && is64) || (flavor == 4 && !is64) || cap < 1) {
+		logf_("    host_statistics%s: sabor %d (capacidad %d) sin implementar\n", is64 ? "64" : "", flavor, cap);
+		return reply_begin(r, req, KERN_INVALID_ARG);
+	}
+	if (flavor == 4 && cap > cnt) cnt = cap < 64 ? cap : 64;          // macOS 26 pide 62: los campos nuevos van a cero
+	if (cap < cnt) cnt = cap;
+	size_t n = reply_begin(r, req, KERN_SUCCESS_);
+	int32_t c32 = cnt;
+	memcpy(r + n, &c32, 4);
+	memcpy(r + n + 4, out, (size_t)cnt * 4);
+	return n + 4 + (size_t)cnt * 4;
+}
+
 // host_info (id 200): NDR, flavor, capacidad. Solo HOST_BASIC_INFO (1): 12 enteros.
 static size_t mig_host_info(const struct hdr* req, const uint8_t* m, uint8_t* r) {
 	int32_t flavor, cap;
@@ -212,6 +358,71 @@ static size_t reply_port(uint8_t* r, const struct hdr* req, uint32_t name, uint8
 	return 40;
 }
 
+// Respuesta compleja con un descriptor OOL: de puertos (names != NULL, derechos de envío) o de memoria (data), seguido de
+// NDR y la cuenta; extra (si no es NULL) va entre el NDR y la cuenta (host_processor_info: out_processor_count).
+static size_t reply_ool(uint8_t* r, const struct hdr* req, const uint32_t* names, const void* data, size_t len, uint32_t cnt, const uint32_t* extra) {
+	void* mm = mmap(NULL, len ? (len + 4095) & ~4095ul : 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (mm == MAP_FAILED) return reply_begin(r, req, 6 /* KERN_RESOURCE_SHORTAGE */);
+	memcpy(mm, names ? (const void*)names : data, len);
+	struct hdr nh = { .bits = 0x80000000u, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = req->id + 100 };
+	memcpy(r, &nh, sizeof nh);
+	uint32_t one = 1; memcpy(r + 24, &one, 4);
+	uint64_t addr = (uint64_t)mm;
+	uint8_t dsc[16] = { 0 }; memcpy(dsc, &addr, 8); dsc[8] = 1;            // deallocate
+	if (names) { dsc[10] = 17; dsc[11] = 2; memcpy(dsc + 12, &cnt, 4); }    // PORT_SEND, OOL_PORTS, cuántos
+	else { uint32_t l32 = (uint32_t)len; dsc[9] = 1; dsc[11] = 1; memcpy(dsc + 12, &l32, 4); }   // VIRTUAL_COPY, OOL, bytes
+	memcpy(r + 28, dsc, 16);
+	memcpy(r + 44, NDR_LE, 8);
+	size_t n = 52;
+	if (extra) { memcpy(r + n, extra, 4); n += 4; }
+	memcpy(r + n, &cnt, 4);
+	return n + 4;
+}
+
+// Conjuntos de procesadores (top, ps): uno solo, como en un Mac. host_processor_sets (419) da su nombre, y
+// host_processor_set_priv (420) el puerto con privilegios, con el que processor_set_tasks (4005) da un puerto de tarea por
+// cada proceso de macOS vivo (los pid del espacio de nombres son los de macOS).
+static int stat_fields(const char* path, long long f[24], char* state);
+static uint32_t pset_name(void) { return kobj_make(KO_PSET, 0); }
+static size_t mig_processor_set_tasks(const struct hdr* req, uint8_t* r) {
+	static uint32_t t[1024]; uint32_t cnt = 0;
+	DIR* d = opendir("/proc"); struct dirent* de;
+	while (d && cnt < 1024 && (de = readdir(d))) {
+		int pid = atoi(de->d_name); if (pid <= 0) continue;
+		char sp[64]; long long f[24]; char st = 0; snprintf(sp, sizeof sp, "/proc/%d/stat", pid);
+		if (!stat_fields(sp, f, &st) || st == 'Z' || st == 'X') continue;
+		t[cnt++] = pid == (int)getpid() ? 0x103 : kobj_make(KO_TASK, pid);
+	}
+	if (d) closedir(d);
+	return reply_ool(r, req, t, NULL, (size_t)cnt * 4, cnt, NULL);
+}
+// host_processor_info (204): PROCESSOR_CPU_LOAD_INFO (2): por CPU, cpu_ticks[USER, SYSTEM, IDLE, NICE] de /proc/stat;
+// PROCESSOR_BASIC_INFO (1): tipo, subtipo, en marcha, ranura, maestra. Lo usan top e iostat.
+static size_t mig_host_processor_info(const struct hdr* req, const uint8_t* m, uint8_t* r) {
+	int32_t flavor; memcpy(&flavor, m + 32, 4);
+	static uint32_t info[256 * 5]; uint32_t ncpu = 0, per = 0;
+	if (flavor == 2) {
+		per = 4;
+		FILE* f = fopen("/proc/stat", "r"); char l[256];
+		while (f && fgets(l, sizeof l, f) && ncpu < 256) {
+			unsigned cpu; unsigned long long u, n, sy, id, io = 0, irq = 0, sirq = 0;
+			if (strncmp(l, "cpu", 3) || l[3] == ' ') continue;
+			if (sscanf(l, "cpu%u %llu %llu %llu %llu %llu %llu %llu", &cpu, &u, &n, &sy, &id, &io, &irq, &sirq) < 5) continue;
+			uint32_t* o = info + ncpu * per;
+			o[0] = (uint32_t)u; o[1] = (uint32_t)(sy + irq + sirq); o[2] = (uint32_t)(id + io); o[3] = (uint32_t)n;
+			ncpu++;
+		}
+		if (f) fclose(f);
+	} else if (flavor == 1) {
+		per = 5; ncpu = (uint32_t)sysconf(_SC_NPROCESSORS_ONLN); if (ncpu > 256) ncpu = 256;
+		for (uint32_t i = 0; i < ncpu; i++) { uint32_t o[5] = { 7, 8, 1, i, i == 0 }; memcpy(info + i * per, o, sizeof o); }
+	} else {
+		logf_("    host_processor_info: sabor %d sin implementar\n", flavor);
+		return reply_begin(r, req, 4 /* KERN_INVALID_ARGUMENT */);
+	}
+	return reply_ool(r, req, NULL, info, (size_t)ncpu * per * 4, ncpu * per, &ncpu);
+}
+
 // semaphore_create (id 3418): NDR, política, valor inicial. Devuelve un puerto de semáforo.
 static size_t mig_semaphore_create(const struct hdr* req, const uint8_t* m, uint8_t* r) {
 	int32_t policy, value;
@@ -272,7 +483,7 @@ static size_t mig_task_info(const struct hdr* req, const uint8_t* m, uint8_t* r)
 	memcpy(&flavor, m + 32, 4);
 	memcpy(&cap, m + 36, 4);
 	if (flavor == 15 && cap >= 8) {                             // audit_token_t: 8 enteros
-		uint32_t tok[8] = { (uint32_t)-1, geteuid(), getegid(), getuid(), getgid(), (uint32_t)getpid(), 0, 1 };
+		uint32_t tok[8] = { cred_auid(), cred_euid(), cred_egid(), cred_euid(), cred_egid(), (uint32_t)getpid(), cred_asid(), 1 };   // auid, euid, egid, ruid, rgid, pid, asid
 		int ktype; int32_t kpid;
 		if (kobj_lookup(req->remote, &ktype, &kpid) && (ktype == KO_TASK || ktype == KO_TASK_NAME) && kpid != (int32_t)getpid()) {
 			// la tarea de otro proceso (task_name_for_pid...): su token, no el de quien pregunta. launchd lo usa como destino de
@@ -286,7 +497,7 @@ static size_t mig_task_info(const struct hdr* req, const uint8_t* m, uint8_t* r)
 				else if (!strncmp(ln, "Gid:", 4)) sscanf(ln + 4, "%u %u", &rg, &eg);
 			}
 			fclose(f);
-			uint32_t o[8] = { (uint32_t)-1, eu, eg, ru, rg, (uint32_t)kpid, 0, 1 };
+			uint32_t o[8] = { (uint32_t)-1, eu, eg, ru, rg, (uint32_t)kpid, 100000, 1 };   // sesión del sistema (la propia del otro proceso no se conoce aquí)
 			memcpy(tok, o, sizeof tok);
 		}
 		size_t n = reply_begin(r, req, KERN_SUCCESS_);
@@ -388,9 +599,22 @@ static uint32_t rx_disp(uint32_t tx) {
 }
 // Recibe un mensaje de `rcv_name` en `buf` (capacidad `cap`) con el trailer que piden las opciones (bits 24-27).
 // Devuelve 0 o un código mach_msg; *total = bytes escritos (mensaje + trailer).
+// Cadenas legibles de un mensaje (de 6 caracteres o más, separadas por «|»), para las trazas: en XPC llevan las claves
+// y valores del diccionario (nombres de rutinas, de servicios...). Devuelve su longitud.
+static int msg_texts(const uint8_t* req, uint32_t size, char* s, size_t cap) {
+	size_t k = 0, run = 0;
+	for (uint32_t q = 24; q < size && k < cap - 2; q++) {
+		uint8_t ch = req[q];
+		if (ch >= 0x20 && ch < 0x7f) { s[k++] = (char)ch; run++; }
+		else { if (run >= 6) s[k++] = 0x7c; else k -= run; run = 0; }
+	}
+	if (run < 6) k -= run;
+	s[k] = 0;
+	return (int)k;
+}
 long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total) {
 	uint32_t elems = (uint32_t)(options >> 24) & 0xf, tsize = elems == 0 ? 8 : elems == 1 ? 12 : elems == 2 ? 20 : elems == 3 ? 52 : 68;
-	uint8_t* m; uint32_t size, snd[3] = { 0, 0, 0 };
+	uint8_t* m; uint32_t size, snd[5] = { 0, 0, 0, (uint32_t)-1, 0 };
 	int large = (options & 0x4) != 0;                         // MACH_RCV_LARGE
 	int r = port_receive(rcv_name, timeout_ms, &m, &size, snd, cap > tsize ? cap - tsize : 1, large);
 	if (r == 0x10004004 && large) {                           // el mensaje sigue en la cola; el receptor lee el tamaño de la cabecera
@@ -409,19 +633,24 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	uint32_t remote = h.local, local = h.remote;
 	h.bits = nb; h.remote = remote; h.local = local;
 	memcpy(m, &h, sizeof h);
-	if (size >= 28 && (m[3] & 0x80)) {                        // complejo: el receptor ve los derechos de los descriptores ya convertidos
-		uint32_t dc, off = 28;
-		memcpy(&dc, m + 24, 4);
-		for (uint32_t i = 0; i < dc && off + 12 <= size; i++) {
-			uint8_t type = m[off + 11];
-			if (trace_all && type == 0) { uint32_t nm; memcpy(&nm, m + off, 4); logf_("    mach_msg: <%d> descriptor de puerto 0x%x disposición %u\n", (int)getpid(), nm, m[off + 10]); }
-			if (type == 0 && m[off + 10] == 16) { uint32_t nm; memcpy(&nm, m + off, 4); port_move_receive(nm); }   // MOVE_RECEIVE: el receptor pasa a ser dueño
-			if (type == 0 || type == 2) m[off + 10] = (uint8_t)rx_disp(m[off + 10]);       // puerto / puertos OOL: disposición
-			off += (type == 0) ? 12 : 16;
+	char rxports[96] = "";                                    // para la traza MSG: puertos que trae el mensaje
+	{                                                          // complejo: el receptor ve los derechos de los descriptores ya convertidos
+		struct nucleo_desc d[64];
+		int nd = nucleo_descriptores(m, size, d, 64);
+		size_t rk = 0;
+		for (int i = 0; i < nd && i < 64; i++) {
+			uint8_t cl = d[i].clase;
+			if ((cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTO_GUARDA) && rk < sizeof rxports - 24)
+				rk += (size_t)snprintf(rxports + rk, sizeof rxports - rk, "%s0x%x%s", rk ? "," : " puertos=", d[i].nombre, port_exists(d[i].nombre) ? "" : "(muerto)");
+			if ((trace_all || mach_trace()) && (cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTO_GUARDA)) logf_("    mach_msg: <%d> descriptor de puerto%s 0x%x disposición %u\n", (int)getpid(), cl == NUCLEO_PUERTO_GUARDA ? " con guarda" : "", d[i].nombre, d[i].disp);
+			// MOVE_RECEIVE: el receptor pasa a ser dueño (también en un puerto con guarda, que es como launchd entrega los
+			// puertos de servicio)
+			if ((cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTO_GUARDA) && d[i].disp == 16) port_move_receive(d[i].nombre);
+			if (cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTOS) m[d[i].off + 10] = (uint8_t)rx_disp(d[i].disp);   // disposición vista por el receptor
 		}
 	}
 	uint8_t tr[68] = { 0 };
-	uint32_t seq = 0, uid = snd[1], gid = snd[2], at[8] = { (uint32_t)-1, snd[1], snd[2], snd[1], snd[2], snd[0], 0, 1 };
+	uint32_t seq = 0, uid = snd[1], gid = snd[2], at[8] = { snd[3], snd[1], snd[2], snd[1], snd[2], snd[0], snd[4], 1 };   // audit_token_t: auid, euid, egid, ruid, rgid, pid, asid, versión
 	memcpy(tr + 4, &tsize, 4);
 	if (tsize >= 12) memcpy(tr + 8, &seq, 4);
 	if (tsize >= 20) { memcpy(tr + 12, &uid, 4); memcpy(tr + 16, &gid, 4); }
@@ -438,6 +667,16 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	else if (safe_write(buf, m, size) != (ssize_t)size || safe_write(buf + size, tr, tsize) != (ssize_t)tsize) res = MACH_RCV_INVALID_DATA_;
 	else if (total) *total = size + tsize;
 	if (trace_all) logf_("    mach_msg: recibe en 0x%x id=%d (%u bytes) -> 0x%lx\n", rcv_name, h.id, size, res);
+	if (msg_trace()) {
+		logf_("    MSG <%d.%ld> recibe en=0x%x dest=0x%x resp=0x%x id=%d tam=%u de=%d -> 0x%lx%s\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, local, remote, h.id, size, (int)snd[0], res, rxports);
+		if (size > 24) {                                        // cuerpo recibido, hasta 400 bytes (respuestas de procesos sin traza)
+			static __thread char hx[2100];
+			uint32_t end = size < 24 + 400 ? size : 24 + 400;
+			for (uint32_t q = 24; q < end; q++) { static const char d[] = "0123456789abcdef"; hx[(q - 24) * 2] = d[m[q] >> 4]; hx[(q - 24) * 2 + 1] = d[m[q] & 15]; }
+			hx[(end - 24) * 2] = 0;
+			logf_("      MSG recibido <%d.%ld>: %s\n", (int)getpid(), (long)syscall(SYS_gettid), hx);
+		}
+	}
 	if (mach_trace()) { uint64_t cx; memcpy(&cx, tr + 52, 8); logf_("    MT pid=%d.%ld rx destino=0x%x id=%d trailer=%u ctx=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), local, h.id, tsize, tsize >= 60 ? cx : 0); }
 	free(m);
 	return res;
@@ -445,14 +684,19 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 
 static long user_receive(struct ctx* c, uint64_t options, uint64_t buf, uint32_t rcv_name, uint32_t rcvsize) {
 	int timeout = (options & 0x100) ? (int)ctx_arg(c, 7) : -1;
-	if (trace_all && timeout < 0 && getenv("TAHOE_STACKS")) diag_crash(c->uc);   // quién se bloquea esperando
+	if (trace_all && timeout < 0 && getenv("TAHOE_STACKS")) diag_stack(c->uc, "espera");   // quién se bloquea esperando
 	if (g_watch) logf_("    WATCH recv espera puerto 0x%x plazo=%d opciones=0x%lx\n", rcv_name, timeout, options);
 	long r = mach_rx_message(rcv_name, timeout, options, buf, rcvsize, NULL);
+	// Errores de recepción que los clientes no esperan (libdispatch aborta con "Unexpected error from
+	// mach_msg_receive"): siempre al registro, son raros. TIMED_OUT (0x10004003), INTERRUPTED (0x10004005) y
+	// TOO_LARGE (0x10004004, se reintenta con un búfer mayor) son normales.
+	if (r && r != 0x10004003 && r != 0x10004005 && r != 0x10004004)
+		logf_("    mach_msg <%d:%ld>: recepción en 0x%x -> 0x%lx (opciones=0x%lx)\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, r, options);
 	if (access("/dev/shm/tahoe-mach-trace", F_OK) == 0) {
 		uint32_t hh[6] = { 0 }; if (r == 0) safe_read(buf, hh, 24);
 		logf_("    MT pid=%d.%ld recv port=0x%x r=0x%lx id=%d size=%u\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, r, (int32_t)hh[5], hh[1]);
 		if (r == 0 && hh[1] <= 192 && hh[1] >= 24) { uint32_t w[48] = { 0 }; safe_read(buf, w, hh[1]); char line[480]; int k = 0; for (uint32_t q = 0; q < hh[1] / 4; q++) k += snprintf(line + k, sizeof line - (size_t)k, " %08x", w[q]); logf_("      MT bytes <%d>:%s\n", (int)getpid(), line); }
-		if (r == 0x10004003 && access("/dev/shm/tahoe-stacks", F_OK) == 0) diag_crash(c->uc);
+		if (r == 0x10004003 && access("/dev/shm/tahoe-stacks", F_OK) == 0) diag_stack(c->uc, "espera");
 	}
 	return r;
 }
@@ -502,7 +746,18 @@ static long mach_msg2(struct ctx* c) {
 	h.voucher = (uint32_t)vi; h.id = (int32_t)(vi >> 32);
 	int kobject = (options & 0x200000000ULL) != 0;
 	if (mtr) logf_("    MT pid=%d.%ld %s dest=0x%x(->%d) resp=0x%x id=%d size=%u rcv=%d\n", (int)getpid(), (long)syscall(SYS_gettid), kobject ? "kobj" : "send", h.remote, kobject ? 0 : port_rpid(h.remote), h.local, h.id, ssize, (options & 2) != 0);
-	if (mtr && !kobject) { char s[200] = ""; size_t k = 0, run = 0; for (uint32_t q = 24; q < ssize && k < sizeof s - 2; q++) { uint8_t ch = req[q]; if (ch >= 0x20 && ch < 0x7f) { s[k++] = (char)ch; run++; } else { if (run >= 6) s[k++] = 0x7c; else k -= run; run = 0; } } if (run < 6) k -= run; s[k] = 0; if (k) logf_("      MT textos: %s\n", s); }
+	if (mtr && !kobject) { char s[200]; if (msg_texts(req, ssize, s, sizeof s)) logf_("      MT textos: %s\n", s); }
+	if (!kobject && msg_trace()) {
+		char s[200]; int t = msg_texts(req, ssize, s, sizeof s);
+		logf_("    MSG <%d.%ld> envía dest=0x%x(->%d) resp=0x%x id=%d tam=%u bits=0x%x%s%s%s\n", (int)getpid(), (long)syscall(SYS_gettid), h.remote, port_rpid(h.remote), h.local, h.id, ssize, h.bits, (options & 2) ? " y espera" : "", t ? " | " : "", t ? s : "");
+		if (ssize > 24) {                                       // el cuerpo en hexadecimal, hasta 400 bytes (mensajes.py descodifica XPC)
+			static __thread char hx[2100];
+			uint32_t end = ssize < 24 + 400 ? ssize : 24 + 400;
+			for (uint32_t q = 24; q < end; q++) { static const char d[] = "0123456789abcdef"; hx[(q - 24) * 2] = d[req[q] >> 4]; hx[(q - 24) * 2 + 1] = d[req[q] & 15]; }
+			hx[(end - 24) * 2] = 0;
+			logf_("      MSG cuerpo <%d.%ld>: %s\n", (int)getpid(), (long)syscall(SYS_gettid), hx);
+		}
+	}
 	if (!kobject && h.remote == 0) { if (trace_all) logf_("    mach_msg2: envío al puerto nulo (id=%d) -> MACH_SEND_INVALID_DEST\n", h.id); return 0x10000003; }   // el núcleo rechaza el destino nulo
 	if (!kobject && (h.bits & 0x1f) == 18 && !port_exists(h.remote)) {   // respuesta (MOVE_SEND_ONCE) a un puerto que ya murió
 		if (mtr) logf_("    MT pid=%d respuesta id=%d a 0x%x, que ya no existe -> MACH_SEND_INVALID_DEST\n", (int)getpid(), h.id, h.remote);
@@ -510,7 +765,12 @@ static long mach_msg2(struct ctx* c) {
 	}
 	if (!kobject && port_exists(h.remote)) {                    // envío a un puerto de usuario: se encola tal cual
 		memcpy(req, &h, sizeof h);
-		if (port_send(h.remote, req, ssize) != 0) {               // el mensaje no se pudo encolar: decirlo, no perderlo en silencio
+		int sr = port_send_timeout(h.remote, req, ssize, (options & 0x10) ? (int)ctx_arg(c, 7) : -1, (options & 0x80) != 0);   // MACH_SEND_TIMEOUT, MACH_SEND_NOTIFY
+		if (sr > 0) {                                             // plazo agotado con la cola llena, o el destino murió
+			if (msg_trace()) logf_("    MSG <%d.%ld> envío a 0x%x id=%d falló 0x%x\n", (int)getpid(), (long)syscall(SYS_gettid), h.remote, h.id, sr);
+			return sr;
+		}
+		if (sr != 0) {                                            // el mensaje no se pudo encolar: decirlo, no perderlo en silencio
 			logf_("    mach_msg2: <%d> envío a 0x%x (id=%d, %u bytes) no encolado\n", (int)getpid(), h.remote, h.id, ssize);
 			return port_exists(h.remote) ? 0x1000000d /* MACH_SEND_NO_BUFFER */ : MACH_SEND_INVALID_DEST_;
 		}
@@ -524,6 +784,7 @@ static long mach_msg2(struct ctx* c) {
 	case 3206: {                                                  // mach_port_deallocate (MIG): soltar un send-once avisa; un derecho de envío no destruye nada
 		uint32_t nm; memcpy(&nm, req + 32, 4);
 		port_release_send_once(nm);
+		kobj_release_thread(nm);                                  // puerto de un hilo de otro proceso (task_threads)
 		n = reply_begin(rep, &h, KERN_SUCCESS_);
 		break;
 	}
@@ -702,6 +963,7 @@ static long mach_msg2(struct ctx* c) {
 	}   // task_policy_set / mach_port_set_attributes: sin efecto
 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;
 	case 4817: n = mig_make_memory_entry(&h, req, rep); break;
+	case 4813: n = mig_mach_vm_remap(&h, req, rep); break;
 	case 4807: {                                                  // mach_vm_copy(task, src, size, dst): el destino ya está asignado
 		uint64_t src, size, dst; memcpy(&src, req + 32, 8); memcpy(&size, req + 40, 8); memcpy(&dst, req + 48, 8);
 		memmove((void*)dst, (void*)src, size);
@@ -714,8 +976,30 @@ static long mach_msg2(struct ctx* c) {
 		n = reply_begin(rep, &h, KERN_SUCCESS_); memcpy(rep + n, &size, 8); n += 8;
 		break;
 	}
+	case 4804: {                                                  // mach_vm_read(task, addr, size) -> data (OOL), dataCnt
+		uint64_t src, size; memcpy(&src, req + 32, 8); memcpy(&size, req + 40, 8);
+		if (size > (1ull << 30)) { n = reply_begin(rep, &h, 4 /* KERN_INVALID_ARGUMENT */); break; }
+		void* mm = size ? mmap(NULL, (size + 4095) & ~4095ul, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) : NULL;
+		if (mm == MAP_FAILED) { n = reply_begin(rep, &h, 6 /* KERN_RESOURCE_SHORTAGE */); break; }
+		if (size && safe_read(src, mm, size) != (ssize_t)size) { munmap(mm, (size + 4095) & ~4095ul); n = reply_begin(rep, &h, 1 /* KERN_INVALID_ADDRESS */); break; }
+		struct hdr nh = { .bits = 0x80000000u, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = h.id + 100 };
+		memcpy(rep, &nh, sizeof nh);
+		uint32_t one = 1; memcpy(rep + 24, &one, 4);
+		uint64_t addr = (uint64_t)mm; uint32_t l32 = (uint32_t)size;
+		uint8_t dsc[16] = { 0 }; memcpy(dsc, &addr, 8); dsc[8] = 1; dsc[9] = 1; dsc[11] = 1; memcpy(dsc + 12, &l32, 4);
+		memcpy(rep + 28, dsc, 16);
+		memcpy(rep + 44, NDR_LE, 8); memcpy(rep + 52, &l32, 4);
+		n = 56;
+		break;
+	}
 	case 4803: case 4809: case 4810: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // inherit / msync / behavior_set: sin efecto
 	case 200:  n = mig_host_info(&h, req, rep); break;
+	case 216:  n = mig_host_statistics(&h, req, rep, 0); break;
+	case 204:  n = mig_host_processor_info(&h, req, rep); break;
+	case 419: { uint32_t ps = pset_name(); n = reply_ool(rep, &h, &ps, NULL, 4, 1, NULL); break; }   // host_processor_sets
+	case 420:  n = reply_port(rep, &h, pset_name(), 17); break;   // host_processor_set_priv: el mismo conjunto
+	case 4005: case 4010: n = mig_processor_set_tasks(&h, rep); break;   // processor_set_tasks(_with_flavor): el sabor (control, read, inspect, name) da igual aquí
+	case 219:  n = mig_host_statistics(&h, req, rep, 1); break;
 	case 206:  n = mig_host_get_clock_service(&h, req, rep); break;
 	case 222: n = reply_port(rep, &h, alloc_port(), 17); break;   // host_create_mach_voucher: puerto de voucher ficticio
 	case 225: n = reply_begin(rep, &h, KERN_SUCCESS_); break;     // (host, un entero): se acepta sin efecto
@@ -779,4 +1063,8 @@ static long mach_msg2(struct ctx* c) {
 	return MACH_MSG_SUCCESS;
 }
 
-void emu_mach_init(void) { reg_mach(47, mach_msg2); }
+static long t_iokit_user_client_trap(struct ctx* c) {
+	uint64_t p[6]; for (int i = 0; i < 6; i++) p[i] = ctx_arg(c, 2 + i);
+	return io_user_client_trap((uint32_t)c->a[0], (uint32_t)c->a[1], p);
+}
+void emu_mach_init(void) { reg_mach(47, mach_msg2); reg_mach(100, t_iokit_user_client_trap); }

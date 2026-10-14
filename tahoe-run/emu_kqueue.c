@@ -141,7 +141,7 @@ static void sync_fd(int kq, int fd) {
 #define NOTE_EXEC 0x20000000u
 // EVFILT_PROC con NOTE_EXEC: ¿llegó un aviso de exec? (se consume) / ¿terminó el proceso? (el pidfd es legible)
 static int proc_exec_pending(struct knote* n) {
-	uint8_t* m = NULL; uint32_t sz = 0, snd[3];
+	uint8_t* m = NULL; uint32_t sz = 0, snd[5];
 	if (port_receive(n->xport, 0, &m, &sz, snd, 0, 0) != 0) return 0;
 	free(m);
 	return 1;
@@ -527,7 +527,7 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 				else { k.fflags = 0; k.ext[0] = k.ext[1] = k.ext[2] = k.ext[3] = 0; }   // sin recepción directa: solo "hay mensaje"
 			}
 			else if (n->k.filter == EVFILT_FS) {
-				uint8_t* m = NULL; uint32_t sz = 0, snd[3];
+				uint8_t* m = NULL; uint32_t sz = 0, snd[5];
 				if (port_receive(n->xport, 0, &m, &sz, snd, 0, 0) != 0) continue;   // aviso sin mensaje
 				uint32_t vq = 0; if (sz >= 24) memcpy(&vq, m + 20, 4);
 				free(m);
@@ -597,43 +597,134 @@ static long bsd_kevent_qos(struct ctx* c) {
 }
 
 // kevent_id(id, changelist, nchanges, eventlist, nevents, data_out, data_available, flags): cola de trabajo de
-// libdispatch (workloop); cada identificador tiene su propio kqueue.
+// libdispatch (workloop); cada identificador tiene su propio kqueue (un epoll).
+// Como los kqworkloop dinámicos de XNU, un workloop vive mientras tiene knotes o alguien lo está usando, y después se
+// libera (lo hace su vigilante, wl_watch en emu_proc.c, con kq_workloop_try_free); si libdispatch vuelve a usar el mismo
+// identificador (la dirección de una cola, que se reutiliza), se crea otro. Antes no se liberaban nunca: opendirectoryd
+// llenaba la tabla en unos minutos, kevent_id fallaba con ENOMEM, libdispatch reintentaba sin fin y sus consultas se
+// quedaban sin respuesta (loginwindow esperando para siempre).
+// refs: usos en curso (kevent_id, recoger eventos, aplicar cambios al volver un hilo) y el de kqueue_workloop_ctl CREATE
+// hasta su DESTROY, como la referencia que tiene en XNU. Orden de candados: wlt_lock -> kq_lock / wls_lock.
 #define MAX_WORKLOOPS 1024
-static struct { uint64_t id; int kq; } workloops[MAX_WORKLOOPS];
+static struct { uint64_t id; int kq, refs; } workloops[MAX_WORKLOOPS];
+static pthread_mutex_t wlt_lock = PTHREAD_MUTEX_INITIALIZER;
+static int wl_slot_locked(uint64_t id, int create) {
+	int libre = -1;
+	for (int i = 0; i < MAX_WORKLOOPS; i++) {
+		if (workloops[i].kq > 0 && workloops[i].id == id) return i;
+		if (workloops[i].kq <= 0 && libre < 0) libre = i;
+	}
+	if (!create || libre < 0) return -1;
+	int fd = epoll_create1(EPOLL_CLOEXEC);
+	if (fd < 0) return -1;
+	workloops[libre].id = id; workloops[libre].kq = fd; workloops[libre].refs = 0;
+	return libre;
+}
 int kq_workloop_fd(uint64_t id) {
 	if (id == WQ_KQID_WORKQ) return workq_kq_get();
-	static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
+	pthread_mutex_lock(&wlt_lock);
+	int i = wl_slot_locked(id, 1);
+	int r = i < 0 ? -1 : workloops[i].kq;
+	pthread_mutex_unlock(&wlt_lock);
+	return r;
+}
+// Como kq_workloop_fd, con un uso más (soltarlo con wl_put).
+static int wl_take(uint64_t id) {
+	if (id == WQ_KQID_WORKQ) return workq_kq_get();
+	pthread_mutex_lock(&wlt_lock);
+	int i = wl_slot_locked(id, 1);
 	int r = -1;
-	pthread_mutex_lock(&wl_lock);
-	for (int i = 0; i < MAX_WORKLOOPS; i++) {
-		if (workloops[i].kq > 0 && workloops[i].id == id) { r = workloops[i].kq; break; }
-		if (workloops[i].kq == 0) { workloops[i].kq = epoll_create1(EPOLL_CLOEXEC); workloops[i].id = id; r = workloops[i].kq; break; }
-	}
-	pthread_mutex_unlock(&wl_lock);
-	if (r >= 0) return r;
-	return -1;
+	if (i >= 0) { workloops[i].refs++; r = workloops[i].kq; }
+	pthread_mutex_unlock(&wlt_lock);
+	return r;
+}
+static void wl_put(uint64_t id) {
+	if (id == WQ_KQID_WORKQ) return;
+	pthread_mutex_lock(&wlt_lock);
+	int i = wl_slot_locked(id, 0);
+	if (i >= 0 && workloops[i].refs > 0) workloops[i].refs--;
+	pthread_mutex_unlock(&wlt_lock);
+}
+// Libera el workloop si nadie lo usa y no le quedan knotes ni esperas síncronas. 1 si ya no existe. Solo la llama su
+// vigilante, que deja de vigilar ese descriptor.
+int kq_workloop_try_free(uint64_t id) {
+	if (id == WQ_KQID_WORKQ) return 0;
+	pthread_mutex_lock(&wlt_lock);
+	int i = wl_slot_locked(id, 0);
+	if (i < 0) { pthread_mutex_unlock(&wlt_lock); return 1; }
+	int fd = workloops[i].kq, busy = workloops[i].refs > 0;
+	if (!busy) { pthread_mutex_lock(&kq_lock); for (struct knote* n = notes; n && !busy; n = n->next) busy = n->kq == fd; pthread_mutex_unlock(&kq_lock); }
+	if (!busy) { pthread_mutex_lock(&wls_lock); for (struct wlsync* w = wlsyncs; w && !busy; w = w->next) busy = w->kq == fd && !w->dead; pthread_mutex_unlock(&wls_lock); }
+	if (!busy) { close(fd); workloops[i].kq = 0; workloops[i].id = 0; workloops[i].refs = 0; }
+	pthread_mutex_unlock(&wlt_lock);
+	return !busy;
 }
 // Recoge sin esperar los eventos pendientes de un workloop (kevent_qos_s de 72 bytes). Devuelve cuántos.
 long kq_drain(uint64_t id, uint64_t evp, int max, uint64_t dout, uint64_t davail) {
 	g_dout = dout; g_davail = davail; g_no_poll = 0;
-	int kq = kq_workloop_fd(id);
-	return kq < 0 ? 0 : do_kevent(kq, 2, 0, 0, evp, max, 0);
+	int kq = wl_take(id);
+	long r = kq < 0 ? 0 : do_kevent(kq, 2, 0, 0, evp, max, 0);
+	if (kq >= 0) wl_put(id);
+	return r;
 }
 static long bsd_kevent_id(struct ctx* c) {
 	uint64_t flags = ctx_arg(c, 7);
-	int kq = kq_workloop_fd(c->a[0]);
+	int kq = wl_take(c->a[0]);
 	if (kq < 0) return -D_ENOMEM;
 	wq_note_workloop(c->a[0]);
 	g_dout = c->a[5]; g_davail = ctx_arg(c, 6); g_no_poll = (flags & 2) != 0;
 	long r = do_kevent(kq, 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & 1) ? 0 : -1);
+	wl_put(c->a[0]);
 	wq_arm_workloop(c->a[0]);
 	return r;
 }
 
+// kqueue_workloop_ctl(cmd, options, addr, sz): libdispatch crea así los workloops con atributos propios (prioridad,
+// política, porcentaje de CPU); sin esta llamada usaba su camino de reserva («simulator fallback»: una cola raíz de
+// pthread), y WindowServer se caía en _dispatch_source_invoke dentro de un workloop. Como en XNU
+// (kqueue_workloop_ctl_internal): params empaquetado de 36 bytes {version = sz, flags, id, sched_pri, sched_pol,
+// cpu_percent, cpu_refillms, wi_port}; CREATE (1) exige flags válidos y que el workloop no exista (EEXIST); los
+// workloops con hilo propio o grupo de trabajo devuelven ENOTSUP (en XNU dependen de un boot-arg o del hardware, y
+// libdispatch reintenta sin ellos); DESTROY (2) exige que exista. Las prioridades no se aplican: aquí solo importa que
+// el workloop exista como cola del núcleo (kevent_id).
+static int kq_workloop_exists(uint64_t id) {
+	pthread_mutex_lock(&wlt_lock);
+	int r = wl_slot_locked(id, 0) >= 0;
+	pthread_mutex_unlock(&wlt_lock);
+	return r;
+}
+static long bsd_kqueue_workloop_ctl(struct ctx* c) {
+	enum { CREATE = 1, DESTROY = 2, F_PRI = 0x1, F_POL = 0x2, F_CPU = 0x4, F_WI = 0x8, F_BOUND = 0x10 };
+	struct __attribute__((packed)) { int32_t version, flags; uint64_t id; int32_t pri, pol, cpu, refill; uint32_t wi_port; } pa = { 0 };
+	uint64_t sz = c->a[3];
+	if (sz < 4) return -D_EINVAL;
+	if (safe_read(c->a[2], &pa, sz < sizeof pa ? sz : sizeof pa) < 0) return -D_EFAULT;
+	if ((uint64_t)pa.version != sz) return -D_EINVAL;
+	if (c->a[0] == CREATE) {
+		if (!pa.flags) return -D_EINVAL;
+		if ((pa.flags & F_PRI) && (pa.pri < 1 || pa.pri > 63)) return -D_EINVAL;
+		if ((pa.flags & F_CPU) && (pa.cpu <= 0 || pa.cpu > 100 || pa.refill <= 0 || pa.refill > 0xffffff)) return -D_EINVAL;
+		if (pa.flags & (F_BOUND | F_WI)) return -45;              // ENOTSUP de Darwin
+		if (!(pa.flags & (F_PRI | F_POL | F_CPU))) return -D_EINVAL;
+		if (kq_workloop_exists(pa.id)) return -17;               // EEXIST
+		return wl_take(pa.id) < 0 ? -D_ENOMEM : 0;               // la referencia de CREATE dura hasta DESTROY
+	}
+	if (c->a[0] == DESTROY) { if (!kq_workloop_exists(pa.id)) return -D_ENOENT; wl_put(pa.id); return 0; }
+	return -D_EINVAL;
+}
+
 void emu_kqueue_init(void) {
+	reg_bsd(530, bsd_kqueue_workloop_ctl);
 	reg_bsd(375, bsd_kevent_id); reg_bsd(443, bsd_kqueue);   // guarded_kqueue_np(guard*, flags) = kqueue
 	reg_bsd(362, bsd_kqueue); reg_bsd(363, bsd_kevent); reg_bsd(369, bsd_kevent64); reg_bsd(374, bsd_kevent_qos);
 }
 
 // Aplica una lista de cambios sin recoger eventos (retorno de hilo de workloop).
-long kq_apply_changes(int layout, uint64_t chg, long n, uint64_t workloop) { g_no_poll = 1; return do_kevent(workloop ? kq_workloop_fd(workloop) : workq_kq_get(), layout, chg, n, 0, 0, 0); }
+long kq_apply_changes(int layout, uint64_t chg, long n, uint64_t workloop) {
+	g_no_poll = 1;
+	if (!workloop) return do_kevent(workq_kq_get(), layout, chg, n, 0, 0, 0);
+	int kq = wl_take(workloop);
+	long r = kq < 0 ? -D_ENOMEM : do_kevent(kq, layout, chg, n, 0, 0, 0);
+	if (kq >= 0) wl_put(workloop);
+	return r;
+}

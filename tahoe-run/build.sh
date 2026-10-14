@@ -4,5 +4,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 [ -f sysnames.h ] || python3 gen_sysnames.py "${1:?indica la ruta de xnu}" > sysnames.h
-clang -O1 -g -Wall -Wextra -Wno-unused-parameter -static -o tahoe-run tahoe_run.c emu_sysctl.c emu_fs.c emu_mach.c emu_proc.c emu_kqueue.c emu_net.c emu_fs2.c emu_port.c emu_sem.c emu_psynch.c emu_cs.c emu_cred.c emu_fileport.c
+[ -f bf_pi.h ] || python3 gen_bf.py > bf_pi.h
+# El núcleo en Rust (nucleo/): biblioteca estática sin la biblioteca estándar, enlazada en el mismo binario.
+cargo build --release --quiet --manifest-path nucleo/Cargo.toml
+clang -O1 -g -Wall -Wextra -Wno-unused-parameter -static -o tahoe-run tahoe_run.c emu_sysctl.c emu_fs.c emu_mach.c emu_proc.c emu_kqueue.c emu_net.c emu_fs2.c emu_port.c emu_sem.c emu_psynch.c emu_cs.c emu_cred.c emu_fileport.c emu_dsmos.c \
+	nucleo/target/release/libnucleo.a
 ls -la tahoe-run

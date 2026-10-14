@@ -32,9 +32,13 @@ ssize_t safe_write(uint64_t addr, const void* buf, size_t len);
 int safe_string(uint64_t addr, char* out, size_t max);
 #include <ucontext.h>
 void diag_crash(ucontext_t* uc);
+void diag_stack(ucontext_t* uc, const char* what);   // "abort" (caída) o "espera" (bloqueo, STACKS)
 extern const char* tahoe_root;
 extern char cache_guest_path[1024];   // ruta de la caché vista desde macOS (sin la raíz del host)
 extern uint64_t cache_ino;
+void dsmos_unprotect(uint8_t* seg, uint64_t fileoff, uint64_t filesize, const char* path);   // emu_dsmos.c
+int sys_volume_present(int k);   // emu_fs.c: 1 si el volumen k (0 Data, 1 Preboot) del macOS completo está montado
+void sys_volumes_mount(void);       // emu_fs.c: volúmenes Data y Preboot de un macOS completo (en el PID 1)
 extern const char *g_cache_path, *g_dyld_path, *g_self_exe;   // para relanzar tahoe-run en execve   // raíz del sistema de archivos de macOS 26 (TAHOE_ROOT)
 extern int trace_all;
 
@@ -66,7 +70,9 @@ int port_exists(uint32_t name);
 static inline int mach_trace(void) { static int v = -1; if (v < 0) v = access("/dev/shm/tahoe-mach-trace", F_OK) == 0; return v; }
 // solo los workloops (peticiones de hilo, entregas, EVFILT_WORKLOOP): mucho menos que la traza Mach, para carreras que esta
 // tapa al cambiar los tiempos (msh.sh WL=1). La traza Mach completa la incluye.
-static inline int wl_trace_on(void) { static int v = -1; if (v < 0) v = mach_trace() || access("/dev/shm/tahoe-wl-trace", F_OK) == 0; return v; }
+// Con nombres en /dev/shm/tahoe-wl-trace, solo esos procesos (vacío: todos).
+int trace_file_on(const char* file);
+static inline int wl_trace_on(void) { static int v = -1; if (v < 0) v = mach_trace() || trace_file_on("/dev/shm/tahoe-wl-trace"); return v; }
 int port_rpid(uint32_t name);
 int port_list_owned(uint32_t* names, uint32_t* types, int max);
 uint64_t port_get_context(uint32_t name);
@@ -77,10 +83,15 @@ extern __thread int g_watch;
 int port_drain_idle(uint32_t name);
 int diag_target(void);
 int diag_all(void);
+int msg_trace(void);
+void cred_spawn_session(uint32_t asid);
+int trace_file_on(const char* file);
 void diag_dump_threads(void);
 void diag_breakpoints(void);
 uint32_t cred_euid(void);
 uint32_t cred_egid(void);
+uint32_t cred_auid(void);           // emu_cred.c: sesión de auditoría del proceso (auid, asid)
+uint32_t cred_asid(void);
 void cred_env(char* out, size_t cap);
 void emu_cred_init(void);
 void emu_fs_xattr_init(void);
@@ -97,6 +108,7 @@ uint32_t guest_gid(uint32_t g);
 int tahoe_sigaction(int sig, void (*h)(int, siginfo_t*, void*));
 int port_eventfd(uint32_t name);
 int port_send(uint32_t dest, const uint8_t* msg, uint32_t size);
+int port_send_timeout(uint32_t dest, const uint8_t* msg, uint32_t size, int timeout_ms, int notify);   // notify: MACH_SEND_NOTIFY   // mach_msg con MACH_SEND_TIMEOUT
 int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, uint32_t* sender, uint32_t limit, int large);
 void emu_sem_init(void);
 void emu_psynch_init(void);
@@ -111,10 +123,14 @@ int port_release_send_once(uint32_t name);
 int port_assert_guard(uint32_t name, uint64_t guard);
 int port_swap_guard(uint32_t name, uint64_t old, uint64_t nw);
 int port_get_refs(uint32_t name, uint32_t right, uint32_t* refs);
-enum { KO_TASK = 1, KO_TASK_NAME = 2, KO_IDENTITY_TOKEN = 3, KO_FILEPORT = 4, KO_THREAD = 5 };   // KO_THREAD: pid = tid de Linux
+enum { KO_TASK = 1, KO_TASK_NAME = 2, KO_IDENTITY_TOKEN = 3, KO_FILEPORT = 4, KO_THREAD = 5, KO_AUDIT_SESSION = 6, KO_PSET = 7 };   // KO_THREAD: pid = tid de Linux   // KO_AUDIT_SESSION: pid = asid   // KO_PSET: el conjunto de procesadores (uno)
 uint32_t kobj_make(int type, int32_t pid);
 uint32_t kobj_new(int type, int32_t pid);
 void kobj_free(uint32_t name);
+void kobj_release_thread(uint32_t name);
+const char* smbios(const char* key, const char* def);   // identidad del equipo (emu_sysctl.c, TAHOE_SMBIOS_FILE)
+const char* smbios_target(int ap);
+int vfs_fsids(uint32_t* out, int max);   // fsid de cada montaje, como getfsstat (vfs.generic.vfsidlist)   // mach_port_deallocate de un puerto de hilo de otro proceso
 int kobj_lookup(uint32_t name, int* type, int32_t* pid);
 uint32_t execwatch_add(int32_t target);   // NOTE_EXEC: puerto que recibe un mensaje cuando target hace exec
 void execwatch_del(uint32_t port);
@@ -136,4 +152,4 @@ void special_port_set(int which, uint32_t name);
 void reenable_dispatch(void);   // el kernel no hereda la interceptación de syscalls en el hijo de un fork
 
 // Códigos de error de Darwin
-enum { D_EPERM = 1, D_ENOENT = 2, D_EBADF = 9, D_ENOMEM = 12, D_EFAULT = 14, D_EINVAL = 22, D_ENOSYS = 78 };
+enum { D_EPERM = 1, D_ENOENT = 2, D_ESRCH = 3, D_EBADF = 9, D_ENOMEM = 12, D_EFAULT = 14, D_EINVAL = 22, D_ENOSYS = 78 };

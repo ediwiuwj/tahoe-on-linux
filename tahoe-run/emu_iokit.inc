@@ -9,7 +9,7 @@
 //     padres, con entrar/salir);
 //   - propiedades serializadas en el formato binario de OSSerialize (el que lee IOKit.framework) y en XML;
 //   - diccionarios de coincidencia (XML, binario o de la ruta OOL) y su evaluación: IOProviderClass con herencia,
-//     IONameMatch, IOPropertyMatch, IOResourceMatch, IOPathMatch y claves sueltas;
+//     IONameMatch, IOPropertyMatch, IOResourceMatch, IOPathMatch, IORegistryEntryID y claves sueltas;
 //   - notificaciones (add_notification / interest): mensaje de despertar id 53 al puerto del cliente;
 //   - conexiones (user clients): ganchos por clase para que el puente a DRM/Metal los atienda; sin gancho,
 //     los métodos devuelven kIOReturnUnsupported.
@@ -29,6 +29,7 @@
 #define kIOReturnBadMedia     IOKIT_RET(0x2d0)
 
 static size_t reply_port(uint8_t* r, const struct hdr* req, uint32_t name, uint8_t disposition);
+static int io_trace_on(void);                               // traza de IOKit (más abajo)
 
 // ------------------------------------------------------------------ valores (plist en memoria)
 enum { V_DICT = 1, V_ARRAY, V_STR, V_NUM, V_BOOL, V_DATA, V_SYM };
@@ -274,7 +275,7 @@ static struct val* any_parse(const uint8_t* p, size_t len) {
 }
 
 // ------------------------------------------------------------------ el registro
-#define IO_MAXENT 96
+#define IO_MAXENT 192
 enum { PL_SERVICE = 1, PL_DT = 2, PL_POWER = 4 };   // planos (máscara): IOService, IODeviceTree, IOPower
 struct ioent {
 	const char* name; const char* cls; const char* supers;   // supers: nombres separados por espacios, de la más cercana a la raíz
@@ -366,10 +367,30 @@ static void io_disks(int bus) {
 	int cont = ent_add(d1, "AppleAPFSContainer", "AppleAPFSContainer", "IORegistryEntry IOService IOStorage IOPartitionScheme", "", PL_SERVICE, 0);
 	p_str(cont, "IOClass", "AppleAPFSContainer"); p_str(cont, "UUID", "B0070000-0000-4000-8000-0000000000C1");
 	p_num(cont, "Size", size, 64); p_num(cont, "CapacityInUse", used, 64);
-	int vol = ent_add(cont, "macOS Base System", "AppleAPFSVolume", "IORegistryEntry IOService IOStorage IOMedia", "1", PL_SERVICE, 0);
+	// En un macOS completo el contenedor tiene además los volúmenes Data y Preboot (los mismos que da getfsstat: disk1s2 y
+	// disk1s3), cada uno con su rol, y el del sistema se llama «Macintosh HD»; Sistema y Datos forman un grupo (VolGroupUUID).
+	// bless --info busca el Preboot del contenedor por su rol; diskutil list los enseña. En la Recovery solo está el primero.
+	int full = sys_volume_present(0) && sys_volume_present(1);
+	const char* sysname = full ? "Macintosh HD" : "macOS Base System";
+	int vol = ent_add(cont, sysname, "AppleAPFSVolume", "IORegistryEntry IOService IOStorage IOMedia", "1", PL_SERVICE, 0);
 	disk_media(vol, "disk1s1", 1, 3, size, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
 	p_str(vol, "UUID", BOOT_VOLUME_UUID); p_str(vol, "VolGroupUUID", BOOT_VOLUME_UUID);
-	p_num(vol, "Partition ID", 1, 32); p_str(vol, "FullName", "macOS Base System");
+	p_num(vol, "Partition ID", 1, 32); p_str(vol, "FullName", sysname);
+	if (!full) return;
+	static const struct { const char *name, *bsd, *uuid, *role; int minor, id, group, rv; } more[] = {
+		{ "Macintosh HD - Data", "disk1s2", "B0070000-0000-4000-8000-000000000002", "Data",    4, 2, 1, 0x40 },
+		{ "Preboot",             "disk1s3", "B0070000-0000-4000-8000-000000000003", "Preboot", 5, 3, 0, 0x10 },
+	};
+	// Rol: APFSVolumeRole lee «RoleValue» (número: APFS_VOL_ROLE_SYSTEM 1, PREBOOT 0x10, DATA 0x40); «Role» es su nombre.
+	struct val* r = v_new(V_ARRAY); v_add(r, NULL, v_str("System")); v_set(io_e[vol].props, "Role", r); p_num(vol, "RoleValue", 1, 16);
+	for (size_t i = 0; i < sizeof more / sizeof more[0]; i++) {
+		int v = ent_add(cont, more[i].name, "AppleAPFSVolume", "IORegistryEntry IOService IOStorage IOMedia", more[i].bsd + 6, PL_SERVICE, 0);
+		disk_media(v, more[i].bsd, 1, more[i].minor, size, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
+		p_str(v, "UUID", more[i].uuid); p_str(v, "VolGroupUUID", more[i].group ? BOOT_VOLUME_UUID : more[i].uuid);
+		p_num(v, "Partition ID", (uint64_t)more[i].id, 32); p_str(v, "FullName", more[i].name);
+		struct val* ro = v_new(V_ARRAY); v_add(ro, NULL, v_str(more[i].role)); v_set(io_e[v].props, "Role", ro);
+		p_num(v, "RoleValue", (uint64_t)more[i].rv, 16);
+	}
 }
 
 // GUID de texto -> 16 bytes en el orden de EFI (los tres primeros campos en little endian)
@@ -415,6 +436,55 @@ static void io_nvram_boot(int opt) {
 	p_str(opt, "efi-boot-device", xml);
 }
 
+// ------------------------------------------------------------------ pantalla emulada
+// Un único modo: 1280×800 a 60 Hz, 32 bits por píxel (IO32BitDirectPixels: en memoria B, G, R, X). La memoria de vídeo es un
+// archivo de /dev/shm que ven a la vez WindowServer (la proyecta con IOConnectMapMemory) y el visor de Linux (tools/tahoe-view).
+#define FB_W      1280
+#define FB_H      800
+#define FB_BPR    (FB_W * 4)
+#define FB_VRAM   (16u << 20)                           // 16 MiB: IOFBMemorySize
+#define FB_MODE   1                                     // IODisplayModeID del único modo
+// EDID 1.4 de un panel interno de 13,3" (286×179 mm) con el modo nativo como temporización detallada (CVT con borrado reducido:
+// 71 MHz, 1280+160 × 800+23). Fabricante "TAH" (no es un panel real).
+static void edid_make(uint8_t e[128]) {
+	static const uint8_t head[] = { 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+		0x50, 0x28, 0x80, 0x12, 0, 0, 0, 0, 1, 35, 1, 4,       // "TAH", producto 0x1280, semana 1 de 2025, EDID 1.4
+		0xa5, 29, 18, 120, 0x02,                              // digital 8 bits; 29×18 cm; gamma 2,2; temporización preferida nativa
+		0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54,   // cromaticidad sRGB
+		0, 0, 0 };
+	memset(e, 0, 128);
+	memcpy(e, head, sizeof head);
+	for (int i = 38; i < 54; i++) e[i] = 0x01;               // sin temporizaciones estándar
+	static const uint8_t dtd[18] = { 0xbc, 0x1b, 0x00, 0xa0, 0x50, 0x20, 0x17, 0x30, 0x30, 0x20, 0x36, 0x00,
+		0x1e, 0xb3, 0x10, 0, 0, 0x1a };
+	memcpy(e + 54, dtd, 18);
+	static const uint8_t name[18] = { 0, 0, 0, 0xfc, 0, 'T', 'a', 'h', 'o', 'e', ' ', 'L', 'C', 'D', '\n', ' ', ' ', ' ' };
+	memcpy(e + 72, name, 18);
+	static const uint8_t dummy[18] = { 0, 0, 0, 0x10, 0 };
+	memcpy(e + 90, dummy, 18); memcpy(e + 108, dummy, 18);
+	uint8_t sum = 0; for (int i = 0; i < 127; i++) sum += e[i];
+	e[127] = (uint8_t)-sum;
+}
+static void fb_props(int fb) {
+	p_num(fb, "IOFBMemorySize", FB_VRAM, 32);
+	p_num(fb, "IOFBCurrentPixelCount", (uint64_t)(FB_W + 160) * (FB_H + 23), 64);
+	p_num(fb, "IOFBCurrentPixelClock", 71000000, 64);
+	p_num(fb, "IOFramebufferOpenGLIndex", 0, 32);
+	p_num(fb, "IOFBGammaWidth", 8, 32); p_num(fb, "IOFBGammaCount", 256, 32); p_num(fb, "IOFBGammaHeaderSize", 0, 32);
+	p_bool(fb, "IOFBNeedsRefresh", 0);
+	p_num(fb, "IOFBWaitCursorFrames", 0, 32);
+	p_num(fb, "IOFBWaitCursorPeriod", 33333333, 32);
+}
+static void display_props(int d) {
+	uint8_t e[128]; edid_make(e);
+	p_data(d, "IODisplayEDID", e, sizeof e);
+	p_num(d, "DisplayVendorID", 0x5028, 32);
+	p_num(d, "DisplayProductID", 0x1280, 32);
+	p_num(d, "DisplaySerialNumber", 0, 32);
+	p_str(d, "IODisplayPrefsKey", "IOService:/AppleACPIPlatformExpert/PCI0/IGPU@20000/AppleIntelFramebuffer@0/display0/AppleDisplay-5028-1280");
+	p_num(d, "IODisplayConnectFlags", 0, 32);
+}
+
 static void io_init(void) {
 	if (io_inited) return;
 	io_inited = 1;
@@ -432,25 +502,29 @@ static void io_init(void) {
 	p_num(root, "OSKernelCPUSubtype", 3, 32);                // CPU_SUBTYPE_X86_64_ALL
 	p_str(root, "IOKitBuildVersion", "Darwin Kernel Version 25.6.0: tahoe-run; root:xnu-12377.121.6~1/RELEASE_X86_64");
 	p_str(root, "OS Build Version", "25G83");
-	int plat = ent_add(root, "MacBookPro16,1", "IOPlatformExpertDevice", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
+	// Identidad del equipo: la de smbios.json (macserial, tools/smbios.sh) o, sin archivo, un MacBookPro16,1 ficticio.
+	const char* modelo = smbios("modelo", "MacBookPro16,1");
+	const char* serie = smbios("serie", "C02TAHOE0001");
+	const char* uuidp = smbios("uuid", "00000000-0000-1000-8000-000000000001");
+	int plat = ent_add(root, modelo, "IOPlatformExpertDevice", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(plat, "name", "/");
-	p_cstr(plat, "model", "MacBookPro16,1");
-	p_data(plat, "compatible", "MacBookPro16,1\0J152F\0AppleACPI", 28);
+	p_cstr(plat, "model", modelo);
+	{ char cp[96]; size_t cn = (size_t)snprintf(cp, sizeof cp, "%s%c%s%cAppleACPI", modelo, 0, smbios_target(0), 0) + 1; p_data(plat, "compatible", cp, cn); }
 	p_cstr(plat, "manufacturer", "Apple Inc.");
-	p_cstr(plat, "board-id", "Mac-E1008331FDC96864");
-	p_cstr(plat, "product-name", "MacBookPro16,1");
-	p_cstr(plat, "target-type", "J152F");
+	p_cstr(plat, "board-id", smbios("placa", "Mac-E1008331FDC96864"));
+	p_cstr(plat, "product-name", modelo);
+	p_cstr(plat, "target-type", smbios_target(0));
 	p_cstr(plat, "device_type", "bridge");
-	p_str(plat, "IOPlatformUUID", "00000000-0000-1000-8000-000000000001");
-	p_str(plat, "IOPlatformSerialNumber", "C02TAHOE0001");
-	p_str(plat, "serial-number-string", "C02TAHOE0001");
+	p_str(plat, "IOPlatformUUID", uuidp);
+	p_str(plat, "IOPlatformSerialNumber", serie);
+	p_str(plat, "serial-number-string", serie);
 	p_str(plat, "IOPlatformSystemSleepPolicy", "none");
 	p_str(plat, "IOBusyInterest", "IOCommand is not serializable");
 	p_bool(plat, "IOKitDiagnostics", 0);
 	p_u32(plat, "clock-frequency", 0);
 	p_u32(plat, "#address-cells", 2); p_u32(plat, "#size-cells", 2);
 	p_str(plat, "IOPolledInterface", "none");
-	v_set(io_e[plat].props, "IOPlatformUUID", v_str("00000000-0000-1000-8000-000000000001"));
+	v_set(io_e[plat].props, "IOPlatformUUID", v_str(uuidp));
 	(void)dmi;
 
 	int acpi = ent_add(plat, "AppleACPIPlatformExpert", "AppleACPIPlatformExpert", "IORegistryEntry IOService IOPlatformExpert", "", PL_SERVICE, 1);
@@ -490,10 +564,56 @@ static void io_init(void) {
 	p_str(di2, "IOProviderClass", "IOResources");
 	p_str(di2, "IOResourceMatch", "IOKit");
 	p_str(di2, "IOUserClientClass", "DIDeviceCreatorUserClient");
+	// Gestor de GPU (AppleGPUWrangler.kext, dentro de AppleGraphicsControl): GPUWrangler.framework lo busca al iniciar las
+	// pantallas (CoreDisplay, en WSInitialize de WindowServer), espera a que aparezca y lo abre para enumerar las GPU.
+	int gw = ent_add(res, "AppleGPUWrangler", "AppleGPUWrangler", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	p_str(gw, "IOClass", "AppleGPUWrangler");
+	p_str(gw, "CFBundleIdentifier", "com.apple.AppleGPUWrangler");
+	p_str(gw, "IOMatchCategory", "AppleGPUWrangler");
+	p_str(gw, "IOProviderClass", "IOResources");
+	p_str(gw, "IOUserClientClass", "AppleGPUWranglerUserClient");
+	// Vigilante del sistema (Watchdog.kext, com.apple.driver.watchdog): watchdogd lo abre al arrancar y le avisa periódicamente
+	// de que userspace sigue vivo; si no lo encuentra y no está en una máquina virtual, aborta. Sin núcleo de macOS no hay a
+	// quién reiniciar: el servicio está y sus métodos se aceptan sin efecto (uc_watchdog).
+	int wd = ent_add(res, "IOWatchdog", "IOWatchdog", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	p_str(wd, "IOClass", "IOWatchdog");
+	p_str(wd, "CFBundleIdentifier", "com.apple.driver.watchdog");
+	p_str(wd, "IOMatchCategory", "IOWatchdog");
+	p_str(wd, "IOProviderClass", "IOResources");
+	p_str(wd, "IOUserClientClass", "IOWatchdogUserClient");
+
+	// EndpointSecurity (EndpointSecurity.kext): libEndpointSecurity lo busca por clase al crear un cliente (es_new_client);
+	// sin él, xprotectd y endpointsecurityd salen con error y launchd los relanza sin parar. Se da un cliente válido que
+	// nunca recibe eventos (uc_es).
+	int esd = ent_add(res, "EndpointSecurityDriver", "EndpointSecurityDriver", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	p_str(esd, "IOClass", "EndpointSecurityDriver");
+	p_str(esd, "CFBundleIdentifier", "com.apple.iokit.EndpointSecurity");
+	p_str(esd, "IOMatchCategory", "EndpointSecurityDriver");
+	p_str(esd, "IOProviderClass", "IOResources");
+	p_str(esd, "IOUserClientClass", "EndpointSecurityDriverClient");
+
+	// Raíz de IOSurface (IOSurface.kext): la memoria compartida de imágenes (ventanas, capas, pantalla) entre procesos.
+	// IOSurface.framework la busca por nombre (IOServiceNameMatching("IOSurfaceRoot")) y abre su user client; sin ella,
+	// Metal y CoreDisplay se quedan reintentando (WindowServer, al crear el dispositivo Metal de la pantalla).
+	int sroot = ent_add(res, "IOSurfaceRoot", "IOSurfaceRoot", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	p_str(sroot, "IOClass", "IOSurfaceRoot");
+	p_str(sroot, "CFBundleIdentifier", "com.apple.iokit.IOSurface");
+	p_str(sroot, "IOMatchCategory", "IOSurfaceRoot");
+	p_str(sroot, "IOProviderClass", "IOResources");
+	p_str(sroot, "IOUserClientClass", "IOSurfaceRootUserClient");
 
 	int opt = ent_add(plat, "options", "IODTNVRAM", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(opt, "name", "options");
 	p_str(opt, "boot-args", "");                              // OSString, como IONVRAMCHRPHandler (las variables de texto son cadenas)
+	// MLB y ROM en la NVRAM de Apple (las pone el firmware; OpenCore, en un Hackintosh): los de smbios.json si los hay.
+	{
+		const char* mlb = smbios("mlb", NULL), *rom = smbios("rom", NULL);
+		if (mlb) p_data(opt, "4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38C14:MLB", mlb, strlen(mlb));
+		if (rom && strlen(rom) == 12) {
+			uint8_t r[6]; for (int i = 0; i < 6; i++) { unsigned b; sscanf(rom + 2 * i, "%2x", &b); r[i] = (uint8_t)b; }
+			p_data(opt, "4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38C14:ROM", r, 6);
+		}
+	}
 	// Modo depuración (tools/macos-shell.sh --depurar): la variable de NVRAM con la que recoveryosd, cuando algo le obliga a
 	// reiniciar, se queda dormido en vez de ejecutar /sbin/reboot (ros_sleep_on_failure_set de RecoveryOS.framework: OSData
 	// cuyo texto UTF-8 da boolValue verdadero). Sin el modo, la NVRAM no la tiene, como en un Mac.
@@ -504,6 +624,21 @@ static void io_init(void) {
 	p_data(efi, "firmware-vendor", "A\0p\0p\0l\0e\0\0", 12);   // UTF-16 con NUL
 	p_cstr(efi, "firmware-abi", "EFI64");
 	{ uint32_t rev = 0x0001000a; p_data(efi, "firmware-revision", &rev, 4); }
+	// /efi/platform: lo que publica el firmware de un Mac Intel (modelo y número de serie en UTF-16, system-id, frecuencias
+	// del bus y del reloj ART). libimage4 lo busca al cargarse (darwin_cpl3_init) y sin él aborta («panic: failed to get
+	// platform node»): cryptexd y kmutil se caían así en bucle.
+	{
+		int pf = ent_add(efi, "platform", "IOService", "IORegistryEntry", "", PL_DT, 0);
+		p_cstr(pf, "name", "platform");
+		uint16_t u16[64]; size_t k;
+		for (k = 0; modelo[k] && k < 63; k++) u16[k] = (uint8_t)modelo[k];
+		u16[k++] = 0; p_data(pf, "Model", u16, k * 2);
+		for (k = 0; serie[k] && k < 63; k++) u16[k] = (uint8_t)serie[k];
+		u16[k++] = 0; p_data(pf, "SystemSerialNumber", u16, k * 2);
+		uint8_t sid[16] = { 0 }; efi_guid(uuidp, sid); p_data(pf, "system-id", sid, 16);
+		uint64_t fsb = 100000000ULL, art = 24000000ULL;            // 100 MHz y 24 MHz (Skylake y posteriores)
+		p_data(pf, "FSBFrequency", &fsb, 8); p_data(pf, "ARTFrequency", &art, 8);
+	}
 	int chosen = ent_add(plat, "chosen", "IOService", "IORegistryEntry", "", PL_SERVICE | PL_DT, 0);
 	p_cstr(chosen, "name", "chosen");
 	p_data(chosen, "boot-uuid", "00000000-0000-1000-8000-000000000002", 37);
@@ -533,19 +668,72 @@ static void io_init(void) {
 	p_str(gpu, "IOPCIMatch", compat);
 	p_bool(gpu, "IOPCIExpressLinkStatus", 1);
 	p_str(gpu, "IOProviderClass", "IOPCIDevice");
+	// Identidad PCI completa (como la publica IOPCIFamily en 00:02.0): CoreDisplay la usa para nombrar la GPU (vid.did, b:d:f).
+	p_u32(gpu, "revision-id", 0x09); p_u32(gpu, "subsystem-vendor-id", vendor); p_u32(gpu, "subsystem-id", device);
+	{ uint32_t reg[5] = { 0x00001000, 0, 0, 0, 0 }; p_data(gpu, "reg", reg, sizeof reg); }   // bus 0, dispositivo 2, función 0
+	p_str(gpu, "pcidebug", "0:2:0");
+	p_cstr(gpu, "AAPL,slot-name", "Internal@0,2,0");
+	p_u32(gpu, "AAPL,ig-platform-id", 0x0a260006);                // Haswell móvil (HD 4400), como en las guías de Dortania
+	p_num(gpu, "IOPCIExpressCapabilities", 2, 32);
+	p_bool(gpu, "built-in", 1);
 	int accel = ent_add(gpu, "AppleIntelFramebuffer", "AppleIntelFramebuffer", "IORegistryEntry IOService IOFramebuffer", "0", PL_SERVICE, 1);
 	p_str(accel, "IOClass", "AppleIntelFramebuffer");
 	p_str(accel, "IOProviderClass", "IOPCIDevice");
-	int accl = ent_add(gpu, "IOAccelerator", "IOAccelerator", "IORegistryEntry IOService", "", PL_SERVICE, 1);
-	p_str(accl, "IOClass", "IOAccelerator");
-	p_str(accl, "IOVARendererID", "0x00000000");
-	int disp = ent_add(accel, "AppleDisplay", "IODisplay", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	fb_props(accel);
+	// Sin IOAccelerator: no hay driver Metal para esta GPU (la HD 4400 no tiene driver en macOS 26), y un acelerador sin
+	// "MetalPluginName" deja a CoreDisplay sin dispositivo Metal y a WindowServer cayendo al iniciar las pantallas. Sin
+	// acelerador, como en una máquina virtual sin GPU, WindowServer compone por software en el framebuffer.
+	int dcon = ent_add(accel, "display0", "IODisplayConnect", "IORegistryEntry IOService", "", PL_SERVICE, 0);
+	p_str(dcon, "IOClass", "IODisplayConnect");
+	int disp = ent_add(dcon, "AppleDisplay", "IODisplay", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(disp, "IOClass", "AppleDisplay");
-	int wr = ent_add(plat, "IODisplayWrangler", "IODisplayWrangler", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	display_props(disp);
+	// IODisplayWrangler cuelga de IOResources (CoreDisplay lo busca por la ruta IOService:/IOResources/IODisplayWrangler):
+	// lleva el estado de energía de las pantallas; encendidas (4 de 4).
+	int wr = ent_add(res, "IODisplayWrangler", "IODisplayWrangler", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(wr, "IOClass", "IODisplayWrangler");
+	p_str(wr, "IOProviderClass", "IOResources");
+	{
+		struct val* pm = v_new(V_DICT);
+		v_set(pm, "CurrentPowerState", v_num(4, 32)); v_set(pm, "MaxPowerState", v_num(4, 32));
+		v_set(pm, "DevicePowerState", v_num(4, 32)); v_set(pm, "DesiredPowerState", v_num(4, 32));
+		v_set(io_e[wr].props, "IOPowerManagement", pm);
+	}
 
 	int hid = ent_add(res, "IOHIDSystem", "IOHIDSystem", "IORegistryEntry IOService", "", PL_SERVICE, 1);
 	p_str(hid, "IOClass", "IOHIDSystem");
+	{
+		// Parámetros de entrada que publica IOHIDSystem (los de fábrica de macOS). IOHIDGetParameter (NXClickTime...) los lee
+		// del registro con la conexión de IOHIDSystem, y solo si faltan pregunta al sistema de eventos HID (com.apple.
+		// iohideventsystem). WindowServer lo hace al crear la sesión, ANTES de montar su propio servidor de eventos: sin esta
+		// propiedad se preguntaba a sí mismo y se quedaba esperando para siempre.
+		struct val* hp = v_new(V_DICT);
+		static const struct { const char* k; uint64_t v; int bits; } hpv[] = {
+			{ "HIDClickTime", 500000000, 64 },            // doble clic: 0,5 s (en ns)
+			{ "HIDKeyRepeat", 83333333, 64 },             // repetición de teclas
+			{ "HIDInitialKeyRepeat", 500000000, 64 },
+			{ "HIDPointerAcceleration", 45056, 32 },
+			{ "HIDMouseAcceleration", 45056, 32 },
+			{ "HIDTrackpadAcceleration", 45056, 32 },
+			{ "HIDScrollAcceleration", 20480, 32 },
+			{ "HIDF12EjectDelay", 250000000, 64 },
+			{ "HIDSlowKeysDelay", 0, 32 },
+			{ "HIDStickyKeysDisabled", 0, 32 },
+			{ "HIDStickyKeysOn", 0, 32 },
+			{ "HIDStickyKeysShiftToggles", 0, 32 },
+			{ "HIDMouseKeysOptionToggles", 0, 32 },
+			{ "HIDWaitCursorFrameInterval", 16666667, 32 },
+			{ "HIDPointerButtonMode", 2, 32 },
+			{ "HIDScrollZoomModifierMask", 0, 32 },
+			{ "HIDDefaultParameters", 1, 32 },
+		};
+		for (size_t k = 0; k < sizeof hpv / sizeof hpv[0]; k++) v_add(hp, hpv[k].k, v_num(hpv[k].v, hpv[k].bits));
+		struct val* cs = v_new(V_DICT);                  // HIDClickSpace: margen del doble clic en píxeles
+		v_add(cs, "x", v_num(4, 32)); v_add(cs, "y", v_num(4, 32));
+		v_add(hp, "HIDClickSpace", cs);
+		v_add(hp, "HIDKeyboardModifierMappingPairs", v_new(V_ARRAY));
+		v_set(io_e[hid].props, "HIDParameters", hp);
+	}
 	int kbd = ent_add(acpi, "AppleACPIPS2Keyboard", "IOHIDDevice", "IORegistryEntry IOService", "", PL_SERVICE, 0);
 	p_num(kbd, "PrimaryUsagePage", 1, 32); p_num(kbd, "PrimaryUsage", 6, 32); p_num(kbd, "DeviceUsagePage", 1, 32); p_num(kbd, "DeviceUsage", 6, 32);
 	p_str(kbd, "Product", "Apple Internal Keyboard / Trackpad");
@@ -680,6 +868,7 @@ static int name_matches(int i, const char* want) {
 static int match_entry(int i, const struct val* m);
 static int match_one(int i, const char* key, const struct val* v) {
 	if (!strcmp(key, "IOProviderClass")) return v->t == V_STR ? ent_conforms(i, v->s) : 0;
+	if (!strcmp(key, "IORegistryEntryID")) return v->t == V_NUM && io_e[i].id == v->n;   // IORegistryEntryIDMatching
 	if (!strcmp(key, "IONameMatch")) {
 		if (v->t == V_STR) return name_matches(i, v->s);
 		if (v->t == V_ARRAY) { for (int k = 0; k < v->cnt; k++) if (v->kid[k]->t == V_STR && name_matches(i, v->kid[k]->s)) return 1; return 0; }
@@ -849,12 +1038,17 @@ static void notif_send(struct ioobj* o, int type) {
 	memcpy(m, &h, sizeof h);
 	uint32_t sz = 0, ty = (uint32_t)type; memcpy(m + 24, &sz, 4); memcpy(m + 28, &ty, 4);
 	for (int i = 0; i < 8; i++) { uint64_t v = i < o->nref ? o->ref[i] : 0; memcpy(m + 32 + i * 8, &v, 8); }
-	port_send(o->wake, m, sizeof m);
+	int r = port_send(o->wake, m, sizeof m);
+	if (io_trace_on()) logf_("    IOKIT <%d> aviso tipo=%d al puerto 0x%x (notificación 0x%x) -> %d\n", (int)getpid(), type, o->wake, o->port, r);
 }
 
 // ------------------------------------------------------------------ user clients: ganchos por clase
 // Un gancho recibe la conexión y la llamada y devuelve kIOReturn*. Aquí no hay ninguno (los registran el puente DRM/Metal).
-struct uc_call { int ent; uint32_t selector; const uint64_t* sin; uint32_t nsin; const uint8_t* inband; uint32_t ninband; uint64_t* sout; uint32_t* nsout; uint8_t* outband; uint32_t* noutband; };
+// Llamada a un método de un user client (io_connect_method). Al entrar, *nsout y *noutband son lo que pide quien llama
+// (como mucho 16 escalares y 4096 bytes); el gancho los deja en lo que devuelve. Las estructuras grandes viajan fuera de
+// línea: ool_in/ool_in_size (entrada) y ool_out/ool_out_size (salida, *ool_out_len lo escrito), memoria de este proceso.
+struct uc_call { int ent; uint32_t selector; const uint64_t* sin; uint32_t nsin; const uint8_t* inband; uint32_t ninband; uint64_t* sout; uint32_t* nsout; uint8_t* outband; uint32_t* noutband;
+	uint64_t ool_in, ool_in_size, ool_out, ool_out_size, *ool_out_len; };
 typedef int32_t (*uc_method_fn)(struct uc_call*);
 // AppleSMC: selector 2 (kSMCHandleYPCEvent) con SMCKeyData_t de 80 bytes; el resultado va en el byte 40. Sin SMC real, toda clave
 // responde "no encontrada" (0x84), que es lo que esperan los clientes ante una clave ausente.
@@ -890,7 +1084,7 @@ static uint8_t* hid_map(void) {
 		v = 1; memcpy(g + G_ENUM, &v, 4);
 		for (int i = 0; i < LLEQSIZE_; i++) { int32_t nx = i + 1 == LLEQSIZE_ ? 0 : i + 1; memcpy(g + G_LLEQ + i * EQELEM_SIZE, &nx, 4); }
 		v = 1; memcpy(g + G_LLEHEAD, &v, 4); memcpy(g + G_LLETAIL, &v, 4); v = 0; memcpy(g + G_LLELAST, &v, 4);
-		int16_t wb[4] = { 0, 1920, 0, 1080 }; memcpy(g + G_WORKBOUNDS, wb, 8);
+		int16_t wb[4] = { 0, FB_W, 0, FB_H }; memcpy(g + G_WORKBOUNDS, wb, 8);
 	}
 	hid_shm = m;
 	return m;
@@ -903,6 +1097,7 @@ static int32_t uc_hid(struct uc_call* c) {
 		return hid_map() ? 0 : kIOReturnNoMemory;
 	}
 	case 1: case 2: return 0;                                          // setEventsEnable / setCursorEnable
+	case 3: return 0;                                                  // extPostEvent (loginwindow): aceptado sin efecto
 	case 4: {                                                          // setMouseLocation(x, y)
 		uint8_t* m = hid_map(); if (!m || c->nsin < 2) return kIOReturnBadArgument;
 		int16_t xy[2] = { (int16_t)c->sin[0], (int16_t)c->sin[1] }; memcpy(m + 8 + G_CURSORLOC, xy, 4);
@@ -926,7 +1121,413 @@ static int32_t uc_lifs(struct uc_call* c) {
 	*c->nsout = 0; *c->noutband = 0;
 	return 0;
 }
+// IOWatchdogUserClient: watchdogd pregunta si el vigilante está activo y se registra; todo se acepta sin datos de salida (el
+// vigilante queda inactivo, como si nunca fuera a disparar). Se anota cada selector la primera vez.
+static int32_t uc_watchdog(struct uc_call* c) {
+	static uint64_t seen;
+	if (c->selector < 64 && !(seen & (1ull << c->selector))) {
+		seen |= 1ull << c->selector;
+		logf_("    iokit: <%d> watchdog selector %u (%u escalares, %u bytes): aceptado sin efecto\n", (int)getpid(), c->selector, c->nsin, c->ninband);
+	}
+	*c->nsout = 0; *c->noutband = 0;
+	return 0;
+}
+// EndpointSecurityDriverClient (selectores deducidos de libEndpointSecurity): 0xb registra el cliente (estructura de 0x218
+// bytes) y 0xa devuelve, como escalar, la dirección del búfer de mensajes que el núcleo proyecta en el proceso («DataPark»:
+// cabecera de 8 bytes justo antes, con la firma 0x42 en su primer byte). Sin núcleo de macOS no hay eventos: el búfer queda
+// vacío y el resto de selectores (suscribir, silenciar, responder...) se aceptan con salidas a cero.
+static int32_t uc_es(struct uc_call* c) {
+	static uint64_t seen;
+	if (c->selector < 64 && !(seen & (1ull << c->selector))) {
+		seen |= 1ull << c->selector;
+		logf_("    iokit: <%d> endpointsecurity selector %u (%u escalares, %u bytes): aceptado sin efecto\n", (int)getpid(), c->selector, c->nsin, c->ninband);
+	}
+	memset(c->outband, 0, *c->noutband);
+	memset(c->sout, 0, *c->nsout * 8);
+	if (c->selector == 0xa && *c->nsout >= 1) {
+		static uint8_t* buf;
+		if (!buf) {
+			void* m = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (m == MAP_FAILED) return kIOReturnNoMemory;
+			buf = m; buf[0] = 0x42;
+		}
+		c->sout[0] = (uint64_t)(buf + 8); *c->nsout = 1;
+	}
+	return 0;
+}
+static int io_trace = -1;                                   // traza de IOKit (TAHOE_IOKIT o /dev/shm/tahoe-iokit-trace)
+// AppleGPUWranglerUserClient (interfaz deducida de GPUWrangler.framework, que es quien la usa):
+//   0xa0000001 saludo: entra y sale una estructura de 4 bytes con la versión ('GW' << 16 | 2).
+//   0xa0000002 lista de GPU: estructura de 0x23bc bytes (fuera de línea): u32 número de GPU, cabecera hasta 0x3c y 16
+//              entradas de 0x238. Entrada: +0 u16 id; +4 u32 banderas (0x1 expulsada, 0x2 extraíble, 0x10 integrada,
+//              0x20 discreta); +8 y +0x10 u64 ID de registro (índices 1 y 0 de GPUWranglerGPUGetRegistryEntryID);
+//              +0x18 u64 número de framebuffers; +0x20 u64[] sus ID de registro; +0x220/+0x228 otros ID (índices 2 y 1).
+//   0xa0000003 eventos: estructura de 0xa9 bytes, u32 número de eventos y el evento; sin eventos, 0.
+//   0xa0000004 entra un u64 (plazo); sin salida.
+// La GPU es la gráfica integrada emulada (IGPU en PCI0), con su framebuffer y su acelerador.
+static int ent_by_name_cls(const char* name, const char* cls) {
+	for (int i = 0; i < io_ne; i++) if (!strcmp(io_e[i].name, name) && !strcmp(io_e[i].cls, cls)) return i;
+	return -1;
+}
+static int32_t uc_gpuwrangler(struct uc_call* c) {
+	if (trace_all || io_trace > 0) logf_("    iokit: <%d> GPUWrangler selector 0x%x entrada=%uB (+%luB fuera) salida=%uB (+%luB fuera)\n", (int)getpid(), c->selector, c->ninband, (unsigned long)c->ool_in_size, *c->noutband, (unsigned long)c->ool_out_size);
+	*c->nsout = 0;
+	switch (c->selector) {
+	case 0xa0000001: {
+		uint32_t v = 0x47570002;                                 // misma versión que pide GPUWrangler
+		if (*c->noutband < 4) return kIOReturnBadArgument;
+		memcpy(c->outband, &v, 4); *c->noutband = 4;
+		return 0;
+	}
+	case 0xa0000002: {
+		static uint8_t list[0x23bc];
+		memset(list, 0, sizeof list);
+		int gpu = ent_by_name_cls("IGPU", "IOPCIDevice"), fb = ent_by_name_cls("AppleIntelFramebuffer", "AppleIntelFramebuffer");
+		int acc = ent_by_name_cls("IOAccelerator", "IOAccelerator");
+		if (gpu >= 0) {
+			uint32_t n = 1; memcpy(list, &n, 4);
+			uint8_t* e = list + 0x3c;
+			uint16_t id = 1; memcpy(e, &id, 2);
+			uint32_t fl = 0x10; memcpy(e + 4, &fl, 4);              // integrada
+			uint64_t rg = io_e[gpu].id, ra = acc >= 0 ? io_e[acc].id : 0, nfb = fb >= 0, rfb = fb >= 0 ? io_e[fb].id : 0;
+			memcpy(e + 0x10, &rg, 8); memcpy(e + 8, ra ? &ra : &rg, 8);
+			memcpy(e + 0x18, &nfb, 8); memcpy(e + 0x20, &rfb, 8);
+		}
+		if (c->ool_out && c->ool_out_size >= sizeof list) {
+			if (safe_write(c->ool_out, list, sizeof list) != (ssize_t)sizeof list) return kIOReturnBadArgument;
+			*c->ool_out_len = sizeof list; *c->noutband = 0;
+			return 0;
+		}
+		if (*c->noutband >= sizeof list) { memcpy(c->outband, list, sizeof list); *c->noutband = sizeof list; return 0; }
+		return kIOReturnBadArgument;
+	}
+	case 0xa0000003: {
+		uint32_t n = *c->noutband < 0xa9 ? *c->noutband : 0xa9;
+		memset(c->outband, 0, n); *c->noutband = n;                // ningún evento pendiente
+		return 0;
+	}
+	case 0xa0000004:
+		*c->noutband = 0;
+		return 0;
+	case 0xc0000001: {
+		// estructura de 0x26 bytes de ida y vuelta (función interna tras GPUWranglerGPUByID, después de leer el ID de
+		// registro del framebuffer): se devuelve tal cual y se anota para estudiarla
+		uint32_t n = c->ninband < *c->noutband ? c->ninband : *c->noutband;
+		memcpy(c->outband, c->inband, n); *c->noutband = n;
+		static int shown;
+		if (!shown++) {
+			char hex[3 * 64 + 1] = ""; for (uint32_t i = 0; i < c->ninband && i < 64; i++) snprintf(hex + 3 * i, 4, " %02x", c->inband[i]);
+			logf_("    iokit: <%d> GPUWrangler 0xc0000001 entrada:%s\n", (int)getpid(), hex);
+		}
+		return 0;
+	}
+	default:
+		logf_("    iokit: <%d> GPUWrangler selector 0x%x sin implementar\n", (int)getpid(), c->selector);
+		*c->noutband = 0;
+		return kIOReturnUnsupported;
+	}
+}
+// IOFramebufferUserClient (IOGraphics-600, IOFramebufferUserClient.cpp: selectores 0-20). Sin acelerador: WindowServer dibuja
+// en la memoria de vídeo (tipo kIOFBVRAMMemory 110, o la apertura del sistema 0) y el cursor va por software en la memoria
+// compartida StdFBShmem_t (tipo kIOFBCursorMemory 100) que crea createSharedCursor.
+// Cabecera para el visor tras la memoria de vídeo (en FB_VRAM): "TFB1", ancho, alto, bytes por fila, formato (0 = BGRX).
+struct fb_hdr { char magic[4]; uint32_t w, h, bpr, fmt, seq; };
+static uint8_t* fb_vram;
+static uint8_t* fb_cursor; static size_t fb_cursor_size;
+static void fb_path(char* b, size_t n, const char* what) { snprintf(b, n, "/dev/shm/tahoe-%s-%s", what, getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x"); }
+static uint8_t* shm_file(const char* what, size_t size, int reset) {
+	char p[128]; fb_path(p, sizeof p, what);
+	int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+	if (fd < 0) return NULL;
+	struct stat st; fstat(fd, &st);
+	if ((reset || (size_t)st.st_size != size) && ftruncate(fd, 0) == 0 && ftruncate(fd, size) != 0) { close(fd); return NULL; }
+	uint8_t* m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	return m == MAP_FAILED ? NULL : m;
+}
+static uint8_t* fb_map(void) {
+	if (fb_vram) return fb_vram;
+	uint8_t* m = shm_file("fb", FB_VRAM + 4096, 0);
+	if (!m) return NULL;
+	struct fb_hdr h = { { 'T', 'F', 'B', '1' }, FB_W, FB_H, FB_BPR, 0, 0 };
+	memcpy(m + FB_VRAM, &h, sizeof h);
+	return fb_vram = m;
+}
+// StdFBShmem_t con IOFB_ARBITRARY_SIZE_CURSOR e IOFB_ARBITRARY_FRAMES_CURSOR (lo que usan el núcleo y WindowServer).
+struct fb_shmem {
+	int32_t cursorSema, frame;
+	char cursorShow, cursorObscured, shieldFlag, shielded;
+	int16_t saveRect[4], shieldRect[4], cursorLoc[2], cursorRect[4], oldCursorRect[4], screenBounds[4];
+	int32_t version, structSize;
+	uint32_t vblTime[2], vblDelta[2];
+	uint64_t vblCount, vblDrift, vblDeltaMeasured;
+	uint32_t vblDeltaReal[2];
+	uint32_t reservedC[22];
+	uint8_t hardwareCursorCapable, hardwareCursorActive, hardwareCursorShields, reservedB[1];
+	int16_t cursorSize[4][2], hotSpot[4][2];
+};
+_Static_assert(offsetof(struct fb_shmem, version) == 56 && offsetof(struct fb_shmem, vblCount) == 80 &&
+               offsetof(struct fb_shmem, hardwareCursorCapable) == 200 && offsetof(struct fb_shmem, hotSpot) == 220 &&
+               sizeof(struct fb_shmem) == 240, "StdFBShmem_t");
+struct fb_pixinfo {                                      // IOPixelInformation
+	uint32_t bytesPerRow, bytesPerPlane, bitsPerPixel, pixelType, componentCount, bitsPerComponent, componentMasks[16];
+	char pixelFormat[64];
+	uint32_t flags, activeWidth, activeHeight, reserved[2];
+};
+_Static_assert(sizeof(struct fb_pixinfo) == 172, "IOPixelInformation");
+struct fb_modeinfo { uint32_t nominalWidth, nominalHeight, refreshRate, maxDepthIndex, flags; uint16_t imageWidth, imageHeight; uint32_t reserved[3]; };
+struct fb_timing_v2 {                                    // IODetailedTimingInformationV2
+	uint32_t reservedA[3], hScaledInset, vScaledInset, scalerFlags, hScaled, vScaled, signalConfig, signalLevels;
+	uint64_t pixelClock, minPixelClock, maxPixelClock;
+	uint32_t hActive, hBlanking, hSyncOffset, hSyncPulseWidth, vActive, vBlanking, vSyncOffset, vSyncPulseWidth;
+	uint32_t hBorderLeft, hBorderRight, vBorderTop, vBorderBottom, hSyncConfig, hSyncLevel, vSyncConfig, vSyncLevel, numLinks;
+	uint32_t vBlankingExtension;
+	uint16_t pixelEncoding, bitsPerColorComponent, colorimetry, dynamicRange, dscBpp, dscSliceHeight, dscSliceWidth, vMaxStretch, vMaxShrink, reservedB[3];
+};
+struct fb_timing { uint32_t appleTimingID, flags; union { uint8_t v1[52]; struct fb_timing_v2 v2; } d; };
+#pragma pack(push, 4)
+struct fb_modedesc { struct fb_modeinfo info; struct fb_timing timing; };   // IOFBDisplayModeDescription
+#pragma pack(pop)
+_Static_assert(sizeof(struct fb_modeinfo) == 36 && offsetof(struct fb_timing_v2, pixelClock) == 40 &&
+               offsetof(struct fb_modedesc, timing) == 36 && offsetof(struct fb_modedesc, timing.d) == 44, "IOFBDisplayModeDescription");
+static int32_t uc_fb(struct uc_call* c) {
+	uint32_t want = *c->noutband;
+	*c->noutband = 0; *c->nsout = 0;
+	switch (c->selector) {
+	case 0: {                                                          // createSharedCursor(versión, ancho máx., ancho de espera)
+		if (c->nsin < 3) return kIOReturnBadArgument;
+		uint32_t ver = (uint32_t)c->sin[0], mw = (uint32_t)c->sin[1], mww = (uint32_t)c->sin[2], frames;
+		if (mw > 256 || mww > 256) return kIOReturnNoMemory;
+		if (!mw || !mww) return kIOReturnBadArgument;
+		if ((ver & 0xff) == 3) { frames = (ver >> 16) & 0xff; if (frames > 32) return kIOReturnNoMemory; if (!frames) return kIOReturnBadArgument; }
+		else if ((ver & 0xff) == 2) frames = 4;
+		else return kIOReturnUnsupported;
+		size_t img = (size_t)mw * mw * 4, wimg = (size_t)mww * mww * 4;
+		size_t size = sizeof(struct fb_shmem) + img + (img > wimg ? img : wimg) + (frames - 1) * wimg;
+		if (fb_cursor) munmap(fb_cursor, fb_cursor_size);
+		fb_cursor = shm_file("fbcursor", size, 1); fb_cursor_size = size;
+		if (!fb_cursor) return kIOReturnNoMemory;
+		struct fb_shmem* sh = (struct fb_shmem*)fb_cursor;
+		sh->version = (int32_t)(ver & 0xff); sh->structSize = (int32_t)size; sh->cursorShow = 1;
+		sh->screenBounds[0] = 0; sh->screenBounds[1] = FB_W; sh->screenBounds[2] = 0; sh->screenBounds[3] = FB_H;
+		sh->cursorLoc[0] = FB_W / 2; sh->cursorLoc[1] = FB_H / 2;
+		p_num(c->ent, "IOFBWaitCursorFrames", frames - 1, 32);
+		return 0;
+	}
+	case 1: {                                                          // getPixelInformation(modo, profundidad, apertura)
+		// modo 0: el actual (CoreDisplay lo pide así tras setDisplayMode con 0)
+		if (c->nsin < 3 || (c->sin[0] != FB_MODE && c->sin[0] != 0) || c->sin[1] != 0 || c->sin[2] != 0) return kIOReturnBadArgument;
+		struct fb_pixinfo pi = { .bytesPerRow = FB_BPR, .bitsPerPixel = 32, .pixelType = 2 /* kIORGBDirectPixels */,
+			.componentCount = 3, .bitsPerComponent = 8, .componentMasks = { 0xff0000, 0xff00, 0xff },
+			.pixelFormat = "--------RRRRRRRRGGGGGGGGBBBBBBBB", .activeWidth = FB_W, .activeHeight = FB_H };
+		uint32_t n = want < sizeof pi ? want : sizeof pi;
+		memcpy(c->outband, &pi, n); *c->noutband = n;
+		return 0;
+	}
+	case 2: c->sout[0] = FB_MODE; c->sout[1] = 0; *c->nsout = 2; return 0;   // getCurrentDisplayMode -> (modo, profundidad)
+	case 5: {                                                          // getInformationForDisplayMode(modo)
+		if (c->nsin < 1 || (c->sin[0] != FB_MODE && c->sin[0] != 0) || want < sizeof(struct fb_modeinfo)) return kIOReturnBadArgument;
+		struct fb_modedesc d = { 0 };
+		d.info = (struct fb_modeinfo){ FB_W, FB_H, 60u << 16, 0, 0x7 | 0x400 /* seguro, válido, por defecto; integrado */, 286, 179, { 0 } };
+		d.timing.flags = want >= sizeof d ? 0x80000000u : 0;          // kIODetailedTimingValid
+		struct fb_timing_v2* t = &d.timing.d.v2;
+		t->pixelClock = t->minPixelClock = t->maxPixelClock = 71000000;
+		t->hActive = FB_W; t->hBlanking = 160; t->hSyncOffset = 48; t->hSyncPulseWidth = 32;
+		t->vActive = FB_H; t->vBlanking = 23; t->vSyncOffset = 3; t->vSyncPulseWidth = 6;
+		t->hScaled = FB_W; t->vScaled = FB_H; t->numLinks = 1; t->bitsPerColorComponent = 8;
+		uint32_t n = want < sizeof d ? want : sizeof d;
+		memcpy(c->outband, &d, n); *c->noutband = n;
+		return 0;
+	}
+	case 6: c->sout[0] = 1; *c->nsout = 1; return 0;                 // getDisplayModeCount
+	case 7: {                                                          // getDisplayModes
+		if (want < 4) return kIOReturnBadArgument;
+		uint32_t m = FB_MODE; memcpy(c->outband, &m, 4); *c->noutband = 4;
+		return 0;
+	}
+	case 8: c->sout[0] = 0; *c->nsout = 1; return 0;                 // getVRAMMapOffset: la imagen empieza al principio
+	case 13:                                                           // setCursorPosition(dispositivo, x, y)
+		if (fb_cursor && c->nsin >= 3) { struct fb_shmem* sh = (struct fb_shmem*)fb_cursor; sh->cursorLoc[0] = (int16_t)c->sin[1]; sh->cursorLoc[1] = (int16_t)c->sin[2]; }
+		return 0;
+	case 3: case 4: case 9: case 10: case 11: case 12: case 14: case 15: case 16: case 19: case 20:
+		return 0;                                                      // cambios de modo, cursor, gamma, CLUT, atributos: aceptados
+	case 21:                                                           // CoreDisplay::Framebuffer registra un búfer suyo de 0x20
+		return 0;                                                      // bytes (1, 0, dirección, tamaño): se acepta, queda a cero
+	case 18: {                                                         // getAttribute(atributo)
+		uint32_t a = c->nsin ? (uint32_t)c->sin[0] : 0;
+		c->sout[0] = 0; *c->nsout = 1;
+		switch (a) {
+		case 0x77737570: case 0x77736368: case 0x77736564:            // 'wsup' 'wsch' 'wsed': inicio de WindowServer, cambios de conexión
+		case 0x6d726466:                                               // 'mrdf' kIOMirrorDefaultAttribute: sin espejo
+		case 0x636c616d:                                               // 'clam' estado de la tapa: abierta (0)
+		case 0x77737276:                                               // 'wsrv' WindowServer activo
+			return 0;
+		case 0x706f7772:                                               // 'powr' encendido: máximo
+			c->sout[0] = 2; return 0;
+		}
+		static uint32_t seen[32]; static int nseen;
+		int known = 0; for (int i = 0; i < nseen; i++) known |= seen[i] == a;
+		if (!known && nseen < 32) { seen[nseen++] = a; logf_("    iokit: <%d> framebuffer getAttribute '%c%c%c%c' sin implementar\n", (int)getpid(), a >> 24, a >> 16 & 0xff, a >> 8 & 0xff, a & 0xff); }
+		*c->nsout = 0;
+		return kIOReturnUnsupported;
+	}
+	default:
+		logf_("    iokit: <%d> framebuffer selector %u sin implementar\n", (int)getpid(), c->selector);
+		return kIOReturnUnsupported;
+	}
+}
+// IOSurfaceRootUserClient (interfaz deducida de IOSurface.framework, que es quien la usa; tools/diag/llamadas.py):
+//   0   crear: 1 escalar (superficie madre o 0) y las propiedades serializadas (binario, como los diccionarios de IOKit);
+//       sale una estructura de 0xc68 bytes (ver struct sf_result).
+//   4   buscar por ID: 1 escalar (el ID); sale la misma estructura.
+//   0xd información de la conexión: sin entradas, sale una estructura de 0x28 bytes; la conexión solo vale si el u16 en
+//       +0x22 es 1 (ioSurfaceConnectInternal la cierra si no).
+// Trampas rápidas (iokit_user_client_trap, ver io_user_client_trap): 0/1 contadores de uso, 2 bloquear, 3 desbloquear,
+// 4 liberar, 5 tras crear o buscar, 6 eventos compartidos, 8/9 quitar valores.
+//
+// Las superficies son de todo el arranque (WindowServer y las apps se las pasan por ID): una tabla en
+// /dev/shm/tahoe-surfaces-<id del arranque> y la memoria de cada una en /dev/shm/tahoe-surf-<id del arranque>-<ID>, que
+// cada proceso proyecta al crearla o buscarla. Tras la imagen va una página con la información que el núcleo comparte
+// con los clientes (el sello, "seed", en +0xc: lo lee IOSurfaceGetSeed y cambia al desbloquear para escribir).
+struct sf_result {                                       // lo que IOSurface copia en su objeto (+0x70)
+	uint64_t base;                                       // +0x00 dirección de la memoria en este proceso
+	uint64_t shared;                                     // +0x08 página compartida (sello en +0xc)
+	uint64_t r10;
+	uint32_t id, r1c;                                    // +0x18 IOSurfaceID
+	uint64_t alloc, width, height, bpr, offset;          // +0x20 tamaño, +0x28/+0x30, +0x38 bytes por fila, +0x40 base
+	uint32_t format, r4c;                                // +0x48 formato de píxel (FourCC)
+	uint64_t r50;
+	uint32_t planes, r5c;                                // +0x58 número de planos (0: uno implícito)
+	uint16_t bpe; uint8_t ew, eh;                        // +0x60 bytes por elemento, ancho/alto del elemento
+	uint8_t r64[0x88 - 0x64];
+	uint8_t plane[20][0x98];                             // +0x88 planos
+};
+_Static_assert(offsetof(struct sf_result, id) == 0x18 && offsetof(struct sf_result, bpr) == 0x38 &&
+               offsetof(struct sf_result, format) == 0x48 && offsetof(struct sf_result, planes) == 0x58 &&
+               offsetof(struct sf_result, bpe) == 0x60 && sizeof(struct sf_result) == 0xc68, "resultado de IOSurface");
+#define SF_MAX 4096
+struct sf_ent { uint32_t id, used; uint64_t alloc, width, height, bpr; uint32_t format; uint16_t bpe; uint8_t ew, eh; };
+struct sf_table { uint32_t next_id, pad; struct sf_ent e[SF_MAX]; };
+static struct sf_table* sf_tab;
+static struct { uint32_t id; uint8_t* m; size_t size; } sf_maps[SF_MAX];   // proyecciones de este proceso
+static struct sf_table* sf_table(void) {
+	if (!sf_tab) { sf_tab = (struct sf_table*)shm_file("surfaces", sizeof(struct sf_table), 0); if (sf_tab && !sf_tab->next_id) sf_tab->next_id = 1; }
+	return sf_tab;
+}
+static uint8_t* sf_map(const struct sf_ent* e) {
+	uint32_t k = e->id % SF_MAX;
+	if (sf_maps[k].id == e->id && sf_maps[k].m) return sf_maps[k].m;
+	char what[32]; snprintf(what, sizeof what, "surf-%u", e->id);
+	char p[128]; fb_path(p, sizeof p, what);                         // /dev/shm/tahoe-surf-<ID>-<arranque>
+	int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+	if (fd < 0) return NULL;
+	size_t size = e->alloc + 4096;
+	struct stat st; fstat(fd, &st);
+	if ((size_t)st.st_size < size && ftruncate(fd, size) != 0) { close(fd); return NULL; }
+	uint8_t* m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (m == MAP_FAILED) return NULL;
+	if (sf_maps[k].m) munmap(sf_maps[k].m, sf_maps[k].size);         // otra superficie ocupaba la ranura
+	sf_maps[k].id = e->id; sf_maps[k].m = m; sf_maps[k].size = size;
+	return m;
+}
+static uint64_t sf_num(const struct val* d, const char* k, uint64_t def) { const struct val* v = d ? v_get(d, k) : NULL; return v && v->t == V_NUM ? v->n : def; }
+static int32_t sf_fill(const struct sf_ent* e, uint8_t* out, uint32_t want, uint32_t* nout) {
+	uint8_t* m = sf_map(e);
+	if (!m) return kIOReturnNoMemory;
+	static struct sf_result r; memset(&r, 0, sizeof r);
+	r.base = (uint64_t)m; r.shared = (uint64_t)(m + e->alloc); r.id = e->id;
+	r.alloc = e->alloc; r.width = e->width; r.height = e->height; r.bpr = e->bpr; r.format = e->format;
+	r.bpe = e->bpe; r.ew = e->ew; r.eh = e->eh;
+	uint32_t n = want < sizeof r ? want : sizeof r;
+	memcpy(out, &r, n); *nout = n;
+	return 0;
+}
+static int32_t uc_iosurface(struct uc_call* c) {
+	uint32_t want = *c->noutband;
+	*c->noutband = 0; *c->nsout = 0;
+	switch (c->selector) {
+	case 0: {                                                          // crear
+		struct sf_table* t = sf_table(); if (!t) return kIOReturnNoMemory;
+		struct val* d = c->ninband ? any_parse(c->inband, c->ninband) : NULL;
+		struct sf_ent e = { 0 };
+		e.width = sf_num(d, "IOSurfaceWidth", 0); e.height = sf_num(d, "IOSurfaceHeight", 0);
+		e.bpe = (uint16_t)sf_num(d, "IOSurfaceBytesPerElement", 4); e.ew = (uint8_t)sf_num(d, "IOSurfaceElementWidth", 1); e.eh = (uint8_t)sf_num(d, "IOSurfaceElementHeight", 1);
+		e.format = (uint32_t)sf_num(d, "IOSurfacePixelFormat", 0);
+		e.bpr = sf_num(d, "IOSurfaceBytesPerRow", (e.width * e.bpe + 63) & ~63ull);
+		e.alloc = sf_num(d, "IOSurfaceAllocSize", e.bpr * e.height);
+		if (!e.alloc) e.alloc = 4096;
+		e.alloc = (e.alloc + 4095) & ~4095ull;
+		if (e.alloc > (1ull << 30)) return kIOReturnNoMemory;
+		e.id = __atomic_fetch_add(&t->next_id, 1, __ATOMIC_SEQ_CST); e.used = 1;
+		t->e[e.id % SF_MAX] = e;
+		if (trace_all || io_trace > 0) logf_("    iokit: <%d> IOSurface %u creada: %lux%lu bpe=%u bpr=%lu tamaño=%lu formato=0x%x\n", (int)getpid(), e.id, (unsigned long)e.width, (unsigned long)e.height, e.bpe, (unsigned long)e.bpr, (unsigned long)e.alloc, e.format);
+		return sf_fill(&t->e[e.id % SF_MAX], c->outband, want, c->noutband);
+	}
+	case 4: {                                                          // buscar por ID
+		struct sf_table* t = sf_table(); if (!t || c->nsin < 1) return kIOReturnBadArgument;
+		uint32_t id = (uint32_t)c->sin[0];
+		struct sf_ent* e = &t->e[id % SF_MAX];
+		if (!e->used || e->id != id) return kIOReturnNotFound;
+		return sf_fill(e, c->outband, want, c->noutband);
+	}
+	case 0xd: {
+		uint8_t info[0x28] = { 0 };
+		uint16_t one = 1; memcpy(info + 0x22, &one, 2);
+		uint32_t n = want < sizeof info ? want : sizeof info;
+		memcpy(c->outband, info, n); *c->noutband = n;
+		return 0;
+	}
+	default: {
+		static uint64_t seen;
+		if (c->selector < 64 && !(seen & (1ull << c->selector))) {
+			seen |= 1ull << c->selector;
+			logf_("    iokit: <%d> IOSurface selector 0x%x sin implementar (%u escalares, %u bytes, +%lu fuera; pide %u bytes, +%lu fuera)\n", (int)getpid(), c->selector, c->nsin, c->ninband, (unsigned long)c->ool_in_size, want, (unsigned long)c->ool_out_size);
+		}
+		return kIOReturnUnsupported;
+	}
+	}
+}
+static int32_t trap_iosurface(int ent, uint32_t idx, const uint64_t* p) {
+	(void)ent;
+	switch (idx) {
+	case 0: case 1: case 2: case 5: return 0;                          // contadores de uso, bloquear, tras crear/buscar
+	case 3: {                                                          // desbloquear: si se escribió, cambia el sello
+		struct sf_table* t = sf_table(); uint32_t id = (uint32_t)p[0];
+		struct sf_ent* e = t ? &t->e[id % SF_MAX] : NULL;
+		uint8_t* m = e && e->used && e->id == id ? sf_map(e) : NULL;
+		if (m) __atomic_fetch_add((uint32_t*)(m + e->alloc + 0xc), 1, __ATOMIC_SEQ_CST);
+		return 0;
+	}
+	case 4: return 0;                                                  // liberar: la memoria se queda (se borra al limpiar)
+	}
+	static uint64_t seen;
+	if (idx < 64 && !(seen & (1ull << idx))) {
+		seen |= 1ull << idx;
+		logf_("    iokit: <%d> IOSurface trampa %u (0x%lx, 0x%lx, 0x%lx) sin implementar\n", (int)getpid(), idx, p[0], p[1], p[2]);
+	}
+	return kIOReturnUnsupported;
+}
+typedef int32_t (*uc_trap_fn)(int ent, uint32_t idx, const uint64_t* p);
+static uc_trap_fn uc_trap_for(const char* cls) {
+	if (!strcmp(cls, "IOSurfaceRoot")) return trap_iosurface;
+	return NULL;
+}
+// iokit_user_client_trap (trampa Mach 100): IOConnectTrap0..6(conexión, índice, p1..p6), la vía rápida de algunos user
+// clients (IOSurface: bloquear, desbloquear, liberar...). Se resuelve en este proceso, como los mensajes a la conexión.
+long io_user_client_trap(uint32_t port, uint32_t idx, const uint64_t* p) {
+	struct ioobj* o = obj_by_port(port);
+	if (!o || o->kind != K_CONNECT || o->closed || o->ent < 0) return kIOReturnBadArgument;
+	uc_trap_fn fn = uc_trap_for(io_e[o->ent].cls);
+	if (!fn) { logf_("    iokit: trampa %u de %s sin gancho\n", idx, io_e[o->ent].cls); return kIOReturnUnsupported; }
+	return fn(o->ent, idx, p);
+}
 static uc_method_fn uc_hook_for(const char* cls) {
+	if (!strcmp(cls, "AppleGPUWrangler")) return uc_gpuwrangler;
+	if (!strcmp(cls, "AppleIntelFramebuffer")) return uc_fb;
+	if (!strcmp(cls, "IOSurfaceRoot")) return uc_iosurface;
+	if (!strcmp(cls, "IOWatchdog")) return uc_watchdog;
+	if (!strcmp(cls, "EndpointSecurityDriver")) return uc_es;
 	if (!strcmp(cls, "AppleSMC")) return uc_smc;
 	if (!strcmp(cls, "com_apple_filesystems_lifs")) return uc_lifs;
 	if (!strcmp(cls, "IOHIDSystem")) return uc_hid;
@@ -1010,11 +1611,15 @@ static const struct { int id; const char* name; } io_names[] = {
 	{ 2889, "registry_entry_get_property_bin_buf" },
 	{ 2890, "service_wait_quiet_with_options" },
 };
-static int io_trace = -1;
+// Traza de IOKit: TAHOE_IOKIT, o /dev/shm/tahoe-iokit-trace (launchd no propaga el entorno): vacío, todos los procesos;
+// con nombres de programas, solo esos (tools/diag/discos.sh IOKS='...'; tools/diag/iokit.py lo resume).
+static int io_trace_on(void) {
+	if (io_trace < 0) io_trace = getenv("TAHOE_IOKIT") != NULL || trace_file_on("/dev/shm/tahoe-iokit-trace");
+	return io_trace;
+}
 static const char* io_name_of(int id) { for (unsigned i = 0; i < sizeof io_names / sizeof *io_names; i++) if (io_names[i].id == id) return io_names[i].name; return "?"; }
 static void io_log_req(const struct hdr* h, const uint8_t* req) {
-	if (io_trace < 0) io_trace = getenv("TAHOE_IOKIT") != NULL || access("/dev/shm/tahoe-iokit-trace", F_OK) == 0;   // el archivo sirve porque launchd no propaga el entorno
-	if (!io_trace) return;
+	if (!io_trace_on()) return;
 	struct rq q; rq_init(&q, h, req);
 	char who[200] = ""; int ent = obj_ent(h->remote);
 	if (ent >= 0) snprintf(who, sizeof who, " [%s:%s]", io_e[ent].cls, io_e[ent].name);
@@ -1048,8 +1653,30 @@ static void io_log_req(const struct hdr* h, const uint8_t* req) {
 	logf_("    IOKIT <%d> %s(%d)%s%s\n", (int)getpid(), io_name_of(h->id), h->id, who, arg);
 }
 
+// Respuesta de una petición, para la traza: el código de retorno o, si devuelve un puerto, a qué objeto corresponde.
+static void io_log_rep(const struct hdr* h, const uint8_t* rep, size_t n) {
+	if (!io_trace_on() || n < 36) return;
+	uint32_t bits; memcpy(&bits, rep, 4);
+	if (bits & 0x80000000u) {
+		uint32_t name; memcpy(&name, rep + 28, 4);
+		int e = name ? obj_ent(name) : -1;
+		if (e >= 0) logf_("    IOKIT <%d>   -> %s: puerto 0x%x [%s:%s]\n", (int)getpid(), io_name_of(h->id), name, io_e[e].cls, io_e[e].name);
+		else logf_("    IOKIT <%d>   -> %s: puerto 0x%x\n", (int)getpid(), io_name_of(h->id), name);
+	} else {
+		int32_t kr; memcpy(&kr, rep + 32, 4);
+		if (h->id == 2831 && n >= 40) { uint32_t b; memcpy(&b, rep + 36, 4); logf_("    IOKIT <%d>   -> %s: kr=0x%x ocupado=%u\n", (int)getpid(), io_name_of(h->id), kr, b); }
+		else logf_("    IOKIT <%d>   -> %s: kr=0x%x tam=%zu\n", (int)getpid(), io_name_of(h->id), kr, n);
+	}
+}
+
 // ------------------------------------------------------------------ el servidor
+static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* rep, int* handled);
 static size_t mig_iokit(const struct hdr* h, const uint8_t* req, uint8_t* rep, int* handled) {
+	size_t n = mig_iokit_req(h, req, rep, handled);
+	if (*handled) io_log_rep(h, rep, n);
+	return n;
+}
+static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* rep, int* handled) {
 	*handled = 1;
 	io_init();
 	io_log_req(h, req);
@@ -1336,6 +1963,14 @@ static size_t mig_iokit(const struct hdr* h, const uint8_t* req, uint8_t* rep, i
 			memcpy(rep + n, &a, 8); memcpy(rep + n + 8, &sz, 8);
 			return n + 16;
 		}
+		if (!strcmp(io_e[self->ent].cls, "AppleIntelFramebuffer") && (mtype == 100 || mtype == 110 || mtype == 0)) {
+			uint8_t* m = mtype == 100 ? fb_cursor : fb_map();                   // 100 cursor compartido; 110/0 memoria de vídeo
+			if (!m) return rp_err(rep, h, mtype == 100 ? kIOReturnBadArgument : kIOReturnNoMemory);
+			size_t n = reply_begin(rep, h, KERN_SUCCESS_);
+			uint64_t a = (uint64_t)m, sz = mtype == 100 ? fb_cursor_size : FB_VRAM;
+			memcpy(rep + n, &a, 8); memcpy(rep + n + 8, &sz, 8);
+			return n + 16;
+		}
 		logf_("    iokit: map_memory tipo=%u de %s sin implementar\n", mtype, io_e[self->ent].cls);
 		return rp_err(rep, h, kIOReturnUnsupported);
 	}
@@ -1344,20 +1979,40 @@ static size_t mig_iokit(const struct hdr* h, const uint8_t* req, uint8_t* rep, i
 		// 2865 io_connect_method: scalar_input[], inband_input, ool_input; salidas inband/scalar/ool. Sin gancho de clase: no soportado.
 		if (!self || self->kind != K_CONNECT || self->closed) return rp_err(rep, h, kIOReturnNoDevice);
 		uc_method_fn fn = uc_hook_for(io_e[self->ent].cls);
-		if (!fn || h->id != 2865) { logf_("    iokit: %s selector sin gancho (id=%d clase=%s)\n", "user client", h->id, io_e[self->ent].cls); return rp_err(rep, h, kIOReturnUnsupported); }
+		// 2872 io_connect_method_var_output: como 2865, pero la salida de estructura es de tamaño variable y vuelve fuera de
+		// línea (respuesta compleja: descriptor OOL, NDR, inband, escalares y la cuenta de la salida variable).
+		int var = h->id == 2872;
+		if (!fn || (h->id != 2865 && !var)) { logf_("    iokit: %s selector sin gancho (id=%d clase=%s)\n", "user client", h->id, io_e[self->ent].cls); return rp_err(rep, h, kIOReturnUnsupported); }
 		struct uc_call uc = { .ent = self->ent };
 		rq_ndr(&q); uc.selector = rq_u32(&q);
 		uint32_t nsin = rq_u32(&q); uint64_t sin[16] = { 0 }; for (uint32_t i = 0; i < nsin && i < 16; i++) sin[i] = rq_u64(&q);
 		uc.sin = sin; uc.nsin = nsin; uc.inband = rq_bytes(&q, &uc.ninband);
-		uint64_t sout[16] = { 0 }; uint32_t nsout = 16, nout = 4096; static __thread uint8_t outband[4096];
-		uc.sout = sout; uc.nsout = &nsout; uc.outband = outband; uc.noutband = &nout;
+		uc.ool_in = rq_u64(&q); uc.ool_in_size = rq_u64(&q);                  // ool_input, ool_input_size
+		uint32_t want_out = rq_u32(&q), want_sout = rq_u32(&q);              // inband_outputCnt, scalar_outputCnt
+		static __thread uint8_t* varbuf;                                       // salida variable de 2872 (64 KB por hilo)
+		if (var) { if (!varbuf) varbuf = malloc(65536); uc.ool_out = (uint64_t)varbuf; uc.ool_out_size = varbuf ? 65536 : 0; }
+		else { uc.ool_out = rq_u64(&q); uc.ool_out_size = rq_u64(&q); }      // ool_output, ool_output_size
+		if (q.p > q.len) { want_out = 4096; want_sout = 16; uc.ool_in = uc.ool_in_size = 0; if (!var) uc.ool_out = uc.ool_out_size = 0; }   // petición corta
+		uint32_t cap_out = want_out < 4096 ? want_out : 4096, cap_sout = want_sout < 16 ? want_sout : 16;
+		uint64_t sout[16] = { 0 }, ool_len = 0; uint32_t nsout = cap_sout, nout = cap_out; static __thread uint8_t outband[4096];
+		uc.sout = sout; uc.nsout = &nsout; uc.outband = outband; uc.noutband = &nout; uc.ool_out_len = &ool_len;
 		int32_t r = fn(&uc);
 		if (trace_all || r) logf_("    iokit: <%d> %s selector %u -> 0x%x\n", (int)getpid(), io_e[self->ent].cls, uc.selector, (unsigned)r);
 		if (r) return rp_err(rep, h, r);
+		if (nout > cap_out) nout = cap_out;
+		if (nsout > cap_sout) nsout = cap_sout;
+		if (var) {                                                             // cabecera compleja + descriptor OOL (como rp_ool)
+			if (ool_len > uc.ool_out_size) ool_len = uc.ool_out_size;
+			size_t n = rp_ool(rep, h, varbuf, (size_t)ool_len, 0, 0) - 4;      // sin la cuenta final: va tras inband y escalares
+			memcpy(rep + n, &nout, 4); memcpy(rep + n + 4, outband, nout); n += 4 + ((nout + 3) & ~3u);
+			memcpy(rep + n, &nsout, 4); memcpy(rep + n + 4, sout, nsout * 8); n += 4 + nsout * 8;
+			uint32_t vl = (uint32_t)ool_len; memcpy(rep + n, &vl, 4);
+			return n + 4;
+		}
 		size_t n = reply_begin(rep, h, KERN_SUCCESS_);
 		memcpy(rep + n, &nout, 4); memcpy(rep + n + 4, outband, nout); n += 4 + ((nout + 3) & ~3u);
 		memcpy(rep + n, &nsout, 4); memcpy(rep + n + 4, sout, nsout * 8); n += 4 + nsout * 8;
-		uint64_t osz = 0; memcpy(rep + n, &osz, 8);
+		memcpy(rep + n, &ool_len, 8);                                          // ool_output_size: lo escrito fuera de línea
 		return n + 8;
 	}
 	}

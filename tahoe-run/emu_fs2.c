@@ -36,7 +36,6 @@ static long bsd_chmod(struct ctx* c)  { PATH1(p, 0); RET(chmod(p, (mode_t)c->a[1
 // daría EINVAL/EPERM. launchd lo hace con sus sockets y servicios; se acepta sin efecto.
 static long chown_result(long r) { if (r < 0 && (errno == EINVAL || errno == EPERM)) return 0; return r < 0 ? err() : 0; }
 static long bsd_chown(struct ctx* c)  { PATH1(p, 0); return chown_result(chown(p, (uid_t)c->a[1], (gid_t)c->a[2])); }
-static long bsd_ret0(struct ctx* c) { (void)c; return 0; }
 #include <sys/xattr.h>
 static long bsd_fchflags(struct ctx* c) { uint32_t v = (uint32_t)c->a[1]; fsetxattr((int)c->a[0], "user.tahoe.flags", &v, 4, 0); return 0; }   // sin soporte de xattr: se acepta igual
 static long bsd_chflags(struct ctx* c) { PATH1(p, 0); uint32_t v = (uint32_t)c->a[1]; lsetxattr(p, "user.tahoe.flags", &v, 4, 0); return 0; }
@@ -83,7 +82,21 @@ static long bsd_flock(struct ctx* c) {        // LOCK_SH 1, LOCK_EX 2, LOCK_NB 4
 }
 static long bsd_getdtablesize(struct ctx* c) { (void)c; return 10240; }
 static long bsd_readv(struct ctx* c)  { RET(readv((int)c->a[0], (const struct iovec*)c->a[1], (int)c->a[2])); }
-static long bsd_writev(struct ctx* c) { RET(writev((int)c->a[0], (const struct iovec*)c->a[1], (int)c->a[2])); }
+// writev; en un proceso de STACKS, lo que escribe en su salida de errores también va al registro (NSLog y los mensajes de
+// AppKit antes de salir van ahí, y el proceso que lo lanzó suele tenerla en /dev/null).
+static long bsd_writev(struct ctx* c) {
+	if ((int)c->a[0] == 2 && diag_target()) {
+		const struct iovec* v = (const struct iovec*)c->a[1];
+		char t[1024]; size_t k = 0;
+		for (int i = 0; i < (int)c->a[2] && i < 8 && k < sizeof t - 1; i++) {
+			size_t n = v[i].iov_len < sizeof t - 1 - k ? v[i].iov_len : sizeof t - 1 - k;
+			if (safe_read((uint64_t)v[i].iov_base, t + k, n) == (ssize_t)n) k += n;
+		}
+		t[k] = 0;
+		logf_("    stderr <%d>: %s%s", (int)getpid(), t, k && t[k - 1] == '\n' ? "" : "\n");
+	}
+	RET(writev((int)c->a[0], (const struct iovec*)c->a[1], (int)c->a[2]));
+}
 static long bsd_utimes(struct ctx* c) {       // struct timeval de Darwin: {i64 segundos, i32 microsegundos, pad}
 	PATH1(p, 0);
 	struct timespec ts[2];
@@ -109,8 +122,16 @@ static long bsd_getgroups(struct ctx* c) {
 	return r;
 }
 static long bsd_ok(struct ctx* c) { (void)c; return 0; }                // setgroups/setuid/setgid...: ya somos el usuario efectivo
-// select(nfds, readfds, writefds, exceptfds, timeval*)
-static long bsd_select(struct ctx* c) {
+// select(nfds, readfds, writefds, exceptfds, timeval*) y pselect(..., timespec*, sigmask*): el fd_set de Darwin es el mismo
+// mapa de bits (int32 por palabra) que el de Linux. pselect se diferencia en el plazo (timespec) y en la máscara de señales
+// durante la espera, que aquí se lee y se ignora: tahoe-run aún no entrega señales al invitado (ver bsd_pthread_sigmask).
+static long do_select(struct ctx* c, int ts);
+static long bsd_select(struct ctx* c) { return do_select(c, 0); }
+static long bsd_pselect(struct ctx* c) {
+	if (c->a[5]) { uint32_t m; if (safe_read(c->a[5], &m, 4) != 4) return -D_EFAULT; }
+	return do_select(c, 1);
+}
+static long do_select(struct ctx* c, int ts) {
 	int n = (int)c->a[0];
 	if (n < 0 || n > 1024) return -D_EINVAL;
 	size_t bytes = ((size_t)n + 7) / 8;
@@ -125,9 +146,10 @@ static long bsd_select(struct ctx* c) {
 	if (c->a[4]) {
 		uint8_t t[16];
 		if (safe_read(c->a[4], t, 16) != 16) return -D_EFAULT;
-		int64_t s; int32_t us;
-		memcpy(&s, t, 8); memcpy(&us, t + 8, 4);
-		tv.tv_sec = s; tv.tv_usec = us; tp = &tv;
+		int64_t s; int32_t us; int64_t ns;
+		memcpy(&s, t, 8); memcpy(&us, t + 8, 4); memcpy(&ns, t + 8, 8);
+		tv.tv_sec = s; tv.tv_usec = ts ? (suseconds_t)(ns / 1000) : us; tp = &tv;   // timespec: {i64 s, i64 ns}
+		if (ts && ns % 1000 && tv.tv_usec < 999999) tv.tv_usec++;                  // no esperar menos de lo pedido
 	}
 	int r = select(n, have[0] ? &sets[0] : NULL, have[1] ? &sets[1] : NULL, have[2] ? &sets[2] : NULL, tp);
 	if (r < 0) return err();
@@ -257,12 +279,12 @@ void emu_fs2_init(void) {
 	reg_bsd(221, bsd_setattrlist); reg_bsd(228, bsd_fsetattrlist); reg_bsd(524, bsd_setattrlistat);
 	reg_bsd(474, bsd_symlinkat); reg_bsd(467, bsd_fchmodat); reg_bsd(468, bsd_fchownat); reg_bsd(471, bsd_linkat);
 	reg_bsd(136, bsd_mkdir); reg_bsd(137, bsd_rmdir); reg_bsd(10, bsd_unlink); reg_bsd(15, bsd_chmod);
-	reg_bsd(364, bsd_lchown); reg_bsd(34, bsd_chflags); reg_bsd(35, bsd_fchflags); reg_bsd(351, bsd_ret0);   // lchown; chflags/fchflags/auditon sin efecto
+	reg_bsd(364, bsd_lchown); reg_bsd(34, bsd_chflags); reg_bsd(35, bsd_fchflags);   // lchown; chflags/fchflags (auditon está en emu_cred.c)
 	reg_bsd(234, bsd_no_xattr); reg_bsd(142, bsd_gethostuuid);
 	reg_bsd(16, bsd_chown); reg_bsd(254, bsd_lchown); reg_bsd(200, bsd_truncate); reg_bsd(132, bsd_mkfifo);
 	reg_bsd(128, bsd_rename); reg_bsd(9, bsd_link); reg_bsd(57, bsd_symlink);
 	reg_bsd(124, bsd_fchmod); reg_bsd(123, bsd_fchown); reg_bsd(201, bsd_ftruncate); reg_bsd(95, bsd_fsync);
 	reg_bsd(131, bsd_flock); reg_bsd(89, bsd_getdtablesize); reg_bsd(120, bsd_readv); reg_bsd(121, bsd_writev);
-	reg_bsd(138, bsd_utimes); reg_bsd(286, bsd_gettid); reg_bsd(79, bsd_getgroups); reg_bsd(93, bsd_select);
+	reg_bsd(138, bsd_utimes); reg_bsd(286, bsd_gettid); reg_bsd(79, bsd_getgroups); reg_bsd(93, bsd_select); reg_bsd(394, bsd_pselect);
 	reg_bsd(80, bsd_ok); reg_bsd(23, bsd_ok); reg_bsd(181, bsd_ok); reg_bsd(182, bsd_ok); reg_bsd(183, bsd_ok);
 }

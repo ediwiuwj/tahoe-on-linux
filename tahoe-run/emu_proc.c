@@ -162,6 +162,58 @@ static long bsd_getrlimit(struct ctx* c) {
 	if (((int)c->a[0] & 0xfff) == 8 && out[0] > 10240 && !(c->a[0] & 0x1000)) out[0] = 10240;   // sin la marca POSIX, macOS limita NOFILE
 	return safe_write(c->a[1], out, 16) == 16 ? 0 : -D_EFAULT;
 }
+// getrusage(who, struct rusage*): RUSAGE_SELF (0) y RUSAGE_CHILDREN (-1) valen lo mismo en Linux, y la struct rusage de
+// Darwin x86_64 ocupa y ordena igual que la de Linux (dos timeval de 16 bytes: en Darwin tv_usec es int32 con relleno y,
+// como es menor que 10^6, sus bytes coinciden; después 14 long). La usan los snmp* (net-snmp) al arrancar.
+// setitimer / getitimer (83 / 86): los temporizadores ITIMER_REAL/VIRTUAL/PROF (mismos números en Darwin y Linux) son los
+// de Linux; SIGALRM llega como cualquier otra señal. struct itimerval de Darwin: dos timeval {long tv_sec; int tv_usec}
+// de 16 bytes (los 4 bytes de relleno se ignoran). Sin ellos, alarm() (p. ej. perl -e 'alarm 10') no avisaba nunca.
+static void itv_in(const uint8_t* b, struct itimerval* v) {
+	int64_t s0, s1; int32_t u0, u1;
+	memcpy(&s0, b, 8); memcpy(&u0, b + 8, 4); memcpy(&s1, b + 16, 8); memcpy(&u1, b + 24, 4);
+	v->it_interval.tv_sec = s0; v->it_interval.tv_usec = u0; v->it_value.tv_sec = s1; v->it_value.tv_usec = u1;
+}
+static void itv_out(uint8_t* b, const struct itimerval* v) {
+	memset(b, 0, 32);
+	int64_t s0 = v->it_interval.tv_sec, s1 = v->it_value.tv_sec; int32_t u0 = (int32_t)v->it_interval.tv_usec, u1 = (int32_t)v->it_value.tv_usec;
+	memcpy(b, &s0, 8); memcpy(b + 8, &u0, 4); memcpy(b + 16, &s1, 8); memcpy(b + 24, &u1, 4);
+}
+static long bsd_setitimer(struct ctx* c) {
+	int which = (int)c->a[0];
+	if (which < 0 || which > 2) return -D_EINVAL;
+	struct itimerval nv = { 0 }, ov;
+	if (c->a[1]) { uint8_t b[32]; if (safe_read(c->a[1], b, 32) != 32) return -D_EFAULT; itv_in(b, &nv); }
+	if (setitimer(which, &nv, &ov) != 0) return -D_EINVAL;
+	if (c->a[2]) { uint8_t b[32]; itv_out(b, &ov); if (safe_write(c->a[2], b, 32) != 32) return -D_EFAULT; }
+	return 0;
+}
+static long bsd_getitimer(struct ctx* c) {
+	int which = (int)c->a[0];
+	if (which < 0 || which > 2) return -D_EINVAL;
+	struct itimerval v; if (getitimer(which, &v) != 0) return -D_EINVAL;
+	uint8_t b[32]; itv_out(b, &v);
+	return safe_write(c->a[1], b, 32) == 32 ? 0 : -D_EFAULT;
+}
+static long bsd_getrusage(struct ctx* c) {
+	int who = (int)c->a[0];
+	if (who != 0 && who != -1) return -D_EINVAL;
+	struct rusage ru;
+	if (getrusage(who == 0 ? RUSAGE_SELF : RUSAGE_CHILDREN, &ru) != 0) return -darwin_errno(errno);
+	_Static_assert(sizeof ru == 144, "struct rusage de Linux x86_64");
+	return safe_write(c->a[1], &ru, sizeof ru) == (ssize_t)sizeof ru ? 0 : -D_EFAULT;
+}
+// memorystatus_get_level(int* nivel): porcentaje de memoria disponible (0-100), como el memorystatus_level de XNU. Aquí,
+// MemAvailable / MemTotal de Linux. Lo usa memory_pressure.
+static long bsd_memorystatus_get_level(struct ctx* c) {
+	unsigned long long tot = 0, av = 0; char l[128];
+	FILE* f = fopen("/proc/meminfo", "r");
+	if (f) {
+		while (fgets(l, sizeof l, f)) { sscanf(l, "MemTotal: %llu", &tot); sscanf(l, "MemAvailable: %llu", &av); }
+		fclose(f);
+	}
+	int32_t lvl = tot ? (int32_t)(av * 100 / tot) : 0;
+	return safe_write(c->a[0], &lvl, 4) == 4 ? 0 : -D_EFAULT;
+}
 static long bsd_setrlimit(struct ctx* c) {
 	int r = linux_rlimit((int)c->a[0]);
 	uint64_t in[2];
@@ -203,6 +255,11 @@ static long bsd_sigaction(struct ctx* c) {
 		memcpy(&sigtab[s].tramp, nw + 8, 8);
 		memcpy(&sigtab[s].mask, nw + 16, 4);
 		memcpy(&sigtab[s].flags, nw + 20, 4);
+		// Señales de control de la terminal (SIGTSTP 18, SIGTTIN 21, SIGTTOU 22): SIG_IGN / SIG_DFL también en Linux. Un bash
+		// interactivo ignora SIGTTOU antes de ponerse en primer plano (tcsetpgrp); si Linux no lo sabía, lo detenía (estado T)
+		// y la shell de tools/macos-shell.sh se quedaba congelada sin prompt. Con un manejador propio se deja la acción
+		// por omisión: aún no se entregan señales al invitado.
+		if ((s == 18 || s == 21 || s == 22) && sigtab[s].handler <= 1) signal(darwin_to_linux_sig(s), sigtab[s].handler == 1 ? SIG_IGN : SIG_DFL);
 	}
 	return 0;
 }
@@ -220,6 +277,20 @@ static long bsd_sigaltstack(struct ctx* c) {
 		memcpy(&alt_sp, nw, 8); memcpy(&alt_size, nw + 8, 8); memcpy(&alt_flags, nw + 16, 4);
 	}
 	return 0;
+}
+// sigreturn(uctx, infostyle, token). Con uctx NULL es la forma con que siglongjmp/longjmp de libplatform avisan al núcleo
+// de que salen (UC_RESET_ALT_STACK) o entran (UC_SET_ALT_STACK) en la pila alternativa: como XNU (unix_signal.c), solo
+// se cambia SS_ONSTACK en ss_flags. La vuelta de un manejador de verdad no puede darse aún (no se construyen marcos de
+// señal): se anota y EINVAL.
+#define UC_SET_ALT_STACK 0x40000000u
+#define UC_RESET_ALT_STACK 0x80000000u
+static long bsd_sigreturn(struct ctx* c) {
+	uint32_t style = (uint32_t)c->a[1];
+	if (style == UC_SET_ALT_STACK) { alt_flags |= 1; return 0; }        // SS_ONSTACK
+	if (style == UC_RESET_ALT_STACK) { alt_flags &= ~1; return 0; }
+	static int dicho;
+	if (!dicho++) logf_("    sigreturn <%d>: vuelta de un marco de señal (uctx=0x%lx estilo=0x%x) sin implementar\n", (int)getpid(), c->a[0], style);
+	return -D_EINVAL;
 }
 static uint32_t pthread_mask;
 static long bsd_pthread_sigmask(struct ctx* c) {                             // (how, set*, oset*) por valor en Darwin: how, set, oset
@@ -241,19 +312,35 @@ static long bsd_kill(struct ctx* c) {
 	int ls = darwin_to_linux_sig(s);
 	if (ls <= 0) return -D_EINVAL;
 	long r = syscall(SYS_kill, (int)c->a[0], ls);
+	// Señales que terminan a otro proceso: al registro (si no, el proceso desaparece sin dejar rastro: SIGKILL no se
+	// puede interceptar en el destino).
+	if ((int)c->a[0] != getpid() && (s == 9 || s == 15 || s == 6 || s == 3 || s == 2 || s == 1))
+		logf_("    kill: <%d> envía la señal %d a %d%s\n", (int)getpid(), s, (int)c->a[0], r < 0 ? " (falló)" : "");
 	return r < 0 ? -darwin_errno(errno) : 0;
 }
-// Diagnóstico dirigido: 1 si este proceso es el indicado en /dev/shm/tahoe-stacks (subcadena de su línea de órdenes).
-int diag_target(void) {
-	static int want = -1;
-	if (want < 0) {
-		char nm[64] = "", cl[512] = "";
-		FILE* f = fopen("/dev/shm/tahoe-stacks", "r"); if (f) { if (fgets(nm, sizeof nm, f)) nm[strcspn(nm, "\n")] = 0; fclose(f); }
-		f = fopen("/proc/self/cmdline", "r"); if (f) { size_t n = fread(cl, 1, 511, f); for (size_t i = 0; i < n; i++) if (!cl[i]) cl[i] = ' '; fclose(f); }
-		want = nm[0] && strstr(cl, nm) != NULL;
-	}
-	return want;
+// Diagnóstico dirigido: 1 si este proceso es uno de los indicados en /dev/shm/tahoe-stacks (nombres separados por espacios;
+// cada uno, subcadena de su línea de órdenes: así también vale el xpcproxy que va a lanzar ese servicio).
+// 1 si alguno de los nombres del archivo (separados por espacios) está en la línea de órdenes de este proceso.
+static int names_match(const char* file) {
+	char nm[256] = "", cl[1024] = "";
+	FILE* f = fopen(file, "r"); if (!f) return 0;
+	if (fgets(nm, sizeof nm, f)) nm[strcspn(nm, "\n")] = 0;
+	fclose(f);
+	f = fopen("/proc/self/cmdline", "r"); if (f) { size_t n = fread(cl, 1, sizeof cl - 1, f); for (size_t i = 0; i < n; i++) if (!cl[i]) cl[i] = ' '; fclose(f); }
+	char* sv = NULL;
+	for (char* t = strtok_r(nm, " \t", &sv); t; t = strtok_r(NULL, " \t", &sv)) if (strstr(cl, t)) return 1;
+	return 0;
 }
+// Traza activada por un archivo de /dev/shm: si está vacío vale para todos los procesos; si tiene nombres, solo para esos.
+int trace_file_on(const char* file) {
+	struct stat st;
+	if (stat(file, &st) != 0) return 0;
+	return st.st_size == 0 ? 1 : names_match(file);
+}
+int diag_target(void) { static int want = -1; if (want < 0) want = names_match("/dev/shm/tahoe-stacks"); return want; }
+// Traza de mensajes Mach (líneas «MSG»: envíos y recepciones) solo de los procesos nombrados en /dev/shm/tahoe-msg-trace;
+// tools/diag/mensajes.py la convierte en una conversación. Mucho más ligera que la traza MT de todos los procesos.
+int msg_trace(void) { static int want = -1; if (want < 0) want = names_match("/dev/shm/tahoe-msg-trace"); return want; }
 // Con /dev/shm/tahoe-stacks-all, el proceso indicado registra todas sus syscalls BSD (no solo las que fallan).
 int diag_all(void) { static int v = -1; if (v < 0) v = access("/dev/shm/tahoe-stacks-all", F_OK) == 0; return v; }
 // Lee los mensajes de aborto del ejecutable principal (cargado en 0x100000000) y de todas las imágenes de la caché
@@ -294,21 +381,23 @@ static void crash_messages(void) {
 		}
 	}
 }
-void diag_crash(ucontext_t* uc) {
+// Pila del hilo actual en el registro. "abort" para caídas (con el motivo que dejó la librería); "espera" para los
+// diagnósticos de bloqueo (STACKS), que no son caídas.
+void diag_stack(ucontext_t* uc, const char* what) {
 		// Motivo del aborto: cada librería que llama a abort/CRASH deja su texto en gCRAnnotations, en su sección
 		// __DATA*,__crash_info (message en +8, message2 en +32). Se recorren las imágenes de la caché compartida.
-		crash_messages();
+		if (!strcmp(what, "abort")) crash_messages();
 		{
 			// Retornos plausibles: valores de la pila dentro de la caché cuya instrucción anterior es un "call".
 			static __thread uint64_t sk[2048]; memset(sk, 0, sizeof sk);
 			ssize_t got = safe_read((uint64_t)uc->uc_mcontext.gregs[REG_RSP], sk, sizeof sk);
-			logf_("    abort <%d>: rip=0x%llx rsp=0x%llx rbp=0x%llx pila:", (int)getpid(), (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], (unsigned long long)uc->uc_mcontext.gregs[REG_RSP], (unsigned long long)uc->uc_mcontext.gregs[REG_RBP]);
+			logf_("    %s <%d>: rip=0x%llx rsp=0x%llx rbp=0x%llx pila:", what, (int)getpid(), (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], (unsigned long long)uc->uc_mcontext.gregs[REG_RSP], (unsigned long long)uc->uc_mcontext.gregs[REG_RBP]);
 			for (int k = 0; k < 14 && k < (int)(got / 8); k++) logf_(" %lx", sk[k]);
 			greg_t* g = uc->uc_mcontext.gregs;
-			logf_("\n    abort <%d>: rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r12=%llx r13=%llx r14=%llx r15=%llx", (int)getpid(),
+			logf_("\n    %s <%d>: rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r12=%llx r13=%llx r14=%llx r15=%llx", what, (int)getpid(),
 				(unsigned long long)g[REG_RAX], (unsigned long long)g[REG_RBX], (unsigned long long)g[REG_RCX], (unsigned long long)g[REG_RDX], (unsigned long long)g[REG_RSI],
 				(unsigned long long)g[REG_RDI], (unsigned long long)g[REG_R8], (unsigned long long)g[REG_R12], (unsigned long long)g[REG_R13], (unsigned long long)g[REG_R14], (unsigned long long)g[REG_R15]);
-			logf_("\n    abort <%d>: marcos (rbp):", (int)getpid());          // pila exacta: macOS conserva el puntero de marco
+			logf_("\n    %s <%d>: marcos (rbp):", what, (int)getpid());          // pila exacta: macOS conserva el puntero de marco
 			uint64_t fp = (uint64_t)g[REG_RBP];
 			for (int k = 0; k < 32 && fp; k++) {
 				uint64_t fr[2];
@@ -317,11 +406,11 @@ void diag_crash(ucontext_t* uc) {
 				if (fr[0] <= fp) break;
 				fp = fr[0];
 			}
-			logf_("\n    abort: llamadas plausibles:");
+			logf_("\n    %s <%d>: llamadas plausibles:", what, (int)getpid());
 			int shown = 0;
 			for (int k = 0; k < (int)(got / 8) && shown < 24; k++) {
 				uint64_t a = sk[k];
-				if (!((a >= 0x7ff800000000UL && a < 0x7ff820000000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;   // caché o ejecutable
+				if (!((a >= 0x7ff800000000UL && a < 0x7ffffe600000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;   // caché o ejecutable
 				uint8_t pre[6];
 				if (safe_read(a - 6, pre, 6) != 6) continue;
 				if (pre[1] == 0xe8 || pre[3] == 0xff || pre[4] == 0xff || pre[2] == 0xff) { logf_(" 0x%lx", a); shown++; }
@@ -329,6 +418,8 @@ void diag_crash(ucontext_t* uc) {
 			logf_("\n");
 		}
 	}
+
+void diag_crash(ucontext_t* uc) { diag_stack(uc, "abort"); }
 
 // ---- Volcado de todos los hilos (diagnóstico de cuelgues): con /dev/shm/tahoe-stacks, cuando el proceso indicado cae,
 // cada hilo dice qué llamada al núcleo emulada tiene en curso (t_cur, puesto por el manejador de SIGSYS) o, si estaba
@@ -341,7 +432,7 @@ static void plausible_returns(uint64_t rsp, int max) {
 	int shown = 0;
 	for (int k = 0; k < (int)(got / 8) && shown < max; k++) {
 		uint64_t a = sk[k];
-		if (!((a >= 0x7ff800000000UL && a < 0x7ff820000000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;
+		if (!((a >= 0x7ff800000000UL && a < 0x7ffffe600000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;
 		uint8_t pre[6];
 		if (safe_read(a - 6, pre, 6) != 6) continue;
 		if (pre[1] == 0xe8 || pre[3] == 0xff || pre[4] == 0xff || pre[2] == 0xff) { logf_(" 0x%lx", a); shown++; }
@@ -437,14 +528,19 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
 				uint64_t a, v = 0;
 				char* e = ln; int deref = *e == '*';                // *expr: además, el texto al que apunta el valor leído
 				if (deref) e++;
+				int strip = *e == '~';                              // ~reg: sin los 4 bits altos (objetos puenteados de Swift)
+				if (strip) e++;
 				static const struct { const char* n; int r; } rn[] = { {"rax",REG_RAX},{"rsi",REG_RSI},{"rdi",REG_RDI},{"rbx",REG_RBX},{"rsp",REG_RSP},{"rbp",REG_RBP},{"rcx",REG_RCX},{"rdx",REG_RDX},{"r8",REG_R8},{"r9",REG_R9},{"r12",REG_R12},{"r13",REG_R13},{"r14",REG_R14},{"r15",REG_R15} };
 				a = 0; for (size_t q = 0; q < sizeof rn / sizeof rn[0]; q++) { size_t nl = strlen(rn[q].n);
-					if (!strncmp(e, rn[q].n, nl) && (e[nl] == '+' || e[nl] == '\n' || e[nl] == 0)) { a = (uint64_t)g[rn[q].r] + (e[nl] == '+' ? strtoull(e + nl + 1, NULL, 16) : 0); break; } }
+					if (!strncmp(e, rn[q].n, nl) && (e[nl] == '+' || e[nl] == '\n' || e[nl] == 0)) { a = ((uint64_t)g[rn[q].r] & (strip ? 0x0fffffffffffffffULL : ~0ULL)) + (e[nl] == '+' ? strtoull(e + nl + 1, NULL, 16) : 0); break; } }
 				if (!a) a = strtoull(e, NULL, 16);
-				if (a && safe_read(a, &v, 8) == 8) {
+				if (a && strip && !deref) {                        // ~reg+n: el texto que hay en esa dirección
+					char t[129] = { 0 };
+					if (safe_read(a, t, 128) > 0) { for (int q = 0; q < 128 && t[q]; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK %.*s: \"%s\"\n", (int)strcspn(ln, "\n"), ln, t); }
+				} else if (a && safe_read(a, &v, 8) == 8) {
 					logf_("    PEEK %.*s[0x%lx] = 0x%lx\n", (int)strcspn(ln, "\n"), ln, a, v);
-					char t[65] = { 0 };
-					if (deref && v && safe_read(v, t, 64) > 0) { for (int q = 0; q < 64 && t[q]; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK *: \"%s\"\n", t); }
+					char t[161] = { 0 };                             // 160 bytes, ceros incluidos (objetos: cabecera y luego el texto)
+					if (deref && v && safe_read(v, t, 160) > 0) { for (int q = 0; q < 160; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK *: \"%s\"\n", t); }
 				} } fclose(pk); }
 			brk_poke(at, brk_orig[i]);
 			g[REG_RIP] = (greg_t)at;
@@ -499,6 +595,9 @@ static long bsd_pthread_kill(struct ctx* c) {
 	if (s == 0) return 0;
 	if (s == 6) {
 		diag_crash(c->uc);
+		// abort() de un programa de macOS: el proceso muere por SIGABRT de verdad (launchd lo ve como en un Mac), pero sin
+		// volcado de memoria de Linux: systemd-coredump guardaría ~10 MB y avisaría en el escritorio en cada caída.
+		syscall(SYS_prctl, 4 /* PR_SET_DUMPABLE */, 0, 0, 0, 0);
 	}
 	int ls = darwin_to_linux_sig(s);
 	if (ls <= 0) return -D_EINVAL;
@@ -539,6 +638,7 @@ static long bsd_wait4(struct ctx* c) {
 	int st = 0;
 	long r = syscall(SYS_wait4, (int)c->a[0], &st, (int)c->a[2], NULL);
 	if (r < 0) return -darwin_errno(errno);
+	if (r > 0 && WIFSIGNALED(st)) logf_("    fin <%ld> por la señal %d de Linux (lo recoge %d)\n", r, WTERMSIG(st), (int)getpid());
 	if (c->a[1] && r > 0) { int ds = darwin_wait_status(st); if (safe_write(c->a[1], &ds, 4) != 4) return -D_EFAULT; }
 	return r;
 }
@@ -705,6 +805,21 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 			snprintf(gpath, sizeof gpath, "%s", interp);
 			continue;
 		}
+		// Como XNU: un Mach-O sin parte x86_64 no se ejecuta y la llamada falla con EBADARCH (86) sin crear el proceso. El
+		// macOS completo es universal pero trae programas solo de Apple Silicon (p. ej. seputil, la tarea de arranque
+		// data-protection), y launchd en un Mac Intel cuenta con ese error para saltarlos.
+		if (hn >= 8) {
+			uint32_t m; memcpy(&m, head, 4);
+			int fat = m == 0xbebafecaU || m == 0xbfbafecaU, ok = 1;     // FAT_MAGIC / FAT_MAGIC_64 (big endian)
+			if (m == 0xfeedfacfU) ok = *(uint32_t*)(head + 4) == 0x01000007;
+			else if (fat) {
+				uint32_t n = __builtin_bswap32(*(uint32_t*)(head + 4)), esz = m == 0xbebafecaU ? 20 : 32;
+				ok = 0;
+				for (uint32_t i = 0; i < n && 8 + (i + 1) * esz <= (uint32_t)hn; i++)
+					if (__builtin_bswap32(*(uint32_t*)(head + 8 + i * esz)) == 0x01000007) ok = 1;
+			}
+			if (!ok) { logf_("    exec \"%s\": sin parte x86_64 -> EBADARCH\n", gpath); return -86; }
+		}
 		break;
 	}
 	// Programas que se sustituyen por un proceso que sale con éxito: rutas separadas por comas en TAHOE_STUB_EXEC (para
@@ -735,7 +850,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	nargv[k++] = (char*)g_dyld_path;
 	nargv[k++] = hpath;
 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
-	char** nenv = calloc(ec + 12 + 8 + 9, sizeof(char*));
+	char** nenv = calloc(ec + 13 + 8 + 9, sizeof(char*));
 	int e = 0;
 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
 	char b1[4300], b2[4300];
@@ -749,6 +864,10 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (getenv("TAHOE_LOGFILE")) { snprintf(b3, sizeof b3, "TAHOE_LOGFILE=%s", getenv("TAHOE_LOGFILE")); nenv[e++] = b3; }
 	static char b6[600];
 	if (getenv("TAHOE_CACHE_DIR")) { snprintf(b6, sizeof b6, "TAHOE_CACHE_DIR=%s", getenv("TAHOE_CACHE_DIR")); nenv[e++] = b6; }
+	static char b8[600];
+	if (getenv("TAHOE_OSK_FILE")) { snprintf(b8, sizeof b8, "TAHOE_OSK_FILE=%s", getenv("TAHOE_OSK_FILE")); nenv[e++] = b8; }
+	static char b9[600];
+	if (getenv("TAHOE_SMBIOS_FILE")) { snprintf(b9, sizeof b9, "TAHOE_SMBIOS_FILE=%s", getenv("TAHOE_SMBIOS_FILE")); nenv[e++] = b9; }
 	if (getenv("TAHOE_FD2LOG")) nenv[e++] = (char*)"TAHOE_FD2LOG=1";
 	if (getenv("TAHOE_DEBUG_NOREBOOT")) nenv[e++] = (char*)"TAHOE_DEBUG_NOREBOOT=1";   // modo depuración (ver emu_iokit.inc)
 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
@@ -793,17 +912,47 @@ static long bsd_posix_spawn(struct ctx* c) {
 			uint32_t act[6] = { 0 };                                // port_type, mask, new_port, behavior, flavor, which
 			if (safe_read(ad[5] + 8 + i * 24, act, 24) != 24) break;
 			if (act[0] == 1 && spawn_special_n < 8) snprintf(spawn_special_env[spawn_special_n++], 32, "TAHOE_SP%u=%u", act[5], act[2]);
+			if (act[0] == 2) {                                      // PSPA_AU_SESSION: el hijo nace en la sesión de ese puerto
+				int kt; int32_t asid;
+				if (kobj_lookup(act[2], &kt, &asid) && kt == KO_AUDIT_SESSION) cred_spawn_session((uint32_t)asid);
+			}
 			logf_("    posix_spawn: acción de puerto tipo=%u which=%u puerto=0x%x\n", act[0], act[5], act[2]);
 		}
 	}
 	logf_("    posix_spawn <%d>(\"%s\") attr_flags=0x%x ad=%lx,%lx,%lx,%lx,%lx,%lx\n", (int)getpid(), gp, psa_flags, ad[0], ad[1], ad[2], ad[3], ad[4], ad[5]);
 	read_file_actions(ad[3], ad[2]);
 	spawn_cloexec_default = (psa_flags & 0x4000) != 0;              // POSIX_SPAWN_CLOEXEC_DEFAULT
-	if (psa_flags & 0x40) return exec_common(c->a[1], c->a[3], c->a[4], 0, NULL);
+	if (psa_flags & 0x40) { long r0 = exec_common(c->a[1], c->a[3], c->a[4], 0, NULL); cred_spawn_session(0); return r0; }
 	pid_t pid = 0;
 	long r = exec_common(c->a[1], c->a[3], c->a[4], 1, &pid);
+	cred_spawn_session(0);
 	if (r == 0 && c->a[0]) { uint32_t p = (uint32_t)pid; safe_write(c->a[0], &p, 4); }
 	return r;
+}
+
+// setpriority(which, who, prio) / getpriority(which, who): PRIO_PROCESS/PGRP/USER (0-2) son el nice de POSIX y van al de Linux
+// (los pid son los del espacio de PID del arranque). Bajar el nice exige CAP_SYS_NICE en el anfitrión: siendo root en macOS
+// se acepta igual, como en XNU. Las clases propias de Darwin (PRIO_DARWIN_THREAD 3, _PROCESS 4, _GPU 5, _ROLE 6, _GAME_MODE
+// 7...: modo de fondo, rol de la app) solo cambian la planificación de XNU: se aceptan sin efecto y getpriority da 0.
+static long bsd_setpriority(struct ctx* c) {
+	int which = (int)c->a[0], prio = (int)c->a[2];
+	if (which > 2) return 0;
+	if (which < 0) return -D_EINVAL;
+	if (prio < -20) prio = -20;
+	if (prio > 20) prio = 20;
+	if (setpriority(which, (id_t)c->a[1], prio) == 0) return 0;
+	if ((errno == EACCES || errno == EPERM) && cred_euid() == 0) return 0;
+	return -darwin_errno(errno);
+}
+static long bsd_getpriority(struct ctx* c) {
+	int which = (int)c->a[0];
+	if (which > 2) return 0;
+	if (which < 0) return -D_EINVAL;
+	errno = 0;
+	int v = getpriority(which, (id_t)c->a[1]);
+	if (v == -1 && errno) return -darwin_errno(errno);
+	c->raw_ret = 1;                                                  // el nice puede ser negativo: sin CF
+	return v;
 }
 
 // bsdthread_ctl(comando, arg1, arg2, arg3): QoS, sobrescrituras de prioridad y permisos de las colas de trabajo.
@@ -884,8 +1033,9 @@ static __thread uint64_t my_workloop;   // workloop que atiende este hilo
 #define WQ_DATA_SIZE 32768
 // npre/pre/pdata: eventos que el vigilante ya recogió del kqueue (y el búfer donde quedaron los mensajes Mach recibidos).
 struct wq_job { uint64_t kqid; int workloop, has_req, npre; uint32_t prio; uint8_t req[72]; uint8_t pre[16 * 72]; uint8_t* pdata; struct wq_job* next; };
-struct wl_state { uint64_t kqid; int running, pending, watching, has_req; uint8_t req[72]; struct wl_state* next; };   // watching: ya tiene vigilante
+struct wl_state { uint64_t kqid; int running, pending, watching, has_req, owned; unsigned gen; uint8_t req[72]; struct wl_state* next; };   // gen: cuántas veces se armó (para no retirar un vigilante que acaban de volver a necesitar)   // watching: ya tiene vigilante; owned: petición en espera porque la cola tiene propietario
 extern int kq_workloop_fd(uint64_t);
+extern int kq_workloop_try_free(uint64_t);
 extern long kq_drain(uint64_t, uint64_t, int, uint64_t, uint64_t);
 static void wl_arm(uint64_t kqid);
 // El kernel solo lanza el hilo si el estado de la cola sigue siendo el que esperaba libdispatch:
@@ -914,6 +1064,18 @@ static int req_still_valid(const uint8_t* req) {
 	if (safe_read(ext[1], &cur, 8) != 8) return 1;
 	return (cur & ext[2]) == (ext[3] & ext[2]);
 }
+// Propietario de la cola (NOTE_WL_DISCOVER_OWNER, 0x80): XNU lee el nombre del hilo propietario de los bits bajos de
+// dq_state (kdata & ~3). Mientras un workloop tiene propietario (un hilo que vacía la cola por su cuenta, p. ej. con
+// dispatch_sync), su petición de hilo no se atiende: queda pendiente hasta que el propietario la suelta. Si se atendía,
+// el hilo no podía tomar la cola, volvía a pedirla y terminaba, en bucle (systemstats gastaba así 1,4 núcleos).
+static uint32_t req_owner(const uint8_t* req) {
+	uint32_t ff; memcpy(&ff, req + 24, 4);
+	if (!(ff & 0x80u)) return 0;
+	uint64_t ext[4]; memcpy(ext, req + 40, 32);
+	uint64_t cur;
+	if (!ext[1] || safe_read(ext[1], &cur, 8) != 8) return 0;
+	return (uint32_t)cur & ~3u;
+}
 // diagnóstico (MACH=1): máscara, valor esperado y valor actual de una petición de hilo
 static void wl_trace(const char* que, uint64_t kqid, const uint8_t* req) {
 	if (!wl_trace_on()) return;
@@ -923,6 +1085,60 @@ static void wl_trace(const char* que, uint64_t kqid, const uint8_t* req) {
 }
 static struct wl_state* wl_states;
 static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
+// Punto de no retorno de una entrega (como filt_wlprocess de XNU, bajo el candado del kqueue): la petición tiene que seguir
+// registrada y válida. libdispatch la retira (EV_DELETE, wq_cancel_workloop) cuando otro hilo toma la cola por traspaso
+// síncrono; un hilo lanzado antes con su copia la entregaba igual, y al encontrar la cola con dueño y sin encolar,
+// libdispatch abortaba («BUG IN LIBDISPATCH: Invalid wlh state»). Se entrega la versión vigente (libdispatch puede haberla
+// actualizado entretanto). 1 si se entrega (req queda con la vigente), 0 si el hilo va sin ella.
+static int wl_req_deliver(uint64_t kqid, uint8_t* req) {
+	pthread_mutex_lock(&wl_lock);
+	struct wl_state* w = wl_states;
+	while (w && w->kqid != kqid) w = w->next;
+	int ok = w && w->has_req;
+	if (ok) memcpy(req, w->req, 72);
+	if (ok && !req_still_valid(req)) ok = 0;
+	pthread_mutex_unlock(&wl_lock);
+	return ok;
+}
+static void wq_spawn(uint64_t kqid, int workloop, const uint8_t* req);
+// Peticiones en espera de que su cola deje de tener propietario: un hilo las revisa cada 10 ms mientras haya alguna (la
+// liberación llega también con NOTE_WL_END_OWNERSHIP, pero así no depende de ella). Llamar con wl_lock tomado.
+static pthread_cond_t wl_owner_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t wl_cv;                                   // (definida más abajo) avisa a los vigilantes
+static int wl_owner_started;
+static void* wl_owner_poll(void* p) {
+	(void)p;
+	pthread_mutex_lock(&wl_lock);
+	for (;;) {
+		int any = 0;
+		for (struct wl_state* w = wl_states; w; w = w->next) {
+			if (!w->owned) continue;
+			if (!w->pending || w->running || !req_still_valid(w->req)) { w->owned = 0; pthread_cond_broadcast(&wl_cv); continue; }
+			if (req_owner(w->req)) { any = 1; continue; }
+			w->owned = 0; w->pending = 0; w->running = 1;           // el propietario la soltó: ahora sí, un hilo
+			uint8_t copy[72]; memcpy(copy, w->req, 72); uint64_t kq = w->kqid;
+			pthread_mutex_unlock(&wl_lock);
+			wl_trace("propietario libre: lanza", kq, copy);
+			wq_spawn(kq, 1, copy);
+			pthread_mutex_lock(&wl_lock);
+			any = 1;                                                 // la lista pudo cambiar: otra vuelta
+			break;
+		}
+		if (any) { struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 10000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+			pthread_cond_timedwait(&wl_owner_cv, &wl_lock, &dl); }
+		else pthread_cond_wait(&wl_owner_cv, &wl_lock);
+	}
+	return NULL;
+}
+static void wl_defer_owned_locked(struct wl_state* w) {
+	w->owned = 1; w->pending = 1; w->running = 0;
+	if (!wl_owner_started) {
+		wl_owner_started = 1;
+		pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+		pthread_t th; if (pthread_create(&th, &at, wl_owner_poll, NULL)) wl_owner_started = 0;
+	}
+	pthread_cond_signal(&wl_owner_cv);
+}
 
 // Hilos de las colas de trabajo: un grupo reutilizable. Cuando libpthread "aparca" un hilo (workq_kernreturn) no se
 // termina: se vuelve a la función del anfitrión con siglongjmp y el hilo espera la siguiente petición. Así las pilas
@@ -953,11 +1169,8 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int
 	my_workloop = j.workloop ? j.kqid : 0;
 	static __thread uint8_t* data;                                   // búfer de datos (32 KB) de los mensajes Mach, uno por hilo
 	if (exit_thread) { j.workloop = 0; nev = -1; }
-	// Punto de no retorno (como XNU al entregar los eventos al hilo): la petición se comprueba otra vez. Si entretanto la
-	// cola dejó de estar encolada (otro hilo la vació, p. ej. un dispatch_sync, y retiró la petición), el hilo llega sin
-	// ella; libdispatch lo trata como «cancelada antes del punto de no retorno» y vuelve. Entregarla caducada lo hace
-	// abortar («BUG IN LIBDISPATCH: Invalid wlh state»).
-	if (j.workloop && j.has_req && j.kqid != ~0ULL && !req_still_valid(j.req)) { wl_trace("entrega: caducada, sin petición", j.kqid, j.req); j.has_req = 0; }
+	// La petición va como evento 0; abajo, en el punto de no retorno, se comprueba que siga registrada y válida (si no, el
+	// hilo llega sin ella y libdispatch lo trata como «cancelada antes del punto de no retorno»).
 	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= (j.kqid == ~0ULL ? 0 : WQ_WORKLOOP) | WQ_KEVENT; if (j.has_req) { memcpy((void*)events, j.req, 72); nev = 1; }
 		if (jp->npre) { memcpy((void*)(events + nev * 72), jp->pre, (size_t)jp->npre * 72); nev += jp->npre; }   // ya recogidos por el vigilante
 		else {
@@ -967,6 +1180,11 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int
 			long d = kq_drain(j.kqid, events + nev * 72, 16 - nev, (uint64_t)data, (uint64_t)avail);
 			if (d > 0) nev += (int)d;
 		} }
+	// Punto de no retorno, lo más tarde posible: la petición (evento 0) sigue registrada y válida, o el hilo va sin ella.
+	if (j.workloop && j.has_req && j.kqid != ~0ULL && !wl_req_deliver(j.kqid, (uint8_t*)events)) {
+		wl_trace("entrega: retirada o caducada, sin petición", j.kqid, j.req);
+		memmove((void*)events, (void*)(events + 72), (size_t)(nev - 1) * 72); nev--;
+	}
 	if (trace_all) logf_("    wqthread: %s kqid=0x%lx pthread=0x%lx flags=0x%lx\n", j.workloop ? "workloop" : "worker", j.kqid, self, flags);
 	if (sigsetjmp(wq_park, 1) == 0) {
 		wq_park_ok = 1;
@@ -1017,8 +1235,14 @@ static void* wq_main(void* p) {
 }
 
 static void wq_spawn_job(struct wq_job* j) {
+	static int max_hilos;
+	if (!max_hilos) { const char* e = getenv("TAHOE_WQ_MAX"); max_hilos = e && atoi(e) > 0 ? atoi(e) : WQ_MAX_HILOS; }
 	pthread_mutex_lock(&wq_pool_lock);
-	if (wq_idle > 0 || wq_live >= WQ_MAX_HILOS) {                  // un hilo libre la atiende, o espera turno
+	if (wq_idle > 0 || wq_live >= max_hilos) {                     // un hilo libre la atiende, o espera turno
+		if (!wq_idle) {                                            // sin hilos libres: la petición espera (una línea por segundo)
+			static time_t ult; time_t now = time(NULL);
+			if (now != ult) { ult = now; logf_("    hilos de cola: %d en uso (máximo), la petición espera\n", wq_live); }
+		}
 		*wq_queue_tail = j; wq_queue_tail = &j->next;
 		pthread_cond_signal(&wq_pool_cv);
 		pthread_mutex_unlock(&wq_pool_lock);
@@ -1052,6 +1276,7 @@ void wq_request_workloop(uint64_t kqid, const void* req) {
 	int start = !w->running;
 	memcpy(w->req, req, 72); w->has_req = 1;
 	uint8_t copy[72]; memcpy(copy, req, 72);
+	if (start && req_owner(req)) { wl_defer_owned_locked(w); pthread_mutex_unlock(&wl_lock); wl_trace("petición: cola con propietario, espera", kqid, copy); return; }
 	if (start) w->running = 1; else w->pending = 1;
 	pthread_mutex_unlock(&wl_lock);
 	wl_trace(start ? "petición: lanza" : "petición: pendiente", kqid, copy);
@@ -1063,7 +1288,7 @@ void wq_cancel_workloop(uint64_t kqid) {
 	pthread_mutex_lock(&wl_lock);
 	struct wl_state* w = wl_states;
 	while (w && w->kqid != kqid) w = w->next;
-	if (w) { w->pending = 0; w->has_req = 0; }
+	if (w) { w->pending = 0; w->has_req = 0; if (w->owned) { w->owned = 0; pthread_cond_broadcast(&wl_cv); } }
 	pthread_mutex_unlock(&wl_lock);
 	wl_trace("petición retirada", kqid, NULL);
 }
@@ -1081,6 +1306,14 @@ static void wl_finished(uint64_t kqid) {
 	// hacer falta, libdispatch pide otro hilo al encolar.
 	int again = w && w->pending && req_still_valid(w->req);
 	uint8_t copy[72];
+	if (again && req_owner(w->req)) {                                // la cola tiene propietario: esperar a que la suelte
+		wl_defer_owned_locked(w); memcpy(copy, w->req, 72);
+		pthread_cond_broadcast(&wl_cv);
+		pthread_mutex_unlock(&wl_lock);
+		wl_trace("fin: cola con propietario, espera", kqid, copy);
+		wl_arm(kqid);
+		return;
+	}
 	if (w) { w->pending = 0; w->running = again; memcpy(copy, w->req, 72); }
 	pthread_cond_broadcast(&wl_cv);
 	pthread_mutex_unlock(&wl_lock);
@@ -1102,10 +1335,29 @@ static void* wl_watch(void* p) {
 	if (!w || fd < 0) return NULL;
 	for (;;) {
 		pthread_mutex_lock(&wl_lock);
-		while (w->running) pthread_cond_wait(&wl_cv, &wl_lock);
+		while (w->running || w->owned) pthread_cond_wait(&wl_cv, &wl_lock);   // con propietario, los eventos son suyos
 		pthread_mutex_unlock(&wl_lock);
 		struct pollfd pf = { .fd = fd, .events = POLLIN };
-		if (poll(&pf, 1, -1) < 0) { if (errno == EINTR) continue; logf_("    wl_watch <%d>: poll falló: %s\n", (int)getpid(), strerror(errno)); break; }
+		int pr = poll(&pf, 1, kqid == ~0ULL ? -1 : 2000);
+		if (pr < 0) { if (errno == EINTR) continue; logf_("    wl_watch <%d>: poll falló: %s\n", (int)getpid(), strerror(errno)); break; }
+		if (pr == 0) {                                              // 2 s sin eventos: ¿se puede liberar el workloop?
+			pthread_mutex_lock(&wl_lock);
+			int idle = !w->running && !w->owned && !w->pending; unsigned g = w->gen;
+			pthread_mutex_unlock(&wl_lock);
+			if (!idle || !kq_workloop_try_free(kqid)) continue;
+			pthread_mutex_lock(&wl_lock);
+			if (!w->running && !w->owned && !w->pending && w->gen == g) {   // nadie lo volvió a usar: fuera el vigilante
+				for (struct wl_state** pp = &wl_states; *pp; pp = &(*pp)->next) if (*pp == w) { *pp = w->next; break; }
+				pthread_mutex_unlock(&wl_lock);
+				if (mach_trace()) logf_("    wl_watch <%d> kqid=0x%lx liberado\n", (int)getpid(), (unsigned long)kqid);
+				free(w);
+				return NULL;
+			}
+			pthread_mutex_unlock(&wl_lock);
+			fd = kq_workloop_fd(kqid);                              // se volvió a usar entretanto: vigilar el nuevo
+			if (fd < 0) break;
+			continue;
+		}
 		if (!(pf.revents & POLLIN)) continue;
 		pthread_mutex_lock(&wl_lock);
 		if (w->running) { pthread_mutex_unlock(&wl_lock); continue; }   // otra petición ya lanzó el hilo
@@ -1159,6 +1411,7 @@ static void* wl_watch(void* p) {
 		pthread_mutex_lock(&wl_lock);                               // aviso falso: liberar, salvo que entretanto llegara una petición
 		int again = w->pending && req_still_valid(w->req);
 		uint8_t copy[72]; memcpy(copy, w->req, 72);
+		if (again && req_owner(w->req)) { wl_defer_owned_locked(w); pthread_mutex_unlock(&wl_lock); continue; }
 		w->pending = 0; w->running = again;
 		pthread_mutex_unlock(&wl_lock);
 		if (again) wq_spawn(kqid, 1, copy);
@@ -1172,6 +1425,7 @@ static void wl_arm(uint64_t kqid) {
 	if (!w) { w = calloc(1, sizeof *w); w->kqid = kqid; w->next = wl_states; wl_states = w; }
 	int start = !w->watching;
 	if (start) w->watching = 1;
+	w->gen++;
 	if (mach_trace()) logf_("    wl_arm <%d> kqid=0x%lx start=%d running=%d\n", (int)getpid(), (unsigned long)kqid, start, w->running);
 	pthread_cond_broadcast(&wl_cv);
 	pthread_mutex_unlock(&wl_lock);
@@ -1226,17 +1480,6 @@ static long bsd_workq_kernreturn(struct ctx* c) {
 
 static long bsd_proc_rlimit_control(struct ctx* c) { (void)c; return 0; }   // límites de monitorización: sin efecto
 
-static long bsd_audit_session_self(struct ctx* c) { (void)c; return 0x1503; }   // puerto ficticio de la sesión de auditoría
-
-// getaudit_addr(auditinfo_addr_t*, tamaño 0x30): auid=-1 (sin sesión de inicio), máscara 0, terminal vacío y
-// un identificador de sesión de auditoría no nulo.
-static long bsd_getaudit_addr(struct ctx* c) {
-	uint8_t a[0x30] = { 0 };
-	uint32_t auid = (uint32_t)-1, asid = (uint32_t)getpid();
-	memcpy(a, &auid, 4);
-	memcpy(a + 36, &asid, 4);
-	return safe_write(c->a[0], a, c->a[1] < sizeof a ? c->a[1] : sizeof a) < 0 ? -D_EFAULT : 0;
-}
 
 // sigsuspend(mask): aquí no hay señales de Darwin reales todavía; el hilo se duerme hasta que Linux lo interrumpa.
 static long bsd_sigsuspend(struct ctx* c) { (void)c; syscall(SYS_pause); return -4; /* EINTR */ }
@@ -1286,7 +1529,7 @@ static long ulock_wait_impl(struct ctx* c, uint64_t timeout_ns) {
 	if (c->a[0] & 0x1000000) c->raw_ret = 1;     // ULF_NO_ERRNO
 	if (mach_trace()) {                          // diagnóstico: pila de cada hilo que se bloquea sin plazo en el proceso indicado por /dev/shm/tahoe-stacks
 		int want = diag_target();
-		if (want && (!timeout_ns || syscall(SYS_gettid) == getpid())) { logf_("    ULW <%d:%ld> %p esperado=0x%x plazo=%lu op=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), (void*)addr, expect, (unsigned long)timeout_ns, c->a[0]); { uint64_t m[8] = { 0 }; safe_read((uint64_t)addr - 24, m, 64); logf_("    ULW mem[-24..+40]: %lx %lx %lx %lx %lx %lx %lx %lx\n", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]); } diag_crash(c->uc); }
+		if (want && (!timeout_ns || syscall(SYS_gettid) == getpid())) { logf_("    ULW <%d:%ld> %p esperado=0x%x plazo=%lu op=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), (void*)addr, expect, (unsigned long)timeout_ns, c->a[0]); { uint64_t m[8] = { 0 }; safe_read((uint64_t)addr - 24, m, 64); logf_("    ULW mem[-24..+40]: %lx %lx %lx %lx %lx %lx %lx %lx\n", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]); } diag_stack(c->uc, "espera"); }
 	}
 	if (trace_all) logf_("    ulock_wait(op=0x%lx, %p, esperado=0x%x, plazo=%luns)\n", c->a[0], (void*)addr, expect, (unsigned long)timeout_ns);
 	int wslot = -1;
@@ -1321,17 +1564,15 @@ static long bsd_ulock_wake(struct ctx* c) {
 void emu_proc_init(void) {
 	reg_bsd(515, bsd_ulock_wait); reg_bsd(516, bsd_ulock_wake); reg_bsd(544, bsd_ulock_wait2);
 	reg_bsd(550, bsd_map_with_linking);
+	reg_bsd(96, bsd_setpriority); reg_bsd(100, bsd_getpriority);
 	reg_bsd(322, bsd_proc_rlimit_control);   // iopolicysys: sin efecto
 	reg_bsd(331, bsd_proc_rlimit_control);   // __disable_threadsignal: sin efecto
 	reg_bsd(111, bsd_sigsuspend); reg_bsd(410, bsd_sigsuspend);
-	reg_bsd(357, bsd_getaudit_addr);
-	reg_bsd(428, bsd_audit_session_self);
 	reg_bsd(446, bsd_proc_rlimit_control);
 	reg_bsd(243, bsd_proc_rlimit_control);   // initgroups: sin efecto
 	reg_bsd(499, bsd_work_interval_ctl);
 	reg_bsd(440, bsd_proc_rlimit_control);   // memorystatus_control: sin efecto reg_bsd(444, bsd_proc_rlimit_control);   // change_fdguard_np
 	reg_bsd(552, bsd_proc_rlimit_control);   // record_system_event: sin efecto
-	reg_bsd(358, bsd_proc_rlimit_control);   // setaudit_addr: sin efecto
 	reg_bsd(50, bsd_proc_rlimit_control);   // setlogin: sin efecto
 	reg_bsd(367, bsd_workq_open); reg_bsd(368, bsd_workq_kernreturn);
 	reg_bsd(360, bsd_bsdthread_create); reg_bsd(361, bsd_bsdthread_terminate);
@@ -1341,7 +1582,7 @@ void emu_proc_init(void) {
 	reg_bsd(31, bsd_getpeername); reg_bsd(59, bsd_execve);
 	reg_bsd(39, bsd_getppid); reg_bsd(81, bsd_getpgrp); reg_bsd(151, bsd_getpgid); reg_bsd(82, bsd_setpgid);
 	reg_bsd(310, bsd_getsid); reg_bsd(147, bsd_setsid); reg_bsd(60, bsd_umask);
-	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit);
+	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit); reg_bsd(117, bsd_getrusage); reg_bsd(83, bsd_setitimer); reg_bsd(86, bsd_getitimer); reg_bsd(453, bsd_memorystatus_get_level); reg_bsd(184, bsd_sigreturn);
 	reg_bsd(46, bsd_sigaction); reg_bsd(53, bsd_sigaltstack); reg_bsd(329, bsd_pthread_sigmask); reg_bsd(52, bsd_sigpending);
 	reg_bsd(37, bsd_kill); reg_bsd(328, bsd_pthread_kill);
 	reg_bsd(98, bsd_connect);
