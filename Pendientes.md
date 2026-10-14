@@ -39,12 +39,17 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
      - El registro inicial de cada proceso en logd (`firehose_send_register`) se queda segundos esperando.
    - Descartado (medido): los servicios que se relanzan en bucle gastan poca CPU (~4 s en 2 min) y el límite de 48
      hilos de cola por proceso no se llena.
-   - Servicios en bucle: KernelEventAgent arreglado. digest-service sigue (no abre su base de Kerberos por
+   - Servicios en bucle: locationd se caía con «-[__NSDictionaryM setObject:forKeyedSubscript:]: key cannot be nil»
+     (el userName de un cliente; probablemente getpwuid fallando bajo carga): con el arranque más tranquilo ya no se ha
+     vuelto a caer. apfs.util (lo lanza diskarbitrationd) falla al sondear disk1s2/disk1s3 (no hay datos detrás).
+     KernelEventAgent arreglado. digest-service sigue (no abre su base de Kerberos por
      OpenDirectory); xprotectd y endpointsecurityd necesitan EndpointSecurity (`es_new_client` da error interno);
      watchdogd, por investigar. Otros que se relanzan: locationd, cryptexd, diskmanagementstartup, apsd, cloudd.
-   - Discos, lo que falta: capacidades en `diskutil apfs list` («ERROR»: APFSExtendedSpaceInfo, selector 8 del cliente de
-     AppleAPFSContainer, devuelve un diccionario cuyas claves no se conocen; con una respuesta incompleta storagekitd se
-     cae, así que de momento el contenedor no admite conexión) y `bless --info` (Preboot no tiene la carpeta de arranque
+   - `diskutil` con el sistema ya asentado: `list` 0,5–3 s, `info /` 2–6 s, siempre con salida.
+   - Discos, lo que falta: capacidades en `diskutil apfs list` («ERROR»). El contenedor tendría que admitir el cliente de
+     AppleAPFSContainer: selector 8 (APFSExtendedSpaceInfo, diccionario con «size», «used», «reserve» y «Max volume
+     count») y además 9, 18 y 30 (entrada 8/8/4 bytes, salida 2/32/64); con solo el 8, storagekitd se atasca en los
+     demás y `diskutil list` sale vacío, así que de momento el contenedor no admite conexión y `bless --info` (Preboot no tiene la carpeta de arranque
      `<UUID>/System/Library/CoreServices` que crea el instalador; con la propiedad IOAPFSPreBootDevice también falla
      `--getBoot`).
    - Esperas parecidas: `log show` ya no se cuelga pero tarda 65–165 s; `system_profiler` y `lwp-request` se cuelgan.

@@ -539,8 +539,8 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
 					if (safe_read(a, t, 128) > 0) { for (int q = 0; q < 128 && t[q]; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK %.*s: \"%s\"\n", (int)strcspn(ln, "\n"), ln, t); }
 				} else if (a && safe_read(a, &v, 8) == 8) {
 					logf_("    PEEK %.*s[0x%lx] = 0x%lx\n", (int)strcspn(ln, "\n"), ln, a, v);
-					char t[65] = { 0 };
-					if (deref && v && safe_read(v, t, 64) > 0) { for (int q = 0; q < 64 && t[q]; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK *: \"%s\"\n", t); }
+					char t[161] = { 0 };                             // 160 bytes, ceros incluidos (objetos: cabecera y luego el texto)
+					if (deref && v && safe_read(v, t, 160) > 0) { for (int q = 0; q < 160; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK *: \"%s\"\n", t); }
 				} } fclose(pk); }
 			brk_poke(at, brk_orig[i]);
 			g[REG_RIP] = (greg_t)at;
