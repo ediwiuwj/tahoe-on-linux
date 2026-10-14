@@ -1056,6 +1056,21 @@ static void wl_trace(const char* que, uint64_t kqid, const uint8_t* req) {
 }
 static struct wl_state* wl_states;
 static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
+// Punto de no retorno de una entrega (como filt_wlprocess de XNU, bajo el candado del kqueue): la petición tiene que seguir
+// registrada y válida. libdispatch la retira (EV_DELETE, wq_cancel_workloop) cuando otro hilo toma la cola por traspaso
+// síncrono; un hilo lanzado antes con su copia la entregaba igual, y al encontrar la cola con dueño y sin encolar,
+// libdispatch abortaba («BUG IN LIBDISPATCH: Invalid wlh state»). Se entrega la versión vigente (libdispatch puede haberla
+// actualizado entretanto). 1 si se entrega (req queda con la vigente), 0 si el hilo va sin ella.
+static int wl_req_deliver(uint64_t kqid, uint8_t* req) {
+	pthread_mutex_lock(&wl_lock);
+	struct wl_state* w = wl_states;
+	while (w && w->kqid != kqid) w = w->next;
+	int ok = w && w->has_req;
+	if (ok) memcpy(req, w->req, 72);
+	if (ok && !req_still_valid(req)) ok = 0;
+	pthread_mutex_unlock(&wl_lock);
+	return ok;
+}
 static void wq_spawn(uint64_t kqid, int workloop, const uint8_t* req);
 // Peticiones en espera de que su cola deje de tener propietario: un hilo las revisa cada 10 ms mientras haya alguna (la
 // liberación llega también con NOTE_WL_END_OWNERSHIP, pero así no depende de ella). Llamar con wl_lock tomado.
@@ -1125,11 +1140,8 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int
 	my_workloop = j.workloop ? j.kqid : 0;
 	static __thread uint8_t* data;                                   // búfer de datos (32 KB) de los mensajes Mach, uno por hilo
 	if (exit_thread) { j.workloop = 0; nev = -1; }
-	// Punto de no retorno (como XNU al entregar los eventos al hilo): la petición se comprueba otra vez. Si entretanto la
-	// cola dejó de estar encolada (otro hilo la vació, p. ej. un dispatch_sync, y retiró la petición), el hilo llega sin
-	// ella; libdispatch lo trata como «cancelada antes del punto de no retorno» y vuelve. Entregarla caducada lo hace
-	// abortar («BUG IN LIBDISPATCH: Invalid wlh state»).
-	if (j.workloop && j.has_req && j.kqid != ~0ULL && !req_still_valid(j.req)) { wl_trace("entrega: caducada, sin petición", j.kqid, j.req); j.has_req = 0; }
+	// La petición va como evento 0; abajo, en el punto de no retorno, se comprueba que siga registrada y válida (si no, el
+	// hilo llega sin ella y libdispatch lo trata como «cancelada antes del punto de no retorno»).
 	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= (j.kqid == ~0ULL ? 0 : WQ_WORKLOOP) | WQ_KEVENT; if (j.has_req) { memcpy((void*)events, j.req, 72); nev = 1; }
 		if (jp->npre) { memcpy((void*)(events + nev * 72), jp->pre, (size_t)jp->npre * 72); nev += jp->npre; }   // ya recogidos por el vigilante
 		else {
@@ -1139,6 +1151,11 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int
 			long d = kq_drain(j.kqid, events + nev * 72, 16 - nev, (uint64_t)data, (uint64_t)avail);
 			if (d > 0) nev += (int)d;
 		} }
+	// Punto de no retorno, lo más tarde posible: la petición (evento 0) sigue registrada y válida, o el hilo va sin ella.
+	if (j.workloop && j.has_req && j.kqid != ~0ULL && !wl_req_deliver(j.kqid, (uint8_t*)events)) {
+		wl_trace("entrega: retirada o caducada, sin petición", j.kqid, j.req);
+		memmove((void*)events, (void*)(events + 72), (size_t)(nev - 1) * 72); nev--;
+	}
 	if (trace_all) logf_("    wqthread: %s kqid=0x%lx pthread=0x%lx flags=0x%lx\n", j.workloop ? "workloop" : "worker", j.kqid, self, flags);
 	if (sigsetjmp(wq_park, 1) == 0) {
 		wq_park_ok = 1;

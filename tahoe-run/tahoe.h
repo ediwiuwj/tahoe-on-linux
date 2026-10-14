@@ -69,7 +69,9 @@ int port_exists(uint32_t name);
 static inline int mach_trace(void) { static int v = -1; if (v < 0) v = access("/dev/shm/tahoe-mach-trace", F_OK) == 0; return v; }
 // solo los workloops (peticiones de hilo, entregas, EVFILT_WORKLOOP): mucho menos que la traza Mach, para carreras que esta
 // tapa al cambiar los tiempos (msh.sh WL=1). La traza Mach completa la incluye.
-static inline int wl_trace_on(void) { static int v = -1; if (v < 0) v = mach_trace() || access("/dev/shm/tahoe-wl-trace", F_OK) == 0; return v; }
+// Con nombres en /dev/shm/tahoe-wl-trace, solo esos procesos (vacío: todos).
+int trace_file_on(const char* file);
+static inline int wl_trace_on(void) { static int v = -1; if (v < 0) v = mach_trace() || trace_file_on("/dev/shm/tahoe-wl-trace"); return v; }
 int port_rpid(uint32_t name);
 int port_list_owned(uint32_t* names, uint32_t* types, int max);
 uint64_t port_get_context(uint32_t name);
