@@ -268,6 +268,11 @@ static long b_identitysvc(struct ctx* c) {
 
 void emu_cred_init(void) {
 	cred_load();
+	// La sesión propia, en el registro si aún no está: casi todas se heredan (TAHOE_CRED) sin pasar por setaudit_addr, y
+	// securityd pregunta por la del cliente (auditon A_GETSINFO_ADDR) al darle servicio; sin ella respondía EINVAL a todo
+	// cliente de otra sesión (la shell, sus programas) y SecKeychainCreate, certtool... fallaban con errSecParam.
+	uint8_t a[0x30];
+	if (ses_get(au_asid, a) != 0) { ses_mine(a); ses_put(a); }
 	reg_bsd(24, b_getuid); reg_bsd(25, b_geteuid); reg_bsd(47, b_getgid); reg_bsd(43, b_getegid);
 	reg_bsd(23, b_setuid); reg_bsd(183, b_seteuid); reg_bsd(181, b_setgid); reg_bsd(182, b_setegid);
 	reg_bsd(126, b_setreuid); reg_bsd(127, b_setregid);

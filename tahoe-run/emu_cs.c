@@ -245,10 +245,26 @@ static long copy_token(const uint8_t* blob, uint32_t len, uint64_t uaddr, uint64
 // Núcleo común de csops y csops_audittoken. pid 0 = el propio proceso.
 static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
 	switch (op) {
-	case 0: {                                                    // CS_OPS_STATUS: sin banderas (como un binario sin restricciones)
-		uint32_t zero = 0;
+	case 0: {                                                    // CS_OPS_STATUS
+		// Como XNU tras validar la firma al cargar: CS_VALID | CS_SIGNED más las banderas del CodeDirectory (hardened
+		// runtime, hard, kill, ad hoc...); con derechos, CS_ENTITLEMENTS_VALIDATED; y los binarios de Apple (firmados y sin
+		// Team ID) son de plataforma (CS_PLATFORM_BINARY | CS_DYLD_PLATFORM), como los que AMFI reconoce. Sin firma, 0.
+		// securityd comprueba con esto la firma dinámica de sus clientes (SecCodeCheckValidity: sin CS_VALID, «guest
+		// invalid» y el llavero del sistema no se desbloquea) y shortcuts exige ser binario de plataforma.
+		uint32_t st = 0, len = 0;
 		if (usize < 4) return -D_EINVAL;
-		return safe_write(uaddr, &zero, 4) == 4 ? 0 : -D_EFAULT;
+		uint8_t* cd = cs_blob(pid, 0, &len);
+		if (cd && len >= 44 && be32(cd) == 0xfade0c02) {
+			st = 0x00000001u | 0x20000000u;                          // CS_VALID | CS_SIGNED
+			st |= be32(cd + 12) & (0x2u | 0x100u | 0x200u | 0x800u | 0x1000u | 0x2000u | 0x10000u | 0x20000u);
+			uint32_t team = len >= 52 && be32(cd + 8) >= 0x20200 ? be32(cd + 48) : 0;
+			if (!team && !(st & 0x2u)) st |= 0x04000000u | 0x02000000u;   // CS_PLATFORM_BINARY | CS_DYLD_PLATFORM
+			uint32_t el = 0; uint8_t* ent = cs_blob(pid, 5, &el);
+			if (ent) st |= 0x4000u;                                  // CS_ENTITLEMENTS_VALIDATED
+			free(ent);
+		}
+		free(cd);
+		return safe_write(uaddr, &st, 4) == 4 ? 0 : -D_EFAULT;
 	}
 	case 7: case 16: {                                           // ENTITLEMENTS_BLOB (XML, ranura 5) / DER_ENTITLEMENTS_BLOB (ranura 7)
 		uint32_t len = 0;

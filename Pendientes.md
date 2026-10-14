@@ -3,6 +3,12 @@
 Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. Se actualiza al cerrar o abrir tareas.
 
 ## Hecho recientemente
+- Llaveros: `security create-keychain`, `add-generic-password`, `list-keychains`... funcionan (securityd daba EINVAL
+  al preguntar por la sesión de auditoría del cliente, que no estaba registrada) y apsd ya guarda su llavero.
+  `csops` da el estado de firma real (CS_VALID, binario de plataforma de Apple...): securityd valida a sus clientes y
+  `shortcuts` ya no se cae con «Assertion failed: (platformBinary)».
+- EndpointSecurity mínimo: el servicio EndpointSecurityDriver y su cliente (sin eventos); xprotectd ya no se relanza en
+  bucle.
 - Arranque: `IODeviceTree:/efi/platform` (libimage4 abortaba sin él: kmutil, una tarea temprana, y cryptexd se caían con
   «failed to get platform node»); ahora salen ~90 programas en los 10 primeros segundos (antes 1–3). La frecuencia del
   TSC se mide una vez (antes 30 ms de espera activa en cada proceso).
@@ -42,9 +48,12 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    - Servicios en bucle: locationd se caía con «-[__NSDictionaryM setObject:forKeyedSubscript:]: key cannot be nil»
      (el userName de un cliente; probablemente getpwuid fallando bajo carga): con el arranque más tranquilo ya no se ha
      vuelto a caer. apfs.util (lo lanza diskarbitrationd) falla al sondear disk1s2/disk1s3 (no hay datos detrás).
-     KernelEventAgent arreglado. digest-service sigue (no abre su base de Kerberos por
-     OpenDirectory); xprotectd y endpointsecurityd necesitan EndpointSecurity (`es_new_client` da error interno);
-     watchdogd, por investigar. Otros que se relanzan: locationd, cryptexd, diskmanagementstartup, apsd, cloudd.
+     KernelEventAgent y xprotectd arreglados. watchdogd no es un bucle: con el vigilante inactivo su diseño es «dormir
+     2 s y salir», y solo vuelve cuando otro servicio le escribe. apfs.util/fsck_apfs tampoco: es el sondeo único de cada
+     volumen al arrancar. digest-service sale con error porque no hay Kerberos local (LKDC): configureLocalKDC lo intenta
+     en cada arranque y falla (certtool crea el certificado del KDC, pero luego no encuentra su clave privada en el
+     llavero del sistema, que no se desbloquea: `systemkeychain -t` dice «System unlock is NOT working» y cada arranque
+     lo recrea con `systemkeychain -C -f`). Otros que se relanzan: locationd, cryptexd, diskmanagementstartup, apsd, cloudd.
    - `diskutil` con el sistema ya asentado: `list` 0,5–3 s, `info /` 2–6 s, siempre con salida.
    - Discos, lo que falta: capacidades en `diskutil apfs list` («ERROR»). El contenedor tendría que admitir el cliente de
      AppleAPFSContainer: selector 8 (APFSExtendedSpaceInfo, diccionario con «size», «used», «reserve» y «Max volume
@@ -56,7 +65,7 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    - General: apagar los registros de diagnóstico fuera de las pruebas; índices en las tablas en vez de recorrerlas;
      mensajes Mach en Rust; arranque de procesos (servicios bajo demanda) más ligero.
 2. **Caídas**:
-   - `shortcuts`: «Assertion failed: (platformBinary)»; `csops` no dice que es un binario de plataforma de Apple.
+   - `shortcuts`: ya no se cae; ahora dice «Couldn’t communicate with a helper application».
    - `screen` (sin terminal debería salir con «Must be connected to a terminal»).
    - `login` (debería pedir el nombre o salir con error, no caerse).
    - El resto de los SIGILL: `kextutil`, `vpnd`, `snmptrapd`, `kgetcred`, `json_xs5.34`, `kill.d`,
