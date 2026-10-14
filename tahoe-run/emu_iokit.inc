@@ -367,10 +367,30 @@ static void io_disks(int bus) {
 	int cont = ent_add(d1, "AppleAPFSContainer", "AppleAPFSContainer", "IORegistryEntry IOService IOStorage IOPartitionScheme", "", PL_SERVICE, 0);
 	p_str(cont, "IOClass", "AppleAPFSContainer"); p_str(cont, "UUID", "B0070000-0000-4000-8000-0000000000C1");
 	p_num(cont, "Size", size, 64); p_num(cont, "CapacityInUse", used, 64);
-	int vol = ent_add(cont, "macOS Base System", "AppleAPFSVolume", "IORegistryEntry IOService IOStorage IOMedia", "1", PL_SERVICE, 0);
+	// En un macOS completo el contenedor tiene además los volúmenes Data y Preboot (los mismos que da getfsstat: disk1s2 y
+	// disk1s3), cada uno con su rol, y el del sistema se llama «Macintosh HD»; Sistema y Datos forman un grupo (VolGroupUUID).
+	// bless --info busca el Preboot del contenedor por su rol; diskutil list los enseña. En la Recovery solo está el primero.
+	int full = sys_volume_present(0) && sys_volume_present(1);
+	const char* sysname = full ? "Macintosh HD" : "macOS Base System";
+	int vol = ent_add(cont, sysname, "AppleAPFSVolume", "IORegistryEntry IOService IOStorage IOMedia", "1", PL_SERVICE, 0);
 	disk_media(vol, "disk1s1", 1, 3, size, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
 	p_str(vol, "UUID", BOOT_VOLUME_UUID); p_str(vol, "VolGroupUUID", BOOT_VOLUME_UUID);
-	p_num(vol, "Partition ID", 1, 32); p_str(vol, "FullName", "macOS Base System");
+	p_num(vol, "Partition ID", 1, 32); p_str(vol, "FullName", sysname);
+	if (!full) return;
+	static const struct { const char *name, *bsd, *uuid, *role; int minor, id, group, rv; } more[] = {
+		{ "Macintosh HD - Data", "disk1s2", "B0070000-0000-4000-8000-000000000002", "Data",    4, 2, 1, 0x40 },
+		{ "Preboot",             "disk1s3", "B0070000-0000-4000-8000-000000000003", "Preboot", 5, 3, 0, 0x10 },
+	};
+	// Rol: APFSVolumeRole lee «RoleValue» (número: APFS_VOL_ROLE_SYSTEM 1, PREBOOT 0x10, DATA 0x40); «Role» es su nombre.
+	struct val* r = v_new(V_ARRAY); v_add(r, NULL, v_str("System")); v_set(io_e[vol].props, "Role", r); p_num(vol, "RoleValue", 1, 16);
+	for (size_t i = 0; i < sizeof more / sizeof more[0]; i++) {
+		int v = ent_add(cont, more[i].name, "AppleAPFSVolume", "IORegistryEntry IOService IOStorage IOMedia", more[i].bsd + 6, PL_SERVICE, 0);
+		disk_media(v, more[i].bsd, 1, more[i].minor, size, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
+		p_str(v, "UUID", more[i].uuid); p_str(v, "VolGroupUUID", more[i].group ? BOOT_VOLUME_UUID : more[i].uuid);
+		p_num(v, "Partition ID", (uint64_t)more[i].id, 32); p_str(v, "FullName", more[i].name);
+		struct val* ro = v_new(V_ARRAY); v_add(ro, NULL, v_str(more[i].role)); v_set(io_e[v].props, "Role", ro);
+		p_num(v, "RoleValue", (uint64_t)more[i].rv, 16);
+	}
 }
 
 // GUID de texto -> 16 bytes en el orden de EFI (los tres primeros campos en little endian)
@@ -1910,15 +1930,20 @@ static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* re
 		// 2865 io_connect_method: scalar_input[], inband_input, ool_input; salidas inband/scalar/ool. Sin gancho de clase: no soportado.
 		if (!self || self->kind != K_CONNECT || self->closed) return rp_err(rep, h, kIOReturnNoDevice);
 		uc_method_fn fn = uc_hook_for(io_e[self->ent].cls);
-		if (!fn || h->id != 2865) { logf_("    iokit: %s selector sin gancho (id=%d clase=%s)\n", "user client", h->id, io_e[self->ent].cls); return rp_err(rep, h, kIOReturnUnsupported); }
+		// 2872 io_connect_method_var_output: como 2865, pero la salida de estructura es de tamaño variable y vuelve fuera de
+		// línea (respuesta compleja: descriptor OOL, NDR, inband, escalares y la cuenta de la salida variable).
+		int var = h->id == 2872;
+		if (!fn || (h->id != 2865 && !var)) { logf_("    iokit: %s selector sin gancho (id=%d clase=%s)\n", "user client", h->id, io_e[self->ent].cls); return rp_err(rep, h, kIOReturnUnsupported); }
 		struct uc_call uc = { .ent = self->ent };
 		rq_ndr(&q); uc.selector = rq_u32(&q);
 		uint32_t nsin = rq_u32(&q); uint64_t sin[16] = { 0 }; for (uint32_t i = 0; i < nsin && i < 16; i++) sin[i] = rq_u64(&q);
 		uc.sin = sin; uc.nsin = nsin; uc.inband = rq_bytes(&q, &uc.ninband);
 		uc.ool_in = rq_u64(&q); uc.ool_in_size = rq_u64(&q);                  // ool_input, ool_input_size
 		uint32_t want_out = rq_u32(&q), want_sout = rq_u32(&q);              // inband_outputCnt, scalar_outputCnt
-		uc.ool_out = rq_u64(&q); uc.ool_out_size = rq_u64(&q);               // ool_output, ool_output_size
-		if (q.p > q.len) { want_out = 4096; want_sout = 16; uc.ool_in = uc.ool_in_size = uc.ool_out = uc.ool_out_size = 0; }   // petición corta
+		static __thread uint8_t* varbuf;                                       // salida variable de 2872 (64 KB por hilo)
+		if (var) { if (!varbuf) varbuf = malloc(65536); uc.ool_out = (uint64_t)varbuf; uc.ool_out_size = varbuf ? 65536 : 0; }
+		else { uc.ool_out = rq_u64(&q); uc.ool_out_size = rq_u64(&q); }      // ool_output, ool_output_size
+		if (q.p > q.len) { want_out = 4096; want_sout = 16; uc.ool_in = uc.ool_in_size = 0; if (!var) uc.ool_out = uc.ool_out_size = 0; }   // petición corta
 		uint32_t cap_out = want_out < 4096 ? want_out : 4096, cap_sout = want_sout < 16 ? want_sout : 16;
 		uint64_t sout[16] = { 0 }, ool_len = 0; uint32_t nsout = cap_sout, nout = cap_out; static __thread uint8_t outband[4096];
 		uc.sout = sout; uc.nsout = &nsout; uc.outband = outband; uc.noutband = &nout; uc.ool_out_len = &ool_len;
@@ -1927,6 +1952,14 @@ static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* re
 		if (r) return rp_err(rep, h, r);
 		if (nout > cap_out) nout = cap_out;
 		if (nsout > cap_sout) nsout = cap_sout;
+		if (var) {                                                             // cabecera compleja + descriptor OOL (como rp_ool)
+			if (ool_len > uc.ool_out_size) ool_len = uc.ool_out_size;
+			size_t n = rp_ool(rep, h, varbuf, (size_t)ool_len, 0, 0) - 4;      // sin la cuenta final: va tras inband y escalares
+			memcpy(rep + n, &nout, 4); memcpy(rep + n + 4, outband, nout); n += 4 + ((nout + 3) & ~3u);
+			memcpy(rep + n, &nsout, 4); memcpy(rep + n + 4, sout, nsout * 8); n += 4 + nsout * 8;
+			uint32_t vl = (uint32_t)ool_len; memcpy(rep + n, &vl, 4);
+			return n + 4;
+		}
 		size_t n = reply_begin(rep, h, KERN_SUCCESS_);
 		memcpy(rep + n, &nout, 4); memcpy(rep + n + 4, outband, nout); n += 4 + ((nout + 3) & ~3u);
 		memcpy(rep + n, &nsout, 4); memcpy(rep + n + 4, sout, nsout * 8); n += 4 + nsout * 8;

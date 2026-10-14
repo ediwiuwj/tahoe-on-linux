@@ -112,6 +112,7 @@ static uint64_t sysvol_mnt(size_t i) {                                  // id de
 	}
 	return id[i];
 }
+int sys_volume_present(int k) { return k >= 0 && (size_t)k < NSYSVOL && sysvol_mnt((size_t)k) != 0; }
 void sys_volumes_mount(void) {                                         // en el PID 1 del arranque, antes que nada de macOS
 	if (!tahoe_root) return;
 	uint64_t r = mnt_id_of(AT_FDCWD, tahoe_root, 0);
@@ -796,6 +797,13 @@ static long bsd_getattrlist(struct ctx* c) {
 	if (stat(rpv, &s) != 0) return err();
 	vol_fix(&s, AT_FDCWD, rpv, 0);
 	struct statfs sf; if (statfs(rpv, &sf) != 0) memset(&sf, 0, sizeof sf);
+	// El volumen al que pertenece la ruta (como statfs): la raíz, Data o Preboot de un macOS completo, /dev o un tmpfs.
+	// Punto de montaje, dispositivo, banderas, nombre y UUID son los suyos (los mismos que dan getfsstat e IOKit): con los
+	// de la raíz para todo, diskarbitrationd no encontraba /System/Volumes/Data ni Preboot («Could not find disk»).
+	const struct gmount* vm = gmount_of_dev(&sf, s.st_dev);
+	int vk = -1; for (size_t k = 0; k < NSYSVOL; k++) if (s.st_dev == sys_volumes[k].mark) vk = (int)k;
+	int full = sysvol_mnt(0) && sysvol_mnt(1);
+	const char* vname = vk == 0 ? "Macintosh HD - Data" : vk == 1 ? "Preboot" : !strcmp(vm->on, "/") ? (full ? "Macintosh HD" : "macOS Base System") : vm->type;
 	uint8_t out[1024];
 	size_t n = 4;                                         // el primer campo es la longitud total
 	struct { size_t pos; const char* str; } refs[8]; int nrefs = 0;
@@ -841,10 +849,10 @@ static long bsd_getattrlist(struct ctx* c) {
 	if (vol & 0x200) PUTU32(sf.f_files - sf.f_ffree);      // FILECOUNT
 	if (vol & 0x400) PUTU32(0);                            // DIRCOUNT
 	if (vol & 0x800) PUTU32(sf.f_files);                   // MAXOBJCOUNT
-	if (vol & 0x1000) PUTREF("/");                         // MOUNTPOINT
-	if (vol & 0x2000) PUTREF("macOS Base System");         // NAME: el del volumen de la Recovery (AppleAPFSVolume en IOKit)
-	if (vol & 0x4000) PUTU32(0x1000 | 0x4000);             // MOUNTFLAGS: MNT_LOCAL | MNT_ROOTFS
-	if (vol & 0x8000) PUTREF("/dev/disk1s1");              // MOUNTEDDEVICE
+	if (vol & 0x1000) PUTREF(vm->on);                      // MOUNTPOINT
+	if (vol & 0x2000) PUTREF(vname);                       // NAME: el del AppleAPFSVolume de IOKit
+	if (vol & 0x4000) PUTU32(vm->flags);                   // MOUNTFLAGS
+	if (vol & 0x8000) PUTREF(vm->from);                    // MOUNTEDDEVICE
 	if (vol & 0x10000) PUTU64(0);                          // ENCODINGSUSED
 	if (vol & ATTR_VOL_CAPABILITIES) {
 		// vol_capabilities_attr_t: capabilities[4] y valid[4] (formato, interfaces, reservados)
@@ -859,11 +867,13 @@ static long bsd_getattrlist(struct ctx* c) {
 	if (vol & ATTR_VOL_UUID) {
 		// el UUID del volumen de arranque (kern.bootuuid y AppleAPFSVolume en IOKit): diskarbitrationd solo toma el nombre del
 		// volumen montado si coincide con el del disco
-		static const uint8_t uuid[16] = { 0xB0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+		// (Data y Preboot: ...02 y ...03, como sus AppleAPFSVolume)
+		uint8_t uuid[16] = { 0xB0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+		if (vk >= 0) uuid[15] = (uint8_t)(2 + vk);
 		PUT(uuid, 16);
 	}
 	if (vol & 0x80000) PUTU32(0);                          // MOUNTEXTFLAGS
-	if (vol & 0x100000) PUTREF("apfs");                    // FSTYPENAME
+	if (vol & 0x100000) PUTREF(vm->type);                 // FSTYPENAME
 	if (vol & 0x200000) PUTU32(0);                         // FSSUBTYPE
 	if (vol & 0x400000) PUTU32(0);                         // OWNER (root)
 	if (vol & 0x800000) PUTU64((sf.f_blocks - sf.f_bfree) * bs);   // SPACEUSED
@@ -1075,6 +1085,14 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 		if (dir & A_DIR_MOUNTSTATUS) {                                                    // DIR_MNTSTATUS_MNTPOINT si es raíz de un montaje
 			uint32_t ms = 0;
 			for (size_t i = 0; isdir && fullpath && i < NGMOUNT; i++) if (!strcmp(fullpath, gmounts[i].on)) ms = 0x1;
+			// también Data y Preboot de un macOS completo y los tmpfs (como getfsstat): diskutil info <ruta> pregunta esto
+			// para saber si la ruta es un volumen
+			for (size_t k = 0; isdir && fullpath && !ms && k < NSYSVOL; k++) if (sysvol_mnt(k) && !strcmp(fullpath, sysvol_gmounts[k].on)) ms = 0x1;
+			if (isdir && fullpath && !ms && !strncmp(fullpath, "/System/Volumes/", 16)) {
+				static __thread struct dmount dm[16];
+				int nd = tmpfs_mounts(dm, 16);
+				for (int i = 0; i < nd; i++) if (!strcmp(fullpath, dm[i].on)) ms = 0x1;
+			}
 			P32(ms); if (isdir) rd |= A_DIR_MOUNTSTATUS;
 		}
 	}
@@ -1209,6 +1227,9 @@ static long bsd_fsctl(struct ctx* c) {
 	// 'h' 22 (_IOW, u32): umbral de espacio libre que fija KernelEventAgent para avisar de disco lleno; se acepta.
 	// 'h' 18 (_IOR, u32): estado del volumen que consulta después; sin avisos pendientes (0).
 	if (c->a[1] == 0x80046816UL) return 0;
+	// APFSIOC_MARK_PURGEABLE ('J' 68, 8 bytes): marcar un archivo como purgable (cachés de CFNetwork, Spotlight, removefile...).
+	// Aquí no hay purga de espacio: se acepta sin efecto.
+	if (c->a[1] == 0xc0084a44UL) return 0;
 	if (c->a[1] == 0x40046812UL) { uint32_t z = 0; return safe_write(c->a[2], &z, 4) == 4 ? 0 : -D_EFAULT; }
 	logf_("    fsctl: comando 0x%lx sin implementar\n", c->a[1]);
 	return -45;

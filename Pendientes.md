@@ -3,6 +3,10 @@
 Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. Se actualiza al cerrar o abrir tareas.
 
 ## Hecho recientemente
+- Discos del macOS completo: `diskutil list` muestra Macintosh HD, Macintosh HD - Data y Preboot (antes «macOS Base
+  System»), con sus roles; `diskutil info /System/Volumes/Data` y `.../Preboot` encuentran su volumen (getattrlist
+  describe el volumen de cada ruta y reconoce sus puntos de montaje).
+- `setitimer`/`getitimer`: `alarm()` no avisaba nunca (perl -e 'alarm N', plazos de muchos programas).
 - Caída «BUG IN LIBDISPATCH: Invalid wlh state» (opendirectoryd, softwareupdated, PerfPowerServices, notifyd...): un hilo
   de workloop llegaba con una petición que libdispatch ya había retirado. Ahora se comprueba en el punto de no retorno
   (3 de 5 arranques con caída antes; 1 de 15 después). Con ello `id eduardo` funciona (uid 501, staff, admin).
@@ -35,8 +39,11 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    - Servicios en bucle: KernelEventAgent arreglado. digest-service sigue (no abre su base de Kerberos por
      OpenDirectory); xprotectd y endpointsecurityd necesitan EndpointSecurity (`es_new_client` da error interno);
      watchdogd, por investigar. Otros que se relanzan: locationd, cryptexd, diskmanagementstartup, apsd, cloudd.
-   - Después: mostrar los volúmenes del macOS completo (Sistema, Datos, Preboot) en vez de «macOS Base System»;
-     `bless --info` también pide Preboot.
+   - Discos, lo que falta: capacidades en `diskutil apfs list` («ERROR»: APFSExtendedSpaceInfo, selector 8 del cliente de
+     AppleAPFSContainer, devuelve un diccionario cuyas claves no se conocen; con una respuesta incompleta storagekitd se
+     cae, así que de momento el contenedor no admite conexión) y `bless --info` (Preboot no tiene la carpeta de arranque
+     `<UUID>/System/Library/CoreServices` que crea el instalador; con la propiedad IOAPFSPreBootDevice también falla
+     `--getBoot`).
    - Esperas parecidas: `log show` ya no se cuelga pero tarda 65–165 s; `system_profiler` y `lwp-request` se cuelgan.
    - General: apagar los registros de diagnóstico fuera de las pruebas; índices en las tablas en vez de recorrerlas;
      mensajes Mach en Rust; arranque de procesos (servicios bajo demanda) más ligero.

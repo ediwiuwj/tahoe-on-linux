@@ -165,6 +165,35 @@ static long bsd_getrlimit(struct ctx* c) {
 // getrusage(who, struct rusage*): RUSAGE_SELF (0) y RUSAGE_CHILDREN (-1) valen lo mismo en Linux, y la struct rusage de
 // Darwin x86_64 ocupa y ordena igual que la de Linux (dos timeval de 16 bytes: en Darwin tv_usec es int32 con relleno y,
 // como es menor que 10^6, sus bytes coinciden; después 14 long). La usan los snmp* (net-snmp) al arrancar.
+// setitimer / getitimer (83 / 86): los temporizadores ITIMER_REAL/VIRTUAL/PROF (mismos números en Darwin y Linux) son los
+// de Linux; SIGALRM llega como cualquier otra señal. struct itimerval de Darwin: dos timeval {long tv_sec; int tv_usec}
+// de 16 bytes (los 4 bytes de relleno se ignoran). Sin ellos, alarm() (p. ej. perl -e 'alarm 10') no avisaba nunca.
+static void itv_in(const uint8_t* b, struct itimerval* v) {
+	int64_t s0, s1; int32_t u0, u1;
+	memcpy(&s0, b, 8); memcpy(&u0, b + 8, 4); memcpy(&s1, b + 16, 8); memcpy(&u1, b + 24, 4);
+	v->it_interval.tv_sec = s0; v->it_interval.tv_usec = u0; v->it_value.tv_sec = s1; v->it_value.tv_usec = u1;
+}
+static void itv_out(uint8_t* b, const struct itimerval* v) {
+	memset(b, 0, 32);
+	int64_t s0 = v->it_interval.tv_sec, s1 = v->it_value.tv_sec; int32_t u0 = (int32_t)v->it_interval.tv_usec, u1 = (int32_t)v->it_value.tv_usec;
+	memcpy(b, &s0, 8); memcpy(b + 8, &u0, 4); memcpy(b + 16, &s1, 8); memcpy(b + 24, &u1, 4);
+}
+static long bsd_setitimer(struct ctx* c) {
+	int which = (int)c->a[0];
+	if (which < 0 || which > 2) return -D_EINVAL;
+	struct itimerval nv = { 0 }, ov;
+	if (c->a[1]) { uint8_t b[32]; if (safe_read(c->a[1], b, 32) != 32) return -D_EFAULT; itv_in(b, &nv); }
+	if (setitimer(which, &nv, &ov) != 0) return -D_EINVAL;
+	if (c->a[2]) { uint8_t b[32]; itv_out(b, &ov); if (safe_write(c->a[2], b, 32) != 32) return -D_EFAULT; }
+	return 0;
+}
+static long bsd_getitimer(struct ctx* c) {
+	int which = (int)c->a[0];
+	if (which < 0 || which > 2) return -D_EINVAL;
+	struct itimerval v; if (getitimer(which, &v) != 0) return -D_EINVAL;
+	uint8_t b[32]; itv_out(b, &v);
+	return safe_write(c->a[1], b, 32) == 32 ? 0 : -D_EFAULT;
+}
 static long bsd_getrusage(struct ctx* c) {
 	int who = (int)c->a[0];
 	if (who != 0 && who != -1) return -D_EINVAL;
@@ -1553,7 +1582,7 @@ void emu_proc_init(void) {
 	reg_bsd(31, bsd_getpeername); reg_bsd(59, bsd_execve);
 	reg_bsd(39, bsd_getppid); reg_bsd(81, bsd_getpgrp); reg_bsd(151, bsd_getpgid); reg_bsd(82, bsd_setpgid);
 	reg_bsd(310, bsd_getsid); reg_bsd(147, bsd_setsid); reg_bsd(60, bsd_umask);
-	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit); reg_bsd(117, bsd_getrusage); reg_bsd(453, bsd_memorystatus_get_level); reg_bsd(184, bsd_sigreturn);
+	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit); reg_bsd(117, bsd_getrusage); reg_bsd(83, bsd_setitimer); reg_bsd(86, bsd_getitimer); reg_bsd(453, bsd_memorystatus_get_level); reg_bsd(184, bsd_sigreturn);
 	reg_bsd(46, bsd_sigaction); reg_bsd(53, bsd_sigaltstack); reg_bsd(329, bsd_pthread_sigmask); reg_bsd(52, bsd_sigpending);
 	reg_bsd(37, bsd_kill); reg_bsd(328, bsd_pthread_kill);
 	reg_bsd(98, bsd_connect);
