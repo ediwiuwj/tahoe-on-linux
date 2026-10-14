@@ -1,0 +1,66 @@
+diff --git a/tahoe-run/emu_iokit.inc b/tahoe-run/emu_iokit.inc
+index 77c6d43..d03bb02 100644
+--- a/tahoe-run/emu_iokit.inc
++++ b/tahoe-run/emu_iokit.inc
+@@ -364,7 +364,7 @@ static void io_disks(int bus) {
+ 	p_str(csch, "IOClass", "AppleAPFSContainerScheme");
+ 	int d1 = ent_add(csch, "AppleAPFSMedia", "AppleAPFSMedia", "IORegistryEntry IOService IOStorage IOMedia", "", PL_SERVICE, 0);
+ 	disk_media(d1, "disk1", 1, 2, size, "EF57347C-0000-11AA-AA11-00306543ECAC", 1, 0);
+-	int cont = ent_add(d1, "AppleAPFSContainer", "AppleAPFSContainer", "IORegistryEntry IOService IOStorage IOPartitionScheme", "", PL_SERVICE, 0);
++	int cont = ent_add(d1, "AppleAPFSContainer", "AppleAPFSContainer", "IORegistryEntry IOService IOStorage IOPartitionScheme", "", PL_SERVICE, 1);
+ 	p_str(cont, "IOClass", "AppleAPFSContainer"); p_str(cont, "UUID", "B0070000-0000-4000-8000-0000000000C1");
+ 	p_num(cont, "Size", size, 64); p_num(cont, "CapacityInUse", used, 64);
+ 	// En un macOS completo el contenedor tiene además los volúmenes Data y Preboot (los mismos que da getfsstat: disk1s2 y
+@@ -1155,6 +1155,44 @@ static int32_t uc_es(struct uc_call* c) {
+ 	}
+ 	return 0;
+ }
++// AppleAPFSContainer (cliente deducido de APFS.framework, que es quien lo usa; storagekitd y diskutil pasan por él):
++//   8    APFSExtendedSpaceInfo: salida variable, diccionario serializado con «size», «used», «reserve» y «Max volume count»
++//        (storagekitd mete cada uno en un NSDictionary: si falta alguno, se cae).
++//   9    APFSVolumeRole: entra u32 índice del volumen (sN - 1), u16 0xffff si se cambia el rol y u16 el rol nuevo; sale u16
++//        el rol (System 1, Preboot 0x10, Data 0x40, como RoleValue).
++//   0x12 APFSVolumeQueryCryptoProgress (entran 8 bytes, salen 32) y 0x1e APFSStatisticsProcessContainer (entran 4, salen
++//        64): a cero, sin cifrado en curso ni estadísticas.
++// El resto (crear o borrar volúmenes, etc.) sale a cero sin efecto; se anota cada selector la primera vez. El espacio es
++// el del disco de Linux donde está la raíz de macOS.
++static int32_t uc_apfs_container(struct uc_call* c) {
++	static uint64_t seen;
++	if (c->selector < 64 && !(seen & (1ull << c->selector))) {
++		seen |= 1ull << c->selector;
++		logf_("    iokit: <%d> AppleAPFSContainer selector %u (%u escalares, %u bytes, salida %u)\n", (int)getpid(), c->selector, c->nsin, c->ninband, *c->noutband);
++	}
++	memset(c->outband, 0, *c->noutband);
++	memset(c->sout, 0, *c->nsout * 8);
++	if (c->selector == 8) {
++		if (!c->ool_out || !c->ool_out_size) return kIOReturnBadArgument;
++		struct statfs sf; uint64_t size = io_disk_size, used = 0;
++		if (tahoe_root && statfs(tahoe_root, &sf) == 0) used = (uint64_t)(sf.f_blocks - sf.f_bfree) * sf.f_bsize;
++		char d[512];
++		int n = snprintf(d, sizeof d, "<dict><key>size</key><integer size=\"64\">%llu</integer><key>used</key><integer size=\"64\">%llu</integer>"
++		                 "<key>reserve</key><integer size=\"64\">0</integer><key>Max volume count</key><integer size=\"32\">100</integer></dict>",
++		                 (unsigned long long)size, (unsigned long long)used);
++		if (n < 0 || (size_t)n + 1 > c->ool_out_size) return kIOReturnNoMemory;
++		memcpy((void*)c->ool_out, d, (size_t)n + 1); *c->ool_out_len = (uint64_t)n + 1; *c->noutband = 0; *c->nsout = 0;
++		return 0;
++	}
++	if (c->selector == 9) {
++		static const uint16_t roles[] = { 1, 0x40, 0x10 };                 // disk1s1, s2, s3 (como RoleValue)
++		uint32_t i = 0; if (c->ninband >= 4) memcpy(&i, c->inband, 4);
++		int full = sys_volume_present(0) && sys_volume_present(1);
++		if (i >= (full ? 3u : 1u) || *c->noutband < 2) return kIOReturnBadArgument;
++		uint16_t r = roles[i]; memcpy(c->outband, &r, 2); *c->noutband = 2;
++	}
++	return 0;
++}
+ static int io_trace = -1;                                   // traza de IOKit (TAHOE_IOKIT o /dev/shm/tahoe-iokit-trace)
+ // AppleGPUWranglerUserClient (interfaz deducida de GPUWrangler.framework, que es quien la usa):
+ //   0xa0000001 saludo: entra y sale una estructura de 4 bytes con la versión ('GW' << 16 | 2).
+@@ -1528,6 +1566,7 @@ static uc_method_fn uc_hook_for(const char* cls) {
+ 	if (!strcmp(cls, "IOSurfaceRoot")) return uc_iosurface;
+ 	if (!strcmp(cls, "IOWatchdog")) return uc_watchdog;
+ 	if (!strcmp(cls, "EndpointSecurityDriver")) return uc_es;
++	if (!strcmp(cls, "AppleAPFSContainer")) return uc_apfs_container;
+ 	if (!strcmp(cls, "AppleSMC")) return uc_smc;
+ 	if (!strcmp(cls, "com_apple_filesystems_lifs")) return uc_lifs;
+ 	if (!strcmp(cls, "IOHIDSystem")) return uc_hid;

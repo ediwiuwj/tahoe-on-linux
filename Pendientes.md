@@ -2,6 +2,22 @@
 
 Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. Se actualiza al cerrar o abrir tareas.
 
+**En pausa desde el 14 de octubre de 2026.** Cómo retomarlo: README, «Cómo retomarlo».
+
+## Por dónde seguir
+1. **Pantalla (punto 4 de abajo)**: WindowServer ya abre el framebuffer y dibuja el cursor, pero no compone el
+   escritorio. Seguir qué le falta para dibujar el fondo o la ventana del Asistente (`tools/tahoe-view`,
+   `tools/diag/captura.py`).
+2. **Llavero del sistema**: `systemkeychain -t` dice «System unlock is NOT working» y cada arranque lo recrea con
+   `systemkeychain -C -f`. Por eso falla el Kerberos local (configureLocalKDC: certtool no encuentra la clave privada) y
+   digest-service sale con error y se relanza. securityd ya valida a los clientes (csops); el siguiente paso es ver por
+   qué el desbloqueo con `/var/db/SystemKey` no funciona (el cliente recibe el error CSSM 0x800110e0). Prueba:
+   `tools/diag/llaveros.sh`.
+3. **Capacidades de `diskutil apfs list`**: parche guardado en `docs/parches-sin-validar/contenedor-apfs.patch`
+   (storagekitd lanza una excepción tras el selector 8; ver su LEEME).
+4. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
+5. Lo demás, en la lista de abajo.
+
 ## Hecho recientemente
 - Llaveros: `security create-keychain`, `add-generic-password`, `list-keychains`... funcionan (securityd daba EINVAL
   al preguntar por la sesión de auditoría del cliente, que no estaba registrada) y apsd ya guarda su llavero.

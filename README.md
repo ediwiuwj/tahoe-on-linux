@@ -1,5 +1,10 @@
 # tahoe-on-linux — macOS 26 (Tahoe) sobre el kernel de Linux, sin XNU
 
+> **Proyecto en pausa (14 de octubre de 2026).** Todo lo que funciona está en `main`. Para retomarlo, ver
+> [«Cómo retomarlo»](#cómo-retomarlo) y la lista de trabajo en [`Pendientes.md`](Pendientes.md).
+> *Paused project: macOS 26 userland booting on Linux without XNU. Everything that works is on `main`; see
+> `Pendientes.md` (Spanish) for the work list. Contributions welcome.*
+
 Capa de compatibilidad propia (`tahoe-run`, en C) que ejecuta binarios x86_64 de **macOS 26** directamente sobre Linux:
 traduce las syscalls BSD y las trampas Mach de XNU en espacio de usuario, y arranca el `launchd` real de macOS.
 Objetivo: el **macOS 26 completo** en la PC, más rápido que un Hackintosh: llegar al Asistente de configuración y al
@@ -8,12 +13,12 @@ Metal 3 de cara a macOS, emulando lo que falte, ampliando `hasvk` de Mesa si hac
 tenía, como Bluetooth (a través de BlueZ). La Recovery fue el primer paso y sigue sirviendo de prueba de regresiones.
 [Darling](https://github.com/darlinghq/darling) se usa solo como referencia.
 
-**Estado actual (13 de octubre de 2026)**, medido en la PC de pruebas (i5-4210U Haswell, 5,8 GB de RAM, Arch/Omarchy, kernel 7.2):
+**Estado actual (14 de octubre de 2026)**, medido en la PC de pruebas (i5-4210U Haswell, 5,8 GB de RAM, Arch/Omarchy, kernel 7.2):
 
 | Parte | Estado |
 |---|---|
 | Arranque | El `launchd` real de macOS 26 corre como **PID 1** en un espacio de nombres de PID de Linux, sin root. `launchctl list` registra **169 servicios**, en un arranque se cargan unos **155-170 procesos**, y es estable (sin reinicios). Funcionan los dominios de proceso de launchd (servicios XPC de los frameworks, como `authd`), las fases de montaje del arranque (`mount -P`) y las señales de `launchctl kill`/`kickstart -k`. Entre los servicios: `syslogd`, `notifyd`, `cfprefsd`, `configd`, `powerd`, `securityd`, `opendirectoryd`, `diskarbitrationd`, `storagekitd`, `fskitd`, `authd`, `trustd`, `coreservicesd`, `WindowServer`. |
-| Shell de macOS | `tools/macos-shell.sh` abre el `bash` de macOS en la terminal. Con `--launchd` se une a launchd y funcionan las órdenes que usan servicios. En la **Recovery**, `diskutil list` funciona (4 discos, en menos de 40 s). En el **macOS completo**, inventario corto (`tools/shell_survey.sh`, 79 órdenes): **54 funcionan**, 18 dan error (6 de ellos igual que en un Mac real), 3 se cuelgan y 4 se caen; fallan sobre todo las que hablan con launchd y servicios del sistema (`launchctl print`, `defaults`, `diskutil`, `log show`, `caffeinate`) y las que leen la memoria del núcleo (`top`, `vm_stat`, `memory_pressure`). Inventario de **todos** los programas (1.167): `tools/inventario_total.sh`. |
+| Shell de macOS | `tools/macos-shell.sh` abre el `bash` de macOS en la terminal. Con `--launchd` se une a launchd y funcionan las órdenes que usan servicios. En el **macOS completo**, inventario corto (`tools/shell_survey.sh`, 79 órdenes): **58–62 funcionan** (varía de un arranque a otro). Funcionan, entre otras, `id` (usuario, grupos), `diskutil list`/`info` (con el sistema ya asentado), `top`, `vm_stat`, `memory_pressure`, los llaveros de usuario (`security create-keychain`, `add`/`find-generic-password`, `list-keychains`) y `alarm`. Falta: el llavero del sistema no se desbloquea, las capacidades de `diskutil apfs list`, `log show` lento, `system_profiler` se cuelga. Inventario de **todos** los programas (1.167): `tools/inventario_total.sh`. |
 | macOS completo | El **macOS 26.7.1 completo** (del instalador oficial, extraído con las herramientas de `tools/`) arranca: launchd carga **~400 servicios**, ~110 procesos, y se lanzan `WindowServer` y `loginwindow` (sistema recién instalado: toca el Asistente de configuración). `loginwindow` ya obtiene de opendirectoryd la lista de usuarios y **lanza Language Chooser** (la pantalla de idioma, la primera del Asistente), que se conecta a WindowServer y le pide ventanas, pero a veces no carga su interfaz (`MainMenu.nib`) y se cierra. Queda una fuga de memoria de 1-3 GB en algún proceso (el guardián ya dice cuál). Ver «macOS 26 completo» al final. |
 | Interfaz gráfica | **Primera imagen** (macOS 26 completo): `WindowServer` abre el framebuffer emulado (`AppleIntelFramebuffer`, 1280×800, EDID propio), crea el cursor compartido, proyecta la memoria de vídeo (en `/dev/shm`) y **dibuja el cursor**, por software (sin dispositivo Metal: CoreDisplay registra «MetalDevice ... 0x0»). Hay IOSurface emulado (superficies compartidas entre procesos). Desde el 12 de octubre WindowServer **ya no se cae** (rwlock de libpthread y workloops de libdispatch implementados) ni crece en memoria (avisos «send-possible» como en XNU): se queda estable en ~95 MB, pero aún no compone el escritorio. Visor en Linux: `tools/tahoe-view` (`macos-shell.sh --pantalla`); captura: `tools/diag/captura.py`. |
 | Metal | Un kernel de Metal (AIR) traducido a SPIR-V con `metal2vulkan` se ejecuta en la GPU (Intel HD 4400) por Vulkan (`test/run_add_arrays.c`). Aún no está conectado a `tahoe-run`. |
@@ -66,10 +71,23 @@ Diagnóstico con `tools/diag/` (registro y salidas en `$TAHOE_DIAG_DIR`, por omi
 | `memoria.sh <programa> [t1] [t2]` | Muestreo de la memoria de un proceso de macOS y comparación de dos fotos de `smaps` (`memoria.py`): qué región crece |
 | `dsmos.py <macho> <salida>` | Descifra el `__TEXT` protegido de un binario de Apple (loginwindow, Finder...) para desensamblarlo, con la clave de la PC |
 | `../inventario_total.sh` + `inventario.py` | Ejecuta todos los programas de la shell del macOS completo y los clasifica (funciona, pide argumentos, error del emulador, se cae, cuelga) |
+| `bateria.sh [binario_anterior]` | La batería de antes de subir un cambio (abajo), con resumen; con el binario anterior, también la comparación A/B |
+| `ab_recorrido.sh <binario_A> [veces]` | Inventario corto alternando el binario anterior (A) y el del repo (B) |
+| `arranque.sh [s]` | Programas cargados por cada 10 s y los que se relanzan más (bucles); necesita `docs/parches-sin-validar/log-con-hora.patch` |
+| `dk_calmo.sh [espera]` | `diskutil` y `bless` cronometrados con el sistema ya asentado (en pleno arranque todo va lento) |
+| `llaveros.sh` | Llavero de usuario (crear, guardar, leer) y del sistema (`systemkeychain -t`) |
 
 **Antes de dar por bueno un cambio**, se pasa una batería fija y se compara con el binario anterior (`TAHOE_RUN`): `diskutil list`
 en la Recovery (`discos.sh`), el inventario corto en el macOS completo dos veces (el arranque completo varía de una vez a otra),
-la memoria de WindowServer (`memoria.sh`) y `cargo test --lib` en `tahoe-run/nucleo`. Si algo empeora, no se sube.
+la memoria de WindowServer (`memoria.sh`) y `cargo test --lib` en `tahoe-run/nucleo`. Todo junto: `tools/diag/bateria.sh <binario_anterior>`. Si algo empeora, no se sube.
+
+## Cómo retomarlo
+
+1. Compilar: `tahoe-run/build.sh` y comprobar que arranca: `TAHOE_ROOT=~/macos26/completo/macOS tools/macos-shell.sh --launchd -c 'sw_vers; id'`.
+2. Guardar una copia del binario como «anterior» (`cp tahoe-run/tahoe-run /tmp/tahoe-run-A`) para comparar.
+3. Elegir trabajo en [`Pendientes.md`](Pendientes.md) (arriba, «Por dónde seguir»). Los cambios a medias que no se subieron
+   están en [`docs/parches-sin-validar/`](docs/parches-sin-validar/LEEME.md), con lo que falta de cada uno.
+4. Un cambio cada vez; antes de subirlo, `tools/diag/bateria.sh /tmp/tahoe-run-A`.
 
 
 ## Hoja de ruta, por orden

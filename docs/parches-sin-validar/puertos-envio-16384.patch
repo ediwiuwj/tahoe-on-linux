@@ -1,0 +1,42 @@
+diff --git a/tahoe-run/emu_port.c b/tahoe-run/emu_port.c
+index 48ec57b..5e859a9 100644
+--- a/tahoe-run/emu_port.c
++++ b/tahoe-run/emu_port.c
+@@ -32,7 +32,7 @@
+ // TAHOE_PORTS) con la tabla de puertos y las colas de mensajes. Un nombre de puerto es global: el mismo número
+ // designa el mismo puerto en cualquier proceso. El dueño del derecho de recepción es quien lo creó; para despertar
+ // a su epoll (EVFILT_MACHPORT) cada puerto tiene un socket de datagramas con nombre abstracto.
+-#define MAXPORTS 8192                // para todo el sistema (unos 170 procesos en el arranque)
++#define MAXPORTS 16384               // para todo el sistema: el macOS completo usa unos 6000 de forma estable (8192 dejaba poco margen)
+ #define NBUCKET 16384                // índice por nombre: cubeta = (nombre >> 8) % NBUCKET, cadenas por hnext
+ #define MAXMSG   4096                    // ranuras de mensaje (archivo disperso: solo ocupan RAM las usadas)
+ #define MSGSZ    (64 * 1024)
+@@ -50,7 +50,7 @@ struct sonce { uint32_t port; int32_t holder; };
+ struct dnreq { uint32_t port, notify; int32_t pid; uint32_t armado; };   // armado: solo SEND_POSSIBLE (ver port_request_notification)
+ struct sproc { int32_t pid; uint64_t start; };
+ // shold: un proceso que no es el dueño tiene un derecho de envío a un puerto (para MACH_NOTIFY_NO_SENDERS, ver más abajo).
+-#define MAXSH 8192
++#define MAXSH 16384
+ struct shold { uint32_t port; int32_t holder; };
+ // Objetos del núcleo con nombre de puerto (tareas de otros procesos, tokens de identidad...): el nombre lleva a su tipo y pid.
+ #define MAXKOBJ 1024
+@@ -66,6 +66,7 @@ struct srmap { int32_t pid; int32_t prot; uint64_t addr, len, off; char path[96]
+ struct shm {
+ 	uint32_t lk, cv;                      // candado y espera compartidos (nucleo/src/candado.rs)
+ 	uint32_t next_name, free_head, magic, special[8];
++	uint32_t port_hint;                   // por dónde empezar a buscar un hueco en ports[] (el siguiente al último que se dio)
+ 	struct sport ports[MAXPORTS];
+ 	int32_t bucket[NBUCKET];              // índice+1 del primer puerto de cada cubeta (0 = vacía)
+ 	struct mslot msgs[MAXMSG];
+@@ -242,7 +243,10 @@ uint32_t port_create(int is_set) {
+ 	uint32_t name = alloc_port();
+ 	lock();
+ 	struct sport* p = NULL;
+-	for (int i = 0; i < MAXPORTS; i++) if (!shm->ports[i].used) { p = &shm->ports[i]; break; }
++	for (int k = 0; k < MAXPORTS; k++) {                    // desde la pista, dando la vuelta: con la tabla grande y casi llena
++		int i = (int)((shm->port_hint + (uint32_t)k) % MAXPORTS);  // no hay que recorrerla entera cada vez
++		if (!shm->ports[i].used) { p = &shm->ports[i]; shm->port_hint = (uint32_t)(i + 1) % MAXPORTS; break; }
++	}
+ 	if (!p) {
+ 		// Diagnóstico (una vez por proceso): quién tiene los puertos. rpid = dueño del derecho de recepción.
+ 		static int dumped;
