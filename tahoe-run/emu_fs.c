@@ -1231,6 +1231,10 @@ static long bsd_fsctl(struct ctx* c) {
 	// Aquí no hay purga de espacio: se acepta sin efecto.
 	if (c->a[1] == 0xc0084a44UL) return 0;
 	if (c->a[1] == 0x40046812UL) { uint32_t z = 0; return safe_write(c->a[2], &z, 4) == 4 ? 0 : -D_EFAULT; }
+	// 'J' 11 (16 bytes de salida): datos de bless de un volumen APFS (identificadores de la carpeta y el archivo de
+	// arranque bendecidos), que «bless --info» lee del Preboot. Aquí no hay nada bendecido (el Preboot no tiene la
+	// carpeta de arranque que crea el instalador): ENOENT, que bless entiende como «sin datos» y muestra a cero.
+	if (c->a[1] == 0xc0104a0bUL) return -D_ENOENT;
 	logf_("    fsctl: comando 0x%lx sin implementar\n", c->a[1]);
 	return -45;
 }

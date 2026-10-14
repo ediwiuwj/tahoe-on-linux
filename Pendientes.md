@@ -19,6 +19,8 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 5. Lo demás, en la lista de abajo.
 
 ## Hecho recientemente
+- `bless --info` funciona (encuentra el Preboot del contenedor y lee sus datos de bless: sin carpeta bendecida) y
+  `bless --info --getBoot` da `/dev/disk1s1`.
 - Llaveros: `security create-keychain`, `add-generic-password`, `list-keychains`... funcionan (securityd daba EINVAL
   al preguntar por la sesión de auditoría del cliente, que no estaba registrada) y apsd ya guarda su llavero.
   `csops` da el estado de firma real (CS_VALID, binario de plataforma de Apple...): securityd valida a sus clientes y
@@ -74,9 +76,7 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    - Discos, lo que falta: capacidades en `diskutil apfs list` («ERROR»). El contenedor tendría que admitir el cliente de
      AppleAPFSContainer: selector 8 (APFSExtendedSpaceInfo, diccionario con «size», «used», «reserve» y «Max volume
      count») y además 9, 18 y 30 (entrada 8/8/4 bytes, salida 2/32/64); con solo el 8, storagekitd se atasca en los
-     demás y `diskutil list` sale vacío, así que de momento el contenedor no admite conexión y `bless --info` (Preboot no tiene la carpeta de arranque
-     `<UUID>/System/Library/CoreServices` que crea el instalador; con la propiedad IOAPFSPreBootDevice también falla
-     `--getBoot`).
+     demás y `diskutil list` sale vacío, así que de momento el contenedor no admite conexión.
    - Esperas parecidas: `log show` ya no se cuelga pero tarda 65–165 s; `system_profiler` y `lwp-request` se cuelgan.
    - General: apagar los registros de diagnóstico fuera de las pruebas; índices en las tablas en vez de recorrerlas;
      mensajes Mach en Rust; arranque de procesos (servicios bajo demanda) más ligero.
@@ -100,9 +100,7 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
     - `top`: columnas de memoria y puertos por proceso (`mach_vm_region` 4816, `mach_port_space_basic_info` 3235).
     - `iostat`: la segunda muestra de CPU sale a 0.
     - `necp_open` (red).
-    - `security list-keychains`.
     - `zprint`: pide las zonas del núcleo de XNU, que no existen en Linux (probablemente se queda así).
 10. **Baja prioridad**: Java (`java`, `javac`... se caen en vez de decir que no hay Java instalado), `kmutil` y lo
     relacionado con kexts.
-11. **README** al día y **PR #8**: fusionar cuando la shell del completo supere de forma estable lo de la Recovery
-    (56 de 79 órdenes; ahora sale entre 56 y 61).
+11. **PR #9** (orden de la pausa y lo que venga después): fusionar en `main` cuando se quiera.

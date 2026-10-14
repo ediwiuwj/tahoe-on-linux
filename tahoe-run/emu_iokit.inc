@@ -391,6 +391,10 @@ static void io_disks(int bus) {
 		struct val* ro = v_new(V_ARRAY); v_add(ro, NULL, v_str(more[i].role)); v_set(io_e[v].props, "Role", ro);
 		p_num(v, "RoleValue", (uint64_t)more[i].rv, 16);
 	}
+	// bless (BLCreateBooterInformationDictionary) sube desde el volumen de arranque por sus padres hasta encontrar
+	// IOAPFSPreBootDevice: la ruta del Preboot relativa al contenedor («nombre@posición»), que junta con la ruta IOService
+	// del contenedor para leer su «BSD Name». Sin ella, «bless --info»: «doesn't appear to have a preboot volume».
+	p_str(cont, "IOAPFSPreBootDevice", "Preboot@3");
 }
 
 // GUID de texto -> 16 bytes en el orden de EFI (los tres primeros campos en little endian)
