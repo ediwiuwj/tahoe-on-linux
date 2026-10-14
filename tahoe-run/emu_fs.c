@@ -542,6 +542,12 @@ static const struct gmount gmounts[] = {
 };
 #define NGMOUNT (sizeof gmounts / sizeof gmounts[0])
 static int is_devfs_host(const struct statfs* s) { return s->f_type == 0x1373 /* devtmpfs */ || s->f_type == 0x1cd1 /* devpts */; }
+// f_fsid: {dev_t del dispositivo, tipo de vfs}, como en XNU
+static void fsid_of(const struct statfs* s, const struct gmount* m, uint32_t id[2]) {
+	int raw, dm = emu_disk_node(m->from, &raw);
+	if (dm >= 0) { id[0] = darwin_dev(EMU_DISK_MAJOR, dm); id[1] = m->ftype; }
+	else { id[0] = (uint32_t)s->f_fsid.__val[0]; id[1] = (uint32_t)s->f_fsid.__val[1]; }
+}
 static void put_statfs(uint64_t out, const struct statfs* s, const struct gmount* m) {
 	uint8_t d[2168];
 	memset(d, 0, sizeof d);
@@ -553,11 +559,7 @@ static void put_statfs(uint64_t out, const struct statfs* s, const struct gmount
 	W(uint64_t, 24, s->f_bavail);
 	W(uint64_t, 32, s->f_files);
 	W(uint64_t, 40, s->f_ffree);
-	{                                                                // f_fsid: {dev_t del dispositivo, tipo de vfs}, como en XNU
-		int raw, dm = emu_disk_node(m->from, &raw);
-		if (dm >= 0) { W(uint32_t, 48, darwin_dev(EMU_DISK_MAJOR, dm)); W(uint32_t, 52, m->ftype); }
-		else { W(uint32_t, 48, s->f_fsid.__val[0]); W(uint32_t, 52, s->f_fsid.__val[1]); }
-	}
+	{ uint32_t id[2]; fsid_of(s, m, id); W(uint32_t, 48, id[0]); W(uint32_t, 52, id[1]); }
 	W(uint32_t, 60, m->ftype);
 	W(uint32_t, 64, m->flags);
 	strncpy((char*)d + 72, m->type, 15);
@@ -633,6 +635,25 @@ static long getfsstat_common(uint64_t buf, uint64_t bufsize) {
 		if (statfs(hp, &s) != 0) memset(&s, 0, sizeof s);
 		put_statfs(buf + (uint64_t)n * 2168, &s, m);
 		n++;
+	}
+	return n;
+}
+// Identificadores (fsid) de todos los montajes, en el mismo orden y con los mismos valores que getfsstat: vfs.generic.vfsidlist
+int vfs_fsids(uint32_t* out, int max) {
+	static __thread struct dmount dm[16];
+	int nd = tmpfs_mounts(dm, 16);
+	for (size_t k = 0; k < NSYSVOL && nd < 16; k++) {
+		if (!sysvol_mnt(k)) continue;
+		snprintf(dm[nd].host, sizeof dm[nd].host, "%s%s", tahoe_root, sys_volumes[k].on);
+		dm[nd].m = sysvol_gmounts[k]; nd++;
+	}
+	int n = 0;
+	for (size_t i = 0; i < NGMOUNT + (size_t)nd && n < max; i++, n++) {
+		struct statfs s;
+		const struct gmount* m = i < NGMOUNT ? &gmounts[i] : &dm[i - NGMOUNT].m;
+		const char* hp = i >= NGMOUNT ? dm[i - NGMOUNT].host : !strcmp(m->on, "/") ? (tahoe_root ? tahoe_root : "/") : m->on;
+		if (statfs(hp, &s) != 0) memset(&s, 0, sizeof s);
+		fsid_of(&s, m, out + 2 * n);
 	}
 	return n;
 }
@@ -1185,6 +1206,10 @@ static long bsd_getattrlistbulk(struct ctx* c) {
 // APFS del estado del dispositivo raíz que lanza launchd; devuelve 8 bytes. Se responde sin banderas.
 static long bsd_fsctl(struct ctx* c) {
 	if (c->a[1] == 0x40084a6aUL) { uint64_t z = 0; return safe_write(c->a[2], &z, 8) == 8 ? 0 : -D_EFAULT; }
+	// 'h' 22 (_IOW, u32): umbral de espacio libre que fija KernelEventAgent para avisar de disco lleno; se acepta.
+	// 'h' 18 (_IOR, u32): estado del volumen que consulta después; sin avisos pendientes (0).
+	if (c->a[1] == 0x80046816UL) return 0;
+	if (c->a[1] == 0x40046812UL) { uint32_t z = 0; return safe_write(c->a[2], &z, 4) == 4 ? 0 : -D_EFAULT; }
 	logf_("    fsctl: comando 0x%lx sin implementar\n", c->a[1]);
 	return -45;
 }

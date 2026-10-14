@@ -499,11 +499,16 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
 				uint64_t a, v = 0;
 				char* e = ln; int deref = *e == '*';                // *expr: además, el texto al que apunta el valor leído
 				if (deref) e++;
+				int strip = *e == '~';                              // ~reg: sin los 4 bits altos (objetos puenteados de Swift)
+				if (strip) e++;
 				static const struct { const char* n; int r; } rn[] = { {"rax",REG_RAX},{"rsi",REG_RSI},{"rdi",REG_RDI},{"rbx",REG_RBX},{"rsp",REG_RSP},{"rbp",REG_RBP},{"rcx",REG_RCX},{"rdx",REG_RDX},{"r8",REG_R8},{"r9",REG_R9},{"r12",REG_R12},{"r13",REG_R13},{"r14",REG_R14},{"r15",REG_R15} };
 				a = 0; for (size_t q = 0; q < sizeof rn / sizeof rn[0]; q++) { size_t nl = strlen(rn[q].n);
-					if (!strncmp(e, rn[q].n, nl) && (e[nl] == '+' || e[nl] == '\n' || e[nl] == 0)) { a = (uint64_t)g[rn[q].r] + (e[nl] == '+' ? strtoull(e + nl + 1, NULL, 16) : 0); break; } }
+					if (!strncmp(e, rn[q].n, nl) && (e[nl] == '+' || e[nl] == '\n' || e[nl] == 0)) { a = ((uint64_t)g[rn[q].r] & (strip ? 0x0fffffffffffffffULL : ~0ULL)) + (e[nl] == '+' ? strtoull(e + nl + 1, NULL, 16) : 0); break; } }
 				if (!a) a = strtoull(e, NULL, 16);
-				if (a && safe_read(a, &v, 8) == 8) {
+				if (a && strip && !deref) {                        // ~reg+n: el texto que hay en esa dirección
+					char t[129] = { 0 };
+					if (safe_read(a, t, 128) > 0) { for (int q = 0; q < 128 && t[q]; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK %.*s: \"%s\"\n", (int)strcspn(ln, "\n"), ln, t); }
+				} else if (a && safe_read(a, &v, 8) == 8) {
 					logf_("    PEEK %.*s[0x%lx] = 0x%lx\n", (int)strcspn(ln, "\n"), ln, a, v);
 					char t[65] = { 0 };
 					if (deref && v && safe_read(v, t, 64) > 0) { for (int q = 0; q < 64 && t[q]; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK *: \"%s\"\n", t); }
@@ -1184,8 +1189,14 @@ static void* wq_main(void* p) {
 }
 
 static void wq_spawn_job(struct wq_job* j) {
+	static int max_hilos;
+	if (!max_hilos) { const char* e = getenv("TAHOE_WQ_MAX"); max_hilos = e && atoi(e) > 0 ? atoi(e) : WQ_MAX_HILOS; }
 	pthread_mutex_lock(&wq_pool_lock);
-	if (wq_idle > 0 || wq_live >= WQ_MAX_HILOS) {                  // un hilo libre la atiende, o espera turno
+	if (wq_idle > 0 || wq_live >= max_hilos) {                     // un hilo libre la atiende, o espera turno
+		if (!wq_idle) {                                            // sin hilos libres: la petición espera (una línea por segundo)
+			static time_t ult; time_t now = time(NULL);
+			if (now != ult) { ult = now; logf_("    hilos de cola: %d en uso (máximo), la petición espera\n", wq_live); }
+		}
 		*wq_queue_tail = j; wq_queue_tail = &j->next;
 		pthread_cond_signal(&wq_pool_cv);
 		pthread_mutex_unlock(&wq_pool_lock);

@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/prctl.h>
@@ -510,7 +511,9 @@ extern void ports_cleanup(void);
 static void show_frames(struct ctx* c);
 // exit: con error y en un proceso de STACKS, también los marcos de quien sale (para saber por qué).
 static long bsd_exit(struct ctx* c)  {
-	logf_("    fin <%d> [%s] exit(%d)\n", getpid(), prog_name, (int)c->a[0]);
+	struct rusage ru; getrusage(RUSAGE_SELF, &ru);       // y la CPU que gastó: el coste de los servicios que se relanzan
+	logf_("    fin <%d> [%s] exit(%d) cpu=%.2fs\n", getpid(), prog_name, (int)c->a[0],
+	      ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6);
 	if ((int)c->a[0] != 0 && diag_target()) show_frames(c);
 	ports_cleanup(); _exit((int)c->a[0]);
 }

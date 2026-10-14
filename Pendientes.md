@@ -18,11 +18,24 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 ## Pendiente
 
 1. **Velocidad y esperas** (`diskutil` como primer caso):
-   - `diskutil`: funciona, pero la primera vez tarda unos 100 s (79 s la segunda, 8 s la tercera). Algo espera hasta
-     agotar un plazo: trazar el primer `diskutil list` y sus servicios (diskmanagementd, storagekitd, diskarbitrationd) y
-     quitar esa espera. Después, mostrar los volúmenes del macOS completo (Sistema, Datos, Preboot) en vez de
-     «macOS Base System»; `bless --info` también pide Preboot.
-   - Esperas parecidas: `log show`, `system_profiler` y `lwp-request` se cuelgan.
+   - `diskutil` en sí va bien: con el sistema ya asentado, `diskutil list` tarda 3,4 s la primera vez y ~1 s después.
+     Era lento porque corría en pleno arranque, que tarda 2–3 minutos en calmarse. Lo que alarga el arranque, medido:
+     - 0–5 s: launchd se prepara (3,5 s en silencio, probablemente leyendo los plists de servicios).
+     - 5–16 s: tareas tempranas en serie (mount, apfs_boot_util, mount_apfs, cc_fips_test...); cada programa cuesta
+       0,3–0,5 s en arrancar en tahoe-run.
+     - Después, xpcproxy pregunta a **opendirectoryd** por el usuario de cada servicio antes de lanzarlo, y
+       opendirectoryd contesta tarde y **se cae** a los ~35 s («BUG IN LIBDISPATCH: Invalid wlh state», en
+       `_dispatch_root_queue_drain_deferred_wlh`): fallo de la emulación de workloops. Es lo siguiente a arreglar;
+       puede ser también la causa del punto 2.
+     - El registro inicial de cada proceso en logd (`firehose_send_register`) se queda segundos esperando.
+   - Descartado (medido): los servicios que se relanzan en bucle gastan poca CPU (~4 s en 2 min) y el límite de 48
+     hilos de cola por proceso no se llena.
+   - Servicios en bucle: KernelEventAgent arreglado. digest-service sigue (no abre su base de Kerberos por
+     OpenDirectory); xprotectd y endpointsecurityd necesitan EndpointSecurity (`es_new_client` da error interno);
+     watchdogd, por investigar. Otros que se relanzan: locationd, cryptexd, diskmanagementstartup, apsd, cloudd.
+   - Después: mostrar los volúmenes del macOS completo (Sistema, Datos, Preboot) en vez de «macOS Base System»;
+     `bless --info` también pide Preboot.
+   - Esperas parecidas: `log show` ya no se cuelga pero tarda 65–165 s; `system_profiler` y `lwp-request` se cuelgan.
    - General: apagar los registros de diagnóstico fuera de las pruebas; índices en las tablas en vez de recorrerlas;
      mensajes Mach en Rust; arranque de procesos (servicios bajo demanda) más ligero.
 2. **`id <usuario>`**: «failed to retrieve group list: Undefined error: 0» (la consulta de grupos del usuario a

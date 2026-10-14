@@ -13,7 +13,7 @@
 
 #include "tahoe.h"
 
-enum kind { K_INT, K_QUAD, K_STR, K_BOOT, K_LOADAVG, K_SWAP };
+enum kind { K_INT, K_QUAD, K_STR, K_BOOT, K_LOADAVG, K_SWAP, K_FSIDS };
 struct entry {
 	const char* name;
 	int mib[2];
@@ -77,6 +77,8 @@ static struct entry table[] = {
 	{ "vm.loadavg", { 2, 2 }, K_LOADAVG, 0, NULL },                  // CTL_VM, VM_LOADAVG: getloadavg (iostat, uptime, top)
 	{ "vm.swapusage", { 2, 5 }, K_SWAP, 0, NULL },                   // CTL_VM, VM_SWAPUSAGE: struct xsw_usage (top, sysctl)
 	{ "sysctl.proc_cputype", { 0, 0x7300 }, K_INT, 0x01000007, NULL },  // con el pid detrás: tipo de CPU de ese proceso (top)
+	{ "kern.procname", { CTL_KERN, 62 }, K_STR, 0, "" },             // KERN_PROCNAME: nombre del proceso (setproctitle lo escribe)
+	{ "vfs.generic.vfsidlist", { 3, 0x7100 }, K_FSIDS, 0, NULL },       // fsid_t de cada montaje (KernelEventAgent)
 	{ "kern.bootargs", { CTL_KERN, 0x7000 }, K_STR, 0, "" },
 	{ "kern.osproductversion", { CTL_KERN, 0x7001 }, K_STR, 0, "26.6.2" },
 	{ "kern.osproductversionextra", { CTL_KERN, 0x7002 }, K_STR, 0, "" },
@@ -432,6 +434,7 @@ static long sysctl_meta(struct ctx* c, int op, const int* oid, uint32_t len) {
 	case K_STR:  kind |= CTLTYPE_STRING; fmt = "A"; break;
 	case K_LOADAVG: kind |= CTLTYPE_STRUCT; fmt = "S,loadavg"; break;
 	case K_SWAP: kind |= CTLTYPE_STRUCT; fmt = "S,xsw_usage"; break;
+	case K_FSIDS: kind |= CTLTYPE_STRUCT; fmt = "S,fsid"; break;
 	default:     kind |= CTLTYPE_STRUCT; fmt = "S,timeval"; break;
 	}
 	memcpy(b, &kind, 4);
@@ -535,6 +538,19 @@ long bsd_sysctl(struct ctx* c) {
 		int v = 0x01000007;                                  // CPU_TYPE_X86_64
 		return sc_out(c, &v, sizeof v);
 	}
+	if (n == 2 && mib[0] == CTL_KERN && mib[1] == 62) {     // kern.procname: la escritura (setproctitle) se acepta sin más
+		if (c->a[4] && !c->a[2]) return 0;
+		char av[1024]; size_t al = 0;
+		const char* nm = "";
+		if (guest_argv(getpid(), av, sizeof av, &al) > 0) { nm = strrchr(av, '/'); nm = nm ? nm + 1 : av; }
+		char b[17] = { 0 }; strncpy(b, nm, 16);              // MAXCOMLEN
+		return sc_out(c, b, strlen(b) + 1);
+	}
+	if (n == 2 && mib[0] == 3 && mib[1] == 0x7100) {      // vfs.generic.vfsidlist: fsid_t[] de los montajes, como getfsstat
+		uint32_t ids[2 * 32];
+		int k = vfs_fsids(ids, 32);
+		return sc_out(c, ids, (size_t)k * 8);
+	}
 	if (n == 2 && mib[0] == CTL_KERN && mib[1] == 0x7005) {   // kern.osvariant_status: lectura y escritura como XNU
 		if (c->a[4]) {
 			uint64_t v = 0;
@@ -578,6 +594,7 @@ long bsd_sysctl(struct ctx* c) {
 				memcpy(x, v, 24); memcpy(x + 24, &pg, 4); memcpy(x + 28, &enc, 4);
 				return sc_out(c, x, sizeof x);
 			}
+			case K_FSIDS: break;                                // se responde antes (vfs.generic.vfsidlist)
 			case K_BOOT: {
 				struct timespec up, now;
 				clock_gettime(CLOCK_BOOTTIME, &up);
