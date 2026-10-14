@@ -582,6 +582,16 @@ static void io_init(void) {
 	p_str(wd, "IOProviderClass", "IOResources");
 	p_str(wd, "IOUserClientClass", "IOWatchdogUserClient");
 
+	// EndpointSecurity (EndpointSecurity.kext): libEndpointSecurity lo busca por clase al crear un cliente (es_new_client);
+	// sin él, xprotectd y endpointsecurityd salen con error y launchd los relanza sin parar. Se da un cliente válido que
+	// nunca recibe eventos (uc_es).
+	int esd = ent_add(res, "EndpointSecurityDriver", "EndpointSecurityDriver", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	p_str(esd, "IOClass", "EndpointSecurityDriver");
+	p_str(esd, "CFBundleIdentifier", "com.apple.iokit.EndpointSecurity");
+	p_str(esd, "IOMatchCategory", "EndpointSecurityDriver");
+	p_str(esd, "IOProviderClass", "IOResources");
+	p_str(esd, "IOUserClientClass", "EndpointSecurityDriverClient");
+
 	// Raíz de IOSurface (IOSurface.kext): la memoria compartida de imágenes (ventanas, capas, pantalla) entre procesos.
 	// IOSurface.framework la busca por nombre (IOServiceNameMatching("IOSurfaceRoot")) y abre su user client; sin ella,
 	// Metal y CoreDisplay se quedan reintentando (WindowServer, al crear el dispositivo Metal de la pantalla).
@@ -1122,6 +1132,29 @@ static int32_t uc_watchdog(struct uc_call* c) {
 	*c->nsout = 0; *c->noutband = 0;
 	return 0;
 }
+// EndpointSecurityDriverClient (selectores deducidos de libEndpointSecurity): 0xb registra el cliente (estructura de 0x218
+// bytes) y 0xa devuelve, como escalar, la dirección del búfer de mensajes que el núcleo proyecta en el proceso («DataPark»:
+// cabecera de 8 bytes justo antes, con la firma 0x42 en su primer byte). Sin núcleo de macOS no hay eventos: el búfer queda
+// vacío y el resto de selectores (suscribir, silenciar, responder...) se aceptan con salidas a cero.
+static int32_t uc_es(struct uc_call* c) {
+	static uint64_t seen;
+	if (c->selector < 64 && !(seen & (1ull << c->selector))) {
+		seen |= 1ull << c->selector;
+		logf_("    iokit: <%d> endpointsecurity selector %u (%u escalares, %u bytes): aceptado sin efecto\n", (int)getpid(), c->selector, c->nsin, c->ninband);
+	}
+	memset(c->outband, 0, *c->noutband);
+	memset(c->sout, 0, *c->nsout * 8);
+	if (c->selector == 0xa && *c->nsout >= 1) {
+		static uint8_t* buf;
+		if (!buf) {
+			void* m = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (m == MAP_FAILED) return kIOReturnNoMemory;
+			buf = m; buf[0] = 0x42;
+		}
+		c->sout[0] = (uint64_t)(buf + 8); *c->nsout = 1;
+	}
+	return 0;
+}
 static int io_trace = -1;                                   // traza de IOKit (TAHOE_IOKIT o /dev/shm/tahoe-iokit-trace)
 // AppleGPUWranglerUserClient (interfaz deducida de GPUWrangler.framework, que es quien la usa):
 //   0xa0000001 saludo: entra y sale una estructura de 4 bytes con la versión ('GW' << 16 | 2).
@@ -1494,6 +1527,7 @@ static uc_method_fn uc_hook_for(const char* cls) {
 	if (!strcmp(cls, "AppleIntelFramebuffer")) return uc_fb;
 	if (!strcmp(cls, "IOSurfaceRoot")) return uc_iosurface;
 	if (!strcmp(cls, "IOWatchdog")) return uc_watchdog;
+	if (!strcmp(cls, "EndpointSecurityDriver")) return uc_es;
 	if (!strcmp(cls, "AppleSMC")) return uc_smc;
 	if (!strcmp(cls, "com_apple_filesystems_lifs")) return uc_lifs;
 	if (!strcmp(cls, "IOHIDSystem")) return uc_hid;
