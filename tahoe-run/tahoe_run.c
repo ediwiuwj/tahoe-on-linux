@@ -349,6 +349,7 @@ static void map_cache(const char* main_path) {
 
 // ---------------------------------------------------------------- commpage (macOS 26, x86_64)
 // Diseño tomado de osfmk/i386/cpu_capabilities.h de XNU 12377.
+uint64_t tsc_hz;                                         // frecuencia del TSC medida (setup_commpage)
 static uint64_t tsc_hz_estimate(void) {
 	struct timespec a, b;
 	clock_gettime(CLOCK_MONOTONIC, &a);
@@ -375,7 +376,21 @@ static void setup_commpage(void) {
 	*(uint64_t*)(p + 0x38) = (uint64_t)sysconf(_SC_PHYS_PAGES) * (uint64_t)sysconf(_SC_PAGESIZE);
 	p[0x4D] = 12; p[0x4E] = 12;                          // desplazamientos de página (4 KiB)
 	// nanotime: ns = ns_base + (((tsc - tsc_base) << shift) * scale >> 32)
-	uint64_t hz = tsc_hz_estimate();
+	// La frecuencia del TSC se mide una vez (30 ms de espera activa) y se guarda en /dev/shm/tahoe-tsc-hz para los demás
+	// procesos: medirla en cada arranque costaba 30 ms de CPU por proceso (dos por servicio: xpcproxy y el programa), y
+	// en el arranque de macOS, con decenas de procesos a la vez, alargaba la avalancha de servicios.
+	uint64_t hz = 0;
+	{
+		char b[32] = ""; int f = open("/dev/shm/tahoe-tsc-hz", O_RDONLY | O_CLOEXEC);
+		if (f >= 0) { ssize_t n = read(f, b, sizeof b - 1); close(f); if (n > 0) { b[n] = 0; hz = strtoull(b, NULL, 10); } }
+		if (hz < 100000000ULL || hz > 10000000000ULL) {          // sin guardar o absurda: medir y guardar
+			hz = tsc_hz_estimate();
+			char tmp[64]; snprintf(tmp, sizeof tmp, "/dev/shm/tahoe-tsc-hz.%d", (int)getpid());
+			f = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+			if (f >= 0) { int n = snprintf(b, sizeof b, "%lu\n", (unsigned long)hz); if (write(f, b, (size_t)n) == n) { close(f); rename(tmp, "/dev/shm/tahoe-tsc-hz"); } else { close(f); unlink(tmp); } }
+		}
+	}
+	tsc_hz = hz;
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	*(uint64_t*)(p + 0x50) = __builtin_ia32_rdtsc();
@@ -398,7 +413,9 @@ struct seg64 { uint32_t cmd, cmdsize; char segname[16]; uint64_t vmaddr, vmsize,
 struct image { uint64_t mh; uint64_t entry; uint32_t filetype; uint64_t hi; };
 
 static char prog_name[64] = "?";                      // programa de macOS de este proceso (para el registro)
+static double lm_ms(const struct timespec* a) { struct timespec b; clock_gettime(CLOCK_MONOTONIC, &b); return (b.tv_sec - a->tv_sec) * 1e3 + (b.tv_nsec - a->tv_nsec) / 1e6; }
 static void load_macho(const char* path, uint64_t slide, struct image* out) {
+	struct timespec lm0; clock_gettime(CLOCK_MONOTONIC, &lm0); double t_map = 0, t_dsmos = 0, t_prot = 0;   // diagnóstico de velocidad
 	int fd = open(path, O_RDONLY);
 	if (fd < 0) DIE("no puedo abrir %s: %s", path, strerror(errno));
 	uint64_t base_off = 0;
@@ -430,11 +447,15 @@ static void load_macho(const char* path, uint64_t slide, struct image* out) {
 			uint64_t maplen = round_up(s->filesize);
 			int prot = s->initprot & 7;
 			if (s->filesize) {
+				struct timespec q; clock_gettime(CLOCK_MONOTONIC, &q);
 				void* p = mmap((void*)addr, maplen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, base_off + s->fileoff);
 				if (p == MAP_FAILED) DIE("%s: mmap de %s en 0x%lx falló: %s", path, s->segname, addr, strerror(errno));
 				if (s->vmsize > s->filesize && maplen > s->filesize) memset((void*)(addr + s->filesize), 0, maplen - s->filesize);
+				t_map += lm_ms(&q); clock_gettime(CLOCK_MONOTONIC, &q);
 				if (s->flags & 0x8) dsmos_unprotect((uint8_t*)addr, s->fileoff, s->filesize, path);   // SG_PROTECTED_VERSION_1
+				t_dsmos += lm_ms(&q); clock_gettime(CLOCK_MONOTONIC, &q);
 				mprotect((void*)addr, maplen, prot);
+				t_prot += lm_ms(&q);
 			}
 			if (round_up(s->vmsize) > maplen) {
 				void* p = mmap((void*)(addr + maplen), round_up(s->vmsize) - maplen, prot ? prot : PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
@@ -455,6 +476,8 @@ static void load_macho(const char* path, uint64_t slide, struct image* out) {
 	free(cmds);
 	close(fd);
 	if (!out->mh) DIE("%s: no se encontró el segmento __TEXT", path);
+	if (access("/dev/shm/tahoe-log-time", F_OK) == 0)
+		logf_("    carga <%d> %s: %.1f ms (mmap %.1f, dsmos %.1f, mprotect %.1f)\n", (int)getpid(), strrchr(path, '/') ? strrchr(path, '/') + 1 : path, lm_ms(&lm0), t_map, t_dsmos, t_prot);
 	LOG("<%d> cargado %-28s mh=0x%lx entrada=0x%lx tipo=%u\n", (int)getpid(), strrchr(path, '/') ? strrchr(path, '/') + 1 : path, out->mh, out->entry, out->filetype);
 	if (out->filetype == 2) snprintf(prog_name, sizeof prog_name, "%s", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
 }
@@ -507,13 +530,18 @@ typedef emu_fn bsd_fn;
 
 // BSD: devuelven >= 0 o -errno_de_Darwin
 extern void ports_cleanup(void);
+// Medida del coste de la emulación (diagnóstico de velocidad): llamadas atendidas por clase y ciclos del TSC dentro del
+// manejador (on_sigsys); se registran al salir, junto a la CPU del proceso.
+static uint64_t sc_count[4], sc_cycles;
 // Cada salida queda en el registro (una línea): sin ella, un servicio que termina por su cuenta desaparece sin rastro.
 static void show_frames(struct ctx* c);
 // exit: con error y en un proceso de STACKS, también los marcos de quien sale (para saber por qué).
 static long bsd_exit(struct ctx* c)  {
 	struct rusage ru; getrusage(RUSAGE_SELF, &ru);       // y la CPU que gastó: el coste de los servicios que se relanzan
-	logf_("    fin <%d> [%s] exit(%d) cpu=%.2fs\n", getpid(), prog_name, (int)c->a[0],
-	      ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6);
+	                                                     // y cuántas llamadas atendió y el tiempo dentro del manejador
+	logf_("    fin <%d> [%s] exit(%d) cpu=%.2fs llamadas bsd=%lu mach=%lu manejador=%.2fs\n", getpid(), prog_name, (int)c->a[0],
+	      ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6,
+	      (unsigned long)sc_count[2], (unsigned long)sc_count[1], tsc_hz ? (double)sc_cycles / (double)tsc_hz : 0.0);
 	if ((int)c->a[0] != 0 && diag_target()) show_frames(c);
 	ports_cleanup(); _exit((int)c->a[0]);
 }
@@ -951,6 +979,7 @@ static void log_call(const char* kind, uint32_t num, const char* name, struct ct
 static void on_sigsys(int sig, siginfo_t* si, void* v) {
 	(void)sig;
 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;   // dentro del manejador, las syscalls van directas a Linux
+	uint64_t t_in = __builtin_ia32_rdtsc();
 	ucontext_t* uc = v;
 	greg_t* g = uc->uc_mcontext.gregs;
 	if (si->si_code != SYS_USER_DISPATCH) DIE("SIGSYS inesperado (si_code=%d) en rip=0x%llx", si->si_code, (unsigned long long)g[REG_RIP]);
@@ -1000,6 +1029,8 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 		g[REG_RAX] = (uint64_t)-1;
 	}
 	t_cur = NULL;
+	__atomic_add_fetch(&sc_count[cls & 3], 1, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&sc_cycles, __builtin_ia32_rdtsc() - t_in, __ATOMIC_RELAXED);
 	selector = SYSCALL_DISPATCH_FILTER_BLOCK;
 }
 
@@ -1211,14 +1242,18 @@ int main(int argc, char** argv, char** envp) {
 	static char self[4096];
 	ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
 	g_self_exe = sl > 0 ? (self[sl] = 0, self) : argv[0];
+	// Fases del arranque de este proceso (diagnóstico de velocidad, con /dev/shm/tahoe-log-time): ms de cada una.
+	struct timespec ft[8]; int nft = 0;
+#define FASE() clock_gettime(CLOCK_MONOTONIC, &ft[nft++])
+	FASE();
 	if (getpid() == 1) sys_volumes_mount();                      // launchd: antes de que macOS mire sus volúmenes
-	map_cache(cache);
-	patch_cpu_number();
+	map_cache(cache); FASE();
+	patch_cpu_number(); FASE();
 	LOG("caché mapeada en 0x%lx\n", CACHE_BASE);
-	setup_commpage();
+	setup_commpage(); FASE();
 	struct image di, ei;
 	load_macho(dyld, DYLD_SLIDE, &di);
-	load_macho(exe, 0, &ei);
+	load_macho(exe, 0, &ei); FASE();
 	diag_breakpoints();                                          // /dev/shm/tahoe-break en el proceso de /dev/shm/tahoe-stacks
 	if (di.filetype != 7) DIE("%s no es un MH_DYLINKER", dyld);
 	// execve relanza tahoe-run: TAHOE_ARGV0 permite que argv[0] del programa no sea su ruta. Se aplica después de mapear la
@@ -1264,7 +1299,13 @@ int main(int argc, char** argv, char** envp) {
 		{ 423, 334 }, { 464, 463 }, { 542, 540 }, { 543, 541 },
 	};
 	for (size_t i = 0; i < sizeof alias / sizeof alias[0]; i++) if (bsd_table[alias[i].normal] && !bsd_table[alias[i].nocancel]) bsd_table[alias[i].nocancel] = bsd_table[alias[i].normal];
-	install_dispatch();
+	install_dispatch(); FASE();
+#define MS(a, b) ((ft[b].tv_sec - ft[a].tv_sec) * 1e3 + (ft[b].tv_nsec - ft[a].tv_nsec) / 1e6)
+	if (access("/dev/shm/tahoe-log-time", F_OK) == 0)
+		logf_("    arranque <%d>: caché %.1f ms, cpu %.1f, commpage %.1f, mach-o %.1f, resto %.1f, total %.1f\n", (int)getpid(),
+		      MS(0, 1), MS(1, 2), MS(2, 3), MS(3, 4), MS(4, 5), MS(0, 5));
+#undef MS
+#undef FASE
 	LOG("saltando a dyld (rip=0x%lx rsp=0x%lx)\n", di.entry, sp);
 	enter(di.entry, sp);
 }

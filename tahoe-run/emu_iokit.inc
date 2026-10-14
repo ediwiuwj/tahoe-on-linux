@@ -614,6 +614,21 @@ static void io_init(void) {
 	p_data(efi, "firmware-vendor", "A\0p\0p\0l\0e\0\0", 12);   // UTF-16 con NUL
 	p_cstr(efi, "firmware-abi", "EFI64");
 	{ uint32_t rev = 0x0001000a; p_data(efi, "firmware-revision", &rev, 4); }
+	// /efi/platform: lo que publica el firmware de un Mac Intel (modelo y número de serie en UTF-16, system-id, frecuencias
+	// del bus y del reloj ART). libimage4 lo busca al cargarse (darwin_cpl3_init) y sin él aborta («panic: failed to get
+	// platform node»): cryptexd y kmutil se caían así en bucle.
+	{
+		int pf = ent_add(efi, "platform", "IOService", "IORegistryEntry", "", PL_DT, 0);
+		p_cstr(pf, "name", "platform");
+		uint16_t u16[64]; size_t k;
+		for (k = 0; modelo[k] && k < 63; k++) u16[k] = (uint8_t)modelo[k];
+		u16[k++] = 0; p_data(pf, "Model", u16, k * 2);
+		for (k = 0; serie[k] && k < 63; k++) u16[k] = (uint8_t)serie[k];
+		u16[k++] = 0; p_data(pf, "SystemSerialNumber", u16, k * 2);
+		uint8_t sid[16] = { 0 }; efi_guid(uuidp, sid); p_data(pf, "system-id", sid, 16);
+		uint64_t fsb = 100000000ULL, art = 24000000ULL;            // 100 MHz y 24 MHz (Skylake y posteriores)
+		p_data(pf, "FSBFrequency", &fsb, 8); p_data(pf, "ARTFrequency", &art, 8);
+	}
 	int chosen = ent_add(plat, "chosen", "IOService", "IORegistryEntry", "", PL_SERVICE | PL_DT, 0);
 	p_cstr(chosen, "name", "chosen");
 	p_data(chosen, "boot-uuid", "00000000-0000-1000-8000-000000000002", 37);
