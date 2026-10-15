@@ -19,6 +19,17 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 5. Lo demás, en la lista de abajo.
 
 ## Hecho recientemente
+- Listado de carpetas con `NSFileManager`/`CFURLEnumerator` (todo macOS): `getattrlist` marcaba siempre `ATTR_CMN_ERROR`
+  en los atributos devueltos, y CoreServices lo toma por «esta entrada falló» → `ENOTDIR`; además `getattrlistbulk` no
+  admitía los comunes extendidos (`REALDEVID`, `EXT_FLAGS`). Con ello `init_featureflags` ve las 500 listas de
+  `/System/Library/FeatureFlags/Domain`: 3328 funciones activas (antes 124) y locationd ya no se cae («key cannot be nil»:
+  con `CoreLocation/cl_pula` apagada, el userName de cada cliente salía vacío). Efecto secundario: órdenes que antes
+  terminaban sin hacer nada ahora hacen el trabajo real y se pasan del plazo del inventario (`say -v ?` encuentra las
+  voces y espera a coreaudiod, que se queda cargando sus complementos de audio): el inventario corto baja de ~61 a ~58.
+- `log show`: la segunda vez tarda ~5 s (antes 20–27 s); `kern.bootsessionuuid` distinto en cada arranque y
+  `proc_info` extendido con los argumentos en su sitio. `lwp-request` no se cuelga (25 s en frío, sale 255 como en un Mac).
+- `thread_policy_get`, grupo de procesos en `posix_spawn` (`POSIX_SPAWN_SETPGROUP`), `fcntl F_GETSIGSINFO`, buzón de
+  EndpointSecurity válido.
 - `bless --info` funciona (encuentra el Preboot del contenedor y lee sus datos de bless: sin carpeta bendecida) y
   `bless --info --getBoot` da `/dev/disk1s1`.
 - Llaveros: `security create-keychain`, `add-generic-password`, `list-keychains`... funcionan (securityd daba EINVAL
@@ -77,7 +88,10 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
      AppleAPFSContainer: selector 8 (APFSExtendedSpaceInfo, diccionario con «size», «used», «reserve» y «Max volume
      count») y además 9, 18 y 30 (entrada 8/8/4 bytes, salida 2/32/64); con solo el 8, storagekitd se atasca en los
      demás y `diskutil list` sale vacío, así que de momento el contenedor no admite conexión.
-   - Esperas parecidas: `log show` ya no se cuelga pero tarda 65–165 s; `system_profiler` y `lwp-request` se cuelgan.
+   - Esperas parecidas: `log show` tarda 90–300 s la primera vez de cada arranque (lee en frío los 543 MB del registro
+     antiguo; se arregla solo cuando logd retire esos archivos, o con `log erase`) y ~5 s después. `system_profiler` no
+     termina en 600 s: espera a lsd por XPC (`_LSCopyServerStore`) mientras lsd escanea. `say -v ?` espera a coreaudiod
+     (se queda en `HALS_PlugIn::RebuildDeviceList`, cargando el detector de incidencias de audio).
    - General: apagar los registros de diagnóstico fuera de las pruebas; índices en las tablas en vez de recorrerlas;
      mensajes Mach en Rust; arranque de procesos (servicios bajo demanda) más ligero.
 2. **Caídas**:
