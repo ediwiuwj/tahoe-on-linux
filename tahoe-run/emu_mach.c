@@ -8,6 +8,7 @@
 // conozca recibe la respuesta estándar de MIG "identificador erróneo" (MIG_BAD_ID) y se registra.
 #define _GNU_SOURCE
 #include <sys/syscall.h>
+#include <pthread.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +48,30 @@ static void hexdump(const uint8_t* b, size_t len) {
 // Respuesta MIG: cabecera (24) + NDR (8) + código de retorno (4) + datos. Todo empaquetado a 4 bytes.
 static const uint8_t NDR_LE[8] = { 0, 0, 0, 0, 1, 0, 0, 0 };   // little-endian, ASCII, IEEE
 
+// Políticas de hilo fijadas con thread_policy_set (por puerto de hilo y flavor), para devolverlas en thread_policy_get.
+#define TPOL_MAX 16
+#define TPOL_N 64
+static struct { uint32_t port, flavor, cnt; uint32_t v[TPOL_MAX]; } tpol[TPOL_N];
+static pthread_mutex_t tpol_lock = PTHREAD_MUTEX_INITIALIZER;
+static void tpol_put(uint32_t port, uint32_t flavor, const uint32_t* v, uint32_t cnt) {
+	pthread_mutex_lock(&tpol_lock);
+	int slot = -1;
+	for (int i = 0; i < TPOL_N; i++) {
+		if (tpol[i].port == port && tpol[i].flavor == flavor) { slot = i; break; }
+		if (slot < 0 && !tpol[i].port) slot = i;
+	}
+	if (slot < 0) slot = (int)(port % TPOL_N);                     // tabla llena: se reutiliza un hueco
+	tpol[slot].port = port; tpol[slot].flavor = flavor; tpol[slot].cnt = cnt;
+	memcpy(tpol[slot].v, v, cnt * 4);
+	pthread_mutex_unlock(&tpol_lock);
+}
+static int tpol_get(uint32_t port, uint32_t flavor, uint32_t* v, uint32_t cnt) {
+	int ok = 0;
+	pthread_mutex_lock(&tpol_lock);
+	for (int i = 0; i < TPOL_N; i++) if (tpol[i].port == port && tpol[i].flavor == flavor && tpol[i].cnt >= cnt) { memcpy(v, tpol[i].v, cnt * 4); ok = 1; break; }
+	pthread_mutex_unlock(&tpol_lock);
+	return ok;
+}
 static size_t reply_begin(uint8_t* r, const struct hdr* req, int32_t retcode) {
 	struct hdr h = { .bits = 0, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = req->id + 100 };
 	memcpy(r, &h, sizeof h);
@@ -779,7 +804,35 @@ static long mach_msg2(struct ctx* c) {
 	}
 	size_t n;
 	switch (h.id) {
-	case 217: case 3616: case 3617: n = reply_begin(rep, &h, KERN_SUCCESS_); break;
+	case 217: case 3616: n = reply_begin(rep, &h, KERN_SUCCESS_); break;
+	case 3617: {                                                  // thread_policy_set(hilo, flavor, info[cuenta]): se guarda, sin efecto
+		uint32_t flavor, cnt; memcpy(&flavor, req + 32, 4); memcpy(&cnt, req + 36, 4);
+		if (cnt > TPOL_MAX) cnt = TPOL_MAX;
+		tpol_put(h.remote, flavor, (const uint32_t*)(req + 40), cnt);
+		n = reply_begin(rep, &h, KERN_SUCCESS_);
+		break;
+	}
+	case 3618: {                                                  // thread_policy_get(hilo, flavor, cuenta, get_default)
+		// Como XNU: lo que se fijó con thread_policy_set, o los valores por omisión con get_default = TRUE. CoreAudio
+		// comprueba así la política de tiempo real de sus hilos; sin respuesta (MIG_BAD_ID) lanzaba una excepción tras otra.
+		uint32_t flavor, cnt, gd; memcpy(&flavor, req + 32, 4); memcpy(&cnt, req + 36, 4); memcpy(&gd, req + 40, 4);
+		uint32_t info[TPOL_MAX] = { 0 }, outc = 0;
+		static const uint32_t defc[] = { 0, 1, 4, 1, 1, 0, 0, 1, 1 };   // cuenta de cada flavor (1..8)
+		if (flavor == 0 || flavor >= sizeof defc / sizeof defc[0] || !defc[flavor]) { n = reply_begin(rep, &h, 4 /* KERN_INVALID_ARGUMENT */); break; }
+		outc = defc[flavor];
+		if (cnt < outc) { n = reply_begin(rep, &h, 4); break; }
+		if (!gd && tpol_get(h.remote, flavor, info, outc)) gd = 0;
+		else {
+			gd = 1;
+			if (flavor == 1) info[0] = 1;                         // THREAD_EXTENDED_POLICY: timeshare
+			if (flavor == 2) { info[0] = 0; info[1] = 5000000; info[2] = 10000000; info[3] = 1; }   // TIME_CONSTRAINT: quantum/2, quantum, preemptible
+		}
+		n = reply_begin(rep, &h, KERN_SUCCESS_);
+		memcpy(rep + n, &outc, 4); n += 4;
+		memcpy(rep + n, info, outc * 4); n += outc * 4;
+		memcpy(rep + n, &gd, 4); n += 4;
+		break;
+	}
 	case 5403: n = reply_begin(rep, &h, 46 /* KERN_NOT_SUPPORTED */); break;   // mach_voucher_attr_command: sin vales de atributos
 	case 3206: {                                                  // mach_port_deallocate (MIG): soltar un send-once avisa; un derecho de envío no destruye nada
 		uint32_t nm; memcpy(&nm, req + 32, 4);
