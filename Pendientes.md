@@ -82,9 +82,8 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
      - El registro inicial de cada proceso en logd (`firehose_send_register`) se queda segundos esperando.
    - Descartado (medido): los servicios que se relanzan en bucle gastan poca CPU (~4 s en 2 min) y el límite de 48
      hilos de cola por proceso no se llena.
-   - Servicios en bucle: locationd se caía con «-[__NSDictionaryM setObject:forKeyedSubscript:]: key cannot be nil»
-     (el userName de un cliente; probablemente getpwuid fallando bajo carga): con el arranque más tranquilo ya no se ha
-     vuelto a caer. apfs.util (lo lanza diskarbitrationd) falla al sondear disk1s2/disk1s3 (no hay datos detrás).
+   - Servicios en bucle: locationd ya no se cae (su «key cannot be nil» venía de la función `CoreLocation/cl_pula`
+     apagada, porque init_featureflags no podía listar sus carpetas). apfs.util (lo lanza diskarbitrationd) falla al sondear disk1s2/disk1s3 (no hay datos detrás).
      KernelEventAgent y xprotectd arreglados. watchdogd no es un bucle: con el vigilante inactivo su diseño es «dormir
      2 s y salir», y solo vuelve cuando otro servicio le escribe. apfs.util/fsck_apfs tampoco: es el sondeo único de cada
      volumen al arrancar. digest-service sale con error porque no hay Kerberos local (LKDC): configureLocalKDC lo intenta
@@ -112,7 +111,7 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    Metal a Vulkan con `ash`, shaders AIR→SPIR-V (`metal2vulkan`); primero la composición de WindowServer y CoreAnimation
    (Liquid Glass), después Metal 2 completo y lo que pida macOS de Metal 3 (ampliando `hasvk` de Mesa si hace falta).
 6. **Sesión gráfica**: con ella, `screencapture`, `osascript` y `pbcopy` (hoy se caen por no haber sesión).
-7. **Servicios que fallan al arrancar**: locationd, mobileassetd, softwareupdate.
+7. **Servicios que fallan al arrancar**: mobileassetd, softwareupdate.
 8. **Teclado y ratón** dentro de macOS.
 9. **Detalles**:
     - `top`: columnas de memoria y puertos por proceso (`mach_vm_region` 4816, `mach_port_space_basic_info` 3235).
@@ -122,3 +121,7 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 10. **Baja prioridad**: Java (`java`, `javac`... se caen en vez de decir que no hay Java instalado), `kmutil` y lo
     relacionado con kexts.
 11. **PR #9** (orden de la pausa y lo que venga después): fusionar en `main` cuando se quiera.
+12. **Para lo último** (funciona, son detalles):
+    - `diskutil apfs list`: los volúmenes Data y Preboot dicen 0 B consumidos (comparten el disco de Linux).
+    - `diskutil list`: cada volumen sale con el tamaño del contenedor (63,1 GB).
+    - `diskutil list` y `system_profiler` tardan la primera vez tras arrancar (~1 min) mientras lsd limpia su base de datos.
