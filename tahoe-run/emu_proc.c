@@ -526,14 +526,23 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
 			FILE* pk = fopen("/dev/shm/tahoe-peek", "r");       // además: valor de 8 bytes en esas direcciones
 			if (pk) { char ln[64]; while (fgets(ln, sizeof ln, pk)) {
 				uint64_t a, v = 0;
+				if (!strncmp(ln, "bt", 2)) {                        // bt: cadena de rbp (direcciones de vuelta, 24 marcos)
+					uint64_t fp = (uint64_t)g[REG_RBP], fr[2];
+					for (int q = 0; q < 24 && fp && safe_read(fp, fr, 16) == 16; q++, fp = fr[0]) logf_("    BT #%d 0x%lx\n", q, fr[1]);
+					continue;
+				}
 				char* e = ln; int deref = *e == '*';                // *expr: además, el texto al que apunta el valor leído
 				if (deref) e++;
 				int strip = *e == '~';                              // ~reg: sin los 4 bits altos (objetos puenteados de Swift)
 				if (strip) e++;
 				static const struct { const char* n; int r; } rn[] = { {"rax",REG_RAX},{"rsi",REG_RSI},{"rdi",REG_RDI},{"rbx",REG_RBX},{"rsp",REG_RSP},{"rbp",REG_RBP},{"rcx",REG_RCX},{"rdx",REG_RDX},{"r8",REG_R8},{"r9",REG_R9},{"r12",REG_R12},{"r13",REG_R13},{"r14",REG_R14},{"r15",REG_R15} };
 				a = 0; for (size_t q = 0; q < sizeof rn / sizeof rn[0]; q++) { size_t nl = strlen(rn[q].n);
-					if (!strncmp(e, rn[q].n, nl) && (e[nl] == '+' || e[nl] == '\n' || e[nl] == 0)) { a = ((uint64_t)g[rn[q].r] & (strip ? 0x0fffffffffffffffULL : ~0ULL)) + (e[nl] == '+' ? strtoull(e + nl + 1, NULL, 16) : 0); break; } }
+					if (!strncmp(e, rn[q].n, nl) && (e[nl] == '+' || e[nl] == '@' || e[nl] == '\n' || e[nl] == 0)) { a = ((uint64_t)g[rn[q].r] & (strip ? 0x0fffffffffffffffULL : ~0ULL)) + (e[nl] == '+' ? strtoull(e + nl + 1, NULL, 16) : 0); break; } }
 				if (!a) a = strtoull(e, NULL, 16);
+				for (char* at = strchr(e, '@'); a && at; at = strchr(at + 1, '@')) {   // reg+n@m: seguir el puntero en a y sumar m
+					uint64_t nx; if (safe_read(a, &nx, 8) != 8) { a = 0; break; }
+					a = (nx & (strip ? 0x0fffffffffffffffULL : ~0ULL)) + strtoull(at + 1, NULL, 16);
+				}
 				if (a && strip && !deref) {                        // ~reg+n: el texto que hay en esa dirección
 					char t[129] = { 0 };
 					if (safe_read(a, t, 128) > 0) { for (int q = 0; q < 128 && t[q]; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK %.*s: \"%s\"\n", (int)strcspn(ln, "\n"), ln, t); }
