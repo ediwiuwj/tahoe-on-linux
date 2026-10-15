@@ -216,7 +216,7 @@ static int make_wake_socket(uint32_t name, int32_t rpid) {
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
 	int n = snprintf(a.sun_path + 1, sizeof a.sun_path - 1, "tahoe.%s.%u.%d", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x", name, (int)rpid);
 	if (bind(s, (struct sockaddr*)&a, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n)) < 0) { close(s); return -1; }
-	return s;
+	return fd_hi(s);
 }
 
 // Diagnóstico: qué clase de puertos recibe un proceso. «solo muertos»: todos sus usuarios anotados (derechos de envío) son
@@ -1159,7 +1159,7 @@ static long t_mk_create(struct ctx* c) {
 	for (int i = 0; i < 64; i++) if (!timers[i].live) { t = &timers[i]; break; }
 	if (!t) { pthread_mutex_unlock(&timers_lock); return 0; }
 	t->name = port_create(0);
-	t->tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+	t->tfd = fd_hi(timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC));
 	t->live = 1;
 	pthread_create(&t->th, NULL, mk_timer_thread, t);
 	pthread_detach(t->th);

@@ -222,8 +222,9 @@ static long bsd_setrlimit(struct ctx* c) {
 	// Los límites que fija launchd para cada servicio (NumberOfFiles, AS, DATA...) no deben bajar los del anfitrión: tahoe-run
 	// necesita descriptores altos y mucho espacio de direcciones para relanzarse, y un servicio sin ellos moría con exit(111).
 	if (r == RLIMIT_NOFILE) {
-		if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < 4096) rl.rlim_cur = 4096;
-		if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < 4096) rl.rlim_max = 4096;
+		// por encima de FD_INTERNAL_BASE: ahí viven los descriptores del emulador (fd_hi); el programa ve 10240 (getrlimit)
+		if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < FD_INTERNAL_LIMIT) rl.rlim_cur = FD_INTERNAL_LIMIT;
+		if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < FD_INTERNAL_LIMIT) rl.rlim_max = FD_INTERNAL_LIMIT;
 	} else if (r != RLIMIT_CORE) return 0;
 	return setrlimit(r, &rl) == 0 ? 0 : -darwin_errno(errno);
 }

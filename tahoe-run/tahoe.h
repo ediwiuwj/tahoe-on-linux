@@ -46,6 +46,14 @@ extern int trace_all;
 // nuevo (eran ~830 KB por hilo: con ~100 procesos de 20-30 hilos, ~2 GB). Así se reservan con mmap al primer uso (solo
 // ocupa lo que se toca, a cero como antes) y se liberan al terminar el hilo (guest_thread_done).
 void* tls_lazy(void** slot, size_t size);
+// Descriptores propios del emulador (registro, sockets de aviso de los puertos, eventfd/timerfd/epoll de kqueue...): van de
+// FD_INTERNAL_BASE en adelante, por encima de lo que el programa cree tener (getdtablesize y RLIMIT_NOFILE dicen 10240), y
+// el programa no puede cerrarlos ni pisarlos con dup2. Un demonio que al arrancar cierra todos sus descriptores (snmptrapd,
+// vpnd: close desde getdtablesize hacia abajo) se llevaba por delante los del emulador y moría con SIGILL.
+#define FD_INTERNAL_BASE 10240
+#define FD_INTERNAL_LIMIT 16384                      // RLIMIT_NOFILE real mínimo (el programa no puede bajarlo)
+int fd_hi(int fd);
+void fd_limit_raise(void);
 #define TLS_LAZY(type, name, count) static __thread type* name##_tls; type* name = (type*)tls_lazy((void**)&name##_tls, sizeof(type) * (count))
 
 // Módulos

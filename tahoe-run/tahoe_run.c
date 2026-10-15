@@ -104,7 +104,7 @@ static int memfd = -1;
 static void memfd_init(void) {
 	int fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
 	if (fd < 0) DIE("no puedo abrir /proc/self/mem: %s", strerror(errno));
-	memfd = fcntl(fd, F_DUPFD_CLOEXEC, 1000);
+	memfd = fcntl(fd, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE);
 	close(fd);
 	if (memfd < 0) DIE("no puedo reservar el descriptor de /proc/self/mem: %s", strerror(errno));
 }
@@ -566,6 +566,7 @@ static long bsd_read(struct ctx* c) {
 	return r < 0 ? -darwin_errno(errno) : r;
 }
 static long bsd_close(struct ctx* c) {
+	if ((int)c->a[0] >= FD_INTERNAL_BASE) return -9;                 // EBADF: descriptores del emulador (ver fd_hi)
 	long r = syscall(SYS_close, c->a[0]);
 	return r < 0 ? -darwin_errno(errno) : r;
 }
@@ -1053,6 +1054,23 @@ void reenable_dispatch(void) {
 extern __thread uint32_t g_thread_port;
 static __thread void* alt_stack;
 // El hilo del invitado terminó y su función del anfitrión va a volver: se quita el despacho de syscalls y la pila alterna.
+// Sube el límite de descriptores del anfitrión si hace falta para la zona del emulador (un servicio de launchd hereda el que
+// le fijó su plist, p. ej. 256 o 4096, con el que F_DUPFD por encima de FD_INTERNAL_BASE fallaría).
+void fd_limit_raise(void) {
+	struct rlimit rl;
+	if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur >= FD_INTERNAL_LIMIT) return;
+	if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < FD_INTERNAL_LIMIT) rl.rlim_max = FD_INTERNAL_LIMIT;   // root puede subirlo
+	rl.rlim_cur = FD_INTERNAL_LIMIT;
+	if (setrlimit(RLIMIT_NOFILE, &rl) != 0) { getrlimit(RLIMIT_NOFILE, &rl); rl.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_NOFILE, &rl); }
+}
+int fd_hi(int fd) {
+	if (fd < 0 || fd >= FD_INTERNAL_BASE) return fd;
+	int fl = fcntl(fd, F_GETFD);
+	int n = fcntl(fd, (fl >= 0 && (fl & FD_CLOEXEC)) ? F_DUPFD_CLOEXEC : F_DUPFD, FD_INTERNAL_BASE);
+	if (n < 0) return fd;
+	close(fd);
+	return n;
+}
 static __thread struct { void** slot; size_t size; } tls_lazies[16];
 static __thread int n_tls_lazies;
 void* tls_lazy(void** slot, size_t size) {
@@ -1244,10 +1262,11 @@ int main(int argc, char** argv, char** envp) {
 		return 2;
 	}
 	g_argv = argv;
-	{ int f = fcntl(2, F_DUPFD_CLOEXEC, 900); if (f >= 0) logfd = f; }
+	fd_limit_raise();                                   // antes de reservar descriptores en la zona del emulador
+	{ int f = fcntl(2, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE); if (f >= 0) logfd = f; }
 	if (getenv("TAHOE_LOGFILE")) {          // los procesos hijos escriben su registro en un archivo común
 		int f = open(getenv("TAHOE_LOGFILE"), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-		if (f >= 0) { int g = fcntl(f, F_DUPFD_CLOEXEC, 900); close(f); if (g >= 0) logfd = g; }
+		if (f >= 0) { int g = fcntl(f, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE); close(f); if (g >= 0) logfd = g; }
 	}
 	tahoe_root = getenv("TAHOE_ROOT");
 	trace_all = getenv("TAHOE_TRACE") != NULL;

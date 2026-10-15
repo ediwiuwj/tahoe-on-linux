@@ -425,7 +425,7 @@ static long bsd_fstat64(struct ctx* c) {
 
 
 static long bsd_dup(struct ctx* c)  { RET(dup((int)c->a[0])); }
-static long bsd_dup2(struct ctx* c) { RET(dup2((int)c->a[0], (int)c->a[1])); }
+static long bsd_dup2(struct ctx* c) { if ((int)c->a[1] >= FD_INTERNAL_BASE) return -9; RET(dup2((int)c->a[0], (int)c->a[1])); }   // EBADF: zona del emulador
 
 // fstatat64(fd, ruta, búfer, flags): AT_FDCWD = -2 y AT_SYMLINK_NOFOLLOW = 0x20 en Darwin. AT_SYMLINK_NOFOLLOW_ANY (0x800,
 // macOS 14) tampoco sigue los enlaces intermedios; aquí cuenta como el primero (el último componente no se sigue).
@@ -467,10 +467,10 @@ static long bsd_fstatat64(struct ctx* c) {
 static long bsd_fcntl(struct ctx* c) {
 	int fd = (int)c->a[0], cmd = (int)c->a[1];
 	switch (cmd) {
-	case 0:  RET(fcntl(fd, F_DUPFD, (int)c->a[2]));
+	case 0:  if ((int)c->a[2] >= FD_INTERNAL_BASE) return -22; RET(fcntl(fd, F_DUPFD, (int)c->a[2]));
 	case 1:  RET(fcntl(fd, F_GETFD));
 	case 2:  RET(fcntl(fd, F_SETFD, (int)c->a[2]));
-	case 67: RET(fcntl(fd, F_DUPFD_CLOEXEC, (int)c->a[2]));
+	case 67: if ((int)c->a[2] >= FD_INTERNAL_BASE) return -22; RET(fcntl(fd, F_DUPFD_CLOEXEC, (int)c->a[2]));
 	case 3: { int f = fcntl(fd, F_GETFL); if (f < 0) return err(); return (f & 3) | ((f & O_NONBLOCK) ? 4 : 0) | ((f & O_APPEND) ? 8 : 0); }
 	case 4: { int f = (int)c->a[2], lf = 0; if (f & 4) lf |= O_NONBLOCK; if (f & 8) lf |= O_APPEND; RET(fcntl(fd, F_SETFL, lf)); }
 	case 45: case 48: case 51: return 0;                  // F_RDAHEAD, F_NOCACHE, F_FULLFSYNC: sin efecto

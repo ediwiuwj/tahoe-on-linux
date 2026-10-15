@@ -70,7 +70,7 @@ static void sig_forward(int sig) {
 	tahoe_selector_set(prev);
 }
 static int signal_source(int ls) {
-	int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	int fd = fd_hi(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
 	if (fd < 0) return -1;
 	pthread_mutex_lock(&sig_lock);
 	int ok = 0;
@@ -166,7 +166,7 @@ static void drop(struct knote* dead) {
 
 static int kq_for(int guest) {
 	if (guest != -1) return guest;
-	if (workq_kq < 0) workq_kq = epoll_create1(EPOLL_CLOEXEC);
+	if (workq_kq < 0) workq_kq = fd_hi(epoll_create1(EPOLL_CLOEXEC));
 	return workq_kq;
 }
 
@@ -303,26 +303,26 @@ static int apply(int kq, const struct kev* c) {
 			int pr = epoll_ctl(kq, EPOLL_CTL_ADD, fd, &probe);            // ¿admite epoll este descriptor?
 			if (pr != 0 && errno == EPERM) {
 				// archivo normal o directorio: kqueue los da siempre listos; epoll no los admite. Un eventfd con valor 1 lo imita.
-				n->fd = eventfd(1, EFD_NONBLOCK | EFD_CLOEXEC); n->owns_fd = 1;
+				n->fd = fd_hi(eventfd(1, EFD_NONBLOCK | EFD_CLOEXEC)); n->owns_fd = 1;
 			} else if (pr != 0 && errno != EEXIST) { int e = darwin_errno(errno); n->fd = -1; drop(n); return e; }
 			else n->fd = fd;
 			break;
 		}
 		case EVFILT_TIMER: {
-			n->fd = timerfd_create(timer_clock(c), TFD_NONBLOCK | TFD_CLOEXEC);
+			n->fd = fd_hi(timerfd_create(timer_clock(c), TFD_NONBLOCK | TFD_CLOEXEC));
 			n->tclock = timer_clock(c);
 			timer_arm(n->fd, c);
 			n->owns_fd = 1;
 			break;
 		}
 		case EVFILT_USER:
-			n->fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+			n->fd = fd_hi(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
 			n->owns_fd = 1;
 			n->k.fflags &= NOTE_FFLAGSMASK;
 			break;
 		case EVFILT_PROC: {
 			// pidfd: legible cuando el proceso termina. NOTE_EXIT con el estado de espera de Darwin en data.
-			int pfd = (int)syscall(SYS_pidfd_open, (pid_t)c->ident, 0);
+			int pfd = fd_hi((int)syscall(SYS_pidfd_open, (pid_t)c->ident, 0));
 			if (pfd < 0) { int e = darwin_errno(errno); drop(n); return e == D_ENOENT ? 3 /* ESRCH */ : e; }
 			n->fd = pfd; n->owns_fd = 1;
 			if (c->fflags & NOTE_EXEC) {
@@ -330,7 +330,7 @@ static int apply(int kq, const struct kev* c) {
 				// servicio): un epoll con el pidfd y el aviso del puerto de exec (execwatch_add, emu_port.c)
 				uint32_t xp = execwatch_add((int32_t)c->ident);
 				int sock = xp ? port_eventfd(xp) : -1;
-				int ep = sock >= 0 ? epoll_create1(EPOLL_CLOEXEC) : -1;
+				int ep = sock >= 0 ? fd_hi(epoll_create1(EPOLL_CLOEXEC)) : -1;
 				if (ep >= 0) {
 					struct epoll_event e1 = { .events = EPOLLIN, .data.u32 = 0 }, e2 = { .events = EPOLLIN, .data.u32 = 1 };
 					epoll_ctl(ep, EPOLL_CTL_ADD, pfd, &e1); epoll_ctl(ep, EPOLL_CTL_ADD, sock, &e2);
@@ -377,7 +377,7 @@ static int apply(int kq, const struct kev* c) {
 	} else if (n->deferdel) {
 		// Ya entregó su último evento: al reactivarlo, el núcleo responde con un evento falso EV_DELETE|EV_ONESHOT y lo suelta.
 		if ((c->flags & EV_ENABLE) && n->fake_fd <= 0) {
-			n->fake_fd = eventfd(1, EFD_NONBLOCK | EFD_CLOEXEC);
+			n->fake_fd = fd_hi(eventfd(1, EFD_NONBLOCK | EFD_CLOEXEC));
 			struct epoll_event e = { .events = EPOLLIN, .data.u64 = (uint64_t)(uint32_t)n->fake_fd };
 			if (n->fake_fd > 0) epoll_ctl(kq, EPOLL_CTL_ADD, n->fake_fd, &e);
 		}
@@ -394,7 +394,7 @@ static int apply(int kq, const struct kev* c) {
 			n->k.flags = (uint16_t)((c->flags & ~(EV_ADD | EV_DELETE | EV_RECEIPT)) | keep);
 			if (c->filter == EVFILT_TIMER && n->fd >= 0) {
 				if (timer_clock(c) != n->tclock) {                  // otro reloj: un timerfd nuevo
-					int old = n->fd, nf = timerfd_create(timer_clock(c), TFD_NONBLOCK | TFD_CLOEXEC);
+					int old = n->fd, nf = fd_hi(timerfd_create(timer_clock(c), TFD_NONBLOCK | TFD_CLOEXEC));
 					if (nf >= 0) { n->fd = nf; n->tclock = timer_clock(c); sync_fd(kq, old); close(old); }
 				}
 				timer_arm(n->fd, c);
@@ -615,7 +615,7 @@ static int wl_slot_locked(uint64_t id, int create) {
 		if (workloops[i].kq <= 0 && libre < 0) libre = i;
 	}
 	if (!create || libre < 0) return -1;
-	int fd = epoll_create1(EPOLL_CLOEXEC);
+	int fd = fd_hi(epoll_create1(EPOLL_CLOEXEC));
 	if (fd < 0) return -1;
 	workloops[libre].id = id; workloops[libre].kq = fd; workloops[libre].refs = 0;
 	return libre;
