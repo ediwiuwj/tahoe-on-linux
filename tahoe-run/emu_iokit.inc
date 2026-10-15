@@ -1138,8 +1138,10 @@ static int32_t uc_watchdog(struct uc_call* c) {
 }
 // EndpointSecurityDriverClient (selectores deducidos de libEndpointSecurity): 0xb registra el cliente (estructura de 0x218
 // bytes) y 0xa devuelve, como escalar, la dirección del búfer de mensajes que el núcleo proyecta en el proceso («DataPark»:
-// cabecera de 8 bytes justo antes, con la firma 0x42 en su primer byte). Sin núcleo de macOS no hay eventos: el búfer queda
-// vacío y el resto de selectores (suscribir, silenciar, responder...) se aceptan con salidas a cero.
+// cabecera de 8 bytes justo antes, con la firma 0x42 en su primer byte y en +4 el tamaño de la zona, al menos 0x28; la
+// zona empieza por un buzón con la firma «MBOX» y la versión 1, o libEndpointSecurity aborta con «invalid or misaligned
+// slice offset»). Sin núcleo de macOS no hay eventos: el buzón queda vacío y el resto de selectores (suscribir,
+// silenciar, responder...) se aceptan con salidas a cero.
 static int32_t uc_es(struct uc_call* c) {
 	static uint64_t seen;
 	if (c->selector < 64 && !(seen & (1ull << c->selector))) {
@@ -1153,7 +1155,9 @@ static int32_t uc_es(struct uc_call* c) {
 		if (!buf) {
 			void* m = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 			if (m == MAP_FAILED) return kIOReturnNoMemory;
-			buf = m; buf[0] = 0x42;
+			buf = m; buf[0] = 0x42;                                // cabecera «DataParkInlineBucketHeader»: firma
+			uint32_t span = (1u << 20) - 8, mb[2] = { 0x4d424f58, 1 };   // +4: tamaño de la zona (>= 0x28); detrás, el buzón
+			memcpy(buf + 4, &span, 4); memcpy(buf + 8, mb, 8);         // vacío: «MBOX», versión 1 y el resto a cero
 		}
 		c->sout[0] = (uint64_t)(buf + 8); *c->nsout = 1;
 	}
