@@ -114,7 +114,7 @@ static struct entry table[] = {
 	{ "security.mac.amfi.allow_only_platform_code", { 201, 0x7213 }, K_INT, 0, NULL },
 	{ "vm.shared_region_pivot", { 201, 0x7214 }, K_INT, 0, NULL },
 	{ "hw.mempath", { 201, 0x7300 }, K_STR, 0, "" },
-	{ "kern.bootsessionuuid", { 201, 0x7215 }, K_STR, 0, boot_session },   // UUID de esta sesión de arranque (el boot_id de Linux)
+	{ "kern.bootsessionuuid", { 201, 0x7215 }, K_STR, 0, boot_session },   // UUID de esta sesión de arranque (boot_session_mix)
 	{ "kern.hv_support", { 201, 0x7216 }, K_INT, 0, NULL },                  // sin Hypervisor.framework
 	{ "kern.hv_vmm_present", { 201, 0x7217 }, K_INT, 0, NULL },
 	{ "vm.darkwake_mode", { 201, 0x7218 }, K_INT, 0, NULL },
@@ -443,8 +443,24 @@ static long sysctl_meta(struct ctx* c, int op, const int* oid, uint32_t len) {
 	return sc_out(c, b, 4 + fl);
 }
 
+// kern.bootsessionuuid distinto en cada arranque de tahoe-run: el boot_id de Linux no cambia hasta reiniciar el PC, y con
+// él cientos de arranques de prueba eran para macOS una sola sesión de días. logd marca cada archivo del registro con este
+// UUID, y «log show --last 1m» tenía que leer el almacén entero (750 MB proyectados, más de 90 s). Se mezcla en la parte
+// final (nodo) el identificador del arranque, TAHOE_PORTS_OWNER, común a todos sus procesos; los primeros 8 caracteres
+// (el centinela del sandbox) quedan como estaban.
+static void boot_session_mix(void) {
+	static int done;
+	const char* t = getenv("TAHOE_PORTS_OWNER");
+	if (done || !t || strlen(boot_session) < 36) return;
+	done = 1;
+	uint64_t h = 1469598103934665603ULL;                          // FNV-1a de 64 bits
+	for (const char* q = t; *q; q++) { h ^= (uint8_t)*q; h *= 1099511628211ULL; }
+	char node[13]; snprintf(node, sizeof node, "%012llX", (unsigned long long)(h & 0xffffffffffffULL));
+	memcpy(boot_session + 24, node, 12);
+}
 long bsd_sysctl(struct ctx* c) {
 	int mib[16];
+	boot_session_mix();
 	uint32_t n = (uint32_t)c->a[1];
 	if (n == 0 || n > 16 || safe_read(c->a[0], mib, n * 4) != (ssize_t)(n * 4)) return -D_EINVAL;
 
