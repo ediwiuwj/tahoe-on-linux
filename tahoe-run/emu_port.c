@@ -36,7 +36,13 @@
 #define NBUCKET 16384                // índice por nombre: cubeta = (nombre >> 8) % NBUCKET, cadenas por hnext
 #define MAXMSG   4096                    // ranuras de mensaje (archivo disperso: solo ocupan RAM las usadas)
 #define MSGSZ    (64 * 1024)
-struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; uint32_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; uint32_t spn; };   // spn: peticiones MACH_NOTIFY_SEND_POSSIBLE pendientes en shm->sp (para no recorrer la tabla si no hay)   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
+// Un puerto puede estar en varios conjuntos a la vez (XNU lo permite y CFRunLoop lo usa: mete el puerto con el que se
+// despierta un runloop en el conjunto de cada uno de sus modos). Con uno solo, el último insert_member se lo quitaba al
+// conjunto en que esperaba el hilo y el aviso no llegaba (NSTask -waitUntilExit no volvía: system_profiler con csrutil).
+#define NSETS 8
+struct sport { uint32_t name, sets[NSETS], head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; uint32_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; uint32_t spn; };   // spn: peticiones MACH_NOTIFY_SEND_POSSIBLE pendientes en shm->sp (para no recorrer la tabla si no hay)   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
+static int in_set(const struct sport* p, uint32_t set) { for (int j = 0; j < NSETS; j++) if (p->sets[j] == set) return 1; return 0; }
+static void set_remove(struct sport* p, uint32_t set) { for (int j = 0; j < NSETS; j++) if (p->sets[j] == set) p->sets[j] = 0; }
 struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint64_t spill; uint8_t data[MSGSZ - 40]; };   // sauid/sasid: sesión de auditoría del remitente   // spill: datos fuera de línea en un archivo aparte (nucleo_desborde_*), 0 = en la ranura
 // Derechos que el núcleo tiene que vigilar para avisar cuando muere su dueño (ver "notificaciones" más abajo):
 //  sonce: un proceso tiene un derecho send-once (normalmente, la respuesta que debe a quien le pidió algo);
@@ -224,7 +230,7 @@ static void puertos_de(int32_t pid) {
 		struct sport* q = &shm->ports[i];
 		if (!q->used || q->rpid != pid) continue;
 		n++;
-		ns += q->nsreq != 0; sets += q->is_set; queued += q->count > 0; msgs += (int)q->count; pd += q->pdreq != 0; insets += q->set != 0;
+		ns += q->nsreq != 0; sets += q->is_set; queued += q->count > 0; msgs += (int)q->count; pd += q->pdreq != 0; insets += q->sets[0] != 0;
 		int h = 0, vivos = 0;
 		for (int j = 0; j < MAXSH; j++) if (shm->sh[j].port == q->name) { h++; if (kill(shm->sh[j].holder, 0) == 0 || errno != ESRCH) vivos++; }
 		held += h > 0; solo_muertos += h > 0 && !vivos; ns_sin += q->nsreq && !h;
@@ -448,8 +454,8 @@ static void destroy_locked(struct sport* p) {
 	}
 	logf_("    puerto 0x%x destruido por pid %d (cola=%u)\n", name, (int)getpid(), p->count);
 	int i = port_index(p);
-	for (int k = 0; k < MAXPORTS; k++) if (shm->ports[k].used && shm->ports[k].set == name) shm->ports[k].set = 0;
-	if (p->set) { struct sport* st = find_locked(p->set); if (st && st->count >= p->count) st->count -= p->count; }
+	for (int k = 0; k < MAXPORTS; k++) if (shm->ports[k].used) set_remove(&shm->ports[k], name);
+	for (int j = 0; j < NSETS; j++) if (p->sets[j]) { struct sport* st = find_locked(p->sets[j]); if (st && st->count >= p->count) st->count -= p->count; }
 	bucket_del_locked(p);
 	p->used = 0;                                              // antes de recorrer: un descriptor no puede volver a destruirlo
 	while (p->head) {                                         // mensajes encolados: sus derechos se destruyen con ellos
@@ -701,14 +707,15 @@ static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 	}
 	if (p->tail) shm->msgs[p->tail - 1].next = idx; else p->head = idx;
 	p->tail = idx; p->count++;
-	uint32_t setname = p->set;
-	int32_t rp_dest = p->rpid, rp_set = 0;
-	if (setname) { struct sport* s = find_locked(setname); if (s) { s->count++; rp_set = s->rpid; } }
+	uint32_t setnames[NSETS]; int32_t rp_sets[NSETS] = { 0 };
+	int32_t rp_dest = p->rpid;
+	memcpy(setnames, p->sets, sizeof setnames);
+	for (int j = 0; j < NSETS; j++) if (setnames[j]) { struct sport* st = find_locked(setnames[j]); if (st) { st->count++; rp_sets[j] = st->rpid; } }
 	nucleo_avisar(&p->cv);
-	if (setname) { struct sport* st2 = find_locked(setname); if (st2) nucleo_avisar(&st2->cv); }
+	for (int j = 0; j < NSETS; j++) if (setnames[j]) { struct sport* st2 = find_locked(setnames[j]); if (st2) nucleo_avisar(&st2->cv); }
 	unlock();
 	poke(dest, rp_dest);
-	if (setname) poke(setname, rp_set);
+	for (int j = 0; j < NSETS; j++) if (setnames[j]) poke(setnames[j], rp_sets[j]);
 	return 0;
 }
 
@@ -724,7 +731,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 		if (!p) { unlock(); return waited ? MACH_RCV_PORT_DIED_ : MACH_RCV_INVALID_NAME_; }
 		struct sport* src = NULL;
 		if (!p->is_set) src = p->count ? p : NULL;
-		else for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used && shm->ports[i].set == name && shm->ports[i].count) { src = &shm->ports[i]; break; }
+		else for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used && shm->ports[i].count && in_set(&shm->ports[i], name)) { src = &shm->ports[i]; break; }
 		if (src) {
 			uint32_t idx = src->head;
 			struct mslot* q = &shm->msgs[idx - 1];
@@ -743,7 +750,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 					if (shm->sp[k].port == src->name && shm->sp[k].armado) { note_locked(shm->sp[k].notify, 66, src->name); shm->sp[k].port = 0; src->spn--; }
 			}
 			msg_rights_locked(q->data, q->size, RIGHTS_RECV, src->name);
-			if (src->set) { struct sport* s = find_locked(src->set); if (s && s->count) s->count--; }
+			for (int j = 0; j < NSETS; j++) if (src->sets[j]) { struct sport* s = find_locked(src->sets[j]); if (s && s->count) s->count--; }
 			uint32_t sz = q->size, tot = q->total; uint64_t spill = q->spill;
 			if (sender) { sender[0] = q->spid; sender[1] = q->suid; sender[2] = q->sgid; sender[3] = q->sauid; sender[4] = q->sasid; }
 			uint8_t* m = malloc(tot ? tot : 1);
@@ -751,14 +758,14 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			q->spill = 0;
 			q->next = shm->free_head; shm->free_head = idx;
 			int si = port_index(src);
-			int fd1 = local_sock[si], fd2 = -1;
-			uint32_t rname1 = src->name, rname2 = 0;
-			if (src->set) { struct sport* s = find_locked(src->set); if (s) { fd2 = local_sock[port_index(s)]; rname2 = s->name; } }
+			int fd1 = local_sock[si], fd2[NSETS];
+			uint32_t rname1 = src->name, rname2[NSETS] = { 0 };
+			for (int j = 0; j < NSETS; j++) { fd2[j] = -1; if (src->sets[j]) { struct sport* s = find_locked(src->sets[j]); if (s) { fd2[j] = local_sock[port_index(s)]; rname2[j] = s->name; } } }
 			unlock();
 			flush_notes();
 			if (spill && nucleo_desborde_leer(tag, spill, m + sz, tot - sz) != 0) logf_("    puertos: datos desbordados %lu perdidos\n", (unsigned long)spill);
 			drain_recheck(rname1, fd1);                         // si aún quedan mensajes (o llegó uno), se renueva el aviso
-			if (rname2) drain_recheck(rname2, fd2);
+			for (int j = 0; j < NSETS; j++) if (rname2[j]) drain_recheck(rname2[j], fd2[j]);
 			// materializar los descriptores OOL en memoria nueva de este proceso
 			uint32_t ooff[32], olen[32];
 			int nool = ool_scan(m, sz, ooff, olen, 32);
@@ -1015,7 +1022,6 @@ static void no_es_mio(const char* que, uint32_t name) {
 	logf_("    %s 0x%x ignorado: <%d> no es su dueño (dueño %d, recibe %d%s)\n", que, name, (int)getpid(), (int)o, (int)r, p ? "" : ", no existe");
 }
 void port_move_receive(uint32_t name) { lock(); struct sport* p = find_locked(name); if (p) { p->owner = (int32_t)getpid(); p->rpid = (int32_t)getpid(); } unlock(); }
-static long t_ret0(struct ctx* c) { (void)c; return KERN_OK; }   // extract_member: sin efecto
 extern void diag_crash(ucontext_t* uc);
 static long t_destruct(struct ctx* c) {
 	if (diag_target()) { logf_("    destruct 0x%x (hilo %ld):\n", (uint32_t)c->a[1], (long)syscall(SYS_gettid)); diag_stack(c->uc, "traza"); }
@@ -1047,12 +1053,41 @@ static long t_mod_refs(struct ctx* c) {
 	return KERN_OK;
 }
 static long t_nop(struct ctx* c) { (void)c; return KERN_OK; }
-// mach_port_insert_member_trap(task, name, pset) / move_member(task, member, after)
+// mach_port_insert_member_trap(task, name, pset): además de los conjuntos en que ya esté (hasta NSETS).
+// Los mensajes ya encolados en el puerto cuentan también para el conjunto nuevo.
 static long t_insert_member(struct ctx* c) {
 	lock();
 	struct sport *p = find_locked((uint32_t)c->a[1]), *st = find_locked((uint32_t)c->a[2]);
 	long r = KERN_INVALID_NAME_;
-	if (p && st && st->is_set) { p->set = st->name; r = KERN_OK; }
+	if (p && st && st->is_set) {
+		if (in_set(p, st->name)) r = 17;                                 // KERN_ALREADY_IN_SET
+		else { r = 3; for (int j = 0; j < NSETS; j++) if (!p->sets[j]) { p->sets[j] = st->name; st->count += p->count; r = KERN_OK; break; } }   // 3: KERN_NO_SPACE
+	}
+	unlock();
+	return r;
+}
+// mach_port_move_member_trap(task, member, after): sale de todos sus conjuntos y entra en «after» (MACH_PORT_NULL: en ninguno)
+static long t_move_member(struct ctx* c) {
+	lock();
+	struct sport *p = find_locked((uint32_t)c->a[1]), *st = c->a[2] ? find_locked((uint32_t)c->a[2]) : NULL;
+	long r = KERN_INVALID_NAME_;
+	if (p && (!c->a[2] || (st && st->is_set))) {
+		for (int j = 0; j < NSETS; j++) if (p->sets[j]) { struct sport* o = find_locked(p->sets[j]); if (o && o->count >= p->count) o->count -= p->count; p->sets[j] = 0; }
+		if (st) { p->sets[0] = st->name; st->count += p->count; }
+		r = KERN_OK;
+	}
+	unlock();
+	return r;
+}
+// mach_port_extract_member_trap(task, name, pset): sale de ese conjunto
+static long t_extract_member(struct ctx* c) {
+	lock();
+	struct sport *p = find_locked((uint32_t)c->a[1]), *st = find_locked((uint32_t)c->a[2]);
+	long r = KERN_INVALID_NAME_;
+	if (p && st && st->is_set) {
+		if (!in_set(p, st->name)) r = 18;                                // KERN_NOT_IN_SET
+		else { set_remove(p, st->name); if (st->count >= p->count) st->count -= p->count; r = KERN_OK; }
+	}
 	unlock();
 	return r;
 }
@@ -1186,7 +1221,7 @@ int port_get_attributes(uint32_t name, int flavor, uint32_t* out, uint32_t* cnt)
 	else {                                                                   // mach_port_status_t
 		uint32_t so = 0;
 		for (int i = 0; i < MAXSO; i++) if (shm->so[i].port == name) so++;
-		out[0] = p->set; out[1] = 0; out[2] = 0; out[3] = ql; out[4] = p->count; out[5] = so; out[6] = 1;
+		out[0] = p->sets[0]; out[1] = 0; out[2] = 0; out[3] = ql; out[4] = p->count; out[5] = so; out[6] = 1;
 		out[7] = p->pdreq != 0; out[8] = 0;
 		out[9] = (p->guarded ? 0x02 : 0) | (p->strict_guard ? 0x04 : 0);    // MACH_PORT_STATUS_FLAG_GUARDED / STRICT_GUARD
 	}
@@ -1509,7 +1544,7 @@ void emu_port_init(void) {
 	reg_mach(70, t_voucher_create);
 	reg_mach(91, t_mk_create); reg_mach(92, t_mk_destroy); reg_mach(93, t_mk_arm); reg_mach(94, t_mk_cancel); reg_mach(95, t_mk_arm_leeway);
 	reg_mach(43, t_activity_id);
-	reg_mach(16, t_allocate); reg_mach(23, t_ret0); reg_mach(24, t_construct); reg_mach(25, t_destruct); reg_mach(19, t_mod_refs);
-	reg_mach(18, t_deallocate); reg_mach(21, t_nop); reg_mach(22, t_insert_member); reg_mach(20, t_insert_member);
+	reg_mach(16, t_allocate); reg_mach(23, t_extract_member); reg_mach(24, t_construct); reg_mach(25, t_destruct); reg_mach(19, t_mod_refs);
+	reg_mach(18, t_deallocate); reg_mach(21, t_nop); reg_mach(22, t_insert_member); reg_mach(20, t_move_member);
 	reg_mach(26, t_reply_port); reg_mach(61, t_thread_switch); reg_mach(50, t_special_reply_port); reg_mach(76, t_type);
 }
