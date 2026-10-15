@@ -682,6 +682,7 @@ enum { PSFA_OPEN = 0, PSFA_CLOSE = 1, PSFA_DUP2 = 2, PSFA_INHERIT = 3, PSFA_FILE
 struct psfa { int type, fd, arg; int oflag; uint16_t mode; char path[1024]; };
 static struct psfa spawn_fa[32];
 static int spawn_fa_n, spawn_cloexec_default;
+static int spawn_setpgroup, spawn_pgroup;                          // POSIX_SPAWN_SETPGROUP: grupo de procesos del hijo (0: el suyo)
 static void read_file_actions(uint64_t addr, uint64_t size) {
 	spawn_fa_n = 0;
 	if (!addr || size < 8) return;
@@ -880,12 +881,16 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (spawn) {
 		posix_spawn_file_actions_t fa;
 		psfa_build(&fa);
-		int pe = posix_spawn(pidout, g_self_exe, &fa, NULL, nargv, nenv);
+		posix_spawnattr_t at; posix_spawnattr_init(&at);
+		if (spawn_setpgroup) { posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP); posix_spawnattr_setpgroup(&at, spawn_pgroup); }
+		int pe = posix_spawn(pidout, g_self_exe, &fa, &at, nargv, nenv);
+		posix_spawnattr_destroy(&at);
 		posix_spawn_file_actions_destroy(&fa);
-		spawn_fa_n = 0; spawn_cloexec_default = 0;
+		spawn_fa_n = 0; spawn_cloexec_default = 0; spawn_setpgroup = 0;
 		return pe ? -darwin_errno(pe) : 0;
 	}
 	if (spawn_fa_n || spawn_cloexec_default) { psfa_apply_here(); spawn_fa_n = 0; spawn_cloexec_default = 0; }   // POSIX_SPAWN_SETEXEC
+	if (spawn_setpgroup) { setpgid(0, spawn_pgroup); spawn_setpgroup = 0; }
 	execwatch_notify();                                              // NOTE_EXEC para quien vigila este proceso (kqueue)
 	execve(g_self_exe, nargv, nenv);
 	return -darwin_errno(errno);
@@ -898,9 +903,10 @@ static long bsd_execve(struct ctx* c) { return exec_common(c->a[0], c->a[1], c->
 static long bsd_posix_spawn(struct ctx* c) {
 	uint64_t ad[6] = { 0 };
 	uint16_t psa_flags = 0;
+	int32_t psa_pgroup = 0;
 	if (c->a[2]) {
 		safe_read(c->a[2], ad, sizeof ad);                          // attr_size, attrp, file_actions_size, file_actions
-		if (ad[1]) safe_read(ad[1], &psa_flags, 2);
+		if (ad[1]) { safe_read(ad[1], &psa_flags, 2); safe_read(ad[1] + 12, &psa_pgroup, 4); }   // psa_flags, ..., psa_pgroup (+12)
 	}
 	char gp[256] = "?";
 	safe_string(c->a[1], gp, sizeof gp);
@@ -922,6 +928,10 @@ static long bsd_posix_spawn(struct ctx* c) {
 	logf_("    posix_spawn <%d>(\"%s\") attr_flags=0x%x ad=%lx,%lx,%lx,%lx,%lx,%lx\n", (int)getpid(), gp, psa_flags, ad[0], ad[1], ad[2], ad[3], ad[4], ad[5]);
 	read_file_actions(ad[3], ad[2]);
 	spawn_cloexec_default = (psa_flags & 0x4000) != 0;              // POSIX_SPAWN_CLOEXEC_DEFAULT
+	// POSIX_SPAWN_SETPGROUP (0x2): el hijo en el grupo psa_pgroup, o en uno nuevo con su pid si es 0. Quien lo lanza puede
+	// luego matar al grupo entero (system_profiler: kill(-pid, SIGTERM) a un informe que no acaba); sin esto fallaba y
+	// system_profiler se quedaba esperando para siempre.
+	spawn_setpgroup = (psa_flags & 0x2) != 0; spawn_pgroup = psa_pgroup;
 	if (psa_flags & 0x40) { long r0 = exec_common(c->a[1], c->a[3], c->a[4], 0, NULL); cred_spawn_session(0); return r0; }
 	pid_t pid = 0;
 	long r = exec_common(c->a[1], c->a[3], c->a[4], 1, &pid);
