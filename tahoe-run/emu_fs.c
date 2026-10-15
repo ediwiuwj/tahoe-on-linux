@@ -147,6 +147,53 @@ static const char* resolve(const char* guest, char* buf, size_t cap) {
 	return tahoe_dev_alias(guest, buf, cap);                                                // /dev: siempre el del anfitrión (el de la raíz está vacío)
 }
 
+// Firmlinks (/usr/share/firmlinks de macOS: /Library, /Users, /private, /System/Library/Caches...). En el árbol del anfitrión
+// son enlaces simbólicos al volumen de datos, pero en XNU un firmlink se ve como un directorio: lstat dice directorio,
+// readlink falla y la ruta canónica (F_GETPATH, getattrlist ATTR_CMN_FULLPATH) es /Library/... (la del volumen de datos,
+// /System/Volumes/Data/Library/..., solo con F_GETPATH_NOFIRMLINK o ATTR_CMNEXT_NOFIRMLINKPATH). Sin esto Security.framework
+// no reconocía el llavero del sistema por su ruta y lo «migraba» a System.keychain-db, borrando el bueno.
+static struct { char src[96], dst[128]; } fl_tab[48];
+static int fl_n;
+static pthread_once_t fl_once = PTHREAD_ONCE_INIT;
+static void fl_load(void) {
+	if (!tahoe_root) return;
+	char p[4200]; snprintf(p, sizeof p, "%s/usr/share/firmlinks", tahoe_root);
+	FILE* f = fopen(p, "r");
+	if (!f) return;
+	char l[300];
+	while (fl_n < 48 && fgets(l, sizeof l, f)) {
+		char* t = strchr(l, '\t');
+		if (!t || l[0] != '/') continue;
+		*t++ = 0; t[strcspn(t, "\r\n")] = 0;
+		snprintf(fl_tab[fl_n].src, sizeof fl_tab[fl_n].src, "%s", l);
+		snprintf(fl_tab[fl_n].dst, sizeof fl_tab[fl_n].dst, "/System/Volumes/Data/%s", t);
+		fl_n++;
+	}
+	fclose(f);
+}
+// ¿Es esta ruta del anfitrión (dentro de la raíz) el origen de un firmlink?
+static int host_is_firmlink(const char* host) {
+	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+	if (!rl || strncmp(host, tahoe_root, rl) || host[rl] != '/') return 0;
+	pthread_once(&fl_once, fl_load);
+	const char* g = host + rl;
+	size_t gl = strlen(g); while (gl > 1 && g[gl - 1] == '/') gl--;
+	for (int i = 0; i < fl_n; i++) if (strlen(fl_tab[i].src) == gl && !strncmp(fl_tab[i].src, g, gl)) return 1;
+	return 0;
+}
+// Ruta de macOS del volumen de datos -> su forma con firmlink (/System/Volumes/Data/Library/x -> /Library/x).
+static void fl_canon(char* g, size_t cap) {
+	pthread_once(&fl_once, fl_load);
+	int best = -1; size_t bl = 0;
+	for (int i = 0; i < fl_n; i++) {
+		size_t dl = strlen(fl_tab[i].dst);
+		if (dl > bl && !strncmp(g, fl_tab[i].dst, dl) && (g[dl] == '/' || g[dl] == '\0')) { best = i; bl = dl; }
+	}
+	if (best < 0) return;
+	char t[4400]; snprintf(t, sizeof t, "%s%s", fl_tab[best].src, g + bl);
+	snprintf(g, cap, "%s", t);
+}
+
 // ---------------------------------------------------------------- memoria
 static long bsd_munmap(struct ctx* c) { RET(munmap((void*)c->a[0], c->a[1])); }
 static long bsd_mprotect(struct ctx* c) { RET(mprotect((void*)c->a[0], c->a[1], (int)c->a[2] & 7)); }
@@ -228,6 +275,7 @@ static ssize_t guest_link_target(const char* host, char* out, size_t cap) {
 static long bsd_readlink(struct ctx* c) {
 	char p[4096], b[4200], out[4096];
 	if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT;
+	if (host_is_firmlink(resolve(p, b, sizeof b))) return -D_EINVAL;   // un firmlink no es un enlace simbólico
 	ssize_t n = guest_link_target(resolve(p, b, sizeof b), out, c->a[2] < sizeof out ? c->a[2] : sizeof out);
 	if (n < 0) return err();
 	return safe_write(c->a[1], out, n) == n ? n : -D_EFAULT;
@@ -241,6 +289,7 @@ static long bsd_readlinkat(struct ctx* c) {
 	if (p[0] == '/' || dfd == AT_FDCWD) host = resolve(p, b, sizeof b);
 	else { char lp[64]; snprintf(lp, sizeof lp, "/proc/self/fd/%d", dfd); char d[4096]; ssize_t dl = readlink(lp, d, sizeof d - 1);
 		if (dl < 0) return err(); d[dl] = 0; snprintf(h, sizeof h, "%s/%s", d, p); host = h; }
+	if (host_is_firmlink(host)) return -D_EINVAL;                      // un firmlink no es un enlace simbólico
 	ssize_t n = guest_link_target(host, out, c->a[3] < sizeof out ? c->a[3] : sizeof out);
 	if (n < 0) return err();
 	return safe_write(c->a[2], out, n) == n ? n : -D_EFAULT;
@@ -330,6 +379,7 @@ static long do_stat(struct ctx* c, int follow) {
 	int raw, dm = emu_disk_node(p, &raw);
 	if (dm >= 0) { emu_disk_stat(dm, raw, &s); put_stat(c->a[1], &s, 0); return 0; }
 	const char* path = resolve(p, b, sizeof b);
+	if (!follow && host_is_firmlink(path)) follow = 1;            // un firmlink se ve como directorio
 	if ((follow ? stat(path, &s) : lstat(path, &s)) != 0) {
 		if (trace_all) logf_("    stat(\"%s\") -> %s\n", p, strerror(errno));
 		return err();
@@ -437,6 +487,7 @@ static long bsd_fstatat64(struct ctx* c) {
 	if (dfd == -2) dfd = AT_FDCWD;
 	int flags = ((int)c->a[3] & (0x20 | 0x800)) ? AT_SYMLINK_NOFOLLOW : 0;
 	if (p[0] == '\0') flags |= AT_EMPTY_PATH;
+	if ((flags & AT_SYMLINK_NOFOLLOW) && p[0] == '/' && host_is_firmlink(resolve(p, b, sizeof b))) flags &= ~AT_SYMLINK_NOFOLLOW;
 	{                                                                // discos emulados: por ruta absoluta o relativa a /dev
 		char full[4200]; int raw, dm = -1;
 		if (p[0] == '/') dm = emu_disk_node(p, &raw);
@@ -474,7 +525,7 @@ static long bsd_fcntl(struct ctx* c) {
 	case 3: { int f = fcntl(fd, F_GETFL); if (f < 0) return err(); return (f & 3) | ((f & O_NONBLOCK) ? 4 : 0) | ((f & O_APPEND) ? 8 : 0); }
 	case 4: { int f = (int)c->a[2], lf = 0; if (f & 4) lf |= O_NONBLOCK; if (f & 8) lf |= O_APPEND; RET(fcntl(fd, F_SETFL, lf)); }
 	case 45: case 48: case 51: return 0;                  // F_RDAHEAD, F_NOCACHE, F_FULLFSYNC: sin efecto
-	case 50: {                                            // F_GETPATH: ruta del descriptor
+	case 50: case 102: {                                  // F_GETPATH / F_GETPATH_NOFIRMLINK: ruta del descriptor
 		char link[64], path[4096];
 		snprintf(link, sizeof link, "/proc/thread-self/fd/%d", fd);
 		ssize_t n = readlink(link, path, sizeof path - 1);
@@ -483,10 +534,11 @@ static long bsd_fcntl(struct ctx* c) {
 		const char* p = path;
 		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
 		if (rl && !strncmp(path, tahoe_root, rl) && (path[rl] == '/' || path[rl] == '\0')) p = path[rl] ? path + rl : "/";    // quitar la raíz de macOS
-		if (trace_all) logf_("    F_GETPATH(fd=%d) = \"%s\"\n", fd, p);
-		return safe_write(c->a[2], p, strlen(p) + 1) > 0 ? 0 : -D_EFAULT;
+		char gp[4400]; snprintf(gp, sizeof gp, "%s", p);
+		if (cmd != 102) fl_canon(gp, sizeof gp);                        // F_GETPATH: con firmlinks; F_GETPATH_NOFIRMLINK: sin ellos
+		if (trace_all) logf_("    F_GETPATH(fd=%d) = \"%s\"\n", fd, gp);
+		return safe_write(c->a[2], gp, strlen(gp) + 1) > 0 ? 0 : -D_EFAULT;
 	}
-	case 102: { struct ctx c2 = *c; c2.a[1] = 50; return bsd_fcntl(&c2); }   // F_GETPATH_NOFIRMLINK: sin firmlinks aquí
 	case 7: case 8: case 9: case 90: case 91: case 92: case 93: {   // F_GETLK/SETLK/SETLKW y sus versiones OFD (por descripción abierta)
 		// struct flock de Darwin: l_start, l_len (off_t), l_pid, l_type, l_whence (short). La de Linux tiene otro orden.
 		uint8_t df[24];
@@ -771,6 +823,7 @@ static long bsd_funmount(struct ctx* c) { (void)c; return -16; }
 #define ATTR_VOL_CAPABILITIES 0x00020000u
 #define ATTR_VOL_UUID  0x00040000u
 static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t file, uint32_t cmnext, const char* name, const char* fullpath, const struct stat* s, int pack_inval);
+static __thread const char* pe_nofirm;                   // ruta sin firmlinks para ATTR_CMNEXT_NOFIRMLINKPATH (getattrlist)
 // Copia el resultado de getattrlist como XNU: si no cabe se copia lo que quepa (truncado, sin error), y el primer campo
 // lleva lo copiado, o lo necesario con FSOPT_REPORT_FULLSIZE (0x4).
 static long attr_copyout(uint64_t dst, uint64_t size, uint64_t opts, uint8_t* buf, size_t n) {
@@ -791,6 +844,7 @@ static long bsd_getattrlist(struct ctx* c) {
 		int nofollow = (c->a[4] & (1 | 0x800)) != 0;          // FSOPT_NOFOLLOW / FSOPT_NOFOLLOW_ANY
 		struct stat st;
 		const char* rpth = resolve(p, b, sizeof b);
+		if (nofollow && host_is_firmlink(rpth)) nofollow = 0;               // un firmlink se ve como directorio
 		if ((nofollow ? lstat(rpth, &st) : stat(rpth, &st)) != 0) return err();
 		vol_fix(&st, AT_FDCWD, rpth, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
 		char real[4096], gp2[4096];
@@ -798,11 +852,15 @@ static long bsd_getattrlist(struct ctx* c) {
 		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
 		if (rl && !strncmp(rp, tahoe_root, rl) && (rp[rl] == '/' || rp[rl] == '\0')) rp += rl;
 		snprintf(gp2, sizeof gp2, "%s", rp[0] ? rp : "/");
+		char nofirm[4096]; snprintf(nofirm, sizeof nofirm, "%s", gp2);       // ATTR_CMNEXT_NOFIRMLINKPATH: la del volumen de datos
+		fl_canon(gp2, sizeof gp2);
 		const char* base = strrchr(gp2, '/');
 		base = base && base[1] ? base + 1 : gp2;
 		fid_note(st.st_ino, gp2);
 		static uint8_t buf[8192];
+		pe_nofirm = nofirm;
 		size_t n = pack_entry(buf, common, al[3], al[4], (c->a[4] & 0x20) ? al[5] : 0, base, gp2, &st, (c->a[4] & 8) != 0);
+		pe_nofirm = NULL;
 		return attr_copyout(c->a[2], c->a[3], c->a[4], buf, n);
 	}
 	// Atributos de volumen (con algunos comunes). Orden de sys/attr.h: longitud, returned_attrs (si se pidió), comunes y de
@@ -858,6 +916,7 @@ static long bsd_getattrlist(struct ctx* c) {
 		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
 		if (rl && !strncmp(rp, tahoe_root, rl) && (rp[rl] == '/' || rp[rl] == '\0')) rp += rl;
 		snprintf(gpath, sizeof gpath, "%s", rp[0] ? rp : "/");
+		fl_canon(gpath, sizeof gpath);
 		PUTREF(gpath);
 	}
 	uint64_t bs = sf.f_bsize ? (uint64_t)sf.f_bsize : 4096;
@@ -984,6 +1043,11 @@ static long bsd_getdirentries64(struct ctx* c) {
 		uint8_t type = lin[pos + 18];
 		const char* name = (const char*)lin + pos + 19;
 		size_t nl = strlen(name);
+		if (type == DT_LNK) {                                              // firmlink: se ve como directorio
+			char lp[64], hd[4096], hp[4400]; snprintf(lp, sizeof lp, "/proc/self/fd/%d", fd);
+			ssize_t hl = readlink(lp, hd, sizeof hd - 1);
+			if (hl > 0) { hd[hl] = 0; snprintf(hp, sizeof hp, "%s/%s", hd, name); if (host_is_firmlink(hp)) type = DT_DIR; }
+		}
 		size_t dr = (21 + nl + 1 + 7) & ~7UL;
 		if (used + dr > gsize) { lseek(fd, prev, SEEK_SET); break; }     // no cabe: devolver la entrada al directorio
 		uint8_t* e = out + used;
@@ -1164,7 +1228,7 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 		memcpy(o + n, fullpath, pl);
 		n += (pl + 3) & ~3UL;
 	}
-	const char* rel_or_path[2] = { fullpath, fullpath };
+	const char* rel_or_path[2] = { fullpath, pe_nofirm ? pe_nofirm : fullpath };
 	size_t refs2[2] = { relpath_ref, nofirm_ref };
 	for (int i = 0; i < 2; i++) {
 		if (!refs2[i]) continue;
@@ -1230,6 +1294,11 @@ static long bsd_getattrlistbulk(struct ctx* c) {
 			if (!strcmp(name, ".") || !strcmp(name, "..")) { prev = off; pos += reclen; continue; }   // el kernel no las devuelve
 			struct stat s;
 			if (fstatat(fd, name, &s, AT_SYMLINK_NOFOLLOW) != 0) { prev = off; pos += reclen; continue; }
+			if (S_ISLNK(s.st_mode)) {                                       // firmlink: se ve como directorio
+				char lp[64], hd[4096], hp[4400]; snprintf(lp, sizeof lp, "/proc/self/fd/%d", fd);
+				ssize_t hl = readlink(lp, hd, sizeof hd - 1);
+				if (hl > 0) { hd[hl] = 0; snprintf(hp, sizeof hp, "%s/%s", hd, name); if (host_is_firmlink(hp)) fstatat(fd, name, &s, 0); }
+			}
 			vol_fix(&s, fd, name, AT_SYMLINK_NOFOLLOW);
 			uint8_t e[2048];
 			size_t en = pack_bulk_entry(e, common, file, name, &s);

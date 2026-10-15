@@ -979,6 +979,25 @@ static void log_call(const char* kind, uint32_t num, const char* name, struct ct
 	logf_("  [%s] <%d:%d> %s %u %s(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", verdict, getpid(), (int)(syscall(SYS_gettid) - getpid()), kind, num, name ? name : "?", c->a[0], c->a[1], c->a[2], c->a[3]);
 }
 
+// Diagnóstico: con /dev/shm/tahoe-watch-path (un texto), todos los procesos anotan las llamadas que crean, escriben, borran o
+// renombran una ruta que lo contenga (para saber quién toca un archivo: el llavero del sistema se convertía en -db).
+static void watch_path_call(unsigned num, struct ctx* c, long r) {
+	static int on = -1; static char want[128];
+	if (on < 0) { FILE* f = fopen("/dev/shm/tahoe-watch-path", "r"); on = 0; if (f) { if (fgets(want, sizeof want, f)) { want[strcspn(want, "\n")] = 0; on = want[0] != 0; } fclose(f); } }
+	if (!on) return;
+	int p1 = -1, p2 = -1;
+	switch (num) {
+	case 5: case 398: if (!(c->a[1] & 0x603)) return; p1 = 0; break;          // open/open_nocancel para escribir o crear
+	case 463: if (!(c->a[2] & 0x603)) return; p1 = 1; break;                   // openat
+	case 10: p1 = 0; break; case 472: p1 = 1; break;                           // unlink / unlinkat
+	case 128: p1 = 0; p2 = 1; break; case 465: case 488: p1 = 1; p2 = 3; break; // rename / renameat / renameatx_np
+	default: return;
+	}
+	char a[300] = "", b[300] = "";
+	safe_string(c->a[p1], a, sizeof a); if (p2 >= 0) safe_string(c->a[p2], b, sizeof b);
+	if (!strstr(a, want) && !strstr(b, want)) return;
+	logf_("    VIGILA <%d:%ld> %s bsd %u \"%s\"%s%s%s -> %ld\n", (int)getpid(), (long)syscall(SYS_gettid), prog_name, num, a, p2 >= 0 ? " -> \"" : "", b, p2 >= 0 ? "\"" : "", r);
+}
 static void on_sigsys(int sig, siginfo_t* si, void* v) {
 	(void)sig;
 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;   // dentro del manejador, las syscalls van directas a Linux
@@ -1005,6 +1024,7 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 			else if (num == 463 || num == 464 || num == 469 || num == 470 || num == 466) pa = 1;
 			if (pa >= 0) { char path[200] = ""; if (safe_read(c.a[pa], path, sizeof path - 1) > 0) { path[199] = 0; logf_("        ruta: \"%s\"\n", path); } }
 		}
+		watch_path_call(num, &c, r);
 		if (c.raw_ret) { g[REG_RAX] = (uint64_t)r; g[REG_EFL] &= ~1UL; }
 		else if (r < 0 && r > -4096) { g[REG_RAX] = -r; g[REG_EFL] |= 1; }   // error: rax = errno, CF = 1
 		else { g[REG_RAX] = r; g[REG_EFL] &= ~1UL; if (c.has_ret2) g[REG_RDX] = c.ret2; }
