@@ -38,6 +38,7 @@ extern char cache_guest_path[1024];   // ruta de la caché vista desde macOS (si
 extern uint64_t cache_ino;
 void dsmos_unprotect(uint8_t* seg, uint64_t fileoff, uint64_t filesize, const char* path);   // emu_dsmos.c
 int sys_volume_present(int k);   // emu_fs.c: 1 si el volumen k (0 Data, 1 Preboot) del macOS completo está montado
+int cs_file_platform(int fd);     // emu_cs.c: 1 si el archivo lleva firma de plataforma de Apple, 0 si no, -1 sin firma
 void sys_volumes_mount(void);       // emu_fs.c: volúmenes Data y Preboot de un macOS completo (en el PID 1)
 extern const char *g_cache_path, *g_dyld_path, *g_self_exe;   // para relanzar tahoe-run en execve   // raíz del sistema de archivos de macOS 26 (TAHOE_ROOT)
 extern int trace_all;

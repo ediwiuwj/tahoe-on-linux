@@ -77,19 +77,15 @@ static int64_t slice_offset(int fd) {
 }
 #define CS_WHOLE 0xffffffffu                                    // «ranura» especial: la firma completa
 // Busca en la firma del ejecutable el blob de la ranura indicada. Devuelve malloc() con el blob (cabecera incluida).
-static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
-	char path[4096];
-	if (exe_host_path(pid, path, sizeof path) != 0) return NULL;
-	int fd = open(path, O_RDONLY | O_CLOEXEC);
-	if (fd < 0) return NULL;
+static uint8_t* cs_blob_fd(int fd, uint32_t slot, uint32_t* len) {
 	uint8_t h[4096];
 	uint64_t base = 0;
-	if (pread(fd, h, sizeof h, 0) < 32) { close(fd); return NULL; }
+	if (pread(fd, h, sizeof h, 0) < 32) return NULL;
 	if (be32(h) == 0xcafebabe) {                              // binario universal: rebanada x86_64
 		uint32_t nf = be32(h + 4);
 		for (uint32_t i = 0; i < nf && 8 + (i + 1) * 20 <= sizeof h; i++)
 			if (be32(h + 8 + i * 20) == 0x01000007) { base = be32(h + 8 + i * 20 + 8); break; }
-		if (!base || pread(fd, h, sizeof h, (off_t)base) < 32) { close(fd); return NULL; }
+		if (!base || pread(fd, h, sizeof h, (off_t)base) < 32) return NULL;
 	}
 	uint8_t* out = NULL;
 	if (rd32(h) == 0xfeedfacf) {
@@ -128,8 +124,27 @@ static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
 		}
 		free(lc);
 	}
+	return out;
+}
+static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
+	char path[4096];
+	if (exe_host_path(pid, path, sizeof path) != 0) return NULL;
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return NULL;
+	uint8_t* out = cs_blob_fd(fd, slot, len);
 	close(fd);
 	return out;
+}
+// ¿Lleva el archivo firma de plataforma de Apple? Como en CS_OPS_STATUS: firmado, sin Team ID y no ad hoc. 1 sí, 0 no,
+// -1 sin firma. Para fcntl F_GETSIGSINFO (emu_fs.c).
+int cs_file_platform(int fd) {
+	uint32_t len = 0;
+	uint8_t* cd = cs_blob_fd(fd, 0, &len);
+	if (!cd || len < 44 || be32(cd) != 0xfade0c02) { free(cd); return -1; }
+	uint32_t team = len >= 52 && be32(cd + 8) >= 0x20200 ? be32(cd + 48) : 0;
+	int r = !team && !(be32(cd + 12) & 0x2u);
+	free(cd);
+	return r;
 }
 
 // LC_UUID del ejecutable de macOS de un proceso (p_uuid de proc_pidinfo): logd lo anota en cada mensaje para encontrar después

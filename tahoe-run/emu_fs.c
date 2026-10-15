@@ -500,6 +500,18 @@ static long bsd_fcntl(struct ctx* c) {
 		int64_t end = st.st_size;
 		return safe_write(c->a[2], &end, 8) == 8 ? 0 : -D_EFAULT;   // fs_file_start de salida: fin cubierto
 	}
+	case 105: {                                             // F_GETSIGSINFO (fgetsigsinfo: offset, petición, es_plataforma)
+		// Como XNU: con GETSIGSINFO_PLATFORM_BINARY (1), si la firma del archivo es de plataforma de Apple; sin firma, ENOENT.
+		// Security lo pide de cada binario que revisa (system_profiler, al hacer inventario de programas).
+		uint8_t g[16];
+		if (safe_read(c->a[2], g, 16) != 16) return -D_EFAULT;
+		int32_t req; memcpy(&req, g + 8, 4);
+		if (req != 1) return -D_EINVAL;
+		int pl = cs_file_platform(fd);
+		if (pl < 0) return -D_ENOENT;
+		int32_t v = pl; memcpy(g + 12, &v, 4);
+		return safe_write(c->a[2], g, 16) == 16 ? 0 : -D_EFAULT;
+	}
 	case 98: case 62: case 76: case 100: case 101: return 0;   // CHECK_LV, NODIRECT, SINGLE_WRITER, TRIM_ACTIVE_FILE, SPECULATIVE_READ
 	case 73: return 0;                                      // F_SETNOSIGPIPE: el emulador ya evita SIGPIPE en los envíos
 	case 74: case 63: case 77: return 0;                    // F_GETNOSIGPIPE, F_GETPROTECTIONCLASS, F_GETPROTECTIONLEVEL: 0
