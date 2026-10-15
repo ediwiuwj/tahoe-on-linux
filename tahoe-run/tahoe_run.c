@@ -622,15 +622,17 @@ done:
 // guarded_pwrite_np(fd, guard*, búfer, tamaño, desplazamiento): pwrite; la guarda no se comprueba.
 static long bsd_guarded_pwrite(struct ctx* c) { long r = pwrite((int)c->a[0], (const void*)c->a[2], c->a[3], (off_t)c->a[4]); return r < 0 ? -darwin_errno(errno) : r; }
 static long bsd_proc_info(struct ctx* c);
-// proc_info_extended_id(callnum, pid, flags, ext_id_type, ext_id, flavor, arg, buffer, buffersize): proc_info con una
-// comprobación de identidad extra (uniqueid/versión) que aquí no hace falta.
+// proc_info_extended_id(callnum, pid, flavor, flags, ext_id, arg, buffer, buffersize): proc_info con una comprobación de
+// identidad extra (flags PIF_COMPARE_*: versión o uniqueid del pid en ext_id) que aquí no hace falta. Los dos últimos van
+// en la pila. La usa proc_pidpath_audittoken (airportd la pide de cada cliente XPC: si falla, rechaza la conexión y el
+// cliente reconecta sin parar, decenas de miles de líneas de registro por minuto).
 static long bsd_proc_info_ext(struct ctx* c) {
 	struct ctx c2 = *c;
 	c2.a[0] = c->a[0]; c2.a[1] = c->a[1];
-	c2.a[2] = c->a[5];                                   // flavor
-	c2.a[3] = ctx_arg(c, 6);                             // arg
-	c2.a[4] = ctx_arg(c, 7);                             // buffer
-	c2.a[5] = ctx_arg(c, 8);                             // buffersize
+	c2.a[2] = c->a[2];                                   // flavor
+	c2.a[3] = c->a[5];                                   // arg
+	c2.a[4] = ctx_arg(c, 6);                             // buffer
+	c2.a[5] = ctx_arg(c, 7);                             // buffersize
 	return bsd_proc_info(&c2);
 }
 // open_dprotected_np(ruta, oflags, clase, dpflags, mode): como open; la clase de protección de datos no existe aquí.

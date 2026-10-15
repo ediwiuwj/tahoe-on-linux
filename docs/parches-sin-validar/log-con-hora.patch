@@ -1,0 +1,25 @@
+diff --git a/tahoe-run/tahoe_run.c b/tahoe-run/tahoe_run.c
+index d02a885..77b807e 100644
+--- a/tahoe-run/tahoe_run.c
++++ b/tahoe-run/tahoe_run.c
+@@ -56,12 +56,19 @@ __thread int g_watch;   // diagnóstico: traza completa de las llamadas de un hi
+ 
+ // ---------------------------------------------------------------- utilidades
+ static int logfd = 2;   // descriptor privado del registro: el programa (p. ej. launchd) puede redirigir el 2 a /dev/null
++// Con /dev/shm/tahoe-log-time (diagnóstico de esperas), cada escritura lleva delante el reloj monótono en segundos, el mismo
++// para todos los procesos: así se ve cuánto tarda algo entre dos líneas del registro.
+ void logf_(const char* fmt, ...) {
+ 	char buf[1024];
++	static int con_hora = -1;
++	if (con_hora < 0) con_hora = access("/dev/shm/tahoe-log-time", F_OK) == 0;
++	int h = 0;
++	if (con_hora) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); h = snprintf(buf, sizeof buf, "[%ld.%03ld] ", (long)t.tv_sec, t.tv_nsec / 1000000); }
+ 	va_list ap;
+ 	va_start(ap, fmt);
+-	int n = vsnprintf(buf, sizeof buf, fmt, ap);
++	int n = vsnprintf(buf + h, sizeof buf - h, fmt, ap);
+ 	va_end(ap);
++	if (n > 0) n += h;
+ 	if (n > 0) {
+ 		ssize_t r = write(logfd, buf, n < (int)sizeof buf ? n : (int)sizeof buf - 1);
+ 		(void)r;

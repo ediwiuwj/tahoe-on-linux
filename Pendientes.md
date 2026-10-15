@@ -2,7 +2,36 @@
 
 Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. Se actualiza al cerrar o abrir tareas.
 
+**En pausa desde el 14 de octubre de 2026.** Cómo retomarlo: README, «Cómo retomarlo».
+
+## Por dónde seguir
+1. **Pantalla (punto 4 de abajo)**: WindowServer ya abre el framebuffer y dibuja el cursor, pero no compone el
+   escritorio. Seguir qué le falta para dibujar el fondo o la ventana del Asistente (`tools/tahoe-view`,
+   `tools/diag/captura.py`).
+2. **Llavero del sistema**: `systemkeychain -t` dice «System unlock is NOT working» y cada arranque lo recrea con
+   `systemkeychain -C -f`. Por eso falla el Kerberos local (configureLocalKDC: certtool no encuentra la clave privada) y
+   digest-service sale con error y se relanza. securityd ya valida a los clientes (csops); el siguiente paso es ver por
+   qué el desbloqueo con `/var/db/SystemKey` no funciona (el cliente recibe el error CSSM 0x800110e0). Prueba:
+   `tools/diag/llaveros.sh`.
+3. **Capacidades de `diskutil apfs list`**: parche guardado en `docs/parches-sin-validar/contenedor-apfs.patch`
+   (storagekitd lanza una excepción tras el selector 8; ver su LEEME).
+4. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
+5. Lo demás, en la lista de abajo.
+
 ## Hecho recientemente
+- Listado de carpetas con `NSFileManager`/`CFURLEnumerator` (todo macOS): `getattrlist` marcaba siempre `ATTR_CMN_ERROR`
+  en los atributos devueltos, y CoreServices lo toma por «esta entrada falló» → `ENOTDIR`; además `getattrlistbulk` no
+  admitía los comunes extendidos (`REALDEVID`, `EXT_FLAGS`). Con ello `init_featureflags` ve las 500 listas de
+  `/System/Library/FeatureFlags/Domain`: 3328 funciones activas (antes 124) y locationd ya no se cae («key cannot be nil»:
+  con `CoreLocation/cl_pula` apagada, el userName de cada cliente salía vacío). Efecto secundario: órdenes que antes
+  terminaban sin hacer nada ahora hacen el trabajo real y se pasan del plazo del inventario (`say -v ?` encuentra las
+  voces y espera a coreaudiod, que se queda cargando sus complementos de audio): el inventario corto baja de ~61 a ~58.
+- `log show`: la segunda vez tarda ~5 s (antes 20–27 s); `kern.bootsessionuuid` distinto en cada arranque y
+  `proc_info` extendido con los argumentos en su sitio. `lwp-request` no se cuelga (25 s en frío, sale 255 como en un Mac).
+- `thread_policy_get`, grupo de procesos en `posix_spawn` (`POSIX_SPAWN_SETPGROUP`), `fcntl F_GETSIGSINFO`, buzón de
+  EndpointSecurity válido.
+- `bless --info` funciona (encuentra el Preboot del contenedor y lee sus datos de bless: sin carpeta bendecida) y
+  `bless --info --getBoot` da `/dev/disk1s1`.
 - Llaveros: `security create-keychain`, `add-generic-password`, `list-keychains`... funcionan (securityd daba EINVAL
   al preguntar por la sesión de auditoría del cliente, que no estaba registrada) y apsd ya guarda su llavero.
   `csops` da el estado de firma real (CS_VALID, binario de plataforma de Apple...): securityd valida a sus clientes y
@@ -58,10 +87,11 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    - Discos, lo que falta: capacidades en `diskutil apfs list` («ERROR»). El contenedor tendría que admitir el cliente de
      AppleAPFSContainer: selector 8 (APFSExtendedSpaceInfo, diccionario con «size», «used», «reserve» y «Max volume
      count») y además 9, 18 y 30 (entrada 8/8/4 bytes, salida 2/32/64); con solo el 8, storagekitd se atasca en los
-     demás y `diskutil list` sale vacío, así que de momento el contenedor no admite conexión y `bless --info` (Preboot no tiene la carpeta de arranque
-     `<UUID>/System/Library/CoreServices` que crea el instalador; con la propiedad IOAPFSPreBootDevice también falla
-     `--getBoot`).
-   - Esperas parecidas: `log show` ya no se cuelga pero tarda 65–165 s; `system_profiler` y `lwp-request` se cuelgan.
+     demás y `diskutil list` sale vacío, así que de momento el contenedor no admite conexión.
+   - Esperas parecidas: `log show` tarda 90–300 s la primera vez de cada arranque (lee en frío los 543 MB del registro
+     antiguo; se arregla solo cuando logd retire esos archivos, o con `log erase`) y ~5 s después. `system_profiler` no
+     termina en 600 s: espera a lsd por XPC (`_LSCopyServerStore`) mientras lsd escanea. `say -v ?` espera a coreaudiod
+     (se queda en `HALS_PlugIn::RebuildDeviceList`, cargando el detector de incidencias de audio).
    - General: apagar los registros de diagnóstico fuera de las pruebas; índices en las tablas en vez de recorrerlas;
      mensajes Mach en Rust; arranque de procesos (servicios bajo demanda) más ligero.
 2. **Caídas**:
@@ -84,9 +114,7 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
     - `top`: columnas de memoria y puertos por proceso (`mach_vm_region` 4816, `mach_port_space_basic_info` 3235).
     - `iostat`: la segunda muestra de CPU sale a 0.
     - `necp_open` (red).
-    - `security list-keychains`.
     - `zprint`: pide las zonas del núcleo de XNU, que no existen en Linux (probablemente se queda así).
 10. **Baja prioridad**: Java (`java`, `javac`... se caen en vez de decir que no hay Java instalado), `kmutil` y lo
     relacionado con kexts.
-11. **README** al día y **PR #8**: fusionar cuando la shell del completo supere de forma estable lo de la Recovery
-    (56 de 79 órdenes; ahora sale entre 56 y 61).
+11. **PR #9** (orden de la pausa y lo que venga después): fusionar en `main` cuando se quiera.

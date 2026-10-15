@@ -500,6 +500,18 @@ static long bsd_fcntl(struct ctx* c) {
 		int64_t end = st.st_size;
 		return safe_write(c->a[2], &end, 8) == 8 ? 0 : -D_EFAULT;   // fs_file_start de salida: fin cubierto
 	}
+	case 105: {                                             // F_GETSIGSINFO (fgetsigsinfo: offset, petición, es_plataforma)
+		// Como XNU: con GETSIGSINFO_PLATFORM_BINARY (1), si la firma del archivo es de plataforma de Apple; sin firma, ENOENT.
+		// Security lo pide de cada binario que revisa (system_profiler, al hacer inventario de programas).
+		uint8_t g[16];
+		if (safe_read(c->a[2], g, 16) != 16) return -D_EFAULT;
+		int32_t req; memcpy(&req, g + 8, 4);
+		if (req != 1) return -D_EINVAL;
+		int pl = cs_file_platform(fd);
+		if (pl < 0) return -D_ENOENT;
+		int32_t v = pl; memcpy(g + 12, &v, 4);
+		return safe_write(c->a[2], g, 16) == 16 ? 0 : -D_EFAULT;
+	}
 	case 98: case 62: case 76: case 100: case 101: return 0;   // CHECK_LV, NODIRECT, SINGLE_WRITER, TRIM_ACTIVE_FILE, SPECULATIVE_READ
 	case 73: return 0;                                      // F_SETNOSIGPIPE: el emulador ya evita SIGPIPE en los envíos
 	case 74: case 63: case 77: return 0;                    // F_GETNOSIGPIPE, F_GETPROTECTIONCLASS, F_GETPROTECTIONLEVEL: 0
@@ -762,7 +774,7 @@ static long bsd_getattrlist(struct ctx* c) {
 	struct stat s;
 	if (safe_string(c->a[0], p, sizeof p) != 0 || safe_read(c->a[1], al, sizeof al) != sizeof al) return -D_EFAULT;
 	uint32_t common = al[1], vol = al[2];
-	if (trace_all || (diag_target() && diag_all())) logf_("    getattrlist(\"%s\") common=0x%x vol=0x%x dir=0x%x file=0x%x opts=0x%lx\n", p, common, vol, al[3], al[4], (long)c->a[4]);
+	if (trace_all || (diag_target() && diag_all())) logf_("    getattrlist(\"%s\") common=0x%x vol=0x%x dir=0x%x file=0x%x fork=0x%x opts=0x%lx\n", p, common, vol, al[3], al[4], al[5], (long)c->a[4]);
 	if (!vol) {                                           // atributos del objeto: empaquetado general
 		int nofollow = (c->a[4] & (1 | 0x800)) != 0;          // FSOPT_NOFOLLOW / FSOPT_NOFOLLOW_ANY
 		struct stat st;
@@ -1072,7 +1084,9 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 	if (common & A_CMN_PARENTID) { P64(0); rc |= A_CMN_PARENTID; }
 	if (common & A_CMN_FULLPATH2) { path_ref = n; n += 8; rc |= A_CMN_FULLPATH2; }
 	if (common & A_CMN_ADDEDTIME) { PTS(s->st_ctim); rc |= A_CMN_ADDEDTIME; }
-	if (common & 0x20000000u) { P32(0); rc |= 0x20000000u; }                              // ATTR_CMN_ERROR: sin error
+	// ATTR_CMN_ERROR: como XNU, solo se empaqueta y se marca en returned_attrs cuando hay error. CoreServices
+	// (_InitalizeDirectoryEnumerator) toma la marca por «esta entrada falló»: con ella, todo listado de carpetas con
+	// NSFileManager/CFURLEnumerator acababa en ENOTDIR (init_featureflags no veía las 500 listas de funciones).
 	if (common & A_CMN_DPFLAGS) { P32(0); rc |= A_CMN_DPFLAGS; }
 	// Como XNU (vfs_attr_pack): los atributos de directorio solo se empaquetan para directorios y los de archivo solo para
 	// lo demás; sin FSOPT_PACK_INVAL_ATTRS los que no valen no ocupan sitio. Antes un archivo llevaba también los 8 bytes de
@@ -1161,9 +1175,9 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 #undef P64
 #undef PTS
 }
-static uint32_t dir_attrs_g;                              // dirattr de la petición en curso (getattrlistbulk)
+static uint32_t dir_attrs_g, cmnext_g;                    // dirattr y comunes extendidos de la petición en curso (getattrlistbulk)
 static size_t pack_bulk_entry(uint8_t* o, uint32_t common, uint32_t file, const char* name, const struct stat* s) {
-	return pack_entry(o, common, dir_attrs_g, file, 0, name, "", s, 1);
+	return pack_entry(o, common, dir_attrs_g, file, cmnext_g, name, "", s, 1);
 }
 
 // getattrlistbulk(fd, attrlist*, búfer, tamaño, opciones): devuelve cuántas entradas empaquetó (0 = fin).
@@ -1176,11 +1190,14 @@ static long bsd_getattrlistbulk(struct ctx* c) {
 		A_CMN_CHGTIME | A_CMN_ACCTIME | A_CMN_FNDRINFO | A_CMN_OWNERID | A_CMN_GRPID | A_CMN_ACCESSMASK | A_CMN_FLAGS | A_CMN_GENCOUNT | A_CMN_DOCID |
 		A_CMN_USERACCESS | A_CMN_FILEID | A_CMN_PARENTID | A_CMN_ADDEDTIME | 0x20000000u /*ERROR*/ | A_CMN_DPFLAGS | A_CMN_RETURNED;
 	uint32_t known_f = A_FILE_LINKCOUNT | A_FILE_TOTALSIZE | A_FILE_ALLOCSIZE | A_FILE_IOBLOCKSIZE | A_FILE_DEVTYPE | A_FILE_DATALENGTH | 0x400u | 0x1000u | 0x2000u;
-	if ((common & ~known_c) || (file & ~known_f) || (dir & ~7u) || al[2] || al[5]) {
-		logf_("    getattrlistbulk: atributos sin implementar common=0x%x dir=0x%x file=0x%x\n", common, dir, file);
+	// con FSOPT_ATTR_CMN_EXTENDED (0x20) el campo forkattr lleva comunes extendidos (CFURLEnumerator pide REALDEVID y
+	// EXT_FLAGS); sin esa opción serían atributos de fork, que no hay
+	uint32_t cmnext = (c->a[4] & 0x20) ? al[5] : 0;
+	if ((common & ~known_c) || (file & ~known_f) || (dir & ~7u) || al[2] || (al[5] & ~(cmnext & 0x1ffcu))) {
+		logf_("    getattrlistbulk: atributos sin implementar common=0x%x dir=0x%x file=0x%x fork=0x%x\n", common, dir, file, al[5]);
 		return -45;
 	}
-	dir_attrs_g = dir;
+	dir_attrs_g = dir; cmnext_g = cmnext;
 	uint64_t gbuf = c->a[2], gsize = c->a[3];
 	uint8_t lin[16384];
 	uint8_t* out = malloc(gsize);
@@ -1231,6 +1248,10 @@ static long bsd_fsctl(struct ctx* c) {
 	// Aquí no hay purga de espacio: se acepta sin efecto.
 	if (c->a[1] == 0xc0084a44UL) return 0;
 	if (c->a[1] == 0x40046812UL) { uint32_t z = 0; return safe_write(c->a[2], &z, 4) == 4 ? 0 : -D_EFAULT; }
+	// 'J' 11 (16 bytes de salida): datos de bless de un volumen APFS (identificadores de la carpeta y el archivo de
+	// arranque bendecidos), que «bless --info» lee del Preboot. Aquí no hay nada bendecido (el Preboot no tiene la
+	// carpeta de arranque que crea el instalador): ENOENT, que bless entiende como «sin datos» y muestra a cero.
+	if (c->a[1] == 0xc0104a0bUL) return -D_ENOENT;
 	logf_("    fsctl: comando 0x%lx sin implementar\n", c->a[1]);
 	return -45;
 }

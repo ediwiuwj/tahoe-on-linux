@@ -526,14 +526,23 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
 			FILE* pk = fopen("/dev/shm/tahoe-peek", "r");       // además: valor de 8 bytes en esas direcciones
 			if (pk) { char ln[64]; while (fgets(ln, sizeof ln, pk)) {
 				uint64_t a, v = 0;
+				if (!strncmp(ln, "bt", 2)) {                        // bt: cadena de rbp (direcciones de vuelta, 24 marcos)
+					uint64_t fp = (uint64_t)g[REG_RBP], fr[2];
+					for (int q = 0; q < 24 && fp && safe_read(fp, fr, 16) == 16; q++, fp = fr[0]) logf_("    BT #%d 0x%lx\n", q, fr[1]);
+					continue;
+				}
 				char* e = ln; int deref = *e == '*';                // *expr: además, el texto al que apunta el valor leído
 				if (deref) e++;
 				int strip = *e == '~';                              // ~reg: sin los 4 bits altos (objetos puenteados de Swift)
 				if (strip) e++;
 				static const struct { const char* n; int r; } rn[] = { {"rax",REG_RAX},{"rsi",REG_RSI},{"rdi",REG_RDI},{"rbx",REG_RBX},{"rsp",REG_RSP},{"rbp",REG_RBP},{"rcx",REG_RCX},{"rdx",REG_RDX},{"r8",REG_R8},{"r9",REG_R9},{"r12",REG_R12},{"r13",REG_R13},{"r14",REG_R14},{"r15",REG_R15} };
 				a = 0; for (size_t q = 0; q < sizeof rn / sizeof rn[0]; q++) { size_t nl = strlen(rn[q].n);
-					if (!strncmp(e, rn[q].n, nl) && (e[nl] == '+' || e[nl] == '\n' || e[nl] == 0)) { a = ((uint64_t)g[rn[q].r] & (strip ? 0x0fffffffffffffffULL : ~0ULL)) + (e[nl] == '+' ? strtoull(e + nl + 1, NULL, 16) : 0); break; } }
+					if (!strncmp(e, rn[q].n, nl) && (e[nl] == '+' || e[nl] == '@' || e[nl] == '\n' || e[nl] == 0)) { a = ((uint64_t)g[rn[q].r] & (strip ? 0x0fffffffffffffffULL : ~0ULL)) + (e[nl] == '+' ? strtoull(e + nl + 1, NULL, 16) : 0); break; } }
 				if (!a) a = strtoull(e, NULL, 16);
+				for (char* at = strchr(e, '@'); a && at; at = strchr(at + 1, '@')) {   // reg+n@m: seguir el puntero en a y sumar m
+					uint64_t nx; if (safe_read(a, &nx, 8) != 8) { a = 0; break; }
+					a = (nx & (strip ? 0x0fffffffffffffffULL : ~0ULL)) + strtoull(at + 1, NULL, 16);
+				}
 				if (a && strip && !deref) {                        // ~reg+n: el texto que hay en esa dirección
 					char t[129] = { 0 };
 					if (safe_read(a, t, 128) > 0) { for (int q = 0; q < 128 && t[q]; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK %.*s: \"%s\"\n", (int)strcspn(ln, "\n"), ln, t); }
@@ -682,6 +691,7 @@ enum { PSFA_OPEN = 0, PSFA_CLOSE = 1, PSFA_DUP2 = 2, PSFA_INHERIT = 3, PSFA_FILE
 struct psfa { int type, fd, arg; int oflag; uint16_t mode; char path[1024]; };
 static struct psfa spawn_fa[32];
 static int spawn_fa_n, spawn_cloexec_default;
+static int spawn_setpgroup, spawn_pgroup;                          // POSIX_SPAWN_SETPGROUP: grupo de procesos del hijo (0: el suyo)
 static void read_file_actions(uint64_t addr, uint64_t size) {
 	spawn_fa_n = 0;
 	if (!addr || size < 8) return;
@@ -880,12 +890,16 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (spawn) {
 		posix_spawn_file_actions_t fa;
 		psfa_build(&fa);
-		int pe = posix_spawn(pidout, g_self_exe, &fa, NULL, nargv, nenv);
+		posix_spawnattr_t at; posix_spawnattr_init(&at);
+		if (spawn_setpgroup) { posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP); posix_spawnattr_setpgroup(&at, spawn_pgroup); }
+		int pe = posix_spawn(pidout, g_self_exe, &fa, &at, nargv, nenv);
+		posix_spawnattr_destroy(&at);
 		posix_spawn_file_actions_destroy(&fa);
-		spawn_fa_n = 0; spawn_cloexec_default = 0;
+		spawn_fa_n = 0; spawn_cloexec_default = 0; spawn_setpgroup = 0;
 		return pe ? -darwin_errno(pe) : 0;
 	}
 	if (spawn_fa_n || spawn_cloexec_default) { psfa_apply_here(); spawn_fa_n = 0; spawn_cloexec_default = 0; }   // POSIX_SPAWN_SETEXEC
+	if (spawn_setpgroup) { setpgid(0, spawn_pgroup); spawn_setpgroup = 0; }
 	execwatch_notify();                                              // NOTE_EXEC para quien vigila este proceso (kqueue)
 	execve(g_self_exe, nargv, nenv);
 	return -darwin_errno(errno);
@@ -898,9 +912,10 @@ static long bsd_execve(struct ctx* c) { return exec_common(c->a[0], c->a[1], c->
 static long bsd_posix_spawn(struct ctx* c) {
 	uint64_t ad[6] = { 0 };
 	uint16_t psa_flags = 0;
+	int32_t psa_pgroup = 0;
 	if (c->a[2]) {
 		safe_read(c->a[2], ad, sizeof ad);                          // attr_size, attrp, file_actions_size, file_actions
-		if (ad[1]) safe_read(ad[1], &psa_flags, 2);
+		if (ad[1]) { safe_read(ad[1], &psa_flags, 2); safe_read(ad[1] + 12, &psa_pgroup, 4); }   // psa_flags, ..., psa_pgroup (+12)
 	}
 	char gp[256] = "?";
 	safe_string(c->a[1], gp, sizeof gp);
@@ -922,6 +937,10 @@ static long bsd_posix_spawn(struct ctx* c) {
 	logf_("    posix_spawn <%d>(\"%s\") attr_flags=0x%x ad=%lx,%lx,%lx,%lx,%lx,%lx\n", (int)getpid(), gp, psa_flags, ad[0], ad[1], ad[2], ad[3], ad[4], ad[5]);
 	read_file_actions(ad[3], ad[2]);
 	spawn_cloexec_default = (psa_flags & 0x4000) != 0;              // POSIX_SPAWN_CLOEXEC_DEFAULT
+	// POSIX_SPAWN_SETPGROUP (0x2): el hijo en el grupo psa_pgroup, o en uno nuevo con su pid si es 0. Quien lo lanza puede
+	// luego matar al grupo entero (system_profiler: kill(-pid, SIGTERM) a un informe que no acaba); sin esto fallaba y
+	// system_profiler se quedaba esperando para siempre.
+	spawn_setpgroup = (psa_flags & 0x2) != 0; spawn_pgroup = psa_pgroup;
 	if (psa_flags & 0x40) { long r0 = exec_common(c->a[1], c->a[3], c->a[4], 0, NULL); cred_spawn_session(0); return r0; }
 	pid_t pid = 0;
 	long r = exec_common(c->a[1], c->a[3], c->a[4], 1, &pid);
