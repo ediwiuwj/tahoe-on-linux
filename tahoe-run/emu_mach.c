@@ -752,12 +752,12 @@ static long mach_msg2(struct ctx* c) {
 
 	static int mtr = -1;
 	if (mtr < 0) mtr = access("/dev/shm/tahoe-mach-trace", F_OK) == 0;   // traza ligera: solo envíos
-	static __thread uint8_t reqbuf[512 * 1024];     // los mensajes entre procesos (listas de servicios...) pueden ser grandes
-	uint8_t* req = reqbuf;
+	enum { REQBUF = 512 * 1024 };                   // los mensajes entre procesos (listas de servicios...) pueden ser grandes
+	TLS_LAZY(uint8_t, req, REQBUF);
 	uint8_t rep[1024];
 	uint32_t rcv_name = (uint32_t)(c->a[5] >> 32);
 	if (!(options & 1) && (options & 2)) return vec_aux(user_receive(c, options, rbuf, rcv_name, rcvsize), aux_addr, aux_size);
-	if (ssize < sizeof(struct hdr) || ssize > sizeof reqbuf || safe_read(buf, req, ssize) != (ssize_t)ssize) {
+	if (ssize < sizeof(struct hdr) || ssize > REQBUF || safe_read(buf, req, ssize) != (ssize_t)ssize) {
 		logf_("    mach_msg2: mensaje ilegible o fuera de tamaño (%u bytes)\n", ssize);
 		return 0x10000002;                                      // MACH_SEND_INVALID_DATA
 	}

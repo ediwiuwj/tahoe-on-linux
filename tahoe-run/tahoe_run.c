@@ -1053,7 +1053,19 @@ void reenable_dispatch(void) {
 extern __thread uint32_t g_thread_port;
 static __thread void* alt_stack;
 // El hilo del invitado terminó y su función del anfitrión va a volver: se quita el despacho de syscalls y la pila alterna.
+static __thread struct { void** slot; size_t size; } tls_lazies[16];
+static __thread int n_tls_lazies;
+void* tls_lazy(void** slot, size_t size) {
+	if (*slot) return *slot;
+	void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED) DIE("tls_lazy: mmap de %zu bytes: %s", size, strerror(errno));
+	*slot = p;
+	if (n_tls_lazies < 16) { tls_lazies[n_tls_lazies].slot = slot; tls_lazies[n_tls_lazies].size = size; n_tls_lazies++; }
+	return p;
+}
 void guest_thread_done(void) {
+	for (int i = 0; i < n_tls_lazies; i++) { munmap(*tls_lazies[i].slot, tls_lazies[i].size); *tls_lazies[i].slot = NULL; }
+	n_tls_lazies = 0;
 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
 	prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF, 0, 0, 0);
 	if (alt_stack) { stack_t ss = { .ss_flags = SS_DISABLE }; sigaltstack(&ss, NULL); munmap(alt_stack, 1 << 18); alt_stack = NULL; }

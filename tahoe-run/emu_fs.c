@@ -150,7 +150,19 @@ static const char* resolve(const char* guest, char* buf, size_t cap) {
 // ---------------------------------------------------------------- memoria
 static long bsd_munmap(struct ctx* c) { RET(munmap((void*)c->a[0], c->a[1])); }
 static long bsd_mprotect(struct ctx* c) { RET(mprotect((void*)c->a[0], c->a[1], (int)c->a[2] & 7)); }
-static long bsd_madvise(struct ctx* c) { (void)c; return 0; }   // solo es una pista
+// madvise: el malloc de macOS devuelve la memoria que libera con MADV_FREE_REUSABLE (7) o MADV_FREE (5), que en Darwin
+// dejan que el núcleo descarte esas páginas (su contenido queda indefinido): es el MADV_FREE de Linux. Sin esto cada
+// proceso se quedaba con todo lo que llegó a usar (UserEventAgent ~80 MB) y con ~100 procesos la máquina no tenía memoria
+// para la caché de páginas: lsd pasaba el arranque esperando al disco. MADV_DONTNEED (4) en Darwin no borra el contenido
+// (el de Linux sí), así que ese y el resto se quedan en pista. En memoria que no es anónima privada Linux da EINVAL: igual.
+static long bsd_madvise(struct ctx* c) {
+	int adv = (int)c->a[2];
+	if (adv == 5 || adv == 7) {
+		uint64_t a = c->a[0] & ~4095ULL, end = (c->a[0] + c->a[1] + 4095) & ~4095ULL;
+		if (end > a) madvise((void*)a, end - a, MADV_FREE);
+	}
+	return 0;
+}
 
 static long bsd_mmap(struct ctx* c) {
 	uint64_t addr = c->a[0], len = c->a[1], flags = c->a[3], off = c->a[5];
@@ -623,7 +635,7 @@ static const struct gmount sysvol_gmounts[NSYSVOL] = {
 // Montaje de macOS al que pertenece un archivo (por su statfs y su dev_t): los tmpfs de la lista, /dev o la raíz
 static const struct gmount* gmount_of_dev(const struct statfs* s, dev_t dev) {
 	if (s->f_type == LINUX_TMPFS_MAGIC) {
-		static __thread struct dmount dm[16];
+		TLS_LAZY(struct dmount, dm, 16);
 		int n = tmpfs_mounts(dm, 16);
 		for (int i = 0; i < n; i++) { struct stat st; if (stat(dm[i].host, &st) == 0 && st.st_dev == dev) return &dm[i].m; }
 	}
@@ -632,7 +644,7 @@ static const struct gmount* gmount_of_dev(const struct statfs* s, dev_t dev) {
 }
 // getfsstat64(buf, bufsize, flags): sin búfer devuelve el número de montajes; si no, copia los que quepan.
 static long getfsstat_common(uint64_t buf, uint64_t bufsize) {
-	static __thread struct dmount dm[16];
+	TLS_LAZY(struct dmount, dm, 16);
 	int nd = tmpfs_mounts(dm, 16);
 	for (size_t k = 0; k < NSYSVOL && nd < 16; k++) {                   // Data y Preboot, tras la raíz y /dev
 		if (!sysvol_mnt(k)) continue;
@@ -653,7 +665,7 @@ static long getfsstat_common(uint64_t buf, uint64_t bufsize) {
 }
 // Identificadores (fsid) de todos los montajes, en el mismo orden y con los mismos valores que getfsstat: vfs.generic.vfsidlist
 int vfs_fsids(uint32_t* out, int max) {
-	static __thread struct dmount dm[16];
+	TLS_LAZY(struct dmount, dm, 16);
 	int nd = tmpfs_mounts(dm, 16);
 	for (size_t k = 0; k < NSYSVOL && nd < 16; k++) {
 		if (!sysvol_mnt(k)) continue;
@@ -1103,7 +1115,7 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 			// para saber si la ruta es un volumen
 			for (size_t k = 0; isdir && fullpath && !ms && k < NSYSVOL; k++) if (sysvol_mnt(k) && !strcmp(fullpath, sysvol_gmounts[k].on)) ms = 0x1;
 			if (isdir && fullpath && !ms && !strncmp(fullpath, "/System/Volumes/", 16)) {
-				static __thread struct dmount dm[16];
+				TLS_LAZY(struct dmount, dm, 16);
 				int nd = tmpfs_mounts(dm, 16);
 				for (int i = 0; i < nd; i++) if (!strcmp(fullpath, dm[i].on)) ms = 0x1;
 			}

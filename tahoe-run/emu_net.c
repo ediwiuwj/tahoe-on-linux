@@ -466,8 +466,9 @@ static long net_recvmsg(struct ctx* c) {
 	m.msg_name = d.name ? l : NULL; m.msg_namelen = d.name ? sizeof l : 0;
 	m.msg_iov = (struct iovec*)d.iov; m.msg_iovlen = (size_t)d.iovlen;
 	m.msg_control = d.control ? cbuf : NULL; m.msg_controllen = d.control ? sizeof cbuf : 0;
-	static __thread uint8_t icin[65536], icout[65536 + 20];
-	struct iovec iv1 = { icin, sizeof icin };
+	TLS_LAZY(uint8_t, icin, 65536);
+	TLS_LAZY(uint8_t, icout, 65536 + 20);
+	struct iovec iv1 = { icin, 65536 };
 	int icmp = is_icmp((int)c->a[0]);
 	if (icmp) { m.msg_iov = &iv1; m.msg_iovlen = 1; }
 	long r = recvmsg((int)c->a[0], &m, msg_flags((int)c->a[2]) & ~MSG_NOSIGNAL);

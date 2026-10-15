@@ -953,9 +953,9 @@ static uint64_t rq_u64(struct rq* r) { uint64_t v = 0; if (r->p + 8 <= r->len) m
 // "IOServiceTerminate" se leía como el diccionario: la notificación de terminación devolvía todos los discos y
 // diskarbitrationd los daba por retirados nada más crearlos.
 static const char* rq_str(struct rq* r) {
-	static __thread char ring[4][4100];
+	TLS_LAZY(char, ring, 4 * 4100);
 	static __thread unsigned next;
-	char* tmp = ring[next++ & 3];
+	char* tmp = ring + 4100 * (next++ & 3);
 	rq_u32(r); uint32_t n = rq_u32(r);
 	if (n > 4096 || r->p + n > r->len) { tmp[0] = 0; r->p = r->len; return tmp; }
 	memcpy(tmp, r->b + r->p, n); tmp[n] = 0;

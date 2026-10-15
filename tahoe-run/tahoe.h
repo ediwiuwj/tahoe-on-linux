@@ -42,6 +42,11 @@ int cs_file_platform(int fd);     // emu_cs.c: 1 si el archivo lleva firma de pl
 void sys_volumes_mount(void);       // emu_fs.c: volúmenes Data y Preboot de un macOS completo (en el PID 1)
 extern const char *g_cache_path, *g_dyld_path, *g_self_exe;   // para relanzar tahoe-run en execve   // raíz del sistema de archivos de macOS 26 (TAHOE_ROOT)
 extern int trace_all;
+// Búferes grandes por hilo: un __thread de tamaño fijo va al TLS estático, que glibc reserva y pone a cero en CADA hilo
+// nuevo (eran ~830 KB por hilo: con ~100 procesos de 20-30 hilos, ~2 GB). Así se reservan con mmap al primer uso (solo
+// ocupa lo que se toca, a cero como antes) y se liberan al terminar el hilo (guest_thread_done).
+void* tls_lazy(void** slot, size_t size);
+#define TLS_LAZY(type, name, count) static __thread type* name##_tls; type* name = (type*)tls_lazy((void**)&name##_tls, sizeof(type) * (count))
 
 // Módulos
 void emu_sysctl_init(void);
