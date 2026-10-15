@@ -13,12 +13,20 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    digest-service sale con error y se relanza. securityd ya valida a los clientes (csops); el siguiente paso es ver por
    qué el desbloqueo con `/var/db/SystemKey` no funciona (el cliente recibe el error CSSM 0x800110e0). Prueba:
    `tools/diag/llaveros.sh`.
-3. **Capacidades de `diskutil apfs list`**: parche guardado en `docs/parches-sin-validar/contenedor-apfs.patch`
-   (storagekitd lanza una excepción tras el selector 8; ver su LEEME).
-4. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
+3. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
+4. **coreaudiod** se queda cargando sus complementos de audio (`HALS_PlugIn::RebuildDeviceList`) y `say -v ?` lo espera.
 5. Lo demás, en la lista de abajo.
 
 ## Hecho recientemente
+- `diskutil apfs list` da las capacidades (tamaño, usado, libre y lo que consume cada volumen): cliente de
+  AppleAPFSContainer (selector 8: diccionario por nombre BSD, el contenedor con size/used/reserve y cada volumen con
+  fs_used/fs_reserve/fs_quota; selector 9: rol de cada volumen).
+- `system_profiler` termina: un puerto Mach puede estar en varios conjuntos a la vez (CFRunLoop lo necesita; sin ello
+  NSTask no se enteraba de que csrutil había terminado).
+- Memoria: el TLS estático de tahoe-run (~830 KB que glibc pone a cero en cada hilo, unos 2 GB en el macOS completo) baja
+  a 40 KB, y `madvise(MADV_FREE*)` devuelve de verdad la memoria. A mitad del arranque: 2,9 GB usados en vez de 4,6 GB.
+  `diskutil list` responde: la primera vez tras arrancar espera ~1 min a que lsd limpie su base de datos (registra de
+  nuevo los paquetes «requeridos», como en un Mac; aquí va lento porque el disco del PC es mecánico), luego 0,2 s.
 - Listado de carpetas con `NSFileManager`/`CFURLEnumerator` (todo macOS): `getattrlist` marcaba siempre `ATTR_CMN_ERROR`
   en los atributos devueltos, y CoreServices lo toma por «esta entrada falló» → `ENOTDIR`; además `getattrlistbulk` no
   admitía los comunes extendidos (`REALDEVID`, `EXT_FLAGS`). Con ello `init_featureflags` ve las 500 listas de
@@ -84,14 +92,10 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
      llavero del sistema, que no se desbloquea: `systemkeychain -t` dice «System unlock is NOT working» y cada arranque
      lo recrea con `systemkeychain -C -f`). Otros que se relanzan: locationd, cryptexd, diskmanagementstartup, apsd, cloudd.
    - `diskutil` con el sistema ya asentado: `list` 0,5–3 s, `info /` 2–6 s, siempre con salida.
-   - Discos, lo que falta: capacidades en `diskutil apfs list` («ERROR»). El contenedor tendría que admitir el cliente de
-     AppleAPFSContainer: selector 8 (APFSExtendedSpaceInfo, diccionario con «size», «used», «reserve» y «Max volume
-     count») y además 9, 18 y 30 (entrada 8/8/4 bytes, salida 2/32/64); con solo el 8, storagekitd se atasca en los
-     demás y `diskutil list` sale vacío, así que de momento el contenedor no admite conexión.
    - Esperas parecidas: `log show` tarda 90–300 s la primera vez de cada arranque (lee en frío los 543 MB del registro
-     antiguo; se arregla solo cuando logd retire esos archivos, o con `log erase`) y ~5 s después. `system_profiler` no
-     termina en 600 s: espera a lsd por XPC (`_LSCopyServerStore`) mientras lsd escanea. `say -v ?` espera a coreaudiod
-     (se queda en `HALS_PlugIn::RebuildDeviceList`, cargando el detector de incidencias de audio).
+     antiguo; se arregla solo cuando logd retire esos archivos, o con `log erase`) y ~5 s después. `system_profiler` ya
+     termina (la primera vez tras arrancar espera a lsd). `say -v ?` espera a coreaudiod (se queda en
+     `HALS_PlugIn::RebuildDeviceList`, cargando el detector de incidencias de audio).
    - General: apagar los registros de diagnóstico fuera de las pruebas; índices en las tablas en vez de recorrerlas;
      mensajes Mach en Rust; arranque de procesos (servicios bajo demanda) más ligero.
 2. **Caídas**:
