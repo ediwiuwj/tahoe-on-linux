@@ -8,16 +8,17 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 1. **Pantalla (punto 4 de abajo)**: WindowServer ya abre el framebuffer y dibuja el cursor, pero no compone el
    escritorio. Seguir qué le falta para dibujar el fondo o la ventana del Asistente (`tools/tahoe-view`,
    `tools/diag/captura.py`).
-2. **Llavero del sistema**: `systemkeychain -t` dice «System unlock is NOT working» y cada arranque lo recrea con
-   `systemkeychain -C -f`. Por eso falla el Kerberos local (configureLocalKDC: certtool no encuentra la clave privada) y
-   digest-service sale con error y se relanza. securityd ya valida a los clientes (csops); el siguiente paso es ver por
-   qué el desbloqueo con `/var/db/SystemKey` no funciona (el cliente recibe el error CSSM 0x800110e0). Prueba:
-   `tools/diag/llaveros.sh`.
-3. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
-4. **coreaudiod** se queda cargando sus complementos de audio (`HALS_PlugIn::RebuildDeviceList`) y `say -v ?` lo espera.
-5. Lo demás, en la lista de abajo.
+2. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
+3. **coreaudiod** se queda cargando sus complementos de audio (`HALS_PlugIn::RebuildDeviceList`) y `say -v ?` lo espera.
+4. Lo demás, en la lista de abajo.
+
+WindowServer a veces se para o muere a mitad del arranque (1 de cada 3, también con binarios anteriores): vigilarlo al trabajar en la pantalla.
 
 ## Hecho recientemente
+- Llavero del sistema: «System unlock is working». Faltaban los firmlinks (`/usr/share/firmlinks`): en un Mac
+  `/Library` del sistema y `/System/Volumes/Data/Library` son la misma carpeta, no un enlace; securityd veía un enlace
+  y convertía el llavero en una copia `-db` que SystemKey no abría. Con ello el Kerberos local (LKDC) se configura y
+  digest-service sale bien en vez de relanzarse.
 - `diskutil apfs list` da las capacidades (tamaño, usado, libre y lo que consume cada volumen): cliente de
   AppleAPFSContainer (selector 8: diccionario por nombre BSD, el contenedor con size/used/reserve y cada volumen con
   fs_used/fs_reserve/fs_quota; selector 9: rol de cada volumen).
@@ -86,10 +87,7 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
      apagada, porque init_featureflags no podía listar sus carpetas). apfs.util (lo lanza diskarbitrationd) falla al sondear disk1s2/disk1s3 (no hay datos detrás).
      KernelEventAgent y xprotectd arreglados. watchdogd no es un bucle: con el vigilante inactivo su diseño es «dormir
      2 s y salir», y solo vuelve cuando otro servicio le escribe. apfs.util/fsck_apfs tampoco: es el sondeo único de cada
-     volumen al arrancar. digest-service sale con error porque no hay Kerberos local (LKDC): configureLocalKDC lo intenta
-     en cada arranque y falla (certtool crea el certificado del KDC, pero luego no encuentra su clave privada en el
-     llavero del sistema, que no se desbloquea: `systemkeychain -t` dice «System unlock is NOT working» y cada arranque
-     lo recrea con `systemkeychain -C -f`). Otros que se relanzan: locationd, cryptexd, diskmanagementstartup, apsd, cloudd.
+     volumen al arrancar. digest-service ya no: el Kerberos local se configura desde que se desbloquea el llavero del sistema. Otros que se relanzan: locationd, cryptexd, diskmanagementstartup, apsd, cloudd.
    - `diskutil` con el sistema ya asentado: `list` 0,5–3 s, `info /` 2–6 s, siempre con salida.
    - Esperas parecidas: `log show` tarda ~55 s la primera vez de cada arranque y ~9 s después (con `log erase` el
      registro bajó de 574 MB a 31 MB; antes 90–300 s: el disco del PC es mecánico). `system_profiler` ya
