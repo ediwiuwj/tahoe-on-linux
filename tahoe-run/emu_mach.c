@@ -103,6 +103,7 @@ static size_t mig_make_memory_entry(const struct hdr* req, const uint8_t* m, uin
 		if (ok && mmap((void*)off, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) ok = 0;
 	}
 	if (fd >= 0) close(fd);
+	if (ok) port_me_created(port); else unlink(path);
 	if (mach_trace()) { uint32_t perm = 0; memcpy(&perm, m + 64, 4); logf_("    MT pid=%d make_memory_entry tamaño=0x%lx dir=0x%lx permiso=0x%x -> puerto 0x%x %s\n", (int)getpid(), size, off, perm, port, ok ? "ok" : "FALLO"); }
 	if (!ok) return reply_begin(r, req, KERN_INVALID_ARG);
 	size_t n = reply_port(r, req, port, 17);
@@ -133,6 +134,7 @@ static size_t mig_mach_vm_map(const struct hdr* req, const uint8_t* m, uint8_t* 
 		char path[128]; me_path(path, sizeof path, objname);
 		addr = rmap_add(tpid, path, moff, round_up(size), cur & 7, mask + 1);
 		if (!addr) kr = KERN_NO_SPACE_;
+		else port_me_hold(objname, tpid);                    // el destino lo abre al primer acceso: que no se borre antes
 		goto done;
 	}
 	if (objname) {                                          // objeto = entrada de memoria compartida

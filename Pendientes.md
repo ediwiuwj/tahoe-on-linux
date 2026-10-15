@@ -9,12 +9,15 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    escritorio. Seguir qué le falta para dibujar el fondo o la ventana del Asistente (`tools/tahoe-view`,
    `tools/diag/captura.py`).
 2. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
-3. **coreaudiod** se queda cargando sus complementos de audio (`HALS_PlugIn::RebuildDeviceList`) y `say -v ?` lo espera.
-4. Lo demás, en la lista de abajo.
+3. Lo demás, en la lista de abajo.
 
-WindowServer a veces se para o muere a mitad del arranque (1 de cada 3, también con binarios anteriores): vigilarlo al trabajar en la pantalla.
 
 ## Hecho recientemente
+- /dev/shm ya no se llena: las entradas de memoria (`mach_make_memory_entry`) se borran cuando nadie tiene ya derechos
+  de envío, como en XNU. lsd crea una de 1,5 MB por cada cliente que pide su base de datos y en ~2 min llenaba /dev/shm
+  (2,3 GB): launchd moría por SIGBUS y con él todo el macOS (también el «WindowServer no está vivo» de algunas pruebas).
+  Ahora /dev/shm se queda en ~360 MB. Con ello coreaudiod arranca y `say` funciona: `say -v ?` da 68 voces, `say -o`
+  crea el AIFF y `say hola` termina (sin sonido: falta la tarjeta de sonido, ver «Teclado, ratón y sonido»).
 - Llavero del sistema: «System unlock is working». Faltaban los firmlinks (`/usr/share/firmlinks`): en un Mac
   `/Library` del sistema y `/System/Volumes/Data/Library` son la misma carpeta, no un enlace; securityd veía un enlace
   y convertía el llavero en una copia `-db` que SystemKey no abría. Con ello el Kerberos local (LKDC) se configura y
@@ -91,8 +94,8 @@ WindowServer a veces se para o muere a mitad del arranque (1 de cada 3, también
    - `diskutil` con el sistema ya asentado: `list` 0,5–3 s, `info /` 2–6 s, siempre con salida.
    - Esperas parecidas: `log show` tarda ~55 s la primera vez de cada arranque y ~9 s después (con `log erase` el
      registro bajó de 574 MB a 31 MB; antes 90–300 s: el disco del PC es mecánico). `system_profiler` ya
-     termina (la primera vez tras arrancar espera a lsd). `say -v ?` espera a coreaudiod (se queda en
-     `HALS_PlugIn::RebuildDeviceList`, cargando el detector de incidencias de audio).
+     termina (la primera vez tras arrancar espera a lsd). `say -v ?` tarda ~135 s la primera vez tras
+     arrancar (espera a que lsd rehaga su base de datos); después `say` tarda 4–5 s.
    - General: apagar los registros de diagnóstico fuera de las pruebas; índices en las tablas en vez de recorrerlas;
      mensajes Mach en Rust; arranque de procesos (servicios bajo demanda) más ligero.
 2. **Caídas**:
@@ -110,7 +113,9 @@ WindowServer a veces se para o muere a mitad del arranque (1 de cada 3, también
    (Liquid Glass), después Metal 2 completo y lo que pida macOS de Metal 3 (ampliando `hasvk` de Mesa si hace falta).
 6. **Sesión gráfica**: con ella, `screencapture`, `osascript` y `pbcopy` (hoy se caen por no haber sesión).
 7. **Servicios que fallan al arrancar**: mobileassetd, softwareupdate.
-8. **Teclado y ratón** dentro de macOS.
+8. **Teclado, ratón y sonido** dentro de macOS (después de ver el escritorio). Sonido: coreaudiod ya arranca y `say`
+   termina, pero no hay tarjeta de sonido: hace falta un dispositivo de audio que macOS vea como propio y que mande el
+   sonido a PipeWire/PulseAudio del PC (para oír un vídeo, `say`...).
 9. **Detalles**:
     - `top`: columnas de memoria y puertos por proceso (`mach_vm_region` 4816, `mach_port_space_basic_info` 3235).
     - `iostat`: la segunda muestra de CPU sale a 0.
