@@ -91,8 +91,8 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
      llavero del sistema, que no se desbloquea: `systemkeychain -t` dice «System unlock is NOT working» y cada arranque
      lo recrea con `systemkeychain -C -f`). Otros que se relanzan: locationd, cryptexd, diskmanagementstartup, apsd, cloudd.
    - `diskutil` con el sistema ya asentado: `list` 0,5–3 s, `info /` 2–6 s, siempre con salida.
-   - Esperas parecidas: `log show` tarda 90–300 s la primera vez de cada arranque (lee en frío los 543 MB del registro
-     antiguo; se arregla solo cuando logd retire esos archivos, o con `log erase`) y ~5 s después. `system_profiler` ya
+   - Esperas parecidas: `log show` tarda ~55 s la primera vez de cada arranque y ~9 s después (con `log erase` el
+     registro bajó de 574 MB a 31 MB; antes 90–300 s: el disco del PC es mecánico). `system_profiler` ya
      termina (la primera vez tras arrancar espera a lsd). `say -v ?` espera a coreaudiod (se queda en
      `HALS_PlugIn::RebuildDeviceList`, cargando el detector de incidencias de audio).
    - General: apagar los registros de diagnóstico fuera de las pruebas; índices en las tablas en vez de recorrerlas;
