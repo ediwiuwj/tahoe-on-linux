@@ -17,6 +17,8 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #define IOKIT_RET(x) ((int32_t)(0xe0000000u | (x)))
 #define kIOReturnError        IOKIT_RET(0x2bc)
@@ -443,6 +445,10 @@ static void io_nvram_boot(int opt) {
 // ------------------------------------------------------------------ pantalla emulada
 // Un único modo: 1280×800 a 60 Hz, 32 bits por píxel (IO32BitDirectPixels: en memoria B, G, R, X). La memoria de vídeo es un
 // archivo de /dev/shm que ven a la vez WindowServer (la proyecta con IOConnectMapMemory) y el visor de Linux (tools/tahoe-view).
+// Colas de eventos del teclado y del puntero (ver uc_hidev)
+#define HIDQ_SIZE 16384                                              // kQueueSizeMax de IOHIDEventServiceUserClient
+static struct hidq { int ent; uint8_t* mem; uint32_t port; int open; } hidq[2] = { { .ent = -1 }, { .ent = -1 } };   // 0 teclado, 1 puntero
+static void fb_path(char* b, size_t n, const char* what);
 #define FB_W      1280
 #define FB_H      800
 #define FB_BPR    (FB_W * 4)
@@ -758,6 +764,24 @@ static void io_init(void) {
 	p_num(ptr, "PrimaryUsagePage", 1, 32); p_num(ptr, "PrimaryUsage", 2, 32); p_num(ptr, "DeviceUsagePage", 1, 32); p_num(ptr, "DeviceUsage", 2, 32);
 	p_str(ptr, "Product", "Apple Internal Keyboard / Trackpad");
 	p_num(ptr, "VendorID", 0x5ac, 32); p_num(ptr, "ProductID", 0x27e, 32); p_str(ptr, "Transport", "USB");
+	// Servicios de eventos HID (IOHIDEventDriver, como el de un teclado y un ratón USB): WindowServer, que en macOS lleva
+	// dentro el sistema de eventos HID, los busca por HIDServiceSupport y les abre un IOHIDEventServiceUserClient por el
+	// que llegan las teclas y el ratón que manda tahoe-view.
+	for (int k = 0; k < 2; k++) {
+		int dev = k ? ptr : kbd, up = 1, u = k ? 2 : 6;
+		int ev = ent_add(dev, "IOHIDEventDriver", "IOHIDEventDriver", "IORegistryEntry IOService IOHIDEventService IOHIDEventDriver", "", PL_SERVICE, 1);
+		p_str(ev, "IOClass", "IOHIDEventDriver"); p_str(ev, "IOProviderClass", "IOHIDInterface");
+		p_str(ev, "IOUserClientClass", "IOHIDEventServiceUserClient");
+		p_bool(ev, "HIDServiceSupport", 1);
+		p_num(ev, "PrimaryUsagePage", up, 32); p_num(ev, "PrimaryUsage", u, 32);
+		struct val* pairs = v_new(V_ARRAY); struct val* pr = v_new(V_DICT);
+		v_add(pr, "DeviceUsagePage", v_num(up, 32)); v_add(pr, "DeviceUsage", v_num(u, 32)); v_add(pairs, NULL, pr);
+		v_set(io_e[ev].props, "DeviceUsagePairs", pairs);
+		p_str(ev, "Product", k ? "tahoe-view Mouse" : "tahoe-view Keyboard"); p_str(ev, "Manufacturer", "tahoe-run");
+		p_num(ev, "VendorID", 0x5ac, 32); p_num(ev, "ProductID", 0x27e, 32); p_str(ev, "Transport", "USB");
+		p_num(ev, "LocationID", 0x14100000 + k, 32); p_num(ev, "CountryCode", 0, 32);
+		hidq[k].ent = ev;
+	}
 
 	int batt = ent_add(acpi, "AppleSmartBattery", "AppleSmartBattery", "IORegistryEntry IOService IOPMPowerSource", "", PL_SERVICE, 1);
 	p_bool(batt, "ExternalConnected", 1); p_bool(batt, "IsCharging", 0); p_bool(batt, "FullyCharged", 1);
@@ -1123,6 +1147,122 @@ static int32_t uc_hid(struct uc_call* c) {
 	default:
 		logf_("    iokit: IOHIDSystem selector %u sin implementar (%u escalares)\n", c->selector, c->nsin);
 		return kIOReturnUnsupported;
+	}
+}
+// Teclado y ratón (IOHIDEventDriver, ver io_registry): IOHIDEventServiceUserClient de IOHIDFamily. WindowServer abre la
+// conexión (tipo 'esuc'), registra un puerto de avisos, proyecta la cola (memoria tipo 0) y llama a open (selector 0).
+// La cola es un IODataQueue de xnu: {queueSize, head, tail} y entradas {tamaño (alineado a 4), datos}; cada evento va
+// como IOHIDSystemQueueElement (marca de tiempo, emisor, opciones, 0, número de eventos) seguido de los datos del evento
+// (cabecera {tamaño, tipo, opciones, profundidad}). El núcleo avisa con un mensaje vacío (id 0) cuando la cola estaba
+// vacía. Los eventos llegan de tahoe-view por /dev/shm/tahoe-input-<id> (ver tools/tahoe-view/src/entrada.rs): un hilo
+// de este proceso (WindowServer) los convierte y los encola. Disposición de los datos medida en IOKit.framework
+// (IOHIDEventCreateKeyboardEvent, RelativePointerEvent, ScrollEvent):
+//   teclado (tipo 3, 32 bytes): +0x10 página de uso (u16), +0x12 uso (u16), +0x14 pulsada (u32), +0x1c pulsaciones (u8)
+//   puntero (tipo 17, 48 bytes): +0x10/+0x18/+0x20 x, y, z (double), +0x28 botones; absoluto: x e y de 0 a 1
+//   rueda (tipo 6, 28 bytes): +0x10/+0x14/+0x18 x, y, z en 16.16
+static pthread_mutex_t hidq_lock = PTHREAD_MUTEX_INITIALIZER;
+static int hidq_of(int ent) { for (int k = 0; k < 2; k++) if (hidq[k].ent == ent) return k; return -1; }
+static void hidq_put(int k, const uint8_t* ev, uint32_t evsize) {
+	pthread_mutex_lock(&hidq_lock);
+	struct hidq* q = &hidq[k];
+	if (!q->mem || !q->open) { pthread_mutex_unlock(&hidq_lock); return; }
+	struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+	uint8_t el[28 + 64] = { 0 };                                     // IOHIDSystemQueueElement + datos
+	uint64_t t = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec, sender = io_e[q->ent].id;
+	uint32_t one = 1;
+	memcpy(el, &t, 8); memcpy(el + 8, &sender, 8); memcpy(el + 24, &one, 4);
+	memcpy(el + 28, ev, evsize);
+	uint32_t len = 28 + evsize, dsize = (len + 3) & ~3u, esize = dsize + 4;
+	volatile uint32_t* hdr = (volatile uint32_t*)q->mem;            // queueSize, head, tail
+	uint8_t* data = q->mem + 12;
+	uint32_t qs = hdr[0], tail = __atomic_load_n(&hdr[2], __ATOMIC_RELAXED), head = __atomic_load_n(&hdr[1], __ATOMIC_ACQUIRE), nt;
+	if (tail >= head) {
+		if (qs - tail >= esize) { memcpy(data + tail, &dsize, 4); memcpy(data + tail + 4, el, len); nt = tail + esize; }
+		else if (head > esize) {                                     // vuelta al principio (como IOSharedDataQueue)
+			memcpy(data, &dsize, 4);
+			if (qs - tail >= 4) memcpy(data + tail, &dsize, 4);
+			memcpy(data + 4, el, len); nt = esize;
+		} else { pthread_mutex_unlock(&hidq_lock); return; }        // llena: se pierde
+	} else if (head - tail > esize) { memcpy(data + tail, &dsize, 4); memcpy(data + tail + 4, el, len); nt = tail + esize; }
+	else { pthread_mutex_unlock(&hidq_lock); return; }
+	__atomic_store_n(&hdr[2], nt, __ATOMIC_RELEASE);
+	if (tail != head) { __atomic_thread_fence(__ATOMIC_SEQ_CST); head = __atomic_load_n(&hdr[1], __ATOMIC_RELAXED); }
+	uint32_t port = q->port;
+	pthread_mutex_unlock(&hidq_lock);
+	if (tail == head && port) {                                      // estaba vacía: aviso (cabecera sola, id 0)
+		struct hdr h = { .bits = 0x13 /* COPY_SEND */, .size = sizeof h, .remote = port };
+		port_send(port, (const uint8_t*)&h, sizeof h);
+	}
+}
+static void* hid_input_thread(void* p) {
+	(void)p;
+	int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	struct sockaddr_un a = { .sun_family = AF_UNIX };
+	fb_path(a.sun_path, sizeof a.sun_path, "input");
+	unlink(a.sun_path);
+	if (fd < 0 || bind(fd, (struct sockaddr*)&a, sizeof a) != 0) { logf_("    iokit: entrada %s: %s\n", a.sun_path, strerror(errno)); return NULL; }
+	chmod(a.sun_path, 0600);
+	logf_("    iokit: <%d> teclado y ratón en %s\n", (int)getpid(), a.sun_path);
+	int32_t m[4];
+	for (;;) {
+		ssize_t n = recv(fd, m, sizeof m, 0);
+		if (n < 0 && errno == EINTR) continue;
+		if (n < 0) break;
+		if (n != sizeof m) continue;
+		uint8_t ev[48] = { 0 };
+		uint32_t opt = 0;
+		if (m[0] == 1) {                                             // tecla
+			uint32_t sz = 0x20, ty = 3, down = m[3] != 0; uint16_t up = (uint16_t)m[1], u = (uint16_t)m[2];
+			memcpy(ev, &sz, 4); memcpy(ev + 4, &ty, 4); memcpy(ev + 8, &opt, 4);
+			memcpy(ev + 0x10, &up, 2); memcpy(ev + 0x12, &u, 2); memcpy(ev + 0x14, &down, 4); ev[0x1c] = 1;
+			hidq_put(0, ev, sz);
+		} else if (m[0] == 2) {                                      // puntero absoluto
+			uint32_t sz = 0x30, ty = 17, btn = (uint32_t)m[3]; opt = 1;   // kIOHIDEventOptionIsAbsolute
+			double x = (double)m[1] / (FB_W - 1), y = (double)m[2] / (FB_H - 1), z = 0;
+			if (x < 0) x = 0; if (x > 1) x = 1; if (y < 0) y = 0; if (y > 1) y = 1;
+			memcpy(ev, &sz, 4); memcpy(ev + 4, &ty, 4); memcpy(ev + 8, &opt, 4);
+			memcpy(ev + 0x10, &x, 8); memcpy(ev + 0x18, &y, 8); memcpy(ev + 0x20, &z, 8); memcpy(ev + 0x28, &btn, 4);
+			hidq_put(1, ev, sz);
+		} else if (m[0] == 3) {                                      // rueda (líneas)
+			uint32_t sz = 0x1c, ty = 6; int32_t fx = m[1] * 65536, fy = m[2] * 65536, fz = 0;
+			memcpy(ev, &sz, 4); memcpy(ev + 4, &ty, 4); memcpy(ev + 8, &opt, 4);
+			memcpy(ev + 0x10, &fx, 4); memcpy(ev + 0x14, &fy, 4); memcpy(ev + 0x18, &fz, 4);
+			hidq_put(1, ev, sz);
+		}
+		if (io_trace_on()) logf_("    iokit: entrada %d %d %d %d\n", m[0], m[1], m[2], m[3]);
+	}
+	return NULL;
+}
+// Memoria de la cola (connect_map_memory tipo 0): la primera vez arranca el hilo que recibe de tahoe-view.
+static uint8_t* hidq_map(int ent) {
+	pthread_mutex_lock(&hidq_lock);
+	int k = -1;
+	for (int i = 0; i < 2; i++) if (hidq[i].ent == ent) k = i;
+	uint8_t* m = k >= 0 ? hidq[k].mem : NULL;
+	if (k >= 0 && !m) {
+		m = mmap(NULL, HIDQ_SIZE + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (m == MAP_FAILED) m = NULL;
+		else { uint32_t qs = HIDQ_SIZE; memcpy(m, &qs, 4); hidq[k].mem = m; }   // tras la cola, el apéndice (versión 0)
+	}
+	static int started;
+	int start = m && !started;
+	if (start) started = 1;
+	pthread_mutex_unlock(&hidq_lock);
+	if (start) {
+		pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+		pthread_t th; pthread_create(&th, &at, hid_input_thread, NULL);
+	}
+	return m;
+}
+static int32_t uc_hidev(struct uc_call* c) {
+	*c->noutband = 0; *c->nsout = 0;
+	int k = hidq_of(c->ent);
+	switch (c->selector) {
+	case 0: case 1:                                                    // open(opciones) / close(opciones)
+		if (k >= 0) { pthread_mutex_lock(&hidq_lock); hidq[k].open = c->selector == 0; pthread_mutex_unlock(&hidq_lock); }
+		return 0;
+	case 3: return 0;                                                  // setElementValue (LED de mayúsculas...): sin efecto
+	default: return kIOReturnUnsupported;                              // copyEvent / copyMatchingEvent: no hay estado que dar
 	}
 }
 // LiveFS (AppleLIFSUserClient): fskitd registra con él sus puertos al arrancar. El kext no está (su código va en la colección
@@ -1616,6 +1756,7 @@ static uc_method_fn uc_hook_for(const char* cls) {
 	if (!strcmp(cls, "AppleSMC")) return uc_smc;
 	if (!strcmp(cls, "com_apple_filesystems_lifs")) return uc_lifs;
 	if (!strcmp(cls, "IOHIDSystem")) return uc_hid;
+	if (!strcmp(cls, "IOHIDEventDriver")) return uc_hidev;
 	return NULL;
 }
 
@@ -2054,7 +2195,13 @@ static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* re
 	}
 	case 2816: if (self && self->kind == K_CONNECT) self->closed = 1; return rp_err(rep, h, KERN_SUCCESS_);
 	case 2817: if (!self || self->kind != K_CONNECT) return rp_err(rep, h, kIOReturnBadArgument); return reply_port(rep, h, ent_handle(self->ent), 17);
-	case 2820: case 2867: return rp_err(rep, h, KERN_SUCCESS_);                         // add_client / set_notification_port
+	case 2867:                                                                          // set_notification_port(tipo, puerto, ref)
+		if (self && self->kind == K_CONNECT && q.nport) {
+			int k = hidq_of(self->ent);
+			if (k >= 0) { pthread_mutex_lock(&hidq_lock); hidq[k].port = q.port[0]; pthread_mutex_unlock(&hidq_lock); }
+		}
+		return rp_err(rep, h, KERN_SUCCESS_);
+	case 2820: return rp_err(rep, h, KERN_SUCCESS_);                                    // add_client
 	case 2863: {                                                                        // io_connect_map_memory_into_task
 		if (!self || self->kind != K_CONNECT || self->closed) return rp_err(rep, h, kIOReturnNoDevice);
 		rq_ndr(&q); uint32_t mtype = rq_u32(&q); uint64_t addr = rq_u64(&q), size = rq_u64(&q); uint32_t flags = rq_u32(&q);
@@ -2063,6 +2210,13 @@ static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* re
 			uint8_t* m = hid_map(); if (!m) return rp_err(rep, h, kIOReturnNoMemory);
 			size_t n = reply_begin(rep, h, KERN_SUCCESS_);
 			uint64_t a = (uint64_t)m, sz = HID_SHM_SIZE; (void)size;
+			memcpy(rep + n, &a, 8); memcpy(rep + n + 8, &sz, 8);
+			return n + 16;
+		}
+		if (!strcmp(io_e[self->ent].cls, "IOHIDEventDriver") && mtype == 0) {   // la cola de eventos
+			uint8_t* m = hidq_map(self->ent); if (!m) return rp_err(rep, h, kIOReturnNoMemory);
+			size_t n = reply_begin(rep, h, KERN_SUCCESS_);
+			uint64_t a = (uint64_t)m, sz = HIDQ_SIZE + 12 + 28;           // cabecera, cola y apéndice {versión, mensaje}
 			memcpy(rep + n, &a, 8); memcpy(rep + n + 8, &sz, 8);
 			return n + 16;
 		}

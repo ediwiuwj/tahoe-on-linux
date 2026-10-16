@@ -5,17 +5,20 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 **En pausa desde el 14 de octubre de 2026.** Cómo retomarlo: README, «Cómo retomarlo».
 
 ## Por dónde seguir
-1. **Teclado y ratón** (punto 8 de abajo): ya se ve la pantalla de inicio de sesión (usuario y campo de contraseña,
-   a los ~8 minutos de arrancar). Falta poder escribir la contraseña: WindowServer recibe la entrada de hidd
-   (IOHIDEventSystem), que busca servicios `IOHIDEventService` en IOKit y lee sus eventos de una cola compartida
-   (IOHIDEventServiceUserClient). Plan: publicar un teclado y un puntero absoluto (como la tableta USB de QEMU) y que
-   tahoe-view mande las teclas y el ratón a esa cola.
+1. **Iniciar sesión y llegar al escritorio**: ya se puede escribir la contraseña en la pantalla de inicio de sesión
+   desde tahoe-view (teclado y ratón hechos). Siguiente: ver qué pasa tras iniciar sesión (Dock, Finder, escritorio).
 2. **`diskutil list` en la Recovery** se cuelga a veces (mucho menos tras arreglar los hilos de cola): mirar con
    `tools/diag/discos.sh`.
 3. Lo demás, en la lista de abajo.
 
 
 ## Hecho recientemente
+- **Teclado y ratón.** En macOS el sistema de eventos HID vive en WindowServer, que busca en IOKit los servicios con
+  `HIDServiceSupport`. tahoe-run publica un teclado y un puntero (IOHIDEventDriver) con su IOHIDEventServiceUserClient:
+  la cola de eventos es un IODataQueue compartido y cada evento un IOHIDSystemQueueElement (formatos de IOHIDFamily,
+  y la disposición de teclado, puntero y rueda medida en IOKit.framework). tahoe-view manda las teclas (por posición
+  física: la distribución la pone macOS), la posición absoluta del ratón, los botones y la rueda por
+  `/dev/shm/tahoe-input-<id>`; `tools/diag/entrada.py` hace lo mismo desde la terminal para probar.
 - **Pantalla de inicio de sesión visible.** Tres arreglos: (1) los hilos de cola encolaban dos trabajos para un solo
   hilo libre, y si el primero se bloqueaba llamando al propio proceso el segundo no salía nunca (configd se quedaba sin
   responder y con él diskarbitrationd, StorageKit, diskutil y SecurityAgent); (2) la respuesta del núcleo emulado en
@@ -151,7 +154,7 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    relanzados en bucle: cryptexd, watchdogd, diskmanagementstartup, triald_system, cupsd. Muchas preferencias de
    `/Library/Preferences` y de root se guardan vacías (0 bytes): loginwindow, dock, CoreGraphics... (¿cfprefsd?
    `fcntl F_PREALLOCATE` no está implementado).
-8. **Teclado, ratón y sonido** dentro de macOS (después de ver el escritorio). Sonido: coreaudiod ya arranca y `say`
+8. **Sonido** dentro de macOS (teclado y ratón ya funcionan, ver «Hecho recientemente»). coreaudiod ya arranca y `say`
    termina, pero no hay tarjeta de sonido: hace falta un dispositivo de audio que macOS vea como propio y que mande el
    sonido a PipeWire/PulseAudio del PC (para oír un vídeo, `say`...).
 9. **Detalles**:
