@@ -39,10 +39,17 @@
 // Un puerto puede estar en varios conjuntos a la vez (XNU lo permite y CFRunLoop lo usa: mete el puerto con el que se
 // despierta un runloop en el conjunto de cada uno de sus modos). Con uno solo, el último insert_member se lo quitaba al
 // conjunto en que esperaba el hilo y el aviso no llegaba (NSTask -waitUntilExit no volvía: system_profiler con csrutil).
-#define NSETS 8
+// XNU no pone límite: con 8, loginwindow (un modo de runloop por cada cosa que espera) se quedaba sin sitio al terminar de
+// arrancar AppKit y abortaba («Unable to insert wake up port into port set»), y WindowServer se cerraba con él.
+// La lista va compactada (sin huecos: los nombres primero, luego ceros) para que mirar un puerto sin conjuntos cueste poco.
+#define NSETS 32
 struct sport { uint32_t name, sets[NSETS], head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; uint32_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; uint32_t spn; uint8_t me; };   // me: entrada de memoria (mach_make_memory_entry), ver mer_add_locked   // spn: peticiones MACH_NOTIFY_SEND_POSSIBLE pendientes en shm->sp (para no recorrer la tabla si no hay)   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
-static int in_set(const struct sport* p, uint32_t set) { for (int j = 0; j < NSETS; j++) if (p->sets[j] == set) return 1; return 0; }
-static void set_remove(struct sport* p, uint32_t set) { for (int j = 0; j < NSETS; j++) if (p->sets[j] == set) p->sets[j] = 0; }
+static int in_set(const struct sport* p, uint32_t set) { for (int j = 0; j < NSETS && p->sets[j]; j++) if (p->sets[j] == set) return 1; return 0; }
+static void set_remove(struct sport* p, uint32_t set) {
+	int n = 0;
+	for (int j = 0; j < NSETS && p->sets[j]; j++) if (p->sets[j] != set) p->sets[n++] = p->sets[j];
+	for (int j = n; j < NSETS && p->sets[j]; j++) p->sets[j] = 0;
+}
 struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint64_t spill; uint8_t data[MSGSZ - 40]; };   // sauid/sasid: sesión de auditoría del remitente   // spill: datos fuera de línea en un archivo aparte (nucleo_desborde_*), 0 = en la ranura
 // Derechos que el núcleo tiene que vigilar para avisar cuando muere su dueño (ver "notificaciones" más abajo):
 //  sonce: un proceso tiene un derecho send-once (normalmente, la respuesta que debe a quien le pidió algo);
@@ -1113,6 +1120,8 @@ static long t_insert_member(struct ctx* c) {
 		if (in_set(p, st->name)) r = 17;                                 // KERN_ALREADY_IN_SET
 		else { r = 3; for (int j = 0; j < NSETS; j++) if (!p->sets[j]) { p->sets[j] = st->name; st->count += p->count; r = KERN_OK; break; } }   // 3: KERN_NO_SPACE
 	}
+	if (r) logf_("    insert_member <%d>: 0x%x en 0x%x -> %ld (puerto %s, conjunto %s)\n", (int)getpid(), (uint32_t)c->a[1], (uint32_t)c->a[2], r,
+		p ? "existe" : "no existe", st ? (st->is_set ? "existe" : "no es conjunto") : "no existe");
 	unlock();
 	return r;
 }

@@ -5,14 +5,19 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 **En pausa desde el 14 de octubre de 2026.** Cómo retomarlo: README, «Cómo retomarlo».
 
 ## Por dónde seguir
-1. **Pantalla (punto 4 de abajo)**: WindowServer ya abre el framebuffer y dibuja el cursor, pero no compone el
-   escritorio. Seguir qué le falta para dibujar el fondo o la ventana del Asistente (`tools/tahoe-view`,
-   `tools/diag/captura.py`).
+1. **Pantalla (punto 4 de abajo)**: WindowServer rellena la pantalla de negro y dibuja el cursor, pero la ventana de
+   inicio de sesión no aparece. loginwindow pasa los primeros ~7 min esperando a lsd, que en cada arranque vuelve a
+   registrar todos los programas (en el disco mecánico tarda; su base de datos sí se guarda). Seguir qué hace
+   loginwindow después (`tools/diag/pantalla.sh`, `tools/diag/hang.sh`).
 2. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
 3. Lo demás, en la lista de abajo.
 
 
 ## Hecho recientemente
+- loginwindow ya no se cae al terminar de arrancar: un puerto podía estar en 8 conjuntos como mucho y loginwindow (un modo
+  de runloop por cada cosa que espera) necesitaba más; abortaba con «Unable to insert wake up port into port set» y
+  WindowServer se cerraba con él, en bucle. Ahora 32. Con eso WindowServer y loginwindow aguantan 15 minutos seguidos.
+  Nueva herramienta: `tools/diag/pantalla.sh` (arranca, guarda la pantalla cada N s y dice qué programas gráficos viven).
 - /dev/shm ya no se llena: las entradas de memoria (`mach_make_memory_entry`) se borran cuando nadie tiene ya derechos
   de envío, como en XNU. lsd crea una de 1,5 MB por cada cliente que pide su base de datos y en ~2 min llenaba /dev/shm
   (2,3 GB): launchd moría por SIGBUS y con él todo el macOS (también el «WindowServer no está vivo» de algunas pruebas).
