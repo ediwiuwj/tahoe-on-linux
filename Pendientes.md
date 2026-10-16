@@ -5,18 +5,22 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 **En pausa desde el 14 de octubre de 2026.** Cómo retomarlo: README, «Cómo retomarlo».
 
 ## Por dónde seguir
-1. **Pantalla (punto 4 de abajo)**: loginwindow ya llega a pedir la ventana de inicio de sesión (SecurityAgent arranca y
-   trabaja), pero WindowServer aborta en cuanto hay una ventana que presentar: en macOS 26 las ventanas se presentan con
-   IOPresentment, que necesita un dispositivo de presentación (AppleGraphicsDeviceControl + IOAccelerator +
-   IOPresentmentClient, «display pipe»). El framebuffer clásico solo le sirve para el fondo y el cursor. Siguiente:
-   emular ese dispositivo de presentación (primera pieza del driver gráfico propio, punto 5): que acepte las superficies
-   que compone WindowServer y las copie a la memoria de vídeo. El primer fallo es `ioPresentmentOpenServiceForID` con el
-   ID de registro del framebuffer. Registros útiles: `log show` de WindowServer/loginwindow/SecurityAgent dentro de macOS.
+1. **Pantalla (punto 4 de abajo)**: WindowServer ya compone por software en el framebuffer (se ve el puntero del ratón) y
+   loginwindow, SecurityAgent y WindowServer aguantan sin caerse. Falta que se pinte la ventana de inicio de sesión: el
+   compositor de CoreAnimation espera «vallas» (fences) y «lotes» de cada commit que no se liberan («timed out fence»,
+   «timed out batch» en `log show` de WindowServer). Se liberan con el aviso MACH_NOTIFY_NO_SENDERS cuando el cliente
+   suelta su derecho de envío; hoy el aviso solo sale cuando muere el proceso. En curso: contar los derechos de envío de
+   cada proceso (urefs) para avisar al soltar el último. CoreDisplay sigue marcando la pantalla «offline» al arrancar
+   (IOPresentment no encuentra dispositivo) pero no impide componer.
 2. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
 3. Lo demás, en la lista de abajo.
 
 
 ## Hecho recientemente
+- WindowServer ya no se cae y dibuja: devolvía 0 como puerto en `MACH_RCV_LARGE_IDENTITY` (CoreAnimation reintentaba en
+  el puerto 0 y abortaba), faltaba `mach_port_extract_right` (loginwindow, SecurityAgent y cualquier app abortaban al
+  mostrar su primera ventana: «Assertion failed: (scheduled)»), y la tabla de puertos de todo el sistema (8192) se llenaba
+  a los pocos minutos de arrancar la parte gráfica (ahora 32768, recorriendo solo lo usado).
 - Camino hasta la ventana de inicio de sesión: loginwindow ya no intenta lanzar el Asistente de configuración
   (`/.resolve/<opciones>/ruta`, la sintaxis de XNU con la que el Asistente mira `.AppleSetupDone`, no se entendía),
   `proc_listpids` implementado, `ptrace(PT_DENY_ATTACH)` aceptado (SecurityAgent salía con «Unable to deny attach»),
