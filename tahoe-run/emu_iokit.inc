@@ -1545,6 +1545,8 @@ static int32_t uc_iosurface(struct uc_call* c) {
 		if (!e->used || e->id != id) return kIOReturnNotFound;
 		return sf_fill(e, c->outband, want, c->noutband);
 	}
+	case 0x29: return 0;                                               // IOSurfaceSharedEventRemoveEventListener: no hay
+	                                                                   // oyentes (SecurityAgent abortaba si fallaba)
 	case 0xd: {
 		uint8_t info[0x28] = { 0 };
 		uint16_t one = 1; memcpy(info + 0x22, &one, 2);

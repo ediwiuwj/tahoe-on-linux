@@ -288,5 +288,6 @@ void emu_fs2_init(void) {
 	reg_bsd(124, bsd_fchmod); reg_bsd(123, bsd_fchown); reg_bsd(201, bsd_ftruncate); reg_bsd(95, bsd_fsync);
 	reg_bsd(131, bsd_flock); reg_bsd(89, bsd_getdtablesize); reg_bsd(120, bsd_readv); reg_bsd(121, bsd_writev);
 	reg_bsd(138, bsd_utimes); reg_bsd(286, bsd_gettid); reg_bsd(79, bsd_getgroups); reg_bsd(93, bsd_select); reg_bsd(394, bsd_pselect);
+	reg_bsd(203, bsd_ok); reg_bsd(204, bsd_ok);                 // mlock/munlock: sin intercambio a disco, no hay que fijar nada
 	reg_bsd(80, bsd_ok); reg_bsd(23, bsd_ok); reg_bsd(181, bsd_ok); reg_bsd(182, bsd_ok); reg_bsd(183, bsd_ok);
 }
