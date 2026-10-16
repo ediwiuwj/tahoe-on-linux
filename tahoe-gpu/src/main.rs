@@ -9,6 +9,8 @@
 //! - `tahoe-gpu metallib <archivo>`: las funciones de una biblioteca de shaders de Metal (tipo, versión AIR, bitcode).
 //! - `tahoe-gpu extraer <archivo> <función> <salida.bc>`: el bitcode AIR de una función (para mirarlo con llvm-dis).
 //! - `tahoe-gpu air <archivo> [función]`: lee el AIR de las funciones (todas o una) y resume cada punto de entrada.
+//! - `tahoe-gpu traducir <archivo> [función|-] [carpeta]`: traduce a SPIR-V (todas o una); con carpeta, guarda cada
+//!   `<función>.spv` (para spirv-val y spirv-dis).
 
 mod air;
 mod informe;
@@ -25,8 +27,9 @@ fn main() {
         "metallib" => listar_metallib(std::env::args().nth(2)),
         "extraer" => extraer(std::env::args().skip(2).collect()),
         "air" => leer_air(std::env::args().skip(2).collect()),
+        "traducir" => traducir(std::env::args().skip(2).collect()),
         _ => {
-            eprintln!("uso: tahoe-gpu informe | prueba | metallib <archivo> | extraer <archivo> <función> <salida.bc> | air <archivo> [función]");
+            eprintln!("uso: tahoe-gpu informe | prueba | metallib <archivo> | extraer <archivo> <función> <salida.bc> | air <archivo> [función] | traducir <archivo> [función] [carpeta]");
             std::process::exit(2);
         }
     };
@@ -85,6 +88,11 @@ fn leer_air(a: Vec<String>) -> vk::Res<()> {
                 for e in air::entradas(&m) {
                     println!("{:?} {}: {}", e.etapa, m.functions[e.funcion].name, air::resumen(&m, e.funcion));
                     if a.len() > 1 {
+                        let fcs = air::fc::constantes(&m);
+                        if !fcs.is_empty() {
+                            println!("    {} function constants; constructor sin valores: {}", fcs.len(),
+                                match air::fc::especializar(&m, &Default::default()) { Ok(_) => "bien".to_string(), Err(e) => e });
+                        }
                         for x in &e.argumentos {
                             println!("    arg {} {} {:?}", x.indice, x.clase, x.datos);
                         }
@@ -101,5 +109,51 @@ fn leer_air(a: Vec<String>) -> vk::Res<()> {
         }
     }
     println!("{bien} funciones leídas, {mal} con error");
+    Ok(())
+}
+
+fn traducir(a: Vec<String>) -> vk::Res<()> {
+    let ruta = a.first().ok_or("uso: traducir <archivo> [función|-] [carpeta]")?;
+    let solo = a.get(1).filter(|x| *x != "-");
+    let carpeta = a.get(2);
+    let d = std::fs::read(ruta).map_err(|e| format!("{ruta}: {e}"))?;
+    let b = metallib::Biblioteca::leer(&d)?;
+    let (mut bien, mut mal) = (0, 0);
+    let mut errores: std::collections::BTreeMap<String, usize> = Default::default();
+    for f in b.funciones.iter().filter(|f| solo.is_none_or(|n| *n == f.nombre)) {
+        let r = air::ir::leer(b.bitcode(f)?).and_then(|m| {
+            let e = air::entradas(&m).into_iter().next().ok_or("sin punto de entrada")?;
+            air::spirv::traducir(&m, &e, &Default::default())
+        });
+        match r {
+            Ok(t) => {
+                bien += 1;
+                if let Some(c) = carpeta {
+                    let bytes: Vec<u8> = t.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    std::fs::write(format!("{c}/{}.spv", f.nombre), bytes).map_err(|e| e.to_string())?;
+                }
+                if solo.is_some() {
+                    println!("{} ({:?}): {} palabras, {} bloques{}", f.nombre, t.etapa, t.spirv.len(), t.bloques, if t.maquina_de_estados { " (máquina de estados)" } else { "" });
+                    for e in &t.enlaces {
+                        println!("    binding {}: {:?}", e.binding, e.recurso);
+                    }
+                }
+            }
+            Err(e) => {
+                mal += 1;
+                if solo.is_some() {
+                    println!("ERROR {}: {e}", f.nombre);
+                }
+                let clave: String = e.split(" (en ").next().unwrap_or(&e).chars().take(90).collect();
+                *errores.entry(clave).or_default() += 1;
+            }
+        }
+    }
+    println!("{bien} traducidas, {mal} con error");
+    let mut v: Vec<_> = errores.into_iter().collect();
+    v.sort_by(|x, y| y.1.cmp(&x.1));
+    for (e, n) in v.iter().take(25) {
+        println!("  {n:4}  {e}");
+    }
     Ok(())
 }

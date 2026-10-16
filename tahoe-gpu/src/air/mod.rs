@@ -2,7 +2,13 @@
 //! `!air.kernel`, `!air.vertex` y `!air.fragment` dicen qué funciones son puntos de entrada y qué es cada argumento:
 //! `!{i32 índice, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", ...}`.
 
+pub mod fc;
+pub mod inline;
+pub mod interp;
 pub mod ir;
+pub mod layout;
+pub mod sccp;
+pub mod spirv;
 
 use ir::{Const, Md, Module, Type, ValueKind};
 
@@ -18,6 +24,8 @@ pub enum Etapa {
 pub enum Dato {
     Txt(String),
     Int(i64),
+    /// La global de un predicado de function constant (`!{ptr @__metal_implicit_fc_pred_N, !"bool", !"nombre"}`).
+    Pred(usize),
     Otro,
 }
 
@@ -48,6 +56,13 @@ impl Descripcion {
             _ => None,
         }
     }
+    /// Los datos sin el predicado de function constant del principio (si lo hay).
+    pub fn propios(&self) -> &[Dato] {
+        match self.datos.first() {
+            Some(Dato::Txt(t)) if t == "air.function_constant" => self.datos.get(2..).unwrap_or(&[]),
+            _ => &self.datos,
+        }
+    }
     pub fn tiene(&self, clave: &str) -> bool {
         self.datos.iter().any(|d| *d == Dato::Txt(clave.to_string()))
     }
@@ -69,6 +84,11 @@ fn dato(m: &Module, i: Option<usize>) -> Dato {
         Some(Md::Value(_, v)) => match m.values.get(*v).map(|x| &x.kind) {
             Some(ValueKind::Const(Const::Int(n))) => Dato::Int(*n as i64),
             Some(ValueKind::Const(Const::Null)) => Dato::Int(0),
+            Some(ValueKind::Global(g)) => Dato::Pred(*g),
+            _ => Dato::Otro,
+        },
+        Some(Md::Node(ops)) => match ops.first().copied().flatten().map(|o| dato(m, Some(o))) {
+            Some(Dato::Pred(g)) => Dato::Pred(g),
             _ => Dato::Otro,
         },
         _ => Dato::Otro,
@@ -86,11 +106,20 @@ fn descripciones(m: &Module, nodo: Option<usize>) -> Vec<Descripcion> {
                 Some(Dato::Int(v)) => *v,
                 _ => -1,
             };
-            let (clase, resto) = match (datos.first(), datos.get(1)) {
+            let (mut clase, mut resto) = match (datos.first(), datos.get(1)) {
                 (Some(Dato::Int(_)), Some(Dato::Txt(c))) => (c.clone(), datos[2..].to_vec()),
                 (Some(Dato::Txt(c)), _) => (c.clone(), datos[1..].to_vec()),
                 _ => (String::new(), datos.clone()),
             };
+            // !"air.function_constant", !{predicado}, !"air.<clase real>", ...: la clase es la real y el predicado
+            // queda en los datos (como Pred)
+            if clase == "air.function_constant" {
+                if let Some(Dato::Txt(c)) = resto.get(1).cloned() {
+                    clase = c;
+                    let pred = resto[0].clone();
+                    resto = std::iter::once(Dato::Txt("air.function_constant".into())).chain(std::iter::once(pred)).chain(resto[2..].iter().cloned()).collect();
+                }
+            }
             Some(Descripcion { indice, clase, datos: resto })
         })
         .collect()
