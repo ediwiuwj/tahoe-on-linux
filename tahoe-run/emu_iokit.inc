@@ -1257,7 +1257,9 @@ static int32_t uc_gpuwrangler(struct uc_call* c) {
 			uint16_t id = 1; memcpy(e, &id, 2);
 			uint32_t fl = 0x10; memcpy(e + 4, &fl, 4);              // integrada
 			uint64_t rg = io_e[gpu].id, ra = acc >= 0 ? io_e[acc].id : 0, nfb = fb >= 0, rfb = fb >= 0 ? io_e[fb].id : 0;
-			memcpy(e + 0x10, &rg, 8); memcpy(e + 8, ra ? &ra : &rg, 8);
+			// +8 es el AGDC (AppleGraphicsDeviceControl): sin acelerador no hay ninguno (0). Con el ID de la GPU ahí,
+			// CoreDisplay intentaba presentar con IOPresentment, fallaba y dejaba la pantalla desconectada (offline).
+			memcpy(e + 0x10, &rg, 8); memcpy(e + 8, &ra, 8);
 			memcpy(e + 0x18, &nfb, 8); memcpy(e + 0x20, &rfb, 8);
 		}
 		if (c->ool_out && c->ool_out_size >= sizeof list) {
