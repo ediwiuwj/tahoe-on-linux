@@ -1023,7 +1023,7 @@ static long bsd_bsdthread_ctl(struct ctx* c) {
 static __thread sigjmp_buf thr_exit, wq_park;
 static __thread int thr_exit_ok, wq_park_ok, wq_terminated;
 extern void guest_thread_done(void);
-struct new_thread { uint64_t pthread, func, arg, stack, flags; };
+struct new_thread { uint64_t pthread, func, arg, stack, flags; uint32_t kport; };
 extern void enter_guest_thread(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((noreturn));
 static void* thread_main(void* p) {
 	struct new_thread t = *(struct new_thread*)p;
@@ -1031,10 +1031,8 @@ static void* thread_main(void* p) {
 	// Como XNU: base de GS en el TSD del hilo, se avisa con TSD_BASE_SET y se retira SUSPENDED (libpthread lo exige).
 	{ FILE* f = fopen("/dev/shm/tahoe-watch-func", "r"); unsigned long fn = 0; if (f) { if (fscanf(f, "%lx", &fn) != 1) fn = 0; fclose(f); } g_watch = fn && fn == t.func; }
 	uint64_t flags = t.flags & ~0x20000000u;
-	uint32_t kport = alloc_port();
+	uint32_t kport = t.kport;
 	if (mach_trace()) logf_("    THR <%d:%ld> puerto de hilo 0x%x func=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), kport, t.func);
-	// cada hilo tiene su propio nombre de puerto (os_unfair_lock lo usa como dueño)
-	if (mach_thread_self_offset) *(uint32_t*)(t.pthread + tsd_offset + mach_thread_self_offset) = kport;   // el kernel deja aquí el puerto del hilo (relativo al TSD)
 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, t.pthread + tsd_offset); flags |= 0x10000000u; }
 	if (sigsetjmp(thr_exit, 1) == 0) {
 		thr_exit_ok = 1;
@@ -1047,6 +1045,11 @@ static long bsd_bsdthread_create(struct ctx* c) {
 	struct new_thread* t = malloc(sizeof *t);
 	if (!t) return -D_ENOMEM;
 	*t = (struct new_thread){ .pthread = c->a[3], .func = c->a[0], .arg = c->a[1], .stack = c->a[2], .flags = c->a[4] };
+	// Cada hilo tiene su propio nombre de puerto (os_unfair_lock lo usa como dueño). Como XNU, queda en el TSD del
+	// pthread antes de volver: pthread_join lo mira, y si el hilo aún no había arrancado lo daba por terminado (volvía en
+	// el acto, liberaba la pila y el hilo nuevo caía al arrancar sobre ella).
+	t->kport = alloc_port();
+	if (mach_thread_self_offset) safe_write(t->pthread + tsd_offset + mach_thread_self_offset, &t->kport, 4);
 	pthread_attr_t at; pthread_attr_init(&at);
 	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
 	pthread_attr_setstacksize(&at, 1 << 20);
