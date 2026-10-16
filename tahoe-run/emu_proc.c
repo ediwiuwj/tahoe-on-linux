@@ -562,7 +562,9 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
 	tahoe_selector_set(sel);
 }
 void diag_breakpoints(void) {
-	if (!diag_target()) return;
+	// en el proceso de /dev/shm/tahoe-stacks, o en los de /dev/shm/tahoe-brk-who sin el resto del diagnóstico (que
+	// ralentiza mucho: WindowServer no llegaba en 15 minutos a donde se quería mirar)
+	if (!diag_target() && !names_match("/dev/shm/tahoe-brk-who")) return;
 	tahoe_sigaction(SIGRTMIN + 4, on_dump);                     // volcados de hilos a petición (SIGRTMIN+5, ver on_dump_all)
 	tahoe_sigaction(SIGRTMIN + 5, on_dump_all);
 	FILE* f = fopen("/dev/shm/tahoe-break", "r");

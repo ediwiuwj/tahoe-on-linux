@@ -14,6 +14,7 @@
 #   SR='<proc>...'    en esos procesos, cada cambio en la cuenta de derechos de envío (SR: puerto, quién, ±n, total)
 #   CONSOLA=1         lo que se escribe en /dev/console (launchd anota ahí sus errores) se imprime al final
 #   BRK='dir dir...'  int3 en esas direcciones (hex) del proceso de STACKS: registra los registros al pasar (BRK)
+#   BRKP='<proc>...'  los BRK en esos procesos en vez de en el de STACKS (sin el resto del diagnóstico, que ralentiza)
 #   PEEK='expr...'    con BRK: lee 8 bytes en cada dirección o registro+desplazamiento (p. ej. rdi+0x50); con * delante
 #                     (*rcx+0x10) muestra además el texto al que apunta ese valor (cadenas C, CFString constantes)
 #   TAHOE_RUN=<bin>   otro binario de tahoe-run (comparar versiones)
@@ -21,7 +22,7 @@
 #                     recoveryosd no reinicia si falla, para poder seguir mirando)
 DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
-rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stacks /dev/shm/tahoe-stacks-all /dev/shm/tahoe-mach-trace /dev/shm/tahoe-wl-trace /dev/shm/tahoe-iokit-trace /dev/shm/tahoe-console /dev/shm/tahoe-ns-trace /dev/shm/tahoe-sr-trace
+rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stacks /dev/shm/tahoe-stacks-all /dev/shm/tahoe-mach-trace /dev/shm/tahoe-wl-trace /dev/shm/tahoe-iokit-trace /dev/shm/tahoe-console /dev/shm/tahoe-ns-trace /dev/shm/tahoe-sr-trace /dev/shm/tahoe-brk-who
 [ -n "$STACKS" ] && echo "$STACKS" > /dev/shm/tahoe-stacks
 [ -n "$ALL" ] && touch /dev/shm/tahoe-stacks-all
 [ -n "$MACH" ] && touch /dev/shm/tahoe-mach-trace
@@ -31,6 +32,7 @@ rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stack
 [ -n "$SR" ] && echo "$SR" > /dev/shm/tahoe-sr-trace
 [ -n "$CONSOLA" ] && : > /dev/shm/tahoe-console
 [ -n "$BRK" ] && printf "%s\n" $BRK > /dev/shm/tahoe-break
+[ -n "$BRKP" ] && echo "$BRKP" > /dev/shm/tahoe-brk-who
 [ -n "$PEEK" ] && printf "%s\n" $PEEK > /dev/shm/tahoe-peek
 G="${TMPDIR:-/tmp}/tahoe-guard.log"; g0=$(wc -l < "$G" 2>/dev/null || echo 0)
 TAHOE_RUN="${TAHOE_RUN:-}" TAHOE_LOGFILE="$D/msh.log" TAHOE_BOOT_WAIT="${2:-12}" timeout -s TERM -k 5 "${3:-60}" \
