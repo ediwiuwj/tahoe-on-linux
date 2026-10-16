@@ -714,6 +714,13 @@ static long bsd_abort_with_payload(struct ctx* c) {
 	show_frames(c);
 	_exit(134);
 }
+// os_fault_with_payload(espacio, código, carga, tamaño, motivo, banderas): un fallo que se informa sin terminar (libxpc,
+// LaunchServices...). Se anota como abort_with_payload y se sigue.
+static long bsd_os_fault_with_payload(struct ctx* c) {
+	show_payload("os_fault_with_payload", c->a[0], c->a[1], c->a[2], c->a[3], c->a[4]);
+	show_frames(c);
+	return 0;
+}
 static long bsd_terminate_with_payload(struct ctx* c) {
 	show_payload("terminate_with_payload", c->a[1], c->a[2], c->a[3], c->a[4], c->a[5]);
 	show_frames(c);
@@ -895,7 +902,7 @@ static long bsd_shared_region_check_np(struct ctx* c) {
 static bsd_fn bsd_table[BSD_NAMES_N] = {
 	[1] = bsd_exit, [3] = bsd_read, [4] = bsd_write, [6] = bsd_close, [20] = bsd_getpid,
 	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [454] = bsd_system_override, [336] = bsd_proc_info,
-	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_reboot, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
+	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_reboot, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload, [529] = bsd_os_fault_with_payload,
 };
 
 

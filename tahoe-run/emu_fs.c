@@ -240,6 +240,39 @@ static long bsd_access(struct ctx* c) {
 	int raw; if (emu_disk_node(p, &raw) >= 0) return ((int)c->a[1] & 1) ? -13 /* EACCES */ : 0;   // discos emulados: rw para root, no x
 	RET(access(resolve(p, b, sizeof b), (int)c->a[1] & 7));          // R_OK/W_OK/X_OK/F_OK coinciden
 }
+// access_extended(entradas, tamaño, resultados, uid) = accessx_np: varias comprobaciones de una vez. Las entradas son
+// struct accessx_descriptor { u32 desplazamiento del nombre; i32 permisos; i32 relleno[2]; } seguidas de los nombres; un
+// desplazamiento 0 repite el nombre anterior y el del primero marca dónde acaban los descriptores. Cada resultado es 0 o
+// un errno. Los permisos extendidos (_READ_OK, _WRITE_OK, _DELETE_OK...) se reducen a leer/escribir/ejecutar. LaunchServices
+// (lsd) lo usa al servir a sus clientes; sin él lanzaba un os_fault y no terminaba de guardar su base de datos.
+static long bsd_access_extended(struct ctx* c) {
+	uint64_t base = c->a[0], size = c->a[1], out = c->a[2];
+	if (size < 16 || size > 65536) return -D_EINVAL;
+	uint8_t* buf = malloc(size + 1);
+	if (!buf) return -D_ENOMEM;
+	if (safe_read(base, buf, size) != (ssize_t)size) { free(buf); return -D_EFAULT; }
+	buf[size] = 0;
+	uint32_t first; memcpy(&first, buf, 4);
+	size_t n = first / 16;
+	if (!n || first > size) { free(buf); return -D_EINVAL; }
+	const char* name = NULL;
+	for (size_t i = 0; i < n; i++) {
+		uint32_t off; int32_t fl; memcpy(&off, buf + i * 16, 4); memcpy(&fl, buf + i * 16 + 4, 4);
+		if (off) { if (off >= size) { free(buf); return -D_EINVAL; } name = (const char*)buf + off; }
+		int mode = fl & 7;
+		if (fl & ((1 << 9) | (1 << 15) | (1 << 17) | (1 << 19))) mode |= R_OK;                       // _READ/_RATTR/_REXT/_RPERM
+		if (fl & ((1 << 10) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 16) | (1 << 18) | (1 << 20) | (1 << 21))) mode |= W_OK;
+		if (fl & (1 << 11)) mode |= X_OK;                                                                  // _EXECUTE_OK
+		char b[4200]; int32_t res = 0;
+		if (!name) res = 2;                                                                                // ENOENT
+		else if (access(resolve(name, b, sizeof b), mode) != 0) res = darwin_errno(errno);
+		if (safe_write(out + i * 4, &res, 4) != 4) { free(buf); return -D_EFAULT; }
+	}
+	free(buf);
+	return 0;
+}
+// quotactl: sin cuotas de disco (como APFS): ENOTSUP. lsd lo pregunta miles de veces mientras guarda su base de datos.
+static long bsd_quotactl(struct ctx* c) { (void)c; return -45; }
 // faccessat(dirfd, ruta, modo, flags): como access, con dirfd (AT_FDCWD de Darwin = -2) para rutas relativas. Flags de
 // Darwin: AT_EACCESS 0x10, AT_SYMLINK_NOFOLLOW 0x20 (y _ANY 0x800); en Linux AT_EACCESS 0x200 y AT_SYMLINK_NOFOLLOW 0x100,
 // que solo admite faccessat2. Lo usan su (PAM) y lwp-request.
@@ -1258,6 +1291,25 @@ static size_t pack_bulk_entry(uint8_t* o, uint32_t common, uint32_t file, const 
 }
 
 // getattrlistbulk(fd, attrlist*, búfer, tamaño, opciones): devuelve cuántas entradas empaquetó (0 = fin).
+// fgetattrlist(fd, attrlist, buf, tamaño, opciones): getattrlist con la ruta del descriptor (la que da F_GETPATH sin
+// firmlinks). Antes el número 228 llevaba a fsetattrlist: quien leía atributos de un archivo abierto no recibía nada (y se
+// intentaba escribir lo que hubiera en su búfer).
+static long bsd_fgetattrlist(struct ctx* c) {
+	char link[64], path[4096];
+	snprintf(link, sizeof link, "/proc/thread-self/fd/%d", (int)c->a[0]);
+	ssize_t n = readlink(link, path, sizeof path - 1);
+	if (n < 0) return err();
+	path[n] = 0;
+	if (path[0] != '/') return -D_EINVAL;                          // tubería, socket...: sin ruta
+	const char* p = path;
+	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+	if (rl && !strncmp(path, tahoe_root, rl) && (path[rl] == '/' || path[rl] == '\0')) p = path[rl] ? path + rl : "/";
+	static __thread char gp[4400];
+	snprintf(gp, sizeof gp, "%s", p);
+	struct ctx c2 = *c;
+	c2.a[0] = (uint64_t)(uintptr_t)gp;                             // mismos argumentos que getattrlist, con la ruta en a[0]
+	return bsd_getattrlist(&c2);
+}
 static long bsd_getattrlistbulk(struct ctx* c) {
 	int fd = (int)c->a[0];
 	uint32_t al[6] = { 0 };
@@ -1539,13 +1591,13 @@ void emu_fs_xattr_init(void) {
 void emu_fs_init(void) {
 	reg_bsd(73, bsd_munmap);   reg_bsd(74, bsd_mprotect); reg_bsd(75, bsd_madvise); reg_bsd(197, bsd_mmap);
 	reg_bsd(199, bsd_lseek);   reg_bsd(153, bsd_pread);   reg_bsd(154, bsd_pwrite);
-	reg_bsd(33, bsd_access); reg_bsd(466, bsd_faccessat);   reg_bsd(58, bsd_readlink); reg_bsd(473, bsd_readlinkat); reg_bsd(92, bsd_fcntl);
+	reg_bsd(33, bsd_access); reg_bsd(466, bsd_faccessat); reg_bsd(284, bsd_access_extended); reg_bsd(165, bsd_quotactl);   reg_bsd(58, bsd_readlink); reg_bsd(473, bsd_readlinkat); reg_bsd(92, bsd_fcntl);
 	reg_bsd(338, bsd_stat64);  reg_bsd(339, bsd_fstat64); reg_bsd(340, bsd_lstat64);
 	reg_bsd(24, bsd_getuid);   reg_bsd(25, bsd_geteuid);  reg_bsd(47, bsd_getgid); reg_bsd(43, bsd_getegid);
 	reg_bsd(381, bsd_mac_syscall);
 	reg_bsd(347, bsd_getfsstat64); reg_bsd(345, bsd_statfs64); reg_bsd(346, bsd_fstatfs64); reg_bsd(426, bsd_mac_getfsstat);
 	reg_bsd(167, bsd_mount); reg_bsd(424, bsd_mount); reg_bsd(526, bsd_fmount); reg_bsd(159, bsd_unmount); reg_bsd(164, bsd_funmount);
-	reg_bsd(242, bsd_fsctl); reg_bsd(220, bsd_getattrlist); reg_bsd(12, bsd_chdir); reg_bsd(13, bsd_fchdir); reg_bsd(344, bsd_getdirentries64); reg_bsd(461, bsd_getattrlistbulk);
+	reg_bsd(242, bsd_fsctl); reg_bsd(220, bsd_getattrlist); reg_bsd(228, bsd_fgetattrlist); reg_bsd(12, bsd_chdir); reg_bsd(13, bsd_fchdir); reg_bsd(344, bsd_getdirentries64); reg_bsd(461, bsd_getattrlistbulk);
 	reg_bsd(41, bsd_dup);      reg_bsd(90, bsd_dup2);     reg_bsd(470, bsd_fstatat64);
 	reg_bsd(463, bsd_openat); reg_bsd(464, bsd_openat);   /* openat_nocancel */     reg_bsd(427, bsd_fsgetpath);
 }

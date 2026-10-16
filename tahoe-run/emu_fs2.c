@@ -172,7 +172,11 @@ static long setattr_common(const char* hp, int nofollow, uint64_t alp, uint64_t 
 	uint32_t al[6];
 	if (safe_read(alp, al, sizeof al) != (ssize_t)sizeof al) return -D_EFAULT;
 	uint32_t common = al[1];
-	const uint32_t known = 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x10000 | 0x20000 | 0x40000 | 0x10000000;
+	// también EXTENDED_SECURITY (ACL), UUID, GRPUUID y DATA_PROTECT_FLAGS (clase de protección): se aceptan sin efecto (en
+	// Linux no hay ACL de macOS ni cifrado por archivo). lsd los fija al guardar su base de datos; con EINVAL no la guardaba
+	// y volvía a registrar todas las apps en cada arranque.
+	const uint32_t known = 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x10000 | 0x20000 | 0x40000 |
+	                       0x400000 | 0x800000 | 0x1000000 | 0x10000000 | 0x40000000;
 	if (al[2] || al[3] || al[4] || al[5] || (common & ~known)) {
 		logf_("    setattrlist: atributos no modificables common=0x%x vol=0x%x dir=0x%x file=0x%x fork=0x%x\n", common, al[2], al[3], al[4], al[5]);
 		return -D_EINVAL;
@@ -194,7 +198,11 @@ static long setattr_common(const char* hp, int nofollow, uint64_t alp, uint64_t 
 	if (common & 0x10000) { NEED(4); memcpy(&gid, b + o, 4); o += 4; }  // GRPID
 	if (common & 0x20000) { NEED(4); memcpy(&mode, b + o, 4); o += 4; } // ACCESSMASK
 	if (common & 0x40000) { NEED(4); memcpy(&flags, b + o, 4); o += 4; }// FLAGS
+	if (common & 0x400000) { NEED(8); o += 8; }                         // EXTENDED_SECURITY (attrreference_t)
+	if (common & 0x800000) { NEED(16); o += 16; }                       // UUID
+	if (common & 0x1000000) { NEED(16); o += 16; }                      // GRPUUID
 	if (common & 0x10000000) { NEED(16); o += 16; }                     // ADDEDTIME
+	if (common & 0x40000000) { NEED(4); o += 4; }                       // DATA_PROTECT_FLAGS
 #undef NEED
 #undef TS
 	struct stat st;
@@ -278,7 +286,7 @@ static long bsd_poll(struct ctx* c) {
 void emu_fs2_init(void) {
 	reg_bsd(230, bsd_poll); reg_bsd(417, bsd_poll);   // poll / poll_nocancel
 	reg_bsd(465, bsd_renameat); reg_bsd(488, bsd_renameatx); reg_bsd(472, bsd_unlinkat); reg_bsd(475, bsd_mkdirat);
-	reg_bsd(221, bsd_setattrlist); reg_bsd(228, bsd_fsetattrlist); reg_bsd(524, bsd_setattrlistat);
+	reg_bsd(221, bsd_setattrlist); reg_bsd(229, bsd_fsetattrlist); reg_bsd(524, bsd_setattrlistat);
 	reg_bsd(474, bsd_symlinkat); reg_bsd(467, bsd_fchmodat); reg_bsd(468, bsd_fchownat); reg_bsd(471, bsd_linkat);
 	reg_bsd(136, bsd_mkdir); reg_bsd(137, bsd_rmdir); reg_bsd(10, bsd_unlink); reg_bsd(15, bsd_chmod);
 	reg_bsd(364, bsd_lchown); reg_bsd(34, bsd_chflags); reg_bsd(35, bsd_fchflags);   // lchown; chflags/fchflags (auditon está en emu_cred.c)
