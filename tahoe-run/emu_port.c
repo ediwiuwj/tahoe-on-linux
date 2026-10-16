@@ -32,8 +32,12 @@
 // TAHOE_PORTS) con la tabla de puertos y las colas de mensajes. Un nombre de puerto es global: el mismo número
 // designa el mismo puerto en cualquier proceso. El dueño del derecho de recepción es quien lo creó; para despertar
 // a su epoll (EVFILT_MACHPORT) cada puerto tiene un socket de datagramas con nombre abstracto.
-#define MAXPORTS 8192                // para todo el sistema (unos 170 procesos en el arranque)
-#define NBUCKET 16384                // índice por nombre: cubeta = (nombre >> 8) % NBUCKET, cadenas por hnext
+// Para todo el sistema. Con 8192, al arrancar la parte gráfica (WindowServer, loginwindow, SecurityAgent, ctkahp...) se
+// llenaba a los pocos minutos y todo lo que pedía un puerto abortaba («Unable to allocate mach port»); en un macOS real
+// hay decenas de miles. Los recorridos de la tabla llegan solo hasta la marca más alta usada (shm->hiwater): el coste
+// sigue siendo el de los puertos en uso, no el del tamaño de la tabla.
+#define MAXPORTS 32768
+#define NBUCKET 32768                // índice por nombre: cubeta = (nombre >> 8) % NBUCKET, cadenas por hnext
 #define MAXMSG   4096                    // ranuras de mensaje (archivo disperso: solo ocupan RAM las usadas)
 #define MSGSZ    (64 * 1024)
 // Un puerto puede estar en varios conjuntos a la vez (XNU lo permite y CFRunLoop lo usa: mete el puerto con el que se
@@ -63,10 +67,10 @@ struct sonce { uint32_t port; int32_t holder; };
 struct dnreq { uint32_t port, notify; int32_t pid; uint32_t armado; };   // armado: solo SEND_POSSIBLE (ver port_request_notification)
 struct sproc { int32_t pid; uint64_t start; };
 // shold: un proceso que no es el dueño tiene un derecho de envío a un puerto (para MACH_NOTIFY_NO_SENDERS, ver más abajo).
-#define MAXSH 8192
+#define MAXSH 32768                    // con 8192 se llenaba igual que la de puertos; recorridos hasta shm->sh_hw
 struct shold { uint32_t port; int32_t holder; };
 // Objetos del núcleo con nombre de puerto (tareas de otros procesos, tokens de identidad...): el nombre lleva a su tipo y pid.
-#define MAXKOBJ 1024
+#define MAXKOBJ 4096                   // 1024 se quedaba corto con la parte gráfica (más de 1000 en uso a los 10 min)
 struct skobj { uint32_t name; uint16_t type; int32_t pid; };
 // Mapeos hechos por otro proceso en esta tarea (mach_vm_map con la tarea de otro como destino): Linux no puede mapear en otro
 // proceso, así que se reserva un hueco en una zona común (RMAP_BASE) y el destino lo mapea él mismo al primer acceso.
@@ -83,6 +87,8 @@ struct srmap { int32_t pid; int32_t prot; uint64_t addr, len, off; char path[96]
 struct shm {
 	uint32_t lk, cv;                      // candado y espera compartidos (nucleo/src/candado.rs)
 	uint32_t next_name, free_head, magic, special[8];
+	uint32_t hiwater;                     // 1 + el índice más alto de ports[] que se ha usado (nunca baja)
+	uint32_t sh_hw;                       // lo mismo para sh[]
 	struct sport ports[MAXPORTS];
 	int32_t bucket[NBUCKET];              // índice+1 del primer puerto de cada cubeta (0 = vacía)
 	struct mslot msgs[MAXMSG];
@@ -238,13 +244,13 @@ static void puertos_de(int32_t pid) {
 	char ejemplos[120] = "";
 	uint32_t recientes[6] = { 0 };
 	lock();
-	for (int i = 0; i < MAXPORTS; i++) {
+	for (int i = 0; i < (int)shm->hiwater; i++) {
 		struct sport* q = &shm->ports[i];
 		if (!q->used || q->rpid != pid) continue;
 		n++;
 		ns += q->nsreq != 0; sets += q->is_set; queued += q->count > 0; msgs += (int)q->count; pd += q->pdreq != 0; insets += q->sets[0] != 0;
 		int h = 0, vivos = 0;
-		for (int j = 0; j < MAXSH; j++) if (shm->sh[j].port == q->name) { h++; if (kill(shm->sh[j].holder, 0) == 0 || errno != ESRCH) vivos++; }
+		for (int j = 0; j < (int)shm->sh_hw; j++) if (shm->sh[j].port == q->name) { h++; if (kill(shm->sh[j].holder, 0) == 0 || errno != ESRCH) vivos++; }
 		held += h > 0; solo_muertos += h > 0 && !vivos; ns_sin += q->nsreq && !h;
 		if (!q->nsreq && !h && !q->is_set) {                        // ejemplos: los 6 de nombre más alto (los más recientes)
 			sin_ns_ni_usuarios++;
@@ -260,14 +266,14 @@ uint32_t port_create(int is_set) {
 	uint32_t name = alloc_port();
 	lock();
 	struct sport* p = NULL;
-	for (int i = 0; i < MAXPORTS; i++) if (!shm->ports[i].used) { p = &shm->ports[i]; break; }
+	for (int i = 0; i < MAXPORTS; i++) if (!shm->ports[i].used) { p = &shm->ports[i]; if ((uint32_t)i >= shm->hiwater) shm->hiwater = (uint32_t)i + 1; break; }
 	if (!p) {
 		// Diagnóstico (una vez por proceso): quién tiene los puertos. rpid = dueño del derecho de recepción.
 		static int dumped;
 		if (!dumped) {
 			dumped = 1;
 			static int pid[1024], cnt[1024]; int np = 0; memset(cnt, 0, sizeof cnt);
-			for (int i = 0; i < MAXPORTS; i++) {
+			for (int i = 0; i < (int)shm->hiwater; i++) {
 				int r = shm->ports[i].rpid, k;
 				for (k = 0; k < np && pid[k] != r; k++) {}
 				if (k == np && np < 1024) { pid[np] = r; np++; }
@@ -373,7 +379,8 @@ static void flush_notes(void) {
 
 static void sh_put_locked(uint32_t port, int32_t holder) {
 	int fr = -1;
-	for (int i = 0; i < MAXSH; i++) { if (shm->sh[i].port == port && shm->sh[i].holder == holder) return; if (fr < 0 && !shm->sh[i].port) fr = i; }
+	for (int i = 0; i < (int)shm->sh_hw; i++) { if (shm->sh[i].port == port && shm->sh[i].holder == holder) return; if (fr < 0 && !shm->sh[i].port) fr = i; }
+	if (fr < 0 && shm->sh_hw < MAXSH) fr = (int)shm->sh_hw++;
 	if (fr >= 0) shm->sh[fr] = (struct shold){ port, holder };
 	else logf_("    no-senders: tabla llena\n");
 }
@@ -490,7 +497,7 @@ static void msg_rights_locked(const uint8_t* m, uint32_t size, int mode, uint32_
 // si no, se descartan los mensajes y se avisa a quien pidió DEAD_NAME.
 static void destroy_locked(struct sport* p) {
 	uint32_t name = p->name;
-	for (int i = 0; i < MAXSH; i++) if (shm->sh[i].port == name) shm->sh[i].port = 0;   // ya no hay a quién avisar
+	for (int i = 0; i < (int)shm->sh_hw; i++) if (shm->sh[i].port == name) shm->sh[i].port = 0;   // ya no hay a quién avisar
 	if (p->pdreq && !p->is_set) {
 		uint32_t to = p->pdreq; p->pdreq = 0;
 		p->owner = 0;                                         // en tránsito hacia quien pidió el aviso
@@ -507,7 +514,7 @@ static void destroy_locked(struct sport* p) {
 		p->me = 0;
 	}
 	int i = port_index(p);
-	for (int k = 0; k < MAXPORTS; k++) if (shm->ports[k].used) set_remove(&shm->ports[k], name);
+	for (int k = 0; k < (int)shm->hiwater; k++) if (shm->ports[k].used) set_remove(&shm->ports[k], name);
 	for (int j = 0; j < NSETS; j++) if (p->sets[j]) { struct sport* st = find_locked(p->sets[j]); if (st && st->count >= p->count) st->count -= p->count; }
 	bucket_del_locked(p);
 	p->used = 0;                                              // antes de recorrer: un descriptor no puede volver a destruirlo
@@ -565,20 +572,20 @@ static int muerto(int32_t pid) { return pid > 0 && kill(pid, 0) != 0 && errno ==
 static void ocupacion(void) {
 	int np = 0, npm = 0, nsh = 0, nshm = 0, nk = 0, nkm = 0, nx = 0, nxm = 0, ndn = 0, ndnm = 0, nso = 0, nsom = 0;
 	lock();
-	for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used) { np++; npm += muerto(shm->ports[i].owner); }
-	for (int i = 0; i < MAXSH; i++) if (shm->sh[i].port) { nsh++; nshm += muerto(shm->sh[i].holder); }
+	for (int i = 0; i < (int)shm->hiwater; i++) if (shm->ports[i].used) { np++; npm += muerto(shm->ports[i].owner); }
+	for (int i = 0; i < (int)shm->sh_hw; i++) if (shm->sh[i].port) { nsh++; nshm += muerto(shm->sh[i].holder); }
 	for (int i = 0; i < MAXKOBJ; i++) if (shm->kobjs[i].name) { nk++; nkm += muerto(shm->kobjs[i].pid); }
 	for (int i = 0; i < MAXEXECW; i++) if (shm->execw[i].port) { nx++; nxm += muerto(shm->execw[i].target); }
 	for (int i = 0; i < MAXDN; i++) if (shm->dn[i].port) { ndn++; ndnm += muerto(shm->dn[i].pid); }
 	for (int i = 0; i < MAXSO; i++) if (shm->so[i].port) { nso++; nsom += muerto(shm->so[i].holder); }
 	// los 6 procesos que más puertos reciben y los 6 que más derechos de envío anotados tienen
 	static int32_t pp[1024], ph[1024]; static int cp[1024], ch[1024]; int npp = 0, nph = 0;
-	for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used) {
+	for (int i = 0; i < (int)shm->hiwater; i++) if (shm->ports[i].used) {
 		int k; for (k = 0; k < npp && pp[k] != shm->ports[i].rpid; k++) {}
 		if (k == npp) { if (npp == 1024) continue; pp[npp] = shm->ports[i].rpid; cp[npp++] = 0; }
 		cp[k]++;
 	}
-	for (int i = 0; i < MAXSH; i++) if (shm->sh[i].port) {
+	for (int i = 0; i < (int)shm->sh_hw; i++) if (shm->sh[i].port) {
 		int k; for (k = 0; k < nph && ph[k] != shm->sh[i].holder; k++) {}
 		if (k == nph) { if (nph == 1024) continue; ph[nph] = shm->sh[i].holder; ch[nph++] = 0; }
 		ch[k]++;
@@ -614,13 +621,14 @@ static void* reaper_thread(void* arg) {
 		// Se recoge hasta 256 pids distintos por vuelta, empezando donde se quedó la anterior: con más de 256 dueños en la
 		// tabla, los del final nunca se revisaban y sus puertos y derechos no se limpiaban al morir.
 		static int cursor;
-		int j0 = cursor;
-		for (int j = 0; j < MAXPORTS + MAXSO + MAXMER && np < 256; j++) {
-			int i = (j0 + j) % (MAXPORTS + MAXSO + MAXMER);
-			cursor = (i + 1) % (MAXPORTS + MAXSO + MAXMER);
-			int32_t pid = i < MAXPORTS ? (shm->ports[i].used ? shm->ports[i].owner : 0)
-				: i < MAXPORTS + MAXSO ? (shm->so[i - MAXPORTS].port ? shm->so[i - MAXPORTS].holder : 0)
-				: (shm->mer[i - MAXPORTS - MAXSO].port ? shm->mer[i - MAXPORTS - MAXSO].pid : 0);
+		const int hw = (int)shm->hiwater, total = hw + MAXSO + MAXMER;   // los puertos, solo hasta la marca
+		int j0 = cursor < total ? cursor : 0;
+		for (int j = 0; j < total && np < 256; j++) {
+			int i = (j0 + j) % total;
+			cursor = (i + 1) % total;
+			int32_t pid = i < hw ? (shm->ports[i].used ? shm->ports[i].owner : 0)
+				: i < hw + MAXSO ? (shm->so[i - hw].port ? shm->so[i - hw].holder : 0)
+				: (shm->mer[i - hw - MAXSO].port ? shm->mer[i - hw - MAXSO].pid : 0);
 			if (pid <= 1) continue;                           // launchd (1) no muere sin llevarse todo
 			int seen = 0; for (int k = 0; k < np; k++) if (pids[k] == pid) { seen = 1; break; }
 			if (seen) continue;
@@ -639,16 +647,16 @@ static void* reaper_thread(void* arg) {
 			for (int i = 0; i < MAXDN; i++) if (shm->dn[i].port && shm->dn[i].pid == pid) shm->dn[i].port = 0;
 			for (int i = 0; i < MAXMER; i++) if (shm->mer[i].port && shm->mer[i].pid == pid) mer_add_locked(shm->mer[i].port, pid, -shm->mer[i].refs);
 			for (int i = 0; i < MAXSP; i++) if (shm->sp[i].port && shm->sp[i].pid == pid) { struct sport* q = find_locked(shm->sp[i].port); if (q && q->spn) q->spn--; shm->sp[i].port = 0; }
-			for (int i = 0; i < MAXSH; i++) {                     // sus derechos de envío desaparecen: ¿queda alguien más?
+			for (int i = 0; i < (int)shm->sh_hw; i++) {                     // sus derechos de envío desaparecen: ¿queda alguien más?
 				if (!shm->sh[i].port || shm->sh[i].holder != pid) continue;
 				uint32_t port = shm->sh[i].port; shm->sh[i].port = 0;
 				int others = 0;
-				for (int j = 0; j < MAXSH && !others; j++) if (shm->sh[j].port == port) others = 1;
+				for (int j = 0; j < (int)shm->sh_hw && !others; j++) if (shm->sh[j].port == port) others = 1;
 				struct sport* q = others ? NULL : find_locked(port);
 				if (q && q->nsreq) { note_locked(q->nsreq, 70, q->nsmscount); q->nsreq = 0; }   // el aviso consume la petición
 			}
-			if (mach_trace()) for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used && shm->ports[i].owner == pid) logf_("    recolector: 0x%x era de %d (rpid %d)\n", shm->ports[i].name, (int)pid, (int)shm->ports[i].rpid);
-			for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used && shm->ports[i].owner == pid) { destroy_locked(&shm->ports[i]); nrecv++; }
+			if (mach_trace()) for (int i = 0; i < (int)shm->hiwater; i++) if (shm->ports[i].used && shm->ports[i].owner == pid) logf_("    recolector: 0x%x era de %d (rpid %d)\n", shm->ports[i].name, (int)pid, (int)shm->ports[i].rpid);
+			for (int i = 0; i < (int)shm->hiwater; i++) if (shm->ports[i].used && shm->ports[i].owner == pid) { destroy_locked(&shm->ports[i]); nrecv++; }
 			logf_("    recolector: pid %d murió (%d derechos de recepción, %d respuestas pendientes)\n", (int)pid, nrecv, nso);
 		}
 		unlock();
@@ -787,7 +795,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 		if (!p) { unlock(); return waited ? MACH_RCV_PORT_DIED_ : MACH_RCV_INVALID_NAME_; }
 		struct sport* src = NULL;
 		if (!p->is_set) src = p->count ? p : NULL;
-		else for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used && shm->ports[i].count && in_set(&shm->ports[i], name)) { src = &shm->ports[i]; break; }
+		else for (int i = 0; i < (int)shm->hiwater; i++) if (shm->ports[i].used && shm->ports[i].count && in_set(&shm->ports[i], name)) { src = &shm->ports[i]; break; }
 		if (src) {
 			uint32_t idx = src->head;
 			struct mslot* q = &shm->msgs[idx - 1];
@@ -1057,7 +1065,7 @@ int port_unguard(uint32_t name, uint64_t guard) {
 int port_list_owned(uint32_t* names, uint32_t* types, int max) {
 	int n = 0;
 	lock();
-	for (int i = 0; i < MAXPORTS && n < max; i++) {
+	for (int i = 0; i < (int)shm->hiwater && n < max; i++) {
 		struct sport* s = &shm->ports[i];
 		if (!s->used || s->rpid != (int32_t)getpid()) continue;
 		names[n] = s->name; types[n] = s->is_set ? (1u << 19) : ((1u << 17) | (1u << 16));
@@ -1550,7 +1558,7 @@ int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_
 		else {
 			*previous = p->nsreq; p->nsreq = notify; p->nsmscount = sync;
 			if (msg_trace()) {
-				int h = 0; for (int j = 0; j < MAXSH; j++) h += shm->sh[j].port == name;
+				int h = 0; for (int j = 0; j < (int)shm->sh_hw; j++) h += shm->sh[j].port == name;
 				logf_("    no-senders <%d>: pedido para 0x%x sync=%u aviso=0x%x usuarios anotados=%d dueño=%d\n", (int)getpid(), name, sync, notify, h, (int)p->owner);
 			}
 		}
