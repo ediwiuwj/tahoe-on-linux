@@ -448,6 +448,11 @@ static void io_nvram_boot(int opt) {
 #define FB_BPR    (FB_W * 4)
 #define FB_VRAM   (16u << 20)                           // 16 MiB: IOFBMemorySize
 #define FB_MODE   1                                     // IODisplayModeID del único modo
+// Clase del framebuffer: la genérica de Apple (la de un framebuffer sencillo sin driver de GPU, como en una máquina virtual).
+// Con «AppleIntelFramebuffer», CoreDisplay veía «Intel» en el nombre, daba la GPU por una Intel integrada y presentaba las
+// imágenes con IOPresentment, que exige acelerador (AGDC, IOAccelerator): WindowServer abortaba al mostrar la primera
+// ventana (la de inicio de sesión). Sin fabricante en el nombre usa el camino clásico del framebuffer.
+#define FB_CLASS  "IONDRVFramebuffer"
 // EDID 1.4 de un panel interno de 13,3" (286×179 mm) con el modo nativo como temporización detallada (CVT con borrado reducido:
 // 71 MHz, 1280+160 × 800+23). Fabricante "TAH" (no es un panel real).
 static void edid_make(uint8_t e[128]) {
@@ -485,7 +490,7 @@ static void display_props(int d) {
 	p_num(d, "DisplayVendorID", 0x5028, 32);
 	p_num(d, "DisplayProductID", 0x1280, 32);
 	p_num(d, "DisplaySerialNumber", 0, 32);
-	p_str(d, "IODisplayPrefsKey", "IOService:/AppleACPIPlatformExpert/PCI0/IGPU@20000/AppleIntelFramebuffer@0/display0/AppleDisplay-5028-1280");
+	p_str(d, "IODisplayPrefsKey", "IOService:/AppleACPIPlatformExpert/PCI0/IGPU@20000/" FB_CLASS "@0/display0/AppleDisplay-5028-1280");
 	p_num(d, "IODisplayConnectFlags", 0, 32);
 }
 
@@ -495,6 +500,11 @@ static void io_init(void) {
 	char gv[32] = "0x8086", gd[32] = "0x0a16", dmi[64] = "";
 	rd_sys("/sys/class/drm/card0/device/vendor", gv, sizeof gv);
 	rd_sys("/sys/class/drm/card0/device/device", gd, sizeof gd);
+	// TAHOE_GPU=vvvv:dddd: otra identidad PCI para la GPU emulada (p. ej. 1234:1111, la VGA estándar de una máquina virtual)
+	if (getenv("TAHOE_GPU") && strchr(getenv("TAHOE_GPU"), ':')) {
+		snprintf(gv, sizeof gv, "0x%.*s", (int)(strchr(getenv("TAHOE_GPU"), ':') - getenv("TAHOE_GPU")), getenv("TAHOE_GPU"));
+		snprintf(gd, sizeof gd, "0x%s", strchr(getenv("TAHOE_GPU"), ':') + 1);
+	}
 	rd_sys("/sys/class/dmi/id/product_name", dmi, sizeof dmi);
 	uint32_t vendor = (uint32_t)strtoul(gv, NULL, 0), device = (uint32_t)strtoul(gd, NULL, 0);
 	long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -608,7 +618,9 @@ static void io_init(void) {
 
 	int opt = ent_add(plat, "options", "IODTNVRAM", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(opt, "name", "options");
-	p_str(opt, "boot-args", "");                              // OSString, como IONVRAMCHRPHandler (las variables de texto son cadenas)
+	// OSString, como IONVRAMCHRPHandler (las variables de texto son cadenas). TAHOE_BOOTARGS: argumentos de arranque (los
+	// leen, p. ej., CoreDisplay y WindowServer: useIOP=0 para no usar IOPresentment, que exige una GPU con acelerador).
+	p_str(opt, "boot-args", getenv("TAHOE_BOOTARGS") ? getenv("TAHOE_BOOTARGS") : "");
 	// MLB y ROM en la NVRAM de Apple (las pone el firmware; OpenCore, en un Hackintosh): los de smbios.json si los hay.
 	{
 		const char* mlb = smbios("mlb", NULL), *rom = smbios("rom", NULL);
@@ -680,8 +692,8 @@ static void io_init(void) {
 	p_u32(gpu, "AAPL,ig-platform-id", 0x0a260006);                // Haswell móvil (HD 4400), como en las guías de Dortania
 	p_num(gpu, "IOPCIExpressCapabilities", 2, 32);
 	p_bool(gpu, "built-in", 1);
-	int accel = ent_add(gpu, "AppleIntelFramebuffer", "AppleIntelFramebuffer", "IORegistryEntry IOService IOFramebuffer", "0", PL_SERVICE, 1);
-	p_str(accel, "IOClass", "AppleIntelFramebuffer");
+	int accel = ent_add(gpu, FB_CLASS, FB_CLASS, "IORegistryEntry IOService IOFramebuffer", "0", PL_SERVICE, 1);
+	p_str(accel, "IOClass", FB_CLASS);
 	p_str(accel, "IOProviderClass", "IOPCIDevice");
 	fb_props(accel);
 	// Sin IOAccelerator: no hay driver Metal para esta GPU (la HD 4400 no tiene driver en macOS 26), y un acelerador sin
@@ -1237,7 +1249,7 @@ static int32_t uc_gpuwrangler(struct uc_call* c) {
 	case 0xa0000002: {
 		static uint8_t list[0x23bc];
 		memset(list, 0, sizeof list);
-		int gpu = ent_by_name_cls("IGPU", "IOPCIDevice"), fb = ent_by_name_cls("AppleIntelFramebuffer", "AppleIntelFramebuffer");
+		int gpu = ent_by_name_cls("IGPU", "IOPCIDevice"), fb = ent_by_name_cls(FB_CLASS, FB_CLASS);
 		int acc = ent_by_name_cls("IOAccelerator", "IOAccelerator");
 		if (gpu >= 0) {
 			uint32_t n = 1; memcpy(list, &n, 4);
@@ -1406,8 +1418,13 @@ static int32_t uc_fb(struct uc_call* c) {
 		return 0;
 	case 3: case 4: case 9: case 10: case 11: case 12: case 14: case 15: case 16: case 19: case 20:
 		return 0;                                                      // cambios de modo, cursor, gamma, CLUT, atributos: aceptados
-	case 21:                                                           // CoreDisplay::Framebuffer registra un búfer suyo de 0x20
-		return 0;                                                      // bytes (1, 0, dirección, tamaño): se acepta, queda a cero
+	case 21: {                                                         // CoreDisplay::Framebuffer registra un búfer suyo de 0x20
+		char hx[200] = ""; int o = 0;                                  // bytes (1, 0, dirección, tamaño): se acepta, queda a cero
+		for (uint32_t i = 0; i < c->ninband && i < 64 && o < (int)sizeof hx - 4; i++) o += snprintf(hx + o, sizeof hx - o, "%02x", ((const uint8_t*)c->inband)[i]);
+		logf_("    iokit: <%d> framebuffer selector 21: %u escalares (%lx %lx), entrada %uB %s, salida %uB\n", (int)getpid(), c->nsin,
+			c->nsin > 0 ? (unsigned long)c->sin[0] : 0UL, c->nsin > 1 ? (unsigned long)c->sin[1] : 0UL, c->ninband, hx, want);
+		return 0;
+	}
 	case 18: {                                                         // getAttribute(atributo)
 		uint32_t a = c->nsin ? (uint32_t)c->sin[0] : 0;
 		c->sout[0] = 0; *c->nsout = 1;
@@ -1579,7 +1596,7 @@ long io_user_client_trap(uint32_t port, uint32_t idx, const uint64_t* p) {
 }
 static uc_method_fn uc_hook_for(const char* cls) {
 	if (!strcmp(cls, "AppleGPUWrangler")) return uc_gpuwrangler;
-	if (!strcmp(cls, "AppleIntelFramebuffer")) return uc_fb;
+	if (!strcmp(cls, FB_CLASS)) return uc_fb;
 	if (!strcmp(cls, "IOSurfaceRoot")) return uc_iosurface;
 	if (!strcmp(cls, "IOWatchdog")) return uc_watchdog;
 	if (!strcmp(cls, "EndpointSecurityDriver")) return uc_es;
@@ -1846,9 +1863,27 @@ static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* re
 		return rp_props(rep, h, v, xml);
 	}
 	case 2828: case 2821: {                                                             // set_properties (entrada / conexión)
+		// Como el núcleo: las claves quedan en la entrada (en la del servicio, si llegan por una conexión). IOGraphicsLib guarda
+		// así la configuración del framebuffer (IOFBConfig: modos y temporizaciones) y CoreDisplay la relee; si se tiraba,
+		// CoreDisplay no encontraba modos, elegía el 0 y daba la pantalla por desconectada (componía en una virtual).
 		rq_ndr(&q);
-		int ok = h->id == 2821 || (ent >= 0 && !strcmp(io_e[ent].cls, "IODTNVRAM"));
-		size_t n = reply_begin(rep, h, KERN_SUCCESS_); int32_t res = ok ? 0 : kIOReturnNotPrivileged; memcpy(rep + n, &res, 4); return n + 4;
+		struct val* nv = rq_match_ool(&q);
+		int ok = ent >= 0 && nv && nv->t == V_DICT;
+		char keys[300] = ""; int o = 0;
+		if (ok) for (int i = 0; i < nv->cnt; i++) {
+			if (!io_e[ent].props) io_e[ent].props = v_new(V_DICT);
+			v_set(io_e[ent].props, nv->key[i], nv->kid[i]);
+			if (o < (int)sizeof keys - 40) o += snprintf(keys + o, sizeof keys - o, "%s%s", i ? " " : "", nv->key[i]);
+			if (io_trace_on()) {                                       // con la traza de IOKit, el contenido entero
+				struct sbuf xb = { 0 }; xml_ser(&xb, nv->kid[i]); sb_put(&xb, "", 1);
+				for (size_t k = 0; xb.p && k < xb.n; k += 900)           // en trozos: logf_ corta a 1 KB
+					logf_("    iokit: <%d> set_properties %s [%zu] = %.900s\n", (int)getpid(), nv->key[i], k, (char*)xb.p + k);
+				free(xb.p);
+			}
+		}
+		logf_("    iokit: <%d> set_properties (%s) en %s: %s\n", (int)getpid(), h->id == 2821 ? "conexión" : "entrada",
+			ent >= 0 ? io_e[ent].cls : "?", ok ? keys : "(no es un diccionario)");
+		size_t n = reply_begin(rep, h, KERN_SUCCESS_); int32_t res = ok || h->id == 2821 ? 0 : kIOReturnBadArgument; memcpy(rep + n, &res, 4); return n + 4;
 	}
 
 	// ---- iteradores
@@ -2019,7 +2054,7 @@ static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* re
 			memcpy(rep + n, &a, 8); memcpy(rep + n + 8, &sz, 8);
 			return n + 16;
 		}
-		if (!strcmp(io_e[self->ent].cls, "AppleIntelFramebuffer") && (mtype == 100 || mtype == 110 || mtype == 0)) {
+		if (!strcmp(io_e[self->ent].cls, FB_CLASS) && (mtype == 100 || mtype == 110 || mtype == 0)) {
 			uint8_t* m = mtype == 100 ? fb_cursor : fb_map();                   // 100 cursor compartido; 110/0 memoria de vídeo
 			if (!m) return rp_err(rep, h, mtype == 100 ? kIOReturnBadArgument : kIOReturnNoMemory);
 			size_t n = reply_begin(rep, h, KERN_SUCCESS_);

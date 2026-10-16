@@ -590,6 +590,7 @@ long bsd_sysctl(struct ctx* c) {
 				const char* v = e->sval;
 				if (e->mib[0] == CTL_HW && e->mib[1] == 2) v = smbios("modelo", v);   // hw.model
 				else if (!strcmp(e->name, "hw.target")) v = smbios_target(1);
+				else if (!strcmp(e->name, "kern.bootargs") && getenv("TAHOE_BOOTARGS")) v = getenv("TAHOE_BOOTARGS");   // como la NVRAM
 				return sc_out(c, v, strlen(v) + 1);
 			}
 			case K_LOADAVG: {                                   // struct loadavg { fixpt_t ldavg[3]; long fscale; }, FSCALE = 1 << 11

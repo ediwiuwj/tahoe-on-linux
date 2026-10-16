@@ -93,9 +93,11 @@ static size_t mig_make_memory_entry(const struct hdr* req, const uint8_t* m, uin
 	uint64_t len = round_up(size);
 	uint32_t port = port_create(0);
 	char path[128]; me_path(path, sizeof path, port);
+	uint32_t perm = 0; memcpy(&perm, m + 64, 4);
+	int named_create = (perm & 0x20000) != 0;                // MAP_MEM_NAMED_CREATE: memoria nueva (a cero), sin rango de origen
 	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-	int ok = fd >= 0 && ftruncate(fd, (off_t)len) == 0 && off != 0;
-	if (ok) {
+	int ok = fd >= 0 && len && ftruncate(fd, (off_t)len) == 0 && (off != 0 || named_create);
+	if (ok && !named_create) {
 		uint8_t* tmp = malloc(len);
 		memcpy(tmp, (void*)off, len);                           // lo que ya hubiera escrito el creador
 		if (pwrite(fd, tmp, len, 0) != (ssize_t)len) ok = 0;
@@ -104,7 +106,7 @@ static size_t mig_make_memory_entry(const struct hdr* req, const uint8_t* m, uin
 	}
 	if (fd >= 0) close(fd);
 	if (ok) port_me_created(port); else unlink(path);
-	if (mach_trace()) { uint32_t perm = 0; memcpy(&perm, m + 64, 4); logf_("    MT pid=%d make_memory_entry tamaño=0x%lx dir=0x%lx permiso=0x%x -> puerto 0x%x %s\n", (int)getpid(), size, off, perm, port, ok ? "ok" : "FALLO"); }
+	if (mach_trace()) { logf_("    MT pid=%d make_memory_entry tamaño=0x%lx dir=0x%lx permiso=0x%x -> puerto 0x%x %s\n", (int)getpid(), size, off, perm, port, ok ? "ok" : "FALLO"); }
 	if (!ok) return reply_begin(r, req, KERN_INVALID_ARG);
 	size_t n = reply_port(r, req, port, 17);
 	memcpy(r + n, NDR_LE, 8); memcpy(r + n + 8, &len, 8);

@@ -61,6 +61,9 @@ OSK_ENV=(); [ -r "$OSK" ] && OSK_ENV=(TAHOE_OSK_FILE="$(readlink -f "$OSK")")
 # repositorio. Sin ella, tahoe-run se presenta como un MacBookPro16,1 ficticio.
 SMBIOS="${TAHOE_SMBIOS_FILE:-$HOME/.config/tahoe-run/smbios.json}"
 [ -r "$SMBIOS" ] && OSK_ENV+=(TAHOE_SMBIOS_FILE="$(readlink -f "$SMBIOS")")
+# Argumentos de arranque de macOS (NVRAM boot-args y kern.bootargs), p. ej. TAHOE_BOOTARGS="useIOP=0".
+[ -n "$TAHOE_BOOTARGS" ] && OSK_ENV+=(TAHOE_BOOTARGS="$TAHOE_BOOTARGS")
+[ -n "$TAHOE_GPU" ] && OSK_ENV+=(TAHOE_GPU="$TAHOE_GPU")          # otra identidad PCI para la GPU emulada
 MACOS_ENV=(PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root USER=root LOGNAME=root SHELL=/bin/bash
 	TERM="${TERM:-xterm-256color}" LANG="${LANG:-es_ES.UTF-8}"
 	TAHOE_ROOT="$ROOT" TAHOE_CACHE_DIR="$CACHE" TAHOE_LOGFILE="$LOG" "${DEBUG_ENV[@]}" "${OSK_ENV[@]}")
