@@ -5,19 +5,25 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 **En pausa desde el 14 de octubre de 2026.** Cómo retomarlo: README, «Cómo retomarlo».
 
 ## Por dónde seguir
-1. **Pantalla (punto 4 de abajo)**: WindowServer compone por software en el framebuffer y loginwindow, SecurityAgent y
-   WindowServer aguantan sin caerse; SecurityAgent ya monta la interfaz de inicio de sesión (LoginUIKit) y las vallas de
-   CoreAnimation se liberan (aviso NO_SENDERS). Pero la pantalla sigue negra: CoreDisplay marca la pantalla principal
-   «offline» al arrancar (`AddCGXDisplayDeviceToDeviceList`: el estado del dispositivo no dice «online») y usa un
-   framebuffer virtual; SecurityAgent dice «window ... is not in any spaces» y WindowServer rechaza ventanas («cannot
-   order in untagged windows before login», quizá de «Installer Progress», que también arranca). Siguiente: averiguar de
-   dónde saca CoreDisplay el «online» de un IOFramebuffer sin IOPresentment (en marcha: punto de ruptura en
-   `reconfigureDisplays`, registro --info --debug de CoreDisplay).
-2. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
+1. **Pantalla (punto 4 de abajo)**: WindowServer compone por software en el framebuffer; loginwindow, SecurityAgent y
+   WindowServer aguantan; SecurityAgent monta la interfaz de inicio de sesión (LoginUIKit); la pantalla está online. Pero
+   WindowServer rechaza las ventanas antes del inicio de sesión: «App … cannot order in untagged windows before login»
+   (`CGXOrderWindowListSpaceSwitchOptions`: la ventana debe llevar `kCGSPermittedBeforeLoginTagBit`, bit 30 de sus
+   etiquetas, que cualquier conexión puede poner). Siguiente: saber qué app es (punto de ruptura en 0x7ff809551541,
+   `PEEK=~rax` da el nombre) y por qué no pone esa etiqueta.
+2. **`diskutil list` en la Recovery** se cuelga a menudo (hoy 2 de 3 veces, igual con el binario anterior): mirar con
+   `tools/diag/discos.sh`.
 3. Lo demás, en la lista de abajo.
 
 
 ## Hecho recientemente
+- LaunchServices (lsd) ya guarda su base de datos: antes no podía («could not write out system content database») y en
+  cada arranque volvía a registrar todas las apps (de 5 a 30 minutos de espera, y la pantalla de inicio llegaba cuando
+  quería). Causas: `fgetattrlist` estaba con el número de `fsetattrlist`, `setattrlist` rechazaba la clase de protección
+  y las ACL, y faltaban `access_extended` y `quotactl`. Quedan en la copia de macOS unos 200 temporales viejos
+  (`…/com.apple.LaunchServices.dv/*(xxxx~).csstore`, 1,3 GB) de cuando fallaba: se pueden borrar.
+- La pantalla no está «offline»: los mensajes «Setting offline display» de CoreDisplay son del orden de arranque; con
+  puntos de ruptura (BRKP) se ve que IOFBUpdateConnectState la da por conectada y MPInitScreen la pone online.
 - Aviso MACH_NOTIFY_NO_SENDERS al soltar el último derecho de envío (antes solo al morir el proceso): se cuentan los urefs
   de cada proceso, también los del receptor. WindowServer libera así las vallas de CoreAnimation (de ~85 plazos agotados
   a 5 en 25 minutos). Trazas nuevas en msh.sh: NS=1 y SR='<procesos>'.
