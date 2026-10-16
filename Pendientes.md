@@ -5,18 +5,22 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 **En pausa desde el 14 de octubre de 2026.** Cómo retomarlo: README, «Cómo retomarlo».
 
 ## Por dónde seguir
-1. **Pantalla (punto 4 de abajo)**: WindowServer ya compone por software en el framebuffer (se ve el puntero del ratón) y
-   loginwindow, SecurityAgent y WindowServer aguantan sin caerse. Falta que se pinte la ventana de inicio de sesión: el
-   compositor de CoreAnimation espera «vallas» (fences) y «lotes» de cada commit que no se liberan («timed out fence»,
-   «timed out batch» en `log show` de WindowServer). Se liberan con el aviso MACH_NOTIFY_NO_SENDERS cuando el cliente
-   suelta su derecho de envío; hoy el aviso solo sale cuando muere el proceso. En curso: contar los derechos de envío de
-   cada proceso (urefs) para avisar al soltar el último. CoreDisplay sigue marcando la pantalla «offline» al arrancar
-   (IOPresentment no encuentra dispositivo) pero no impide componer.
+1. **Pantalla (punto 4 de abajo)**: WindowServer compone por software en el framebuffer y loginwindow, SecurityAgent y
+   WindowServer aguantan sin caerse; SecurityAgent ya monta la interfaz de inicio de sesión (LoginUIKit) y las vallas de
+   CoreAnimation se liberan (aviso NO_SENDERS). Pero la pantalla sigue negra: CoreDisplay marca la pantalla principal
+   «offline» al arrancar (`AddCGXDisplayDeviceToDeviceList`: el estado del dispositivo no dice «online») y usa un
+   framebuffer virtual; SecurityAgent dice «window ... is not in any spaces» y WindowServer rechaza ventanas («cannot
+   order in untagged windows before login», quizá de «Installer Progress», que también arranca). Siguiente: averiguar de
+   dónde saca CoreDisplay el «online» de un IOFramebuffer sin IOPresentment (en marcha: punto de ruptura en
+   `reconfigureDisplays`, registro --info --debug de CoreDisplay).
 2. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
 3. Lo demás, en la lista de abajo.
 
 
 ## Hecho recientemente
+- Aviso MACH_NOTIFY_NO_SENDERS al soltar el último derecho de envío (antes solo al morir el proceso): se cuentan los urefs
+  de cada proceso, también los del receptor. WindowServer libera así las vallas de CoreAnimation (de ~85 plazos agotados
+  a 5 en 25 minutos). Trazas nuevas en msh.sh: NS=1 y SR='<procesos>'.
 - WindowServer ya no se cae y dibuja: devolvía 0 como puerto en `MACH_RCV_LARGE_IDENTITY` (CoreAnimation reintentaba en
   el puerto 0 y abortaba), faltaba `mach_port_extract_right` (loginwindow, SecurityAgent y cualquier app abortaban al
   mostrar su primera ventana: «Assertion failed: (scheduled)»), y la tabla de puertos de todo el sistema (8192) se llenaba
