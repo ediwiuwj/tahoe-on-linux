@@ -846,6 +846,7 @@ static long mach_msg2(struct ctx* c) {
 		uint32_t nm; memcpy(&nm, req + 32, 4);
 		port_release_send_once(nm);
 		kobj_release_thread(nm);                                  // puerto de un hilo de otro proceso (task_threads)
+		port_send_release(nm, -1);                                // para el aviso NO_SENDERS
 		n = reply_begin(rep, &h, KERN_SUCCESS_);
 		break;
 	}
@@ -1135,6 +1136,15 @@ static long mach_msg2(struct ctx* c) {
 		return MACH_RCV_TOO_LARGE;
 	}
 	if (safe_write(rbuf, rep, n + 8) != (ssize_t)(n + 8)) return MACH_RCV_INVALID_DATA_;
+	{   // derechos de envío que la respuesta da a este proceso (task_get_special_port...): cuentan para NO_SENDERS
+		uint32_t bits; memcpy(&bits, rep, 4);
+		if (bits & 0x80000000u) {
+			struct nucleo_desc d[16];
+			int nd = nucleo_descriptores(rep, (uint32_t)n, d, 16);
+			for (int i = 0; i < nd && i < 16; i++)
+				if ((d[i].clase == NUCLEO_PUERTO || d[i].clase == NUCLEO_PUERTO_GUARDA) && d[i].disp == 17 && d[i].nombre) port_send_got(d[i].nombre);
+		}
+	}
 	return MACH_MSG_SUCCESS;
 }
 

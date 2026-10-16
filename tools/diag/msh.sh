@@ -10,6 +10,8 @@
 #   MACH=1            traza de mensajes Mach, workloops e hilos de las colas (MT, WL, THR)
 #   WL=1              solo la de workloops (WL, WLQ, THR): para carreras que la traza Mach completa tapa
 #   IOK=1             traza de IOKit
+#   NS=1              cada aviso MACH_NOTIFY_NO_SENDERS: puerto, quién lo recibe y quién soltó el último derecho
+#   SR='<proc>...'    en esos procesos, cada cambio en la cuenta de derechos de envío (SR: puerto, quién, ±n, total)
 #   CONSOLA=1         lo que se escribe en /dev/console (launchd anota ahí sus errores) se imprime al final
 #   BRK='dir dir...'  int3 en esas direcciones (hex) del proceso de STACKS: registra los registros al pasar (BRK)
 #   PEEK='expr...'    con BRK: lee 8 bytes en cada dirección o registro+desplazamiento (p. ej. rdi+0x50); con * delante
@@ -19,12 +21,14 @@
 #                     recoveryosd no reinicia si falla, para poder seguir mirando)
 DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
-rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stacks /dev/shm/tahoe-stacks-all /dev/shm/tahoe-mach-trace /dev/shm/tahoe-wl-trace /dev/shm/tahoe-iokit-trace /dev/shm/tahoe-console
+rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stacks /dev/shm/tahoe-stacks-all /dev/shm/tahoe-mach-trace /dev/shm/tahoe-wl-trace /dev/shm/tahoe-iokit-trace /dev/shm/tahoe-console /dev/shm/tahoe-ns-trace /dev/shm/tahoe-sr-trace
 [ -n "$STACKS" ] && echo "$STACKS" > /dev/shm/tahoe-stacks
 [ -n "$ALL" ] && touch /dev/shm/tahoe-stacks-all
 [ -n "$MACH" ] && touch /dev/shm/tahoe-mach-trace
 [ -n "$WL" ] && touch /dev/shm/tahoe-wl-trace
 [ -n "$IOK" ] && touch /dev/shm/tahoe-iokit-trace
+[ -n "$NS" ] && touch /dev/shm/tahoe-ns-trace
+[ -n "$SR" ] && echo "$SR" > /dev/shm/tahoe-sr-trace
 [ -n "$CONSOLA" ] && : > /dev/shm/tahoe-console
 [ -n "$BRK" ] && printf "%s\n" $BRK > /dev/shm/tahoe-break
 [ -n "$PEEK" ] && printf "%s\n" $PEEK > /dev/shm/tahoe-peek

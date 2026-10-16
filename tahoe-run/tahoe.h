@@ -74,6 +74,8 @@ void emu_fs2_init(void);
 void emu_port_init(void);
 uint32_t port_create(int is_set);
 void port_me_created(uint32_t port);
+void port_send_got(uint32_t port);                 // derecho de envío recibido en una respuesta del núcleo (NO_SENDERS)
+void port_send_release(uint32_t port, int delta);  // deallocate (-1) / mod_refs de un derecho de envío
 void port_me_hold(uint32_t port, int32_t pid);
 // Códigos de mach_msg (osfmk/mach/message.h). Con sufijo _ para no chocar con definiciones locales.
 #define MACH_SEND_INVALID_DATA_  0x10000002
