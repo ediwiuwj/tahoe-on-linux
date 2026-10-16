@@ -7,8 +7,10 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 ## Por dónde seguir
 1. **Pantalla (punto 4 de abajo)**: WindowServer rellena la pantalla de negro y dibuja el cursor, pero la ventana de
    inicio de sesión no aparece. loginwindow pasa los primeros ~7 min esperando a lsd, que en cada arranque vuelve a
-   registrar todos los programas (en el disco mecánico tarda; su base de datos sí se guarda). Seguir qué hace
-   loginwindow después (`tools/diag/pantalla.sh`, `tools/diag/hang.sh`).
+   registrar todos los programas (en el disco mecánico tarda; su base de datos sí se guarda). A los 11 min loginwindow
+   sigue en `_LSCopyServerStore` esperando a lsd (pide la base de datos y lsd no responde). Siguiente: qué hace lsd a
+   los 10–11 min (`ESPERA=60 STACKS=lsd tools/diag/hang.sh true lsd 600`, con `/dev/shm/tahoe-msg-trace` = «lsd
+   loginwindow») y por qué rehace la base de datos en cada arranque.
 2. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
 3. Lo demás, en la lista de abajo.
 
@@ -117,7 +119,10 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    Metal a Vulkan con `ash`, shaders AIR→SPIR-V (`metal2vulkan`); primero la composición de WindowServer y CoreAnimation
    (Liquid Glass), después Metal 2 completo y lo que pida macOS de Metal 3 (ampliando `hasvk` de Mesa si hace falta).
 6. **Sesión gráfica**: con ella, `screencapture`, `osascript` y `pbcopy` (hoy se caen por no haber sesión).
-7. **Servicios que fallan al arrancar**: mobileassetd, softwareupdate.
+7. **Servicios que fallan al arrancar**: mobileassetd, softwareupdate; apsd se cae en bucle («ProductType» nil);
+   relanzados en bucle: cryptexd, watchdogd, diskmanagementstartup, triald_system, cupsd. Muchas preferencias de
+   `/Library/Preferences` y de root se guardan vacías (0 bytes): loginwindow, dock, CoreGraphics... (¿cfprefsd?
+   `fcntl F_PREALLOCATE` no está implementado).
 8. **Teclado, ratón y sonido** dentro de macOS (después de ver el escritorio). Sonido: coreaudiod ya arranca y `say`
    termina, pero no hay tarjeta de sonido: hace falta un dispositivo de audio que macOS vea como propio y que mande el
    sonido a PipeWire/PulseAudio del PC (para oír un vídeo, `say`...).
