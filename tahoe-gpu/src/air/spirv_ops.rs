@@ -21,6 +21,7 @@ fn bits(m: &Module, t: TypeId) -> u32 {
     match m.types[elem(m, t)] {
         Type::Int(w) => w,
         Type::Half => 16,
+        Type::BFloat => super::interp::BF16,
         Type::Float => 32,
         Type::Double => 64,
         _ => 0,
@@ -28,7 +29,7 @@ fn bits(m: &Module, t: TypeId) -> u32 {
 }
 
 fn es_real(m: &Module, t: TypeId) -> bool {
-    matches!(m.types[elem(m, t)], Type::Half | Type::Float | Type::Double)
+    matches!(m.types[elem(m, t)], Type::Half | Type::BFloat | Type::Float | Type::Double)
 }
 
 impl Tr<'_> {
@@ -215,7 +216,12 @@ impl Tr<'_> {
             Inst::Select { c, t, f } => {
                 if espacio(m, ty).is_some() {
                     let (pt, pf) = (self.tv(*t)?, self.tv(*f)?);
-                    let (TV::Ptr(bt, ot), TV::Ptr(bf, of)) = (pt, pf) else { return Err("select de punteros sin forma conocida".into()) };
+                    // con undef en un lado vale el otro
+                    match (&pt, &pf) {
+                        (TV::C(V::Undef), x) | (x, TV::C(V::Undef)) => return Ok(Some(x.clone())),
+                        _ => {}
+                    }
+                    let (TV::Ptr(bt, ot), TV::Ptr(bf, of)) = (pt.clone(), pf.clone()) else { return Err(format!("select de punteros sin forma conocida: {pt:?} / {pf:?}")) };
                     if bt != bf {
                         return Err("select entre punteros de bases distintas".into());
                     }
@@ -283,11 +289,19 @@ impl Tr<'_> {
                 TV::Id(self.b.composite_insert(st, None, x, base, idx.clone()).unwrap())
             }
             Inst::Load { ptr, .. } => {
-                let TV::Ptr(base, off) = self.tv(*ptr)? else { return Err("load de algo que no es memoria".into()) };
+                let (base, off) = match self.tv(*ptr)? {
+                    TV::Ptr(b, o) => (b, o),
+                    TV::C(V::Undef) => (Base::Nula, Off::C(0)), // buffer ausente en esta variante
+                    _ => return Err("load de algo que no es memoria".into()),
+                };
                 TV::Id(self.cargar(base, off, ty)?)
             }
             Inst::Store { ptr, val, .. } => {
-                let TV::Ptr(base, off) = self.tv(*ptr)? else { return Err("store en algo que no es memoria".into()) };
+                let (base, off) = match self.tv(*ptr)? {
+                    TV::Ptr(b, o) => (b, o),
+                    TV::C(V::Undef) => return Ok(None),
+                    _ => return Err("store en algo que no es memoria".into()),
+                };
                 let t = self.f.values[*val].ty;
                 let x = self.id(*val)?;
                 self.guardar(base, off, t, x)?;
@@ -299,6 +313,7 @@ impl Tr<'_> {
                 match p {
                     TV::Ptr(base, off) => TV::Ptr(base, self.gep(*src_ty, off, idx)?),
                     TV::Tex(_) | TV::Smp(_) => p,
+                    TV::C(V::Undef) => TV::Ptr(Base::Nula, Off::C(0)), // buffer ausente en esta variante
                     _ => return Err("gep sobre algo que no es memoria".into()),
                 }
             }
@@ -444,7 +459,13 @@ impl Tr<'_> {
                 if wt == 16 { self.b.quantize_to_f16(st, None, r).unwrap() } else { r }
             }
             CastOp::FPTrunc => {
-                if wt == 16 { self.b.quantize_to_f16(st, None, x).unwrap() } else { x }
+                if wt == 16 {
+                    self.b.quantize_to_f16(st, None, x).unwrap()
+                } else if wt == super::interp::BF16 {
+                    self.a_bf16(x, n, st)
+                } else {
+                    x
+                }
             }
             CastOp::FPExt => x,
             CastOp::BitCast => return self.reinterpretar(x, from, to),
@@ -544,6 +565,9 @@ impl Tr<'_> {
         if nombre.starts_with("llvm.memset") {
             return self.memset(args).map(|_| None);
         }
+        if let Some(resto) = nombre.strip_prefix("llvm.") {
+            return self.intrinseca_llvm(resto, args, ty).map(|r| Some(TV::Id(r)));
+        }
         let Some(resto) = nombre.strip_prefix("air.") else { return Err(format!("llamada a {nombre}")) };
         let partes: Vec<&str> = resto.split('.').collect();
         let base = partes[0].strip_prefix("fast_").unwrap_or(partes[0]);
@@ -606,15 +630,35 @@ impl Tr<'_> {
                 self.ext(st, 43, &[x, c0, c1])
             }
             "clamp" => {
-                let ids: Vec<Word> = a.iter().map(|&v| self.id(v)).collect::<Res<_>>()?;
+                let mut ids: Vec<Word> = a.iter().map(|&v| self.id(v)).collect::<Res<_>>()?;
                 let op = if real { 43 } else if signo { 45 } else { 44 };
-                self.ext(st, op, &ids)
+                let w = bits(self.m, ty);
+                if !real && signo && w < 32 {
+                    for x in ids.iter_mut() {
+                        *x = self.ext_signo(*x, w, ty);
+                    }
+                    let r = self.ext(st, op, &ids);
+                    self.recortar(r, w, ty)
+                } else {
+                    self.ext(st, op, &ids)
+                }
             }
             "min" | "max" if !real => {
-                let ids: Vec<Word> = a.iter().map(|&v| self.id(v)).collect::<Res<_>>()?;
+                let mut ids: Vec<Word> = a.iter().map(|&v| self.id(v)).collect::<Res<_>>()?;
                 let op = match (base, signo) { ("min", true) => 39, ("min", false) => 38, ("max", true) => 42, _ => 41 };
-                self.ext(st, op, &ids)
+                let w = bits(self.m, ty);
+                if signo && w < 32 {
+                    for x in ids.iter_mut() {
+                        *x = self.ext_signo(*x, w, ty);
+                    }
+                    let r = self.ext(st, op, &ids);
+                    self.recortar(r, w, ty)
+                } else {
+                    self.ext(st, op, &ids)
+                }
             }
+            // pista de optimización: el mismo valor
+            "is_uniform" => return self.tv(a[0]).map(Some),
             "fmax3" | "fmin3" => {
                 let ids: Vec<Word> = a.iter().map(|&v| self.id(v)).collect::<Res<_>>()?;
                 let op = if base == "fmax3" { 40 } else { 37 };
@@ -667,6 +711,14 @@ impl Tr<'_> {
                 self.b.control_barrier(sc, sc, sem).unwrap();
                 return Ok(None);
             }
+            "simdgroup" if partes.get(1) == Some(&"barrier") => {
+                self.usa_subgrupos = true;
+                let (sc, sem) = (self.cu(Scope::Subgroup as u32), self.cu((MemorySemantics::ACQUIRE_RELEASE | MemorySemantics::WORKGROUP_MEMORY | MemorySemantics::UNIFORM_MEMORY | MemorySemantics::IMAGE_MEMORY).bits()));
+                self.b.control_barrier(sc, sc, sem).unwrap();
+                return Ok(None);
+            }
+            b if b.starts_with("simd_") || b.starts_with("quad_") => return self.simd(b, &partes, &a, ty).map(Some),
+            "atomic" => return self.atomica(&partes, &a, ty),
             "mem" if partes.get(1) == Some(&"barrier") => {
                 let (sc, sem) = (self.cu(Scope::Workgroup as u32), self.cu((MemorySemantics::ACQUIRE_RELEASE | MemorySemantics::WORKGROUP_MEMORY | MemorySemantics::UNIFORM_MEMORY).bits()));
                 self.b.memory_barrier(sc, sem).unwrap();
@@ -701,7 +753,7 @@ impl Tr<'_> {
                 let var = self.builtin(BuiltIn::SubgroupSize, self.t_u32, StorageClass::Input);
                 self.b.load(self.t_u32, None, var, None, []).unwrap()
             }
-            b if b.starts_with("sample_texture") || b.starts_with("read_texture") || b.starts_with("write_texture") || b.starts_with("get_width") || b.starts_with("get_height") || b.starts_with("get_num_mip") => {
+            b if b.contains("_texture_") && ["sample_", "read_", "write_texture", "gather_", "get_", "is_null_", "calculate_"].iter().any(|x| b.starts_with(x)) && !b.starts_with("get_null") => {
                 return self.textura(base, &partes, &a, ty);
             }
             b => {
@@ -712,6 +764,431 @@ impl Tr<'_> {
             }
         };
         Ok(Some(TV::Id(r)))
+    }
+
+    /// Intrínsecas de LLVM que deja el compilador de Metal (llvm.smax.i32, llvm.ctpop.i32, llvm.fma.f32…).
+    fn intrinseca_llvm(&mut self, resto: &str, args: &[ValueId], ty: TypeId) -> Res<Word> {
+        let base = resto.split('.').next().unwrap_or("");
+        let st = self.ty(ty)?;
+        let (w, n) = (bits(self.m, ty), comps(self.m, ty));
+        let ids: Vec<Word> = args.iter().map(|&v| self.id(v)).collect::<Res<_>>()?;
+        let real = es_real(self.m, ty);
+        let r = match base {
+            "smax" | "smin" => {
+                let (x, y) = (self.ext_signo(ids[0], w, ty), self.ext_signo(ids[1], w, ty));
+                let r = self.ext(st, if base == "smax" { 42 } else { 39 }, &[x, y]);
+                self.recortar(r, w, ty)
+            }
+            "umax" => self.ext(st, 41, &ids[..2]),
+            "umin" => self.ext(st, 38, &ids[..2]),
+            "abs" if !real => {
+                let x = self.ext_signo(ids[0], w, ty);
+                let r = self.ext(st, 5, &[x]);
+                self.recortar(r, w, ty)
+            }
+            "ctpop" => self.b.bit_count(st, None, ids[0]).unwrap(),
+            "cttz" => {
+                // FindILsb(0) = -1; cttz(0) = ancho
+                let l = self.ext(st, 73, &[ids[0]]);
+                let m = self.cu_n(w.min(32), n);
+                self.ext(st, 38, &[l, m])
+            }
+            "ctlz" => {
+                // (ancho-1) - FindUMsb; FindUMsb(0) = -1 da justo «ancho»
+                let msb = self.ext(st, 75, &[ids[0]]);
+                let c = self.cu_n(w.min(32) - 1, n);
+                self.b.i_sub(st, None, c, msb).unwrap()
+            }
+            "bitreverse" => {
+                let r = self.b.bit_reverse(st, None, ids[0]).unwrap();
+                if w < 32 {
+                    let s = self.cu_n(32 - w, n);
+                    self.b.shift_right_logical(st, None, r, s).unwrap()
+                } else {
+                    r
+                }
+            }
+            "bswap" => {
+                // por bytes: solo 16 y 32 bits
+                let ocho = self.cu_n(8, n);
+                match w {
+                    16 => {
+                        let a = self.b.shift_left_logical(st, None, ids[0], ocho).unwrap();
+                        let b = self.b.shift_right_logical(st, None, ids[0], ocho).unwrap();
+                        let o = self.b.bitwise_or(st, None, a, b).unwrap();
+                        self.recortar(o, 16, ty)
+                    }
+                    _ => {
+                        let mut acc = self.cu_n(0, n);
+                        for k in 0..4u32 {
+                            let (off, cnt) = (self.cu_n(k * 8, n), ocho);
+                            let byte = self.b.bit_field_u_extract(st, None, ids[0], off, cnt).unwrap();
+                            let d = self.cu_n((3 - k) * 8, n);
+                            let mv = self.b.shift_left_logical(st, None, byte, d).unwrap();
+                            acc = self.b.bitwise_or(st, None, acc, mv).unwrap();
+                        }
+                        acc
+                    }
+                }
+            }
+            "fabs" => self.ext(st, 4, &ids[..1]),
+            "floor" => self.ext(st, 8, &ids[..1]),
+            "ceil" => self.ext(st, 9, &ids[..1]),
+            "trunc" => self.ext(st, 3, &ids[..1]),
+            "rint" | "nearbyint" | "roundeven" => self.ext(st, 2, &ids[..1]),
+            "round" => self.ext(st, 1, &ids[..1]),
+            "sqrt" => self.ext(st, 31, &ids[..1]),
+            "exp2" => self.ext(st, 29, &ids[..1]),
+            "log2" => self.ext(st, 30, &ids[..1]),
+            "exp" => self.ext(st, 27, &ids[..1]),
+            "log" => self.ext(st, 28, &ids[..1]),
+            "sin" => self.ext(st, 13, &ids[..1]),
+            "cos" => self.ext(st, 14, &ids[..1]),
+            "pow" => self.ext(st, 26, &ids[..2]),
+            "minnum" | "minimum" => self.ext(st, 37, &ids[..2]),
+            "maxnum" | "maximum" => self.ext(st, 40, &ids[..2]),
+            "fma" | "fmuladd" => self.ext(st, 50, &ids[..3]),
+            "copysign" => {
+                // |x| con el signo de y, por bits
+                let ut = self.vec_t(self.t_u32, n);
+                let (xu, yu) = (self.b.bitcast(ut, None, ids[0]).unwrap(), self.b.bitcast(ut, None, ids[1]).unwrap());
+                let (m1, m2) = (self.cu_n(0x7fff_ffff, n), self.cu_n(0x8000_0000, n));
+                let a = self.b.bitwise_and(ut, None, xu, m1).unwrap();
+                let s = self.b.bitwise_and(ut, None, yu, m2).unwrap();
+                let o = self.b.bitwise_or(ut, None, a, s).unwrap();
+                self.b.bitcast(st, None, o).unwrap()
+            }
+            _ => return Err(format!("llamada a llvm.{resto}")),
+        };
+        Ok(if real && w == 16 && !matches!(base, "fabs" | "copysign") { self.b.quantize_to_f16(st, None, r).unwrap() } else { r })
+    }
+
+    /// Redondea un f32 (o vector) a bfloat16, devolviendo un f32: (bits + 0x7fff + bit16) & 0xffff0000.
+    pub(crate) fn a_bf16(&mut self, x: Word, n: u32, st: Word) -> Word {
+        let ut = self.vec_t(self.t_u32, n);
+        let b = self.b.bitcast(ut, None, x).unwrap();
+        let (c16, c1, c7, mk) = (self.cu_n(16, n), self.cu_n(1, n), self.cu_n(0x7fff, n), self.cu_n(0xffff_0000, n));
+        let par = self.b.shift_right_logical(ut, None, b, c16).unwrap();
+        let par = self.b.bitwise_and(ut, None, par, c1).unwrap();
+        let r = self.b.i_add(ut, None, b, c7).unwrap();
+        let r = self.b.i_add(ut, None, r, par).unwrap();
+        let r = self.b.bitwise_and(ut, None, r, mk).unwrap();
+        self.b.bitcast(st, None, r).unwrap()
+    }
+
+    // ------------------------------------------------------------ atómicas
+
+    /// air.atomic.{global,local}.<op>[.u|.s].<tipo>(puntero, valor, orden, ámbito, volatile); load sin valor; cmpxchg
+    /// (puntero, puntero a lo esperado, deseado, orden, orden, ámbito, volatile) devuelve si acertó y deja el valor
+    /// que había en lo esperado; atomic.fence(flags, orden, ámbito).
+    fn atomica(&mut self, p: &[&str], a: &[ValueId], ty: TypeId) -> Res<Option<TV>> {
+        if p.get(1) == Some(&"fence") {
+            let (sc, sem) = (self.cu(Scope::Device as u32), self.cu((MemorySemantics::ACQUIRE_RELEASE | MemorySemantics::WORKGROUP_MEMORY | MemorySemantics::UNIFORM_MEMORY | MemorySemantics::IMAGE_MEMORY).bits()));
+            self.b.memory_barrier(sc, sem).unwrap();
+            return Ok(None);
+        }
+        let op = p.get(2).copied().unwrap_or("");
+        let signo = p.get(3) == Some(&"s");
+        let real = p.last().is_some_and(|t| t.starts_with('f'));
+        let TV::Ptr(base, off) = self.tv(a[0])? else { return Err("atómica sin puntero conocido".into()) };
+        let (ptr, sc) = self.palabra(base, off)?;
+        let local = sc == StorageClass::Workgroup;
+        let scope = self.cu(if local { Scope::Workgroup as u32 } else { Scope::Device as u32 });
+        let sem = self.cu(0);
+        let u = self.t_u32;
+        // los valores de 8 y 16 bits no existen en las atómicas de Metal; todo es de 32
+        let r = match op {
+            "load" => self.b.atomic_load(u, None, ptr, scope, sem).unwrap(),
+            "store" => {
+                let v = self.id(a[1])?;
+                let v = if real { self.b.bitcast(u, None, v).unwrap() } else { v };
+                self.b.atomic_store(ptr, scope, sem, v).unwrap();
+                return Ok(None);
+            }
+            "cmpxchg" => {
+                // p[3] = weak/strong
+                let TV::Ptr(be, oe) = self.tv(a[1])? else { return Err("cmpxchg sin puntero a lo esperado".into()) };
+                let i32t = self.m.types.iter().position(|t| *t == Type::Int(32)).ok_or("sin tipo i32")?;
+                let esperado = self.cargar(be, oe, i32t)?;
+                let deseado = self.id(a[2])?;
+                let deseado = if real { self.b.bitcast(u, None, deseado).unwrap() } else { deseado };
+                let viejo = self.b.atomic_compare_exchange(u, None, ptr, scope, sem, sem, deseado, esperado).unwrap();
+                self.guardar(be, oe, i32t, viejo)?;
+                let ok = self.b.i_equal(self.t_bool, None, viejo, esperado).unwrap();
+                let st = self.ty(ty)?;
+                return Ok(Some(TV::Id(if self.es_bool(ty) { ok } else { let (uno, cero) = (self.cu(1), self.cu(0)); self.b.select(st, None, ok, uno, cero).unwrap() })));
+            }
+            "add" | "sub" if real => {
+                // sin atómicas de punto flotante: bucle de compare-exchange
+                let v = self.id(a[1])?;
+                let v = if op == "sub" { self.b.f_negate(self.t_f32, None, v).unwrap() } else { v };
+                return self.atomica_cas_real(ptr, scope, sem, v).map(|x| Some(TV::Id(x)));
+            }
+            _ => {
+                let v = self.id(a[1])?;
+                match (op, signo) {
+                    ("add", _) => self.b.atomic_i_add(u, None, ptr, scope, sem, v).unwrap(),
+                    ("sub", _) => self.b.atomic_i_sub(u, None, ptr, scope, sem, v).unwrap(),
+                    ("max", true) => self.b.atomic_s_max(u, None, ptr, scope, sem, v).unwrap(),
+                    ("min", true) => self.b.atomic_s_min(u, None, ptr, scope, sem, v).unwrap(),
+                    ("max", false) => self.b.atomic_u_max(u, None, ptr, scope, sem, v).unwrap(),
+                    ("min", false) => self.b.atomic_u_min(u, None, ptr, scope, sem, v).unwrap(),
+                    ("and", _) => self.b.atomic_and(u, None, ptr, scope, sem, v).unwrap(),
+                    ("or", _) => self.b.atomic_or(u, None, ptr, scope, sem, v).unwrap(),
+                    ("xor", _) => self.b.atomic_xor(u, None, ptr, scope, sem, v).unwrap(),
+                    ("xchg", _) => {
+                        let v = if real { self.b.bitcast(u, None, v).unwrap() } else { v };
+                        self.b.atomic_exchange(u, None, ptr, scope, sem, v).unwrap()
+                    }
+                    (o, _) => return Err(format!("atómica {o} sin traducción")),
+                }
+            }
+        };
+        Ok(Some(TV::Id(if real { self.b.bitcast(self.t_f32, None, r).unwrap() } else { r })))
+    }
+
+    /// Suma atómica de punto flotante con un bucle de compare-exchange; devuelve el valor anterior.
+    fn atomica_cas_real(&mut self, ptr: Word, scope: Word, sem: Word, v: Word) -> Res<Word> {
+        let u = self.t_u32;
+        let (cab, cuerpo, cont, fin) = (self.b.id(), self.b.id(), self.b.id(), self.b.id());
+        self.b.branch(cab).unwrap();
+        self.b.begin_block(Some(cab)).unwrap();
+        self.b.loop_merge(fin, cont, spirv::LoopControl::NONE, []).unwrap();
+        self.b.branch(cuerpo).unwrap();
+        self.b.begin_block(Some(cuerpo)).unwrap();
+        let viejo = self.b.atomic_load(u, None, ptr, scope, sem).unwrap();
+        let vf = self.b.bitcast(self.t_f32, None, viejo).unwrap();
+        let suma = self.b.f_add(self.t_f32, None, vf, v).unwrap();
+        let nuevo = self.b.bitcast(u, None, suma).unwrap();
+        let visto = self.b.atomic_compare_exchange(u, None, ptr, scope, sem, sem, nuevo, viejo).unwrap();
+        let ok = self.b.i_equal(self.t_bool, None, visto, viejo).unwrap();
+        self.b.branch(cont).unwrap();
+        self.b.begin_block(Some(cont)).unwrap();
+        self.b.branch_conditional(ok, fin, cab, []).unwrap();
+        self.b.begin_block(Some(fin)).unwrap();
+        Ok(self.b.bitcast(self.t_f32, None, viejo).unwrap())
+    }
+
+    // ------------------------------------------------------------ funciones de SIMD-group y quad
+
+    /// Índice del hilo en el subgrupo.
+    fn carril(&mut self) -> Word {
+        self.usa_subgrupos = true;
+        let var = self.builtin(BuiltIn::SubgroupLocalInvocationId, self.t_u32, StorageClass::Input);
+        self.b.load(self.t_u32, None, var, None, []).unwrap()
+    }
+
+    fn tam_subgrupo(&mut self) -> Word {
+        self.usa_subgrupos = true;
+        let var = self.builtin(BuiltIn::SubgroupSize, self.t_u32, StorageClass::Input);
+        self.b.load(self.t_u32, None, var, None, []).unwrap()
+    }
+
+    /// Instrucción de shuffle de subgrupo (Shuffle, ShuffleXor, ShuffleUp, ShuffleDown) a mano: rspirv no la tiene.
+    fn shuffle(&mut self, op: spirv::Op, st: Word, v: Word, id: Word) -> Word {
+        let sc = self.cu(Scope::Subgroup as u32);
+        let r = self.b.id();
+        let inst = rspirv::dr::Instruction::new(op, Some(st), Some(r), vec![Operand::IdRef(sc), Operand::IdRef(v), Operand::IdRef(id)]);
+        self.b.insert_into_block(rspirv::dr::InsertPoint::End, inst).unwrap();
+        r
+    }
+
+    /// Operación de reducción entre dos valores del tipo `ty`.
+    fn op_reduccion(&mut self, op: &str, st: Word, ty: TypeId, x: Word, y: Word, signo: bool) -> Res<Word> {
+        let real = es_real(self.m, ty);
+        let w = bits(self.m, ty);
+        Ok(match (op, real) {
+            ("sum", true) => self.b.f_add(st, None, x, y).unwrap(),
+            ("sum", false) => self.b.i_add(st, None, x, y).unwrap(),
+            ("product", true) => self.b.f_mul(st, None, x, y).unwrap(),
+            ("product", false) => self.b.i_mul(st, None, x, y).unwrap(),
+            ("max", true) => self.ext(st, 40, &[x, y]),
+            ("min", true) => self.ext(st, 37, &[x, y]),
+            ("max" | "min", false) if signo => {
+                let (sx, sy) = (self.ext_signo(x, w, ty), self.ext_signo(y, w, ty));
+                let r = self.ext(st, if op == "max" { 42 } else { 39 }, &[sx, sy]);
+                self.recortar(r, w, ty)
+            }
+            ("max", false) => self.ext(st, 41, &[x, y]),
+            ("min", false) => self.ext(st, 38, &[x, y]),
+            ("and", _) | ("all", _) => if self.es_bool(ty) { self.b.logical_and(st, None, x, y).unwrap() } else { self.b.bitwise_and(st, None, x, y).unwrap() },
+            ("or", _) | ("any", _) => if self.es_bool(ty) { self.b.logical_or(st, None, x, y).unwrap() } else { self.b.bitwise_or(st, None, x, y).unwrap() },
+            ("xor", _) => if self.es_bool(ty) { self.b.logical_not_equal(st, None, x, y).unwrap() } else { self.b.bitwise_xor(st, None, x, y).unwrap() },
+            _ => return Err(format!("reducción {op} sin traducción")),
+        })
+    }
+
+    fn es_bool(&self, ty: TypeId) -> bool {
+        matches!(self.m.types[elem(self.m, ty)], Type::Int(1))
+    }
+
+    /// simd_* y quad_*: reducciones con mariposa de ShuffleXor (la GPU no tiene la aritmética de subgrupos), prefijos
+    /// con ShuffleUp, y los shuffles de Metal (que dejan el valor propio cuando el origen se sale del grupo).
+    fn simd(&mut self, base: &str, partes: &[&str], a: &[ValueId], ty: TypeId) -> Res<TV> {
+        self.usa_subgrupos = true;
+        let quad = base.starts_with("quad_");
+        let op = base.split_once('_').map(|x| x.1).unwrap_or("");
+        let signo = partes.get(1) == Some(&"s");
+        let ancho = if quad { 4 } else { 32 };
+        let st = self.ty(ty)?;
+        let half = es_real(self.m, ty) && bits(self.m, ty) == 16;
+        let q = |tr: &mut Self, r: Word| if half { tr.b.quantize_to_f16(st, None, r).unwrap() } else { r };
+        let carril = self.carril();
+        let r = match op {
+            "sum" | "product" | "max" | "min" | "and" | "or" | "xor" | "all" | "any" => {
+                let mut v = self.id(a[0])?;
+                let tam = self.tam_subgrupo();
+                let mut paso = ancho / 2;
+                while paso >= 1 {
+                    let c = self.cu(paso);
+                    let otro = self.shuffle(spirv::Op::GroupNonUniformShuffleXor, st, v, c);
+                    let r = self.op_reduccion(op, st, ty, v, otro, signo)?;
+                    // con subgrupos más pequeños que el paso, el compañero no existe
+                    let dentro = self.b.u_less_than(self.t_bool, None, c, tam).unwrap();
+                    v = self.select_valor(ty, dentro, r, v)?;
+                    paso /= 2;
+                }
+                q(self, v)
+            }
+            "prefix_inclusive_sum" | "prefix_exclusive_sum" | "prefix_inclusive_product" | "prefix_exclusive_product" => {
+                let red = if op.ends_with("sum") { "sum" } else { "product" };
+                let mut v = self.id(a[0])?;
+                let mut paso = 1;
+                while paso < 32 {
+                    let c = self.cu(paso);
+                    let otro = self.shuffle(spirv::Op::GroupNonUniformShuffleUp, st, v, c);
+                    let r = self.op_reduccion(red, st, ty, v, otro, signo)?;
+                    let tiene = self.b.u_greater_than_equal(self.t_bool, None, carril, c).unwrap();
+                    v = self.select_valor(ty, tiene, r, v)?;
+                    paso *= 2;
+                }
+                if op.contains("exclusive") {
+                    let uno = self.cu(1);
+                    let antes = self.shuffle(spirv::Op::GroupNonUniformShuffleUp, st, v, uno);
+                    let neutro = if red == "sum" { self.cero_de(ty)? } else { self.uno_de(ty)? };
+                    let cero = self.cu(0);
+                    let es0 = self.b.i_equal(self.t_bool, None, carril, cero).unwrap();
+                    v = self.select_valor(ty, es0, neutro, antes)?;
+                }
+                q(self, v)
+            }
+            "shuffle" | "broadcast" | "shuffle_xor" | "shuffle_down" | "shuffle_up" | "shuffle_rotate_down" | "shuffle_rotate_up" => {
+                let v = self.id(a[0])?;
+                let d = self.id(a[1])?;
+                let mk = self.cu(ancho - 1);
+                let base_q = if quad { let nm = self.cu(!(ancho - 1)); self.b.bitwise_and(self.t_u32, None, carril, nm).unwrap() } else { self.cu(0) };
+                let local = self.b.bitwise_and(self.t_u32, None, carril, mk).unwrap();
+                // índice de origen dentro del grupo (de `ancho` hilos) y si es válido
+                let (orig, valido) = match op {
+                    "shuffle" | "broadcast" => (self.b.bitwise_and(self.t_u32, None, d, mk).unwrap(), None),
+                    "shuffle_xor" => {
+                        let x = self.b.bitwise_xor(self.t_u32, None, local, d).unwrap();
+                        let lim = self.cu(ancho);
+                        let ok = self.b.u_less_than(self.t_bool, None, x, lim).unwrap();
+                        (x, Some(ok))
+                    }
+                    "shuffle_down" => {
+                        let x = self.b.i_add(self.t_u32, None, local, d).unwrap();
+                        let lim = self.cu(ancho);
+                        let ok = self.b.u_less_than(self.t_bool, None, x, lim).unwrap();
+                        (x, Some(ok))
+                    }
+                    "shuffle_up" => {
+                        let ok = self.b.u_greater_than_equal(self.t_bool, None, local, d).unwrap();
+                        (self.b.i_sub(self.t_u32, None, local, d).unwrap(), Some(ok))
+                    }
+                    "shuffle_rotate_down" => {
+                        let x = self.b.i_add(self.t_u32, None, local, d).unwrap();
+                        (self.b.bitwise_and(self.t_u32, None, x, mk).unwrap(), None)
+                    }
+                    _ => {
+                        let x = self.b.i_sub(self.t_u32, None, local, d).unwrap();
+                        (self.b.bitwise_and(self.t_u32, None, x, mk).unwrap(), None)
+                    }
+                };
+                let orig = self.b.bitwise_and(self.t_u32, None, orig, mk).unwrap();
+                let id = self.b.bitwise_or(self.t_u32, None, base_q, orig).unwrap();
+                let r = self.shuffle(spirv::Op::GroupNonUniformShuffle, st, v, id);
+                match valido {
+                    Some(ok) => self.select_valor(ty, ok, r, v)?,
+                    None => r,
+                }
+            }
+            "shuffle_and_fill_down" | "shuffle_and_fill_up" => {
+                // (datos, relleno, delta[, módulo]): lo que se sale se toma del relleno
+                let (v, rell, d) = (self.id(a[0])?, self.id(a[1])?, self.id(a[2])?);
+                let lim = self.cu(ancho);
+                let mk = self.cu(ancho - 1);
+                let local = self.b.bitwise_and(self.t_u32, None, carril, mk).unwrap();
+                let base_q = { let nm = self.cu(!(ancho - 1)); self.b.bitwise_and(self.t_u32, None, carril, nm).unwrap() };
+                let (x, dentro) = if op.ends_with("down") {
+                    let x = self.b.i_add(self.t_u32, None, local, d).unwrap();
+                    (x, self.b.u_less_than(self.t_bool, None, x, lim).unwrap())
+                } else {
+                    let x = self.b.i_sub(self.t_u32, None, local, d).unwrap();
+                    (self.b.i_add(self.t_u32, None, x, lim).unwrap(), self.b.u_greater_than_equal(self.t_bool, None, local, d).unwrap())
+                };
+                let xm = self.b.bitwise_and(self.t_u32, None, x, mk).unwrap();
+                let id = self.b.bitwise_or(self.t_u32, None, base_q, xm).unwrap();
+                let rd = self.shuffle(spirv::Op::GroupNonUniformShuffle, st, v, id);
+                let rr = self.shuffle(spirv::Op::GroupNonUniformShuffle, st, rell, id);
+                self.select_valor(ty, dentro, rd, rr)?
+            }
+            "is_first" if !quad => {
+                let sc = self.cu(Scope::Subgroup as u32);
+                self.b.group_non_uniform_elect(self.t_bool, None, sc).unwrap()
+            }
+            "is_first" => {
+                // el primer hilo activo de su quad: bits del ballot de su quad
+                let sc = self.cu(Scope::Subgroup as u32);
+                let v4 = self.vec_t(self.t_u32, 4);
+                let t = self.cbool(true);
+                let bal = self.b.group_non_uniform_ballot(v4, None, sc, t).unwrap();
+                let x = self.b.composite_extract(self.t_u32, None, bal, [0]).unwrap();
+                let nm = self.cu(!3);
+                let base_q = self.b.bitwise_and(self.t_u32, None, carril, nm).unwrap();
+                let bits_q = self.b.shift_right_logical(self.t_u32, None, x, base_q).unwrap();
+                let f = self.cu(0xf);
+                let bits_q = self.b.bitwise_and(self.t_u32, None, bits_q, f).unwrap();
+                let lsb = self.ext(self.t_u32, 73, &[bits_q]);
+                let tres = self.cu(3);
+                let local = self.b.bitwise_and(self.t_u32, None, carril, tres).unwrap();
+                self.b.i_equal(self.t_bool, None, lsb, local).unwrap()
+            }
+            "ballot" | "active_threads_mask" => {
+                let sc = self.cu(Scope::Subgroup as u32);
+                let v4 = self.vec_t(self.t_u32, 4);
+                let c = if op == "ballot" { let x = self.id(a[0])?; self.a_bool(x, self.f.values[a[0]].ty) } else { self.cbool(true) };
+                let bal = self.b.group_non_uniform_ballot(v4, None, sc, c).unwrap();
+                self.b.composite_extract(self.t_u32, None, bal, [0]).unwrap()
+            }
+            _ => return Err(format!("air.{base} sin traducción")),
+        };
+        Ok(TV::Id(r))
+    }
+
+    /// select entre dos valores de tipo `ty` con una condición escalar (los vectores la necesitan repetida).
+    fn select_valor(&mut self, ty: TypeId, c: Word, x: Word, y: Word) -> Res<Word> {
+        let st = self.ty(ty)?;
+        Ok(self.b.select(st, None, c, x, y).unwrap())
+    }
+
+    fn a_bool(&mut self, x: Word, t: TypeId) -> Word {
+        if self.es_bool(t) {
+            return x;
+        }
+        let cero = self.cu(0);
+        self.b.i_not_equal(self.t_bool, None, x, cero).unwrap()
+    }
+
+    fn cero_de(&mut self, ty: TypeId) -> Res<Word> {
+        let n = comps(self.m, ty);
+        Ok(if es_real(self.m, ty) { self.cf_n(0.0, n) } else { self.cu_n(0, n) })
+    }
+
+    fn uno_de(&mut self, ty: TypeId) -> Res<Word> {
+        let n = comps(self.m, ty);
+        Ok(if es_real(self.m, ty) { self.cf_n(1.0, n) } else { self.cu_n(1, n) })
     }
 
     /// air.convert.<a>.<tipo a>.<de>.<tipo de>: f (real), u (sin signo), s (con signo).
@@ -765,15 +1242,26 @@ impl Tr<'_> {
     // ------------------------------------------------------------ texturas
 
     /// Variable de una textura: (variable, tipo de imagen). `escritura`: imagen de almacenamiento.
-    fn var_textura(&mut self, idx: u32, escritura: bool, dim: Dim, arreglo: bool, muestra: Word) -> Word {
+    fn var_textura(&mut self, idx: u32, escritura: bool, forma: Forma, muestra: Word) -> Word {
         if let Some(&(v, _)) = self.texturas.get(&(idx, escritura)) {
             return v;
         }
-        let it = self.b.type_image(muestra, dim, 0, arreglo as u32, 0, if escritura { 2 } else { 1 }, ImageFormat::Unknown, None);
+        let Forma { dim, arreglo, ms } = forma;
+        match (dim, escritura) {
+            (Dim::Dim1D, false) => self.capacidades.push(Capability::Sampled1D),
+            (Dim::Dim1D, true) => self.capacidades.push(Capability::Image1D),
+            (Dim::DimCube, false) if arreglo => self.capacidades.push(Capability::SampledCubeArray),
+            (Dim::DimCube, true) if arreglo => self.capacidades.push(Capability::ImageCubeArray),
+            _ => {}
+        }
+        if ms && escritura {
+            self.capacidades.push(Capability::StorageImageMultisample);
+        }
+        let it = self.b.type_image(muestra, dim, 0, arreglo as u32, ms as u32, if escritura { 2 } else { 1 }, ImageFormat::Unknown, None);
         let pt = self.ptr_t(StorageClass::UniformConstant, it);
         let v = self.var_global(pt, StorageClass::UniformConstant, None);
         self.b.decorate(v, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
-        let binding = BIND_TEXTURA + idx + if escritura { 16 } else { 0 };
+        let binding = if escritura { BIND_TEXTURA_ESCRITURA } else { BIND_TEXTURA } + idx;
         self.b.decorate(v, Decoration::Binding, [Operand::LiteralBit32(binding)]);
         if escritura {
             self.b.decorate(v, Decoration::NonReadable, []);
@@ -809,22 +1297,78 @@ impl Tr<'_> {
         Ok(v)
     }
 
-    fn textura(&mut self, base: &str, p: &[&str], a: &[ValueId], ty: TypeId) -> Res<Option<TV>> {
-        let dim_txt = base.split('_').skip(1).collect::<Vec<_>>().join("_"); // texture_2d, texture_2d_array...
-        let (dim, arreglo) = if dim_txt.contains("3d") {
-            (Dim::Dim3D, false)
-        } else if dim_txt.contains("cube") {
-            (Dim::DimCube, dim_txt.contains("array"))
+    /// Coordenada con la capa al final (texturas array y caras de cubo). `real`: la coordenada es de punto flotante
+    /// (la capa entera se convierte).
+    fn coord_con_capa(&mut self, coord: ValueId, capa: Option<Word>, real: bool) -> Res<Word> {
+        let c = self.id(coord)?;
+        let Some(capa) = capa else { return Ok(c) };
+        let n = comps(self.m, self.f.values[coord].ty);
+        let e = if real { self.t_f32 } else { self.t_u32 };
+        let capa = if real { self.b.convert_u_to_f(self.t_f32, None, capa).unwrap() } else { capa };
+        let vt = self.vec_t(e, n + 1);
+        let mut partes = Vec::new();
+        if n == 1 {
+            partes.push(c);
         } else {
-            (Dim::Dim2D, dim_txt.contains("array"))
+            for k in 0..n {
+                partes.push(self.b.composite_extract(e, None, c, [k]).unwrap());
+            }
+        }
+        partes.push(capa);
+        Ok(self.b.composite_construct(vt, None, partes).unwrap())
+    }
+
+    /// Desplazamiento constante distinto de cero (o None).
+    fn desplazamiento(&mut self, v: ValueId) -> Res<Option<Word>> {
+        Ok(match self.tv(v)? {
+            TV::C(V::Vec(es)) if es.iter().any(|e| e.int().unwrap_or(0) != 0) => Some(self.id(v)?),
+            TV::C(V::Int(_, x)) if x != 0 => Some(self.id(v)?),
+            _ => None,
+        })
+    }
+
+    fn sampler_de(&mut self, v: ValueId) -> Res<Word> {
+        let smp = match self.tv(v)? {
+            TV::Smp(s) => s,
+            TV::Ptr(Base::Glob(g), _) => Smp::Fijo(g),
+            o => return Err(format!("sampler desconocido: {o:?}")),
         };
-        // tipo de muestra: del valor de vuelta ({<4 x T>, i8} o void)
+        let sv = self.var_sampler(smp)?;
+        Ok(self.b.load(self.t_sampler, None, sv, None, []).unwrap())
+    }
+
+    /// Funciones de texturas de AIR. Las firmas (de todos los metallib de macOS):
+    /// - sample_texture_{1d,2d,3d}[_array]: (tex, smp, coord, [capa], i1, desplazamiento, i1 nivel explícito, nivel o
+    ///   sesgo, lod mínimo, i32); cube: (tex, smp, coord3, i1 nivel explícito, nivel, lod mínimo, i32);
+    ///   2d_grad: (tex, smp, coord, [capa], dPdx, dPdy, lod mínimo, i1, desplazamiento, i32)
+    /// - gather_texture_2d[_array]: (tex, smp, coord, [capa], i1, desplazamiento, componente, i32)
+    /// - read_texture_*: (tex, [smp], coord, [capa o cara], [muestra (ms)], [desplazamiento], [nivel], acceso)
+    /// - write_texture_*: (tex, coord, [capa o cara], valor, [nivel], acceso)
+    /// - get_{width,height,depth}_texture_*(tex, nivel), get_array_size_*(tex), get_num_mip_levels_*(tex),
+    ///   get_num_samples_*(tex), is_null_texture_*(tex), calculate_[un]clamped_lod_*(tex, smp, coord, i32)
+    fn textura(&mut self, base: &str, p: &[&str], a: &[ValueId], ty: TypeId) -> Res<Option<TV>> {
+        let dim_txt = base.split("texture_").nth(1).unwrap_or("2d");
+        let ms = dim_txt.contains("_ms");
+        let cubo = dim_txt.starts_with("cube");
+        let dim = if dim_txt.starts_with("1d") {
+            Dim::Dim1D
+        } else if dim_txt.starts_with("3d") {
+            Dim::Dim3D
+        } else if cubo {
+            Dim::DimCube
+        } else if dim_txt.starts_with("buffer") {
+            return Err(format!("air.{base}: texturas buffer sin soporte aún"));
+        } else {
+            Dim::Dim2D
+        };
+        let arreglo = dim_txt.contains("array");
+        let forma = Forma { dim, arreglo, ms };
+        if base.starts_with("is_null_texture") {
+            let nula = matches!(self.tv(a[0])?, TV::Ptr(Base::Nula, _) | TV::C(V::Undef));
+            return Ok(Some(TV::Id(self.cbool(nula))));
+        }
+        // tipo de muestra: del tipo del argumento (texture2d<uint>...) y, si no se sabe, del nombre (.u., .s.)
         let (muestra, vec4) = {
-            let tipo_v = match &self.m.types[ty] {
-                Type::Struct { elems, .. } => elems[0],
-                _ => ty,
-            };
-            // del tipo del argumento (texture2d<uint>...) y, si no se sabe, del nombre de la función (.u., .s.)
             let tex_idx0 = match self.tv(a[0])? { TV::Tex(i) => Some(i), _ => None };
             let sufijo = match tex_idx0.and_then(|i| self.tipos_textura.get(&i).copied()) {
                 Some(k) => k,
@@ -835,15 +1379,33 @@ impl Tr<'_> {
                 2 => self.t_i32,
                 _ => self.t_f32,
             };
-            let _ = tipo_v;
             (w, self.vec_t(w, 4))
         };
         let tex_idx = match self.tv(a[0])? {
             TV::Tex(i) => i,
-            TV::Ptr(Base::Nula, _) => return Err("textura nula".into()),
+            // textura nula (o ausente en esta variante): Metal da 0 al leer, no escribe y mide 0
+            TV::Ptr(Base::Nula, _) | TV::C(V::Undef) => {
+                if base.starts_with("write_") {
+                    return Ok(None);
+                }
+                if matches!(self.m.types[ty], Type::Void) {
+                    return Ok(None);
+                }
+                if let Type::Struct { .. } = self.m.types[ty] {
+                    let st = self.ty(ty)?;
+                    let cero4 = { let c = self.cu(0); let z = match muestra { x if x == self.t_f32 => self.cf(0.0), _ => c }; self.b.constant_composite(vec4, vec![z; 4]) };
+                    let cero = self.cu(0);
+                    return Ok(Some(TV::Id(self.b.composite_construct(st, None, [cero4, cero]).unwrap())));
+                }
+                let st = self.ty(ty)?;
+                return Ok(Some(TV::Id(self.b.constant_null(st))));
+            }
             o => return Err(format!("textura desconocida: {o:?}")),
         };
+        // variantes half (v4f16): el texel se redondea a half, como en Metal
+        let es_half = p.iter().any(|x| x.ends_with("f16"));
         let res_ty = |tr: &mut Self, texel: Word| -> Res<TV> {
+            let texel = if es_half { tr.b.quantize_to_f16(vec4, None, texel).unwrap() } else { texel };
             // {<4 x T>, i8}: el texel y la residencia (siempre presente)
             if let Type::Struct { .. } = tr.m.types[ty] {
                 let st = tr.ty(ty)?;
@@ -853,58 +1415,139 @@ impl Tr<'_> {
                 Ok(TV::Id(texel))
             }
         };
+        // capa de las coordenadas enteras: la capa, o la cara del cubo (cube_array: capa·6 + cara)
+        let capa_entera = |tr: &mut Self, k: &mut usize| -> Res<Option<Word>> {
+            if !(arreglo || cubo) {
+                return Ok(None);
+            }
+            let c = tr.id(a[*k])?;
+            *k += 1;
+            if cubo && arreglo {
+                let l = tr.id(a[*k])?;
+                *k += 1;
+                let seis = tr.cu(6);
+                let x = tr.b.i_mul(tr.t_u32, None, l, seis).unwrap();
+                return Ok(Some(tr.b.i_add(tr.t_u32, None, x, c).unwrap()));
+            }
+            Ok(Some(c))
+        };
         if base.starts_with("write_texture") {
-            let v = self.var_textura(tex_idx, true, dim, arreglo, muestra);
+            let v = self.var_textura(tex_idx, true, forma, muestra);
             let (_, it) = self.texturas[&(tex_idx, true)];
             let img = self.b.load(it, None, v, None, []).unwrap();
-            let coord = self.id(a[1])?;
-            let texel = self.id(a[2])?;
+            let mut k = 2;
+            let capa = capa_entera(self, &mut k)?;
+            let coord = self.coord_con_capa(a[1], capa, false)?;
+            let texel = self.id(a[k])?;
             self.b.image_write(img, coord, texel, None, []).unwrap();
             return Ok(None);
         }
-        let v = self.var_textura(tex_idx, false, dim, arreglo, muestra);
+        let v = self.var_textura(tex_idx, false, forma, muestra);
         let (_, it) = self.texturas[&(tex_idx, false)];
         let img = self.b.load(it, None, v, None, []).unwrap();
-        if base.starts_with("get_width") || base.starts_with("get_height") {
-            let n = match dim { Dim::Dim3D => 3, _ => 2 + arreglo as u32 };
+        if let Some(q) = ["get_width", "get_height", "get_depth", "get_array_size"].iter().find(|q| base.starts_with(**q)) {
+            let n = match dim { Dim::Dim1D => 1, Dim::Dim3D => 3, _ => 2 } + arreglo as u32;
             let vt = self.vec_t(self.t_u32, n);
-            let lod = if a.len() > 1 { self.id(a[1])? } else { self.cu(0) };
-            let sz = self.b.image_query_size_lod(vt, None, img, lod).unwrap();
-            let k = if base.starts_with("get_width") { 0 } else { 1 };
-            return Ok(Some(TV::Id(self.b.composite_extract(self.t_u32, None, sz, [k]).unwrap())));
+            let sz = if ms {
+                self.b.image_query_size(vt, None, img).unwrap()
+            } else {
+                let lod = if a.len() > 1 { self.id(a[1])? } else { self.cu(0) };
+                self.b.image_query_size_lod(vt, None, img, lod).unwrap()
+            };
+            let k = match *q { "get_width" => 0, "get_height" => 1, "get_depth" => 2, _ => n - 1 };
+            let r = if n == 1 { sz } else { self.b.composite_extract(self.t_u32, None, sz, [k]).unwrap() };
+            let r = if *q == "get_array_size" && cubo { let seis = self.cu(6); self.b.u_div(self.t_u32, None, r, seis).unwrap() } else { r };
+            return Ok(Some(TV::Id(r)));
+        }
+        if base.starts_with("get_num_mip_levels") {
+            return Ok(Some(TV::Id(self.b.image_query_levels(self.t_u32, None, img).unwrap())));
+        }
+        if base.starts_with("get_num_samples") {
+            return Ok(Some(TV::Id(self.b.image_query_samples(self.t_u32, None, img).unwrap())));
         }
         if base.starts_with("read_texture") {
-            // (textura, sampler, coord, desplazamiento, lod, acceso)
-            let coord = self.id(a[2])?;
-            let lod = self.id(a[4])?;
-            let texel = self.b.image_fetch(vec4, None, img, coord, Some(ImageOperands::LOD), [Operand::IdRef(lod)]).unwrap();
+            if cubo {
+                return Err(format!("air.{base}: lectura de cubos sin soporte aún"));
+            }
+            // ¿segundo argumento sampler? (punteros del espacio 2)
+            let con_smp = espacio(self.m, self.f.values[a[1]].ty) == Some(2);
+            let mut k = if con_smp { 2 } else { 1 };
+            let c0 = a[k];
+            k += 1;
+            let capa = capa_entera(self, &mut k)?;
+            let coord = self.coord_con_capa(c0, capa, false)?;
+            let resto = a.len() - k;
+            let texel = if ms {
+                let s = self.id(a[k])?;
+                self.b.image_fetch(vec4, None, img, coord, Some(ImageOperands::SAMPLE), [Operand::IdRef(s)]).unwrap()
+            } else {
+                // (desplazamiento, nivel, acceso) o (nivel, acceso)
+                let (desp, lod) = if resto >= 3 { (self.desplazamiento(a[k])?, a[k + 1]) } else { (None, a[k]) };
+                let lod = self.id(lod)?;
+                let mut flags = ImageOperands::LOD;
+                let mut ops = vec![Operand::IdRef(lod)];
+                if let Some(d) = desp {
+                    flags |= ImageOperands::CONST_OFFSET;
+                    ops.push(Operand::IdRef(d));
+                }
+                self.b.image_fetch(vec4, None, img, coord, Some(flags), ops).unwrap()
+            };
             return res_ty(self, texel).map(Some);
         }
-        // sample: (textura, sampler, coord, ¿desplazamiento?, desplazamiento, nivel explícito, nivel o sesgo, lod mínimo, ...)
-        let smp = match self.tv(a[1])? {
-            TV::Smp(s) => s,
-            TV::Ptr(Base::Glob(g), _) => Smp::Fijo(g),
-            o => return Err(format!("sampler desconocido: {o:?}")),
-        };
-        let sv = self.var_sampler(smp)?;
-        let s = self.b.load(self.t_sampler, None, sv, None, []).unwrap();
+        let s = self.sampler_de(a[1])?;
         let sit = self.b.type_sampled_image(it);
         let si = self.b.sampled_image(sit, None, img, s).unwrap();
-        let coord = self.id(a[2])?;
-        let explicito = matches!(self.tv(a[5])?, TV::C(V::Int(_, 1)));
-        let nivel = self.tv(a[6])?;
-        let desplazamiento = match self.tv(a[4])? {
-            TV::C(V::Vec(es)) if es.iter().any(|e| e.int().unwrap_or(0) != 0) => Some(self.id(a[4])?),
-            _ => None,
+        let mut k = 3;
+        let capa = if arreglo {
+            k += 1;
+            Some(self.id(a[3])?)
+        } else {
+            None
         };
+        let coord = self.coord_con_capa(a[2], capa, true)?;
+        if base.starts_with("calculate_") {
+            let v2 = self.vec_t(self.t_f32, 2);
+            let q = self.b.image_query_lod(v2, None, si, coord).unwrap();
+            let i = if base.starts_with("calculate_clamped") { 0 } else { 1 };
+            return Ok(Some(TV::Id(self.b.composite_extract(self.t_f32, None, q, [i]).unwrap())));
+        }
+        if base.starts_with("gather_texture") {
+            // (i1, desplazamiento, componente, i32)
+            let desp = self.desplazamiento(a[k + 1])?;
+            let comp = self.id(a[k + 2])?;
+            let (flags, ops) = match desp {
+                Some(d) => (Some(ImageOperands::CONST_OFFSET), vec![Operand::IdRef(d)]),
+                None => (None, vec![]),
+            };
+            let texel = self.b.image_gather(vec4, None, si, coord, comp, flags, ops).unwrap();
+            return res_ty(self, texel).map(Some);
+        }
         let fragment = self.ent.etapa == Etapa::Fragment;
         let mut ops = Vec::new();
         let mut flags = ImageOperands::NONE;
+        if base.contains("_grad") {
+            // (dPdx, dPdy, lod mínimo, i1, desplazamiento, i32)
+            let (dx, dy) = (self.id(a[k])?, self.id(a[k + 1])?);
+            flags |= ImageOperands::GRAD;
+            ops.push(Operand::IdRef(dx));
+            ops.push(Operand::IdRef(dy));
+            if let Some(d) = self.desplazamiento(a[k + 4])? {
+                flags |= ImageOperands::CONST_OFFSET;
+                ops.push(Operand::IdRef(d));
+            }
+            let texel = self.b.image_sample_explicit_lod(vec4, None, si, coord, flags, ops).unwrap();
+            return res_ty(self, texel).map(Some);
+        }
+        // (i1, desplazamiento, i1 explícito, nivel, …) o, en cubos, (i1 explícito, nivel, …)
+        let (desp, i_expl) = if cubo { (None, k) } else { (self.desplazamiento(a[k + 1])?, k + 2) };
+        let explicito = matches!(self.tv(a[i_expl])?, TV::C(V::Int(_, 1)));
+        let nivel = self.tv(a[i_expl + 1])?;
+        let t_nivel = self.f.values[a[i_expl + 1]].ty;
         let texel = if explicito || !fragment {
             flags |= ImageOperands::LOD;
-            let l = if explicito { self.id_de(&nivel, self.f.values[a[6]].ty)? } else { self.cf(0.0) };
+            let l = if explicito { self.id_de(&nivel, t_nivel)? } else { self.cf(0.0) };
             ops.push(Operand::IdRef(l));
-            if let Some(d) = desplazamiento {
+            if let Some(d) = desp {
                 flags |= ImageOperands::CONST_OFFSET;
                 ops.push(Operand::IdRef(d));
             }
@@ -912,10 +1555,10 @@ impl Tr<'_> {
         } else {
             if !matches!(nivel, TV::C(V::Real(_, x)) if x == 0.0) {
                 flags |= ImageOperands::BIAS;
-                let l = self.id_de(&nivel, self.f.values[a[6]].ty)?;
+                let l = self.id_de(&nivel, t_nivel)?;
                 ops.push(Operand::IdRef(l));
             }
-            if let Some(d) = desplazamiento {
+            if let Some(d) = desp {
                 flags |= ImageOperands::CONST_OFFSET;
                 ops.push(Operand::IdRef(d));
             }
@@ -923,4 +1566,12 @@ impl Tr<'_> {
         };
         res_ty(self, texel).map(Some)
     }
+}
+
+/// Forma de una textura en SPIR-V.
+#[derive(Clone, Copy)]
+pub(super) struct Forma {
+    dim: Dim,
+    arreglo: bool,
+    ms: bool,
 }

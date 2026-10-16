@@ -22,6 +22,8 @@ pub struct Gpu {
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     /// Extensiones de dispositivo disponibles (nombres).
     pub extensions: Vec<String>,
+    /// VK_EXT_subgroup_size_control activa
+    pub subgrupo_fijo: bool,
     /// VK_EXT_external_memory_host activada (MTLBuffer en memoria compartida sin copias).
     pub host_memory: Option<ash::ext::external_memory_host::Device>,
 }
@@ -66,17 +68,57 @@ impl Gpu {
         let prio = [1.0f32];
         let qci = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&prio)];
         let want_host = extensions.iter().any(|e| e == "VK_EXT_external_memory_host");
+        let want_demote = extensions.iter().any(|e| e == "VK_EXT_shader_demote_to_helper_invocation");
         let mut names: Vec<*const c_char> = Vec::new();
         if want_host {
             names.push(ash::ext::external_memory_host::NAME.as_ptr());
         }
-        let dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci).enabled_extension_names(&names);
+        if want_demote {
+            names.push(ash::ext::shader_demote_to_helper_invocation::NAME.as_ptr());
+        }
+        // subgrupos de tamaño fijo (32, como los SIMD-groups de Apple) en los kernels que los usan
+        let want_ssc = extensions.iter().any(|e| e == "VK_EXT_subgroup_size_control");
+        if want_ssc {
+            names.push(ash::ext::subgroup_size_control::NAME.as_ptr());
+        }
+        // características que usan los shaders traducidos (las que la GPU tenga)
+        // SAFETY: dispositivo físico de esta instancia.
+        let tiene = unsafe { instance.get_physical_device_features(phys) };
+        let feats = vk::PhysicalDeviceFeatures {
+            // accesos fuera de los buffers acotados: un shader de macOS con datos raros no hace fallar a la GPU
+            robust_buffer_access: tiene.robust_buffer_access,
+            shader_storage_image_write_without_format: tiene.shader_storage_image_write_without_format,
+            sampler_anisotropy: tiene.sampler_anisotropy,
+            independent_blend: tiene.independent_blend,
+            dual_src_blend: tiene.dual_src_blend,
+            depth_clamp: tiene.depth_clamp,
+            fill_mode_non_solid: tiene.fill_mode_non_solid,
+            image_cube_array: tiene.image_cube_array,
+            texture_compression_bc: tiene.texture_compression_bc,
+            multi_draw_indirect: tiene.multi_draw_indirect,
+            draw_indirect_first_instance: tiene.draw_indirect_first_instance,
+            fragment_stores_and_atomics: tiene.fragment_stores_and_atomics,
+            shader_clip_distance: tiene.shader_clip_distance,
+            large_points: tiene.large_points,
+            wide_lines: tiene.wide_lines,
+            ..Default::default()
+        };
+        let mut demote = vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default().shader_demote_to_helper_invocation(want_demote);
+        let mut f12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true).shader_output_layer(true).shader_output_viewport_index(true);
+        let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci).enabled_extension_names(&names).enabled_features(&feats).push_next(&mut f12);
+        if want_demote {
+            dci = dci.push_next(&mut demote);
+        }
+        let mut ssc = vk::PhysicalDeviceSubgroupSizeControlFeatures::default().subgroup_size_control(true);
+        if want_ssc {
+            dci = dci.push_next(&mut ssc);
+        }
         // SAFETY: estructuras válidas; las extensiones pedidas están en la lista del dispositivo.
         let device = unsafe { instance.create_device(phys, &dci, None) }.map_err(err("vkCreateDevice"))?;
         // SAFETY: familia y cola creadas arriba.
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let host_memory = want_host.then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
-        Ok(Gpu { _entry: entry, instance, phys, device, queue, queue_family, props, mem_props, extensions, host_memory })
+        Ok(Gpu { _entry: entry, instance, phys, device, queue, queue_family, props, mem_props, extensions, host_memory, subgrupo_fijo: want_ssc })
     }
 
     pub fn name(&self) -> String {

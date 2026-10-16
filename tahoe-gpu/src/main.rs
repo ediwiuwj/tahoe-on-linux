@@ -11,10 +11,14 @@
 //! - `tahoe-gpu air <archivo> [función]`: lee el AIR de las funciones (todas o una) y resume cada punto de entrada.
 //! - `tahoe-gpu traducir <archivo> [función|-] [carpeta]`: traduce a SPIR-V (todas o una); con carpeta, guarda cada
 //!   `<función>.spv` (para spirv-val y spirv-dis).
+//! - `tahoe-gpu probar <archivo> <kernel> [ancho alto]`: ejecuta el kernel traducido en la GPU y el AIR en el
+//!   intérprete de la CPU con las mismas entradas, y compara.
 
 mod air;
 mod informe;
 mod metallib;
+mod motor;
+mod probar;
 mod prueba;
 mod shaders;
 mod vk;
@@ -28,8 +32,9 @@ fn main() {
         "extraer" => extraer(std::env::args().skip(2).collect()),
         "air" => leer_air(std::env::args().skip(2).collect()),
         "traducir" => traducir(std::env::args().skip(2).collect()),
+        "probar" => probar::probar(std::env::args().skip(2).collect()),
         _ => {
-            eprintln!("uso: tahoe-gpu informe | prueba | metallib <archivo> | extraer <archivo> <función> <salida.bc> | air <archivo> [función] | traducir <archivo> [función] [carpeta]");
+            eprintln!("uso: tahoe-gpu informe | prueba | metallib <archivo> | extraer <archivo> <función> <salida.bc> | air <archivo> [función] | traducir <archivo> [función] [carpeta] | probar <archivo> <kernel> [ancho alto]");
             std::process::exit(2);
         }
     };
@@ -141,7 +146,7 @@ fn traducir(a: Vec<String>) -> vk::Res<()> {
             }
             Err(e) => {
                 mal += 1;
-                if solo.is_some() {
+                if solo.is_some() || std::env::var_os("TAHOE_ERRORES").is_some() {
                     println!("ERROR {}: {e}", f.nombre);
                 }
                 let clave: String = e.split(" (en ").next().unwrap_or(&e).chars().take(90).collect();

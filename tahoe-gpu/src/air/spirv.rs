@@ -14,8 +14,8 @@
 //!   de un bloque a otro y los phi van por variables.
 //! - Function constants: antes de traducir se pliegan (ver `fc` y `sccp`) y solo se emiten los bloques alcanzables.
 //!
-//! Recursos (conjunto 0): buffer N de Metal → binding N; textura N → 32 + N; sampler N → 96 + N; los samplers
-//! constantes del shader (constexpr) → 112 en adelante (sus estados van en `Traduccion::samplers_fijos`).
+//! Recursos (conjunto 0): buffer N de Metal → binding N; textura N → 32 + N (160 + N si se escribe en ella); sampler
+//! N → 192 + N; los samplers constantes del shader (constexpr) → 208 en adelante (con su estado en el enlace).
 
 use std::collections::HashMap;
 
@@ -30,8 +30,9 @@ use super::{fc, inline, layout, sccp, Descripcion, Entrada, Etapa};
 pub type Res<T> = Result<T, String>;
 
 pub const BIND_TEXTURA: u32 = 32;
-pub const BIND_SAMPLER: u32 = 96;
-pub const BIND_SAMPLER_FIJO: u32 = 112;
+pub const BIND_TEXTURA_ESCRITURA: u32 = 160;
+pub const BIND_SAMPLER: u32 = 192;
+pub const BIND_SAMPLER_FIJO: u32 = 208;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Recurso {
@@ -65,6 +66,8 @@ pub struct Traduccion {
     pub colores: Vec<u32>,
     pub bloques: usize,
     pub maquina_de_estados: bool,
+    /// Usa operaciones de subgrupo (SIMD-group de Metal): el pipeline pide subgrupos de 32 como en Apple.
+    pub subgrupos: bool,
 }
 
 #[derive(Default, Clone)]
@@ -80,6 +83,8 @@ pub struct Opciones {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Base {
     Buf(u32),
+    /// Memoria de threadgroup que llega como argumento (índice de Metal).
+    WgArg(u32),
     Priv(ValueId),
     Glob(usize),
     Wg(usize),
@@ -154,13 +159,18 @@ struct Tr<'a> {
     grid: Option<Word>,
     usa_demote: bool,
     usa_subgrupos: bool,
+    /// Capacidades que piden los recursos usados (Sampled1D, SampledCubeArray...).
+    capacidades: Vec<Capability>,
     /// Base de los punteros que cruzan bloques (la variable guarda solo el desplazamiento).
     bases: HashMap<ValueId, Base>,
+    /// Valores que son siempre la misma textura o sampler (phi/select con la textura nula): se resuelven sin variable.
+    fijos: HashMap<ValueId, TV>,
     /// Tamaño del grupo de un kernel (constantes de especialización 0, 1 y 2).
     wg_size: Option<Word>,
     t_bloque: Option<Word>,
     /// Tipo de muestra de cada textura (0 real, 1 sin signo, 2 con signo), del tipo de su argumento.
     tipos_textura: HashMap<u32, u8>,
+    wg_args: HashMap<u32, Word>,
 }
 
 fn espacio(m: &Module, t: TypeId) -> Option<u32> {
@@ -213,7 +223,7 @@ impl<'a> Tr<'a> {
             Type::Void => self.t_void,
             Type::Int(1) => self.t_bool,
             Type::Int(_) => self.t_u32,
-            Type::Half | Type::Float => self.t_f32,
+            Type::Half | Type::BFloat | Type::Float => self.t_f32,
             Type::Vector(n, e) => {
                 let e = self.ty(e)?;
                 self.vec_t(e, n)
@@ -260,7 +270,7 @@ impl<'a> Tr<'a> {
             (_, V::Undef) => self.b.constant_null(st),
             (Type::Int(1), V::Int(_, x)) => self.cbool(*x != 0),
             (Type::Int(_), V::Int(_, x)) => self.cu(*x as u32),
-            (Type::Half | Type::Float, V::Real(_, x)) => self.cf(*x as f32),
+            (Type::Half | Type::BFloat | Type::Float, V::Real(_, x)) => self.cf(*x as f32),
             (Type::Vector(_, e), V::Vec(xs)) | (Type::Array(_, e), V::Agg(xs)) => {
                 let e = *e;
                 let cs: Vec<Word> = xs.iter().map(|x| self.constante(e, x)).collect::<Res<_>>()?;
@@ -281,6 +291,9 @@ impl<'a> Tr<'a> {
         if v >= 1_000_000_000 {
             return Ok(TV::C(V::Undef)); // argumento de metadatos
         }
+        if let Some(x) = self.fijos.get(&v) {
+            return Ok(x.clone());
+        }
         if let Some(Some(c)) = self.an.constantes.get(v) {
             return Ok(match c {
                 V::Ptr(Mem::Global(g), off) => TV::Ptr(self.base_global(*g), Off::C(*off)),
@@ -295,7 +308,21 @@ impl<'a> Tr<'a> {
             // valor de otro bloque: por su variable
             let t = self.f.values[v].ty;
             if espacio(self.m, t).is_some() {
-                let base = *self.bases.get(&v).ok_or("puntero que cruza bloques sin base conocida")?;
+                let base = *self.bases.get(&v).ok_or_else(|| {
+                    let d = |v: ValueId| match self.f.values[v].kind {
+                        ValueKind::Inst(b, k) => format!("{:?}", self.f.blocks[b].insts[k].inst),
+                        ref o => format!("{o:?}"),
+                    };
+                    let mut def = d(v);
+                    if let ValueKind::Inst(b, k) = self.f.values[v].kind {
+                        if let Inst::Phi { incoming } = &self.f.blocks[b].insts[k].inst {
+                            for (x, _) in incoming {
+                                def += &format!("; %{x} = {}", d(*x));
+                            }
+                        }
+                    }
+                    format!("puntero que cruza bloques sin base conocida: %{v} = {def}")
+                })?;
                 let o = self.b.load(self.t_u32, None, var, None, []).map_err(|e| format!("{e:?}"))?;
                 return Ok(TV::Ptr(base, Off::Id(o)));
             }
@@ -371,6 +398,21 @@ impl<'a> Tr<'a> {
                 self.buffers.insert(i, v);
                 self.interfaz.push(v);
                 Ok((v, StorageClass::StorageBuffer))
+            }
+            Base::WgArg(i) => {
+                if let Some(&v) = self.wg_args.get(&i) {
+                    return Ok((v, StorageClass::Workgroup));
+                }
+                // tamaño en palabras: constante de especialización 16 + índice (la fija la app con
+                // setThreadgroupMemoryLength; por omisión 4096 palabras = 16 KB)
+                let n = self.b.spec_constant_bit32(self.t_u32, 4096);
+                self.b.decorate(n, Decoration::SpecId, [Operand::LiteralBit32(16 + i)]);
+                let at = self.b.type_array(self.t_u32, n);
+                let pt = self.ptr_t(StorageClass::Workgroup, at);
+                let v = self.var_global(pt, StorageClass::Workgroup, None);
+                self.wg_args.insert(i, v);
+                self.interfaz.push(v);
+                Ok((v, StorageClass::Workgroup))
             }
             Base::Priv(a) => self.privadas.get(&a).map(|&v| (v, StorageClass::Function)).ok_or_else(|| "alloca sin variable".to_string()),
             Base::Wg(g) | Base::Glob(g) => {
@@ -463,6 +505,11 @@ impl<'a> Tr<'a> {
     }
 
     fn cargar(&mut self, b: Base, o: Off, t: TypeId) -> Res<Word> {
+        if b == Base::Nula {
+            // puntero nulo (buffer ausente en esta variante): 0; solo en caminos que el shader no toma
+            let st = self.ty(t)?;
+            return Ok(self.b.constant_null(st));
+        }
         let tipo = self.m.types[t].clone();
         match tipo {
             Type::Int(32) | Type::Int(64) | Type::Float => {
@@ -482,6 +529,15 @@ impl<'a> Tr<'a> {
                     return Ok(self.b.i_not_equal(self.t_bool, None, x, cero).unwrap());
                 }
                 Ok(x)
+            }
+            Type::BFloat => {
+                let (p, _) = self.palabra(b, o)?;
+                let w = self.b.load(self.t_u32, None, p, None, []).unwrap();
+                let sh = self.bits_en_palabra(o);
+                let x = self.b.shift_right_logical(self.t_u32, None, w, sh).unwrap();
+                let c16 = self.cu(16);
+                let x = self.b.shift_left_logical(self.t_u32, None, x, c16).unwrap();
+                Ok(self.b.bitcast(self.t_f32, None, x).unwrap())
             }
             Type::Half => {
                 let (p, _) = self.palabra(b, o)?;
@@ -527,6 +583,9 @@ impl<'a> Tr<'a> {
     }
 
     fn guardar(&mut self, b: Base, o: Off, t: TypeId, v: Word) -> Res<()> {
+        if b == Base::Nula {
+            return Ok(());
+        }
         if let Base::Buf(i) = b {
             if !self.buffers_escritos.contains(&i) {
                 self.buffers_escritos.push(i);
@@ -548,6 +607,13 @@ impl<'a> Tr<'a> {
                     v
                 };
                 self.guardar_trozo(b, o, x, if n <= 8 { 0xff } else { 0xffff })
+            }
+            Type::BFloat => {
+                let r = self.a_bf16(v, 1, self.t_f32);
+                let u = self.b.bitcast(self.t_u32, None, r).unwrap();
+                let c16 = self.cu(16);
+                let bits = self.b.shift_right_logical(self.t_u32, None, u, c16).unwrap();
+                self.guardar_trozo(b, o, bits, 0xffff)
             }
             Type::Half => {
                 let cero = self.cf(0.0);

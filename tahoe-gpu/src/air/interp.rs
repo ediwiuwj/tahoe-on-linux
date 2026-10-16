@@ -45,9 +45,25 @@ fn sext(bits: u32, v: u64) -> i64 {
     ((v << s) as i64) >> s
 }
 
+/// bfloat16 (los 16 bits altos de un f32, redondeo al par más cercano). En el intérprete se marca con «17 bits».
+pub const BF16: u32 = 17;
+
+pub fn f32_a_bf16(x: f32) -> u16 {
+    let b = x.to_bits();
+    if x.is_nan() {
+        return ((b >> 16) | 0x40) as u16;
+    }
+    ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
+}
+
+pub fn bf16_a_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
 fn redondear(bits: u32, x: f64) -> f64 {
     match bits {
         16 => f16_a_f32(f32_a_f16(x as f32)) as f64,
+        BF16 => bf16_a_f32(f32_a_bf16(x as f32)) as f64,
         32 => x as f32 as f64,
         _ => x,
     }
@@ -141,6 +157,7 @@ pub fn constante(m: &Module, values: &[super::ir::Value], ty: TypeId, c: &Const)
         },
         Const::Float(b) => match &m.types[ty] {
             Type::Half => V::Real(16, f16_a_f32(*b as u16) as f64),
+            Type::BFloat => V::Real(BF16, bf16_a_f32(*b as u16) as f64),
             Type::Float => V::Real(32, f32::from_bits(*b as u32) as f64),
             Type::Double => V::Real(64, f64::from_bits(*b)),
             _ => return None,
@@ -168,6 +185,7 @@ pub fn constante(m: &Module, values: &[super::ir::Value], ty: TypeId, c: &Const)
                 .map(|&x| match &m.types[e] {
                     Type::Int(w) => V::Int(*w, x & mask(*w)),
                     Type::Half => V::Real(16, f16_a_f32(x as u16) as f64),
+                    Type::BFloat => V::Real(BF16, bf16_a_f32(x as u16) as f64),
                     Type::Float => V::Real(32, f32::from_bits(x as u32) as f64),
                     Type::Double => V::Real(64, f64::from_bits(x)),
                     _ => V::Undef,
@@ -215,6 +233,7 @@ pub fn cero(m: &Module, ty: TypeId) -> V {
     match &m.types[ty] {
         Type::Int(w) => V::Int(*w, 0),
         Type::Half => V::Real(16, 0.0),
+        Type::BFloat => V::Real(BF16, 0.0),
         Type::Float => V::Real(32, 0.0),
         Type::Double => V::Real(64, 0.0),
         Type::Ptr(_) => V::Ptr(Mem::Null, 0),
@@ -228,6 +247,7 @@ pub fn cero(m: &Module, ty: TypeId) -> V {
 fn real_bits(m: &Module, t: TypeId) -> Option<u32> {
     match &m.types[t] {
         Type::Half => Some(16),
+        Type::BFloat => Some(BF16),
         Type::Float => Some(32),
         Type::Double => Some(64),
         Type::Vector(_, e) => real_bits(m, *e),
@@ -260,10 +280,11 @@ fn bin(op: BinOp, a: &V, b: &V) -> Option<V> {
                 BinOp::Add => x.wrapping_add(y),
                 BinOp::Sub => x.wrapping_sub(y),
                 BinOp::Mul => x.wrapping_mul(y),
-                BinOp::UDiv => x.checked_div(y)?,
-                BinOp::SDiv => sx.checked_div(sy)? as u64,
-                BinOp::URem => x.checked_rem(y)?,
-                BinOp::SRem => sx.checked_rem(sy)? as u64,
+                // entre cero: indefinido en LLVM (y en la GPU, un valor cualquiera)
+                BinOp::UDiv => match x.checked_div(y) { Some(r) => r, None => return Some(V::Undef) },
+                BinOp::SDiv => match sx.checked_div(sy) { Some(r) => r as u64, None => return Some(V::Undef) },
+                BinOp::URem => match x.checked_rem(y) { Some(r) => r, None => return Some(V::Undef) },
+                BinOp::SRem => match sx.checked_rem(sy) { Some(r) => r as u64, None => return Some(V::Undef) },
                 BinOp::Shl => if y >= w as u64 { return Some(V::Undef) } else { x << y },
                 BinOp::LShr => if y >= w as u64 { return Some(V::Undef) } else { x >> y },
                 BinOp::AShr => if y >= w as u64 { return Some(V::Undef) } else { (sx >> y) as u64 },
@@ -396,6 +417,7 @@ pub fn de_bytes(m: &Module, t: TypeId, b: &[u8]) -> Option<V> {
     Some(match &m.types[t] {
         Type::Int(w) => V::Int(*w, rd((*w as usize).div_ceil(8))? & mask(*w)),
         Type::Half => V::Real(16, f16_a_f32(rd(2)? as u16) as f64),
+        Type::BFloat => V::Real(BF16, bf16_a_f32(rd(2)? as u16) as f64),
         Type::Float => V::Real(32, f32::from_bits(rd(4)? as u32) as f64),
         Type::Double => V::Real(64, f64::from_bits(rd(8)?)),
         Type::Vector(n, e) => {
@@ -425,6 +447,7 @@ pub fn a_bytes(m: &Module, t: TypeId, v: &V, out: &mut [u8]) -> Option<()> {
         (_, V::Undef) => Some(()),
         (Type::Int(w), V::Int(_, x)) => wr(out, (*w as usize).div_ceil(8), *x),
         (Type::Half, V::Real(_, x)) => wr(out, 2, f32_a_f16(*x as f32) as u64),
+        (Type::BFloat, V::Real(_, x)) => wr(out, 2, f32_a_bf16(*x as f32) as u64),
         (Type::Float, V::Real(_, x)) => wr(out, 4, (*x as f32).to_bits() as u64),
         (Type::Double, V::Real(_, x)) => wr(out, 8, x.to_bits()),
         (Type::Ptr(_), V::Ptr(Mem::Null, o)) => wr(out, 8, *o as u64),
@@ -602,14 +625,25 @@ impl Memoria {
         let V::Ptr(r, o) = p else { return Err(format!("load de algo que no es un puntero: {p:?}")) };
         let b = self.region(*r).ok_or_else(|| format!("load de {r:?}"))?;
         let n = layout::size(m, t) as usize;
-        let s = b.get(*o as usize..*o as usize + n).ok_or_else(|| format!("load fuera de {r:?} ({o}+{n})"))?;
+        let Some(s) = b.get(*o as usize..*o as usize + n) else {
+            // fuera de un buffer: 0, como con robustBufferAccess en la GPU
+            if matches!(r, Mem::Externa(_)) {
+                return de_bytes(m, t, &vec![0u8; n]).ok_or_else(|| "load de un tipo no soportado".into());
+            }
+            return Err(format!("load fuera de {r:?} ({o}+{n})"));
+        };
         de_bytes(m, t, s).ok_or_else(|| "load de un tipo no soportado".into())
     }
     pub fn guardar(&mut self, m: &Module, p: &V, t: TypeId, v: &V) -> Res<()> {
         let V::Ptr(r, o) = p else { return Err(format!("store en algo que no es un puntero: {p:?}")) };
         let n = layout::size(m, t) as usize;
         let b = self.region(*r).ok_or_else(|| format!("store en {r:?}"))?;
-        let s = b.get_mut(*o as usize..*o as usize + n).ok_or_else(|| format!("store fuera de {r:?}"))?;
+        let Some(s) = b.get_mut(*o as usize..*o as usize + n) else {
+            if matches!(r, Mem::Externa(_)) {
+                return Ok(()); // fuera de un buffer: se ignora (robustBufferAccess)
+            }
+            return Err(format!("store fuera de {r:?}"));
+        };
         a_bytes(m, t, v, s).ok_or_else(|| "store de un tipo no soportado".into())
     }
 }
@@ -656,10 +690,54 @@ pub fn ejecutar(m: &Module, fi: usize, args: &[V], mem: &mut Memoria, externas: 
     if f.is_proto {
         return externas(&f.name, args).ok_or_else(|| format!("llamada externa sin resolver: {}", f.name));
     }
-    let mut reg: Vec<Option<V>> = vec![None; f.values.len()];
-    for (k, &a) in f.args.iter().enumerate() {
-        reg[a] = args.get(k).cloned();
+    let mut h = Hilo::nuevo(f, args);
+    loop {
+        if let Parada::Fin(v) = correr(m, f, &mut h, mem, externas, pasos, u64::MAX)? {
+            return Ok(v);
+        }
     }
+}
+
+/// Estado de un hilo del intérprete: se puede parar en una barrera y seguir después (para ejecutar un threadgroup).
+pub struct Hilo {
+    reg: Vec<Option<V>>,
+    bb: usize,
+    prev: usize,
+    /// instrucción por la que sigue dentro de `bb` (0: el bloque empieza, con sus phis)
+    pos: usize,
+    /// valor que espera el resultado de una función colectiva
+    pendiente: Option<ValueId>,
+}
+
+pub enum Parada {
+    Fin(Option<V>),
+    /// llegó a una barrera de threadgroup (air.wg.barrier)
+    Barrera,
+    /// llegó a una función de SIMD-group (air.simd_*, air.quad_*): espera a los demás hilos del grupo; el resultado
+    /// se le da con `Hilo::reanudar`
+    Colectiva(String, Vec<V>),
+}
+
+impl Hilo {
+    pub fn nuevo(f: &Function, args: &[V]) -> Hilo {
+        let mut reg: Vec<Option<V>> = vec![None; f.values.len()];
+        for (k, &a) in f.args.iter().enumerate() {
+            reg[a] = args.get(k).cloned();
+        }
+        Hilo { reg, bb: 0, prev: usize::MAX, pos: 0, pendiente: None }
+    }
+
+    /// Da el resultado de la función colectiva en la que se paró.
+    pub fn reanudar(&mut self, v: Option<V>) {
+        if let (Some(k), Some(v)) = (self.pendiente.take(), v) {
+            self.reg[k] = Some(v);
+        }
+    }
+}
+
+/// Ejecuta `f` (que puede no estar en el módulo, p. ej. con todo en línea) desde donde se quedó el hilo hasta que
+/// termina o llega a una barrera. Las llamadas a funciones del módulo se ejecutan enteras (sin barreras dentro).
+pub fn correr(m: &Module, f: &Function, h: &mut Hilo, mem: &mut Memoria, externas: &mut Externas, pasos: &mut u64, max_pasos: u64) -> Res<Parada> {
     let valor = |reg: &Vec<Option<V>>, v: ValueId| -> Option<V> {
         if let Some(x) = reg.get(v).cloned().flatten() {
             return Some(x);
@@ -672,27 +750,32 @@ pub fn ejecutar(m: &Module, fi: usize, args: &[V], mem: &mut Memoria, externas: 
             _ => None,
         }
     };
-    let (mut bb, mut prev) = (0usize, usize::MAX);
+    let limite = max_pasos.min(50_000_000);
     loop {
-        let blk = f.blocks.get(bb).ok_or("salto a un bloque inexistente")?;
-        // phis: todos a la vez con los valores del bloque anterior
-        let mut nuevos = Vec::new();
-        for ins in &blk.insts {
-            if let Inst::Phi { incoming } = &ins.inst {
-                let (v, _) = incoming.iter().find(|(_, b)| *b == prev).ok_or("phi sin entrada para el bloque anterior")?;
-                nuevos.push((ins.val.unwrap(), valor(&reg, *v).unwrap_or(V::Undef)));
+        let blk = f.blocks.get(h.bb).ok_or("salto a un bloque inexistente")?;
+        if h.pos == 0 {
+            // phis: todos a la vez con los valores del bloque anterior
+            let mut nuevos = Vec::new();
+            for ins in &blk.insts {
+                if let Inst::Phi { incoming } = &ins.inst {
+                    let (v, _) = incoming.iter().find(|(_, b)| *b == h.prev).ok_or("phi sin entrada para el bloque anterior")?;
+                    nuevos.push((ins.val.unwrap(), valor(&h.reg, *v).unwrap_or(V::Undef)));
+                }
             }
-        }
-        for (k, v) in nuevos {
-            reg[k] = Some(v);
+            for (k, v) in nuevos {
+                h.reg[k] = Some(v);
+            }
         }
         let mut siguiente = None;
-        for ins in &blk.insts {
+        while h.pos < blk.insts.len() {
+            let ins = &blk.insts[h.pos];
+            h.pos += 1;
             *pasos += 1;
-            if *pasos > 50_000_000 {
+            if *pasos > limite {
                 return Err("demasiados pasos (¿bucle infinito?)".into());
             }
-            let get = |v: ValueId| valor(&reg, v);
+            let reg = &h.reg;
+            let get = |v: ValueId| valor(reg, v);
             let res: Option<V> = match &ins.inst {
                 Inst::Phi { .. } => continue,
                 Inst::Br(t) => {
@@ -710,7 +793,7 @@ pub fn ejecutar(m: &Module, fi: usize, args: &[V], mem: &mut Memoria, externas: 
                     siguiente = Some(dest);
                     break;
                 }
-                Inst::Ret(v) => return Ok(v.and_then(get)),
+                Inst::Ret(v) => return Ok(Parada::Fin(v.and_then(get))),
                 Inst::Unreachable => return Err("unreachable".into()),
                 Inst::Load { ptr, .. } => Some(mem.cargar(m, &get(*ptr).ok_or("puntero desconocido")?, ins.ty)?),
                 Inst::Store { ptr, val, .. } => {
@@ -733,8 +816,18 @@ pub fn ejecutar(m: &Module, fi: usize, args: &[V], mem: &mut Memoria, externas: 
                     match get(*callee) {
                         Some(V::Ptr(Mem::Function(g), _)) => {
                             let gf = &m.functions[g];
-                            if gf.name.starts_with("llvm.lifetime") || gf.name.starts_with("llvm.dbg") {
+                            if gf.name.starts_with("llvm.lifetime") || gf.name.starts_with("llvm.dbg") || gf.name == "llvm.assume" || gf.name.starts_with("llvm.experimental.noalias") {
                                 None
+                            } else if gf.name.starts_with("llvm.memset") || gf.name.starts_with("llvm.memcpy") || gf.name.starts_with("llvm.memmove") {
+                                memoria_llvm(mem, &gf.name, &av)?;
+                                None
+                            } else if gf.name.starts_with("air.atomic.") {
+                                atomica_cpu(m, mem, &gf.name, &av, ins.ty)?
+                            } else if gf.name == "air.wg.barrier" || gf.name == "air.simdgroup.barrier" {
+                                return Ok(Parada::Barrera);
+                            } else if gf.name.starts_with("air.simd_") || gf.name.starts_with("air.quad_") {
+                                h.pendiente = ins.val;
+                                return Ok(Parada::Colectiva(gf.name.clone(), av));
                             } else {
                                 ejecutar(m, g, &av, mem, externas, pasos)?
                             }
@@ -746,11 +839,12 @@ pub fn ejecutar(m: &Module, fi: usize, args: &[V], mem: &mut Memoria, externas: 
                 other => Some(plegar(m, f, other, ins.ty, &get).ok_or_else(|| format!("no se puede ejecutar {other:?}"))?),
             };
             if let (Some(k), Some(v)) = (ins.val, res) {
-                reg[k] = Some(v);
+                h.reg[k] = Some(v);
             }
         }
-        prev = bb;
-        bb = siguiente.ok_or("bloque sin terminador")?;
+        h.prev = h.bb;
+        h.bb = siguiente.ok_or("bloque sin terminador")?;
+        h.pos = 0;
     }
 }
 
@@ -776,4 +870,372 @@ mod tests {
         assert_eq!(cmp(40, &V::Int(8, 0xff), &V::Int(8, 1)), Some(V::Int(1, 1))); // -1 < 1 con signo
         assert_eq!(cmp(36, &V::Int(8, 0xff), &V::Int(8, 1)), Some(V::Int(1, 0)));
     }
+}
+
+// ---------------------------------------------------------------- funciones air.* en la CPU (referencia)
+
+fn mapa1(v: &V, f: &impl Fn(f64) -> f64) -> Option<V> {
+    Some(match v {
+        V::Real(w, x) => V::Real(*w, redondear(*w, f(*x))),
+        V::Vec(xs) => V::Vec(xs.iter().map(|x| mapa1(x, f)).collect::<Option<_>>()?),
+        _ => return None,
+    })
+}
+
+fn mapa_n(args: &[V], f: &impl Fn(&[f64]) -> f64) -> Option<V> {
+    match &args[0] {
+        V::Real(w, _) => {
+            let xs: Vec<f64> = args.iter().map(|a| a.real()).collect::<Option<_>>()?;
+            Some(V::Real(*w, redondear(*w, f(&xs))))
+        }
+        V::Vec(e0) => {
+            let n = e0.len();
+            let mut out = Vec::with_capacity(n);
+            for k in 0..n {
+                let comp: Vec<V> = args.iter().map(|a| match a { V::Vec(e) => e.get(k).cloned(), s => Some(s.clone()) }).collect::<Option<_>>()?;
+                out.push(mapa_n(&comp, f)?);
+            }
+            Some(V::Vec(out))
+        }
+        _ => None,
+    }
+}
+
+fn enteros_n(args: &[V], f: &impl Fn(&[(u32, u64)]) -> u64) -> Option<V> {
+    match &args[0] {
+        V::Int(w, _) => {
+            let xs: Vec<(u32, u64)> = args.iter().map(|a| match a { V::Int(w, x) => Some((*w, *x)), _ => None }).collect::<Option<_>>()?;
+            Some(V::Int(*w, f(&xs) & mask(*w)))
+        }
+        V::Vec(e0) => {
+            let n = e0.len();
+            let mut out = Vec::with_capacity(n);
+            for k in 0..n {
+                let comp: Vec<V> = args.iter().map(|a| match a { V::Vec(e) => e.get(k).cloned(), s => Some(s.clone()) }).collect::<Option<_>>()?;
+                out.push(enteros_n(&comp, f)?);
+            }
+            Some(V::Vec(out))
+        }
+        _ => None,
+    }
+}
+
+/// Funciones matemáticas y de conversión de AIR. `ty` es el tipo del resultado (para convert).
+pub fn air_math(m: &Module, nombre: &str, args: &[V], ty: TypeId) -> Option<V> {
+    let resto = nombre.strip_prefix("air.")?;
+    let p: Vec<&str> = resto.split('.').collect();
+    let base = p[0].strip_prefix("fast_").unwrap_or(p[0]);
+    let signo = p.get(1) == Some(&"s");
+    Some(match base {
+        "convert" => {
+            let (a, de) = (p.get(1).copied()?, p.get(3).copied()?);
+            let op = match (a, de) {
+                ("f", "f") => CastOp::FPExt,
+                ("f", "u") => CastOp::UIToFP,
+                ("f", "s") => CastOp::SIToFP,
+                ("u", "f") => CastOp::FPToUI,
+                ("s", "f") => CastOp::FPToSI,
+                (_, "u") => CastOp::ZExt,
+                (_, "s") => CastOp::SExt,
+                _ => return None,
+            };
+            // del mismo ancho o a menos bits: recortar
+            let op = match (op, &args[0]) {
+                (CastOp::ZExt | CastOp::SExt, V::Int(w, _)) if int_bits(m, ty)? <= *w => CastOp::Trunc,
+                (CastOp::ZExt | CastOp::SExt, V::Vec(e)) if matches!(e.first(), Some(V::Int(w, _)) if int_bits(m, ty)? <= *w) => CastOp::Trunc,
+                (o, _) => o,
+            };
+            return cast(m, op, &args[0], ty);
+        }
+        "dot" => {
+            let (V::Vec(a), V::Vec(b)) = (&args[0], &args[1]) else { return None };
+            let w = match m.types[ty] { Type::Half => 16, Type::Double => 64, _ => 32 };
+            let s: f64 = a.iter().zip(b).map(|(x, y)| x.real().unwrap_or(0.0) * y.real().unwrap_or(0.0)).sum();
+            V::Real(w, redondear(w, s))
+        }
+        "saturate" => mapa1(&args[0], &|x| x.clamp(0.0, 1.0))?,
+        "fabs" => mapa1(&args[0], &f64::abs)?,
+        "floor" => mapa1(&args[0], &f64::floor)?,
+        "ceil" => mapa1(&args[0], &f64::ceil)?,
+        "trunc" => mapa1(&args[0], &f64::trunc)?,
+        "fract" => mapa1(&args[0], &|x| x - x.floor())?,
+        "sqrt" => mapa1(&args[0], &f64::sqrt)?,
+        "rsqrt" => mapa1(&args[0], &|x| 1.0 / x.sqrt())?,
+        "exp" => mapa1(&args[0], &f64::exp)?,
+        "exp2" => mapa1(&args[0], &f64::exp2)?,
+        "log" => mapa1(&args[0], &f64::ln)?,
+        "log2" => mapa1(&args[0], &f64::log2)?,
+        "sin" => mapa1(&args[0], &f64::sin)?,
+        "cos" => mapa1(&args[0], &f64::cos)?,
+        "sign" => mapa1(&args[0], &|x| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 })?,
+        "tan" => mapa1(&args[0], &f64::tan)?,
+        "asin" => mapa1(&args[0], &f64::asin)?,
+        "acos" => mapa1(&args[0], &f64::acos)?,
+        "atan" => mapa1(&args[0], &f64::atan)?,
+        "sinh" => mapa1(&args[0], &f64::sinh)?,
+        "cosh" => mapa1(&args[0], &f64::cosh)?,
+        "tanh" => mapa1(&args[0], &f64::tanh)?,
+        "round" => mapa1(&args[0], &f64::round)?,
+        "rint" => mapa1(&args[0], &|x| { let r = x.round(); if (x - x.trunc()).abs() == 0.5 { 2.0 * (x / 2.0).round() } else { r } })?,
+        "step" => mapa_n(args, &|a| if a[1] < a[0] { 0.0 } else { 1.0 })?,
+        "smoothstep" => mapa_n(args, &|a| { let t = ((a[2] - a[0]) / (a[1] - a[0])).clamp(0.0, 1.0); t * t * (3.0 - 2.0 * t) })?,
+        "is_uniform" => args[0].clone(),
+        "any" | "all" => {
+            let xs: Vec<u64> = match &args[0] { V::Vec(e) => e.iter().map(|x| x.int().unwrap_or(0)).collect(), x => vec![x.int().unwrap_or(0)] };
+            let r = if base == "any" { xs.iter().any(|&x| x != 0) } else { xs.iter().all(|&x| x != 0) };
+            match m.types[ty] { Type::Int(w) => V::Int(w, r as u64), _ => V::Int(1, r as u64) }
+        }
+        "length" => {
+            let xs: Vec<f64> = match &args[0] { V::Vec(e) => e.iter().map(|x| x.real().unwrap_or(0.0)).collect(), x => vec![x.real()?] };
+            let w = match m.types[ty] { Type::Half => 16, _ => 32 };
+            V::Real(w, redondear(w, xs.iter().map(|x| x * x).sum::<f64>().sqrt()))
+        }
+        "fmax" => mapa_n(args, &|a| a[0].max(a[1]))?,
+        "fmin" => mapa_n(args, &|a| a[0].min(a[1]))?,
+        "fmax3" => mapa_n(args, &|a| a[0].max(a[1]).max(a[2]))?,
+        "fmin3" => mapa_n(args, &|a| a[0].min(a[1]).min(a[2]))?,
+        "pow" | "powr" => mapa_n(args, &|a| a[0].powf(a[1]))?,
+        "atan2" => mapa_n(args, &|a| a[0].atan2(a[1]))?,
+        "fma" => mapa_n(args, &|a| a[0] * a[1] + a[2])?,
+        "mix" => mapa_n(args, &|a| a[0] + (a[1] - a[0]) * a[2])?,
+        "clamp" if matches!(args[0], V::Real(..)) || matches!(&args[0], V::Vec(e) if matches!(e.first(), Some(V::Real(..)))) => {
+            mapa_n(args, &|a| a[0].max(a[1]).min(a[2]))?
+        }
+        "clamp" => enteros_n(args, &|a| {
+            let (w, x) = a[0];
+            if signo {
+                sext(w, x).max(sext(w, a[1].1)).min(sext(w, a[2].1)) as u64
+            } else {
+                x.max(a[1].1).min(a[2].1)
+            }
+        })?,
+        "min" => enteros_n(args, &|a| if signo { sext(a[0].0, a[0].1).min(sext(a[0].0, a[1].1)) as u64 } else { a[0].1.min(a[1].1) })?,
+        "max" => enteros_n(args, &|a| if signo { sext(a[0].0, a[0].1).max(sext(a[0].0, a[1].1)) as u64 } else { a[0].1.max(a[1].1) })?,
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------- funciones de SIMD-group en la CPU
+
+fn elem2(a: &V, b: &V, f: &dyn Fn(&V, &V) -> Option<V>) -> Option<V> {
+    match (a, b) {
+        (V::Vec(x), V::Vec(y)) => Some(V::Vec(x.iter().zip(y).map(|(p, q)| elem2(p, q, f)).collect::<Option<_>>()?)),
+        _ => f(a, b),
+    }
+}
+
+fn red(op: &str, signo: bool, a: &V, b: &V) -> Option<V> {
+    elem2(a, b, &|x, y| match (x, y) {
+        (V::Real(w, p), V::Real(_, q)) => Some(V::Real(*w, redondear(*w, match op {
+            "sum" => p + q,
+            "product" => p * q,
+            "max" => p.max(*q),
+            "min" => p.min(*q),
+            _ => return None,
+        }))),
+        (V::Int(w, p), V::Int(_, q)) => Some(V::Int(*w, mask(*w) & match op {
+            "sum" => p.wrapping_add(*q),
+            "product" => p.wrapping_mul(*q),
+            "max" if signo => sext(*w, *p).max(sext(*w, *q)) as u64,
+            "min" if signo => sext(*w, *p).min(sext(*w, *q)) as u64,
+            "max" => *p.max(q),
+            "min" => *p.min(q),
+            "and" | "all" => p & q,
+            "or" | "any" => p | q,
+            "xor" => p ^ q,
+            _ => return None,
+        })),
+        _ => None,
+    })
+}
+
+/// Calcula una función colectiva para los hilos de un SIMD-group (32 carriles). `args[c]`: los argumentos del carril
+/// `c` si está en la llamada (activo). Devuelve el resultado de cada carril activo.
+pub fn simd_cpu(nombre: &str, args: &[Option<Vec<V>>]) -> Result<Vec<Option<V>>, String> {
+    let resto = nombre.strip_prefix("air.").unwrap_or(nombre);
+    let partes: Vec<&str> = resto.split('.').collect();
+    let base = partes[0];
+    let quad = base.starts_with("quad_");
+    let op = base.split_once('_').map(|x| x.1).unwrap_or("");
+    let signo = partes.get(1) == Some(&"s");
+    let ancho = if quad { 4 } else { 32 };
+    let n = args.len();
+    let val = |c: usize| args.get(c).and_then(|a| a.as_ref()).and_then(|a| a.first().cloned());
+    let arg = |c: usize, k: usize| args.get(c).and_then(|a| a.as_ref()).and_then(|a| a.get(k).cloned());
+    let mut out = vec![None; n];
+    for c in 0..n {
+        if args[c].is_none() {
+            continue;
+        }
+        let g0 = c / ancho * ancho;
+        let activos: Vec<usize> = (g0..(g0 + ancho).min(n)).filter(|&k| args[k].is_some()).collect();
+        let r = match op {
+            "sum" | "product" | "max" | "min" | "and" | "or" | "xor" | "all" | "any" => {
+                let mut acc = val(activos[0]).ok_or("sin valor")?;
+                for &k in &activos[1..] {
+                    acc = red(op, signo, &acc, &val(k).ok_or("sin valor")?).ok_or_else(|| format!("{nombre}: tipos"))?;
+                }
+                acc
+            }
+            "prefix_inclusive_sum" | "prefix_exclusive_sum" | "prefix_inclusive_product" | "prefix_exclusive_product" => {
+                let o = if op.ends_with("sum") { "sum" } else { "product" };
+                let incl = op.contains("inclusive");
+                let previos: Vec<usize> = activos.iter().copied().filter(|&k| if incl { k <= c } else { k < c }).collect();
+                let v0 = val(c).ok_or("sin valor")?;
+                let neutro = match &v0 {
+                    V::Real(w, _) => V::Real(*w, if o == "sum" { 0.0 } else { 1.0 }),
+                    V::Int(w, _) => V::Int(*w, (o != "sum") as u64),
+                    V::Vec(e) => V::Vec(e.iter().map(|x| match x { V::Real(w, _) => V::Real(*w, if o == "sum" { 0.0 } else { 1.0 }), V::Int(w, _) => V::Int(*w, (o != "sum") as u64), _ => V::Undef }).collect()),
+                    _ => V::Undef,
+                };
+                let mut acc = neutro;
+                for k in previos {
+                    acc = red(o, signo, &acc, &val(k).ok_or("sin valor")?).ok_or_else(|| format!("{nombre}: tipos"))?;
+                }
+                acc
+            }
+            "shuffle" | "broadcast" | "shuffle_xor" | "shuffle_down" | "shuffle_up" | "shuffle_rotate_down" | "shuffle_rotate_up" => {
+                let d = arg(c, 1).and_then(|x| x.int()).ok_or("índice desconocido")? as i64;
+                let local = (c - g0) as i64;
+                let (orig, valido) = match op {
+                    "shuffle" | "broadcast" => (d & (ancho as i64 - 1), true),
+                    "shuffle_xor" => (local ^ d, (local ^ d) < ancho as i64),
+                    "shuffle_down" => (local + d, local + d < ancho as i64),
+                    "shuffle_up" => (local - d, local >= d),
+                    "shuffle_rotate_down" => ((local + d).rem_euclid(ancho as i64), true),
+                    _ => ((local - d).rem_euclid(ancho as i64), true),
+                };
+                if valido { val(g0 + orig as usize).unwrap_or(V::Undef) } else { val(c).unwrap_or(V::Undef) }
+            }
+            "is_first" => V::Int(1, (activos.first() == Some(&c)) as u64),
+            "ballot" | "active_threads_mask" => {
+                let mut m = 0u64;
+                for &k in &activos {
+                    if op == "active_threads_mask" || arg(k, 0).and_then(|x| x.int()).unwrap_or(0) != 0 {
+                        m |= 1 << (k - g0);
+                    }
+                }
+                V::Int(32, m)
+            }
+            _ => return Err(format!("{nombre} sin referencia en la CPU")),
+        };
+        out[c] = Some(r);
+    }
+    Ok(out)
+}
+
+/// llvm.memset / llvm.memcpy / llvm.memmove en el intérprete.
+fn memoria_llvm(mem: &mut Memoria, nombre: &str, a: &[V]) -> Res<()> {
+    let n = a.get(2).and_then(|x| x.int()).ok_or("memset/memcpy de tamaño desconocido")? as usize;
+    let V::Ptr(rd, od) = a[0] else { return Err("memset/memcpy sin destino".into()) };
+    let datos: Vec<u8> = if nombre.starts_with("llvm.memset") {
+        vec![a[1].int().unwrap_or(0) as u8; n]
+    } else {
+        let V::Ptr(ro, oo) = a[1] else { return Err("memcpy sin origen".into()) };
+        let b = mem.region(ro).ok_or("memcpy desde una región desconocida")?;
+        let mut v = vec![0u8; n];
+        if let Some(s) = b.get(oo as usize..oo as usize + n) {
+            v.copy_from_slice(s);
+        }
+        v
+    };
+    let b = mem.region(rd).ok_or("memset/memcpy a una región desconocida")?;
+    if let Some(s) = b.get_mut(od as usize..od as usize + n) {
+        s.copy_from_slice(&datos);
+    }
+    Ok(())
+}
+
+/// Intrínsecas llvm.* en la CPU (referencia).
+pub fn llvm_math(nombre: &str, args: &[V]) -> Option<V> {
+    let resto = nombre.strip_prefix("llvm.")?;
+    let base = resto.split('.').next()?;
+    let ent = |f: &dyn Fn(u32, u64, u64) -> u64| enteros_n(args, &|a| f(a[0].0, a[0].1, a.get(1).map(|x| x.1).unwrap_or(0)));
+    Some(match base {
+        "smax" => ent(&|w, x, y| sext(w, x).max(sext(w, y)) as u64)?,
+        "smin" => ent(&|w, x, y| sext(w, x).min(sext(w, y)) as u64)?,
+        "umax" => ent(&|_, x, y| x.max(y))?,
+        "umin" => ent(&|_, x, y| x.min(y))?,
+        "abs" if matches!(args[0], V::Int(..)) || matches!(&args[0], V::Vec(e) if matches!(e.first(), Some(V::Int(..)))) => {
+            enteros_n(&args[..1], &|a| sext(a[0].0, a[0].1).unsigned_abs())?
+        }
+        "ctpop" => enteros_n(&args[..1], &|a| a[0].1.count_ones() as u64)?,
+        "cttz" => enteros_n(&args[..1], &|a| if a[0].1 == 0 { a[0].0 as u64 } else { a[0].1.trailing_zeros() as u64 })?,
+        "ctlz" => enteros_n(&args[..1], &|a| if a[0].1 == 0 { a[0].0 as u64 } else { (a[0].1.leading_zeros() - (64 - a[0].0)) as u64 })?,
+        "bitreverse" => enteros_n(&args[..1], &|a| a[0].1.reverse_bits() >> (64 - a[0].0))?,
+        "bswap" => enteros_n(&args[..1], &|a| a[0].1.swap_bytes() >> (64 - a[0].0))?,
+        "fabs" => mapa1(&args[0], &f64::abs)?,
+        "floor" => mapa1(&args[0], &f64::floor)?,
+        "ceil" => mapa1(&args[0], &f64::ceil)?,
+        "trunc" => mapa1(&args[0], &f64::trunc)?,
+        "rint" | "nearbyint" | "roundeven" => mapa1(&args[0], &|x| { let r = x.round(); if (x - x.trunc()).abs() == 0.5 { 2.0 * (x / 2.0).round() } else { r } })?,
+        "round" => mapa1(&args[0], &f64::round)?,
+        "sqrt" => mapa1(&args[0], &f64::sqrt)?,
+        "exp2" => mapa1(&args[0], &f64::exp2)?,
+        "log2" => mapa1(&args[0], &f64::log2)?,
+        "exp" => mapa1(&args[0], &f64::exp)?,
+        "log" => mapa1(&args[0], &f64::ln)?,
+        "sin" => mapa1(&args[0], &f64::sin)?,
+        "cos" => mapa1(&args[0], &f64::cos)?,
+        "pow" => mapa_n(args, &|a| a[0].powf(a[1]))?,
+        "minnum" | "minimum" => mapa_n(args, &|a| a[0].min(a[1]))?,
+        "maxnum" | "maximum" => mapa_n(args, &|a| a[0].max(a[1]))?,
+        "fma" | "fmuladd" => mapa_n(args, &|a| a[0] * a[1] + a[2])?,
+        "copysign" => mapa_n(args, &|a| a[0].abs().copysign(a[1]))?,
+        _ => return None,
+    })
+}
+
+/// Atómicas de AIR en el intérprete (los hilos van de uno en uno: basta con leer y escribir).
+fn atomica_cpu(m: &Module, mem: &mut Memoria, nombre: &str, a: &[V], ty: TypeId) -> Res<Option<V>> {
+    let p: Vec<&str> = nombre.split('.').collect();
+    let op = p.get(3).copied().unwrap_or("");
+    if p.get(2) == Some(&"fence") {
+        return Ok(None);
+    }
+    let signo = p.get(4) == Some(&"s");
+    let real = p.last().is_some_and(|t| t.starts_with('f'));
+    let t32 = m.types.iter().position(|t| *t == Type::Int(32)).ok_or("sin tipo i32")?;
+    let viejo = mem.cargar(m, &a[0], t32)?;
+    let V::Int(_, x) = viejo else { return Err("atómica sobre un valor desconocido".into()) };
+    let bits = |v: &V| -> u64 { match v { V::Real(_, f) => (*f as f32).to_bits() as u64, o => o.int().unwrap_or(0) & 0xffff_ffff } };
+    let como = |x: u64| if real { V::Real(32, f32::from_bits(x as u32) as f64) } else { V::Int(32, x) };
+    let (nuevo, res) = match op {
+        "load" => (None, Some(como(x))),
+        "store" => (Some(bits(&a[1])), None),
+        "cmpxchg" => {
+            let esperado = mem.cargar(m, &a[1], t32)?.int().unwrap_or(0);
+            let ok = x == esperado;
+            mem.guardar(m, &a[1], t32, &V::Int(32, x))?;
+            let r = match m.types[ty] { Type::Int(w) => V::Int(w, ok as u64), _ => V::Int(1, ok as u64) };
+            (if ok { Some(bits(&a[2])) } else { None }, Some(r))
+        }
+        _ => {
+            let y = bits(&a[1]);
+            let n = if real {
+                let (fx, fy) = (f32::from_bits(x as u32), f32::from_bits(y as u32));
+                (match op { "add" => fx + fy, "sub" => fx - fy, "xchg" => fy, _ => return Err(format!("{nombre} sin referencia")) }).to_bits() as u64
+            } else {
+                let (sx, sy) = (x as u32 as i32, y as u32 as i32);
+                match op {
+                    "add" => x.wrapping_add(y),
+                    "sub" => x.wrapping_sub(y),
+                    "max" if signo => sx.max(sy) as u32 as u64,
+                    "min" if signo => sx.min(sy) as u32 as u64,
+                    "max" => x.max(y),
+                    "min" => x.min(y),
+                    "and" => x & y,
+                    "or" => x | y,
+                    "xor" => x ^ y,
+                    "xchg" => y,
+                    _ => return Err(format!("{nombre} sin referencia")),
+                }
+            };
+            (Some(n & 0xffff_ffff), Some(como(x)))
+        }
+    };
+    if let Some(n) = nuevo {
+        mem.guardar(m, &a[0], t32, &V::Int(32, n))?;
+    }
+    Ok(res)
 }

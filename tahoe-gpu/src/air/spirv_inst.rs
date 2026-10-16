@@ -64,10 +64,13 @@ pub fn traducir(m: &Module, e: &Entrada, op: &Opciones) -> Res<Traduccion> {
         grid: None,
         usa_demote: false,
         usa_subgrupos: false,
+        capacidades: Vec::new(),
         bases: HashMap::new(),
+        fijos: HashMap::new(),
         wg_size: None,
         t_bloque: None,
         tipos_textura: HashMap::new(),
+        wg_args: HashMap::new(),
     };
     t.emitir()?;
     // recursos usados
@@ -86,8 +89,15 @@ pub fn traducir(m: &Module, e: &Entrada, op: &Opciones) -> Res<Traduccion> {
         t.b.capability(Capability::DemoteToHelperInvocation);
         t.b.extension("SPV_EXT_demote_to_helper_invocation");
     }
+    let mut caps = std::mem::take(&mut t.capacidades);
+    caps.sort_by_key(|c| *c as u32);
+    caps.dedup();
+    for c in caps {
+        t.b.capability(c);
+    }
     if t.usa_subgrupos {
-        for c in [Capability::GroupNonUniform, Capability::GroupNonUniformShuffle, Capability::GroupNonUniformArithmetic, Capability::GroupNonUniformQuad, Capability::GroupNonUniformBallot, Capability::GroupNonUniformVote] {
+        // (sin GroupNonUniformArithmetic: la GPU no la tiene; las reducciones van con shuffles)
+        for c in [Capability::GroupNonUniform, Capability::GroupNonUniformShuffle, Capability::GroupNonUniformShuffleRelative, Capability::GroupNonUniformQuad, Capability::GroupNonUniformBallot, Capability::GroupNonUniformVote] {
             t.b.capability(c);
         }
     }
@@ -95,7 +105,7 @@ pub fn traducir(m: &Module, e: &Entrada, op: &Opciones) -> Res<Traduccion> {
     let varyings = t.varyings_out.clone();
     let atributos = t.atributos.clone();
     let spirv = t.b.module().assemble();
-    Ok(Traduccion { spirv, etapa: e.etapa, enlaces, varyings, atributos, colores, bloques: reach, maquina_de_estados: reach > 1 })
+    Ok(Traduccion { spirv, etapa: e.etapa, enlaces, varyings, atributos, colores, bloques: reach, maquina_de_estados: reach > 1, subgrupos: t.usa_subgrupos })
 }
 
 fn nombre_air<'a>(m: &'a Module, f: &Function, callee: ValueId) -> &'a str {
@@ -131,6 +141,7 @@ impl Tr<'_> {
         self.b.begin_block(None).unwrap();
         self.preparar_variables()?;
         self.argumentos()?;
+        self.analizar_bases();
         if self.ent.etapa == Etapa::Kernel {
             self.limite_de_rejilla()?;
         }
@@ -299,7 +310,10 @@ impl Tr<'_> {
                 }
             }
             let tv = match d.clase.as_str() {
-                "air.buffer" | "air.indirect_buffer" => TV::Ptr(Base::Buf(d.int_tras("air.location_index").unwrap_or(0) as u32), Off::C(0)),
+                "air.buffer" | "air.indirect_buffer" => {
+                    let i = d.int_tras("air.location_index").unwrap_or(0) as u32;
+                    if d.int_tras("air.address_space") == Some(3) { TV::Ptr(Base::WgArg(i), Off::C(0)) } else { TV::Ptr(Base::Buf(i), Off::C(0)) }
+                }
                 "air.texture" => {
                     let i = d.int_tras("air.location_index").unwrap_or(0) as u32;
                     let nombre = d.txt_tras("air.arg_type_name").unwrap_or("");
@@ -340,6 +354,34 @@ impl Tr<'_> {
                 "air.simdgroup_index_in_threadgroup" => {
                     self.usa_subgrupos = true;
                     TV::Id(self.leer_builtin(BuiltIn::SubgroupId, 1, t_arg)?)
+                }
+                "air.thread_index_in_quadgroup" | "air.quadgroup_index_in_threadgroup" | "air.quadgroups_per_threadgroup" => {
+                    let x = match d.clase.as_str() {
+                        "air.thread_index_in_quadgroup" => {
+                            let l = self.leer_builtin(BuiltIn::SubgroupLocalInvocationId, 1, t_arg)?;
+                            self.usa_subgrupos = true;
+                            let tres = self.cu(3);
+                            self.b.bitwise_and(self.t_u32, None, l, tres).unwrap()
+                        }
+                        "air.quadgroup_index_in_threadgroup" => {
+                            let l = self.leer_builtin(BuiltIn::LocalInvocationIndex, 1, t_arg)?;
+                            let dos = self.cu(2);
+                            self.b.shift_right_logical(self.t_u32, None, l, dos).unwrap()
+                        }
+                        _ => {
+                            let g = self.wg_size.ok_or("tamaño de grupo fuera de un kernel")?;
+                            let gx = self.b.composite_extract(self.t_u32, None, g, [0]).unwrap();
+                            let gy = self.b.composite_extract(self.t_u32, None, g, [1]).unwrap();
+                            let gz = self.b.composite_extract(self.t_u32, None, g, [2]).unwrap();
+                            let xy = self.b.i_mul(self.t_u32, None, gx, gy).unwrap();
+                            let n = self.b.i_mul(self.t_u32, None, xy, gz).unwrap();
+                            let tres = self.cu(3);
+                            let n3 = self.b.i_add(self.t_u32, None, n, tres).unwrap();
+                            let dos = self.cu(2);
+                            self.b.shift_right_logical(self.t_u32, None, n3, dos).unwrap()
+                        }
+                    };
+                    TV::Id(x)
                 }
                 "air.threads_per_simdgroup" => {
                     self.usa_subgrupos = true;
@@ -463,15 +505,14 @@ impl Tr<'_> {
     }
 
     /// Tamaño de la rejilla (constantes de empuje: x, y, z en hilos).
+    /// Tamaño de la rejilla de Metal (en hilos), de la push constant (se lee en el bloque de entrada).
     fn rejilla(&mut self) -> Res<Word> {
         if let Some(g) = self.grid {
             return Ok(g);
         }
-        Err("rejilla no preparada".into())
-    }
-
-    /// En un kernel: los hilos fuera de la rejilla de Metal (dispatchThreads con grupos que no la dividen) salen ya.
-    fn limite_de_rejilla(&mut self) -> Res<()> {
+        if self.ent.etapa != Etapa::Kernel {
+            return Err("tamaño de rejilla fuera de un kernel".into());
+        }
         let v3 = self.vec_t(self.t_u32, 3);
         let st = self.b.type_struct([v3]);
         self.b.decorate(st, Decoration::Block, []);
@@ -484,6 +525,13 @@ impl Tr<'_> {
         let p = self.b.access_chain(pv, None, var, [cero]).unwrap();
         let g = self.b.load(v3, None, p, None, []).unwrap();
         self.grid = Some(g);
+        Ok(g)
+    }
+
+    /// En un kernel: los hilos fuera de la rejilla de Metal (dispatchThreads con grupos que no la dividen) salen ya.
+    fn limite_de_rejilla(&mut self) -> Res<()> {
+        let v3 = self.vec_t(self.t_u32, 3);
+        let g = self.rejilla()?;
         let gidv = self.builtin(BuiltIn::GlobalInvocationId, v3, StorageClass::Input);
         let gid = self.b.load(v3, None, gidv, None, []).unwrap();
         let bv3 = self.vec_t(self.t_bool, 3);
@@ -512,14 +560,14 @@ impl Tr<'_> {
         for ins in insts {
             if let Inst::Phi { .. } = ins.inst {
                 let v = ins.val.unwrap();
-                if self.an.constantes.get(v).cloned().flatten().is_some() {
+                if self.an.constantes.get(v).cloned().flatten().is_some() || self.fijos.contains_key(&v) {
                     continue;
                 }
                 let t = f.values[v].ty;
                 if espacio(self.m, t).is_some() {
                     // phi de punteros: misma base en todas las entradas (se toma la de la primera ya traducida)
                     let Inst::Phi { incoming } = &ins.inst else { unreachable!() };
-                    let base = incoming.iter().find_map(|(x, _)| match self.tv(*x) { Ok(TV::Ptr(b, _)) => Some(b), _ => None });
+                    let base = self.bases.get(&v).copied().or_else(|| incoming.iter().find_map(|(x, _)| match self.tv(*x) { Ok(TV::Ptr(b, _)) => Some(b), _ => None }));
                     let var = *self.vars.get(&v).ok_or("phi sin variable")?;
                     let off = self.b.load(self.t_u32, None, var, None, []).unwrap();
                     self.vals[v] = Some(TV::Ptr(base.ok_or("phi de punteros sin base conocida")?, Off::Id(off)));
@@ -589,6 +637,141 @@ impl Tr<'_> {
         Err(format!("bloque {bb} sin terminador"))
     }
 
+    /// Base de cada puntero de la función, antes de traducir (para los que cruzan bloques y los phi, sobre todo en
+    /// bucles, cuya entrada puede venir de un bloque aún sin traducir): argumentos, allocas y globales, y de ahí por
+    /// GEP, casts, select y phi hasta que no cambia nada. Los que mezclan bases distintas no entran.
+    fn analizar_bases(&mut self) {
+        let f = self.f;
+        let mut base: HashMap<ValueId, Option<Base>> = HashMap::new(); // None: bases distintas
+        let inicial = |tr: &Self, v: ValueId| -> Option<Option<Base>> {
+            if let Some(Some(TV::Ptr(b, _))) = tr.vals.get(v) {
+                return Some(Some(*b));
+            }
+            match tr.an.constantes.get(v).cloned().flatten() {
+                Some(V::Ptr(Mem::Global(g), _)) => Some(Some(tr.base_global(g))),
+                _ => match f.values.get(v).map(|x| &x.kind) {
+                    Some(ValueKind::Global(g)) => Some(Some(tr.base_global(*g))),
+                    _ => None,
+                },
+            }
+        };
+        for _ in 0..64 {
+            let mut cambio = false;
+            for (bb, blk) in f.blocks.iter().enumerate() {
+                if !self.an.alcanzables.get(bb).copied().unwrap_or(false) {
+                    continue;
+                }
+                for ins in &blk.insts {
+                    let Some(v) = ins.val else { continue };
+                    if espacio(self.m, f.values[v].ty).is_none() {
+                        continue;
+                    }
+                    let de = |x: ValueId, base: &HashMap<ValueId, Option<Base>>| -> Option<Option<Base>> { base.get(&x).copied().or_else(|| inicial(self, x)) };
+                    let fuentes: Vec<ValueId> = match &ins.inst {
+                        Inst::Alloca { .. } => {
+                            if base.insert(v, Some(Base::Priv(v))) != Some(Some(Base::Priv(v))) {
+                                cambio = true;
+                            }
+                            continue;
+                        }
+                        Inst::Gep { ptr, .. } => vec![*ptr],
+                        Inst::Cast { v: x, .. } => vec![*x],
+                        Inst::Select { t, f: fl, .. } => vec![*t, *fl],
+                        Inst::Phi { incoming } => incoming.iter().filter(|(_, pb)| self.an.alcanzables.get(*pb).copied().unwrap_or(false)).map(|(x, _)| *x).collect(),
+                        _ => continue,
+                    };
+                    // encuentro: las desconocidas (undef, nulos, aún sin saber) no cuentan
+                    let mut r: Option<Option<Base>> = None;
+                    for x in fuentes {
+                        match de(x, &base) {
+                            None | Some(Some(Base::Nula)) => {}
+                            Some(b) => {
+                                r = Some(match (r, b) {
+                                    (None, b) => b,
+                                    (Some(Some(a)), Some(b)) if a == b => Some(a),
+                                    _ => None,
+                                })
+                            }
+                        }
+                    }
+                    if let Some(r) = r {
+                        if base.get(&v) != Some(&r) {
+                            // solo baja: de una base a «distintas»
+                            let nuevo = match base.get(&v) { Some(Some(a)) if Some(*a) != r => None, _ => r };
+                            if base.get(&v) != Some(&nuevo) {
+                                base.insert(v, nuevo);
+                                cambio = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !cambio {
+                break;
+            }
+        }
+        for (v, b) in base {
+            if let Some(b) = b {
+                self.bases.entry(v).or_insert(b);
+            }
+        }
+        // texturas y samplers: la misma en todas las entradas (sin contar la nula)
+        for _ in 0..16 {
+            let mut cambio = false;
+            for (bb, blk) in f.blocks.iter().enumerate() {
+                if !self.an.alcanzables.get(bb).copied().unwrap_or(false) {
+                    continue;
+                }
+                for ins in &blk.insts {
+                    let Some(v) = ins.val else { continue };
+                    if self.fijos.contains_key(&v) {
+                        continue;
+                    }
+                    let fuentes: Vec<ValueId> = match &ins.inst {
+                        Inst::Select { t, f: fl, .. } => vec![*t, *fl],
+                        Inst::Phi { incoming } => incoming.iter().filter(|(_, pb)| self.an.alcanzables.get(*pb).copied().unwrap_or(false)).map(|(x, _)| *x).collect(),
+                        Inst::Cast { v: x, .. } => vec![*x],
+                        _ => continue,
+                    };
+                    let mut r: Option<TV> = None;
+                    let mut ok = true;
+                    for x in fuentes {
+                        let tvx = self.fijos.get(&x).cloned().or_else(|| match self.vals.get(x) {
+                            Some(Some(t @ (TV::Tex(_) | TV::Smp(_)))) => Some(t.clone()),
+                            _ => None,
+                        });
+                        let nula = match f.values[x].kind {
+                            ValueKind::Inst(b2, k2) => matches!(&f.blocks[b2].insts[k2].inst, Inst::Call { callee, .. } if nombre_air(self.m, f, *callee).starts_with("air.get_null_texture")),
+                            ValueKind::Const(_) => true,
+                            _ => false,
+                        };
+                        // argumentos que no están en esta variante (function constants): undef, como la nula
+                        let ausente = matches!(self.vals.get(x), Some(Some(TV::C(V::Undef)))) || matches!(self.fijos.get(&x), Some(TV::Ptr(Base::Nula, _)));
+                        match (tvx, &r) {
+                            (Some(TV::Ptr(Base::Nula, _)), _) => {}
+                            (Some(t), None) => r = Some(t),
+                            (Some(t), Some(a)) if t == *a => {}
+                            (None, _) if nula || ausente => {}
+                            _ => ok = false,
+                        }
+                    }
+                    // solo nulas: es la textura nula
+                    let r = if ok && r.is_none() && espacio(self.m, f.values[v].ty) == Some(1) { Some(TV::Ptr(Base::Nula, Off::C(0))) } else { r };
+                    if std::env::var_os("TAHOE_AIR_DEBUG").is_some() && matches!(ins.inst, Inst::Phi { .. }) && espacio(self.m, f.values[v].ty).is_some() {
+                        eprintln!("fijos: %{v} ok={ok} r={r:?} fuentes={:?}", match &ins.inst { Inst::Phi { incoming } => incoming.iter().map(|(x, _)| (self.vals.get(*x).cloned(), f.values[*x].kind.clone())).collect::<Vec<_>>(), _ => vec![] });
+                    }
+                    if let (true, Some(t)) = (ok, r) {
+                        self.fijos.insert(v, t);
+                        cambio = true;
+                    }
+                }
+            }
+            if !cambio {
+                break;
+            }
+        }
+    }
+
     /// Antes de saltar de `desde` a `hacia`: los phi de `hacia` reciben su valor (todos leídos antes de escribir).
     fn copiar_phis(&mut self, desde: usize, hacia: usize) -> Res<()> {
         let f = self.f;
@@ -597,6 +780,9 @@ impl Tr<'_> {
             let Inst::Phi { incoming } = &ins.inst else { continue };
             let v = ins.val.unwrap();
             let Some(&var) = self.vars.get(&v) else { continue };
+            if self.fijos.contains_key(&v) {
+                continue;
+            }
             let Some((x, _)) = incoming.iter().find(|(_, b)| *b == desde) else { continue };
             let t = f.values[v].ty;
             let tvx = self.tv(*x)?;
