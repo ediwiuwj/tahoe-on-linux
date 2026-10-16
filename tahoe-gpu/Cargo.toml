@@ -1,0 +1,14 @@
+[package]
+name = "tahoe-gpu"
+version = "0.1.0"
+edition = "2021"
+description = "La GPU del PC para el macOS de tahoe-run: Metal sobre Vulkan (lado Linux)"
+license = "MIT"
+
+[dependencies]
+ash = "0.38"
+rspirv = "0.12"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3

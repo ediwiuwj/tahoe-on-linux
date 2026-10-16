@@ -146,9 +146,20 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    (antes: 615 responden, 190 fallos del emulador).
 4. **Pantalla**: que WindowServer dibuje y se vea el escritorio (o el Asistente, si se deshace la preconfiguración);
    fallo intermitente del nib de Language Chooser.
-5. **Metal 2 sobre Vulkan (Rust)**: driver Metal propio publicado en IOKit (IOAccelerator, `MetalPluginName`), órdenes de
-   Metal a Vulkan con `ash`, shaders AIR→SPIR-V (`metal2vulkan`); primero la composición de WindowServer y CoreAnimation
-   (Liquid Glass), después Metal 2 completo y lo que pida macOS de Metal 3 (ampliando `hasvk` de Mesa si hace falta).
+5. **Metal 2 sobre Vulkan (Rust)**. La GPU del PC (Intel HD 4400, Haswell, Vulkan 1.2 de Mesa `hasvk`) **alcanza para
+   Metal 2 como lo tenían los Mac con Intel**: `tahoe-gpu informe` da 18 requisitos nativos, 8 emulables en el
+   traductor de shaders (half, enteros de 64 y 16 bits, punteros, SIMD-group, texturas read_write...) y 4 que faltan,
+   de hardware o poco usados (texturas de 16384, argument buffers tier 2 —los Mac con Intel solo tienen tier 1—,
+   escritura en buffers desde vertex shaders y raster order groups). Un driver Vulkan propio no daría lo que no tiene
+   el hardware, así que **no se toca el driver del sistema**: lo que falte se emula en Rust en nuestro lado.
+   Plan, todo en Rust:
+   - `tahoe-gpu/` (Linux, `ash`): el dispositivo, memoria compartida sin copias (memfd importado con
+     VK_EXT_external_memory_host: probado, 1 millón de enteros en 1,6 ms), lector de `.metallib` (los 180 shaders de
+     CoreAnimation: AIR 2.8, bitcode LLVM). Siguiente: leer el bitcode (crate `llvm-bitcode`) y traducir AIR a SPIR-V
+     (`rspirv`), empezando por los kernels y los vertex/fragment de CoreAnimation.
+   - Driver Metal dentro de macOS (`tahoe-metal`, Rust compilado para macOS: ver `tools/macos-rs/LEEME.md`): un
+     IOAccelerator con `MetalPluginName` en el registro, el bundle con su `NSPrincipalClass` (el MTLDevice) y el
+     camino de órdenes hasta tahoe-gpu (user client de IOKit → tahoe-run → socket con memfd).
 6. **Sesión gráfica**: con ella, `screencapture`, `osascript` y `pbcopy` (hoy se caen por no haber sesión).
 7. **Servicios que fallan al arrancar**: mobileassetd, softwareupdate; apsd se cae en bucle («ProductType» nil);
    relanzados en bucle: cryptexd, watchdogd, diskmanagementstartup, triald_system, cupsd. Muchas preferencias de
