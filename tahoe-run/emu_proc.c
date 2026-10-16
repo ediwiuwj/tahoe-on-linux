@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <dirent.h>
+#include <execinfo.h>
 #include <stddef.h>
 #include "tahoe.h"
 __thread struct ctx* volatile t_cur;   // llamada en curso del hilo (la pone el manejador de SIGSYS)
@@ -607,10 +608,30 @@ void diag_dump_threads(void) {
 	struct timespec ts = { 0, 200 * 1000000L }; nanosleep(&ts, NULL);   // que escriban antes de salir
 }
 
+// SIGABRT que no viene de un abort() de macOS (ver bsd_pthread_kill): un assert o un pánico del propio tahoe-run, o un
+// kill de fuera. Sin esto el proceso moría sin rastro («fin <pid> por la señal 6 de Linux»). Se anota quién lo envió, la
+// pila de tahoe-run (addr2line -e tahoe-run) y qué hacía el hilo de macOS, y se muere igual.
+static __thread int guest_abort;
+static void on_sigabrt(int sig, siginfo_t* si, void* v) {
+	tahoe_selector_set(0);
+	if (!guest_abort) {
+		logf_("    SIGABRT del anfitrión <%d:%ld> código=%d de pid %d\n", (int)getpid(), (long)syscall(SYS_gettid), si->si_code, (int)si->si_pid);
+		void* bt[32]; int n = backtrace(bt, 32);
+		char ln[1024]; int k = snprintf(ln, sizeof ln, "    SIGABRT <%d> pila de tahoe-run:", (int)getpid());
+		for (int i = 0; i < n && k < (int)sizeof ln - 24; i++) k += snprintf(ln + k, sizeof ln - k, " %p", bt[i]);
+		logf_("%s\n", ln);
+		on_dump(sig, si, v);
+	}
+	struct { void* h; unsigned long flags; void* restorer; unsigned long mask; } dfl = { 0 };   // SIG_DFL y otra vez
+	syscall(SYS_rt_sigaction, SIGABRT, &dfl, NULL, 8);
+	syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGABRT);
+}
+
 static long bsd_pthread_kill(struct ctx* c) {
 	int s = (int)c->a[1];
 	if (s == 0) return 0;
 	if (s == 6) {
+		guest_abort = 1;
 		diag_crash(c->uc);
 		// abort() de un programa de macOS: el proceso muere por SIGABRT de verdad (launchd lo ve como en un Mac), pero sin
 		// volcado de memoria de Linux: systemd-coredump guardaría ~10 MB y avisaría en el escritorio en cada caída.
@@ -1606,6 +1627,7 @@ static long bsd_ptrace(struct ctx* c) {
 }
 
 void emu_proc_init(void) {
+	tahoe_sigaction(SIGABRT, on_sigabrt);
 	reg_bsd(26, bsd_ptrace);
 	reg_bsd(515, bsd_ulock_wait); reg_bsd(516, bsd_ulock_wake); reg_bsd(544, bsd_ulock_wait2);
 	reg_bsd(550, bsd_map_with_linking);

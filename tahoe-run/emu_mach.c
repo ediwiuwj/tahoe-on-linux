@@ -762,7 +762,9 @@ static long mach_msg2(struct ctx* c) {
 	if (mtr < 0) mtr = access("/dev/shm/tahoe-mach-trace", F_OK) == 0;   // traza ligera: solo envíos
 	enum { REQBUF = 512 * 1024 };                   // los mensajes entre procesos (listas de servicios...) pueden ser grandes
 	TLS_LAZY(uint8_t, req, REQBUF);
-	uint8_t rep[1024];
+	// Respuesta del núcleo emulado: io_connect_method (mig_iokit) devuelve hasta 4096 bytes de salida más 16 escalares;
+	// con 1024 bytes en la pila, una salida grande (SecurityAgent) la desbordaba y el proceso moría por __stack_chk_fail.
+	TLS_LAZY(uint8_t, rep, 8192);
 	uint32_t rcv_name = (uint32_t)(c->a[5] >> 32);
 	if (!(options & 1) && (options & 2)) return vec_aux(user_receive(c, options, rbuf, rcv_name, rcvsize), aux_addr, aux_size);
 	if (ssize < sizeof(struct hdr) || ssize > REQBUF || safe_read(buf, req, ssize) != (ssize_t)ssize) {
