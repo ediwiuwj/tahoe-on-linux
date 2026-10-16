@@ -648,6 +648,10 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	int r = port_receive(rcv_name, timeout_ms, &m, &size, snd, cap > tsize ? cap - tsize : 1, large);
 	if (r == 0x10004004 && large) {                           // el mensaje sigue en la cola; el receptor lee el tamaño de la cabecera
 		struct hdr hh; memcpy(&hh, m, sizeof hh);
+		// MACH_RCV_LARGE_IDENTITY: como XNU, msgh_local_port lleva el puerto donde espera el mensaje (el miembro del
+		// conjunto), para recibirlo de ahí con el búfer mayor. CoreAnimation lo hace así en WindowServer: con 0 recibía
+		// en el puerto 0 y abortaba al llegar la primera ventana grande.
+		if (options & 0x8) { hh.local = hh.remote; memcpy(m, &hh, sizeof hh); }
 		safe_write(buf, m, sizeof hh < size ? sizeof hh : size);
 		if (trace_all) logf_("    mach_msg: 0x%x demasiado grande (%u bytes, cabía %u): RCV_LARGE\n", rcv_name, size, cap);
 		if (total) *total = size + tsize;                      // tamaño necesario (con trailer), para kevent ext[1]
@@ -1011,6 +1015,20 @@ static long mach_msg2(struct ctx* c) {
 	case 3238: {                                                  // mach_port_swap_guard(task, name, viejo, nuevo): solo sin guarda estricta
 		uint32_t nm; uint64_t o, nw; memcpy(&nm, req + 32, 4); memcpy(&o, req + 36, 8); memcpy(&nw, req + 44, 8);
 		n = reply_begin(rep, &h, port_swap_guard(nm, o, nw));
+		break;
+	}
+	case 3215: {                                                  // mach_port_extract_right(task, name, msgt_name) -> poly
+		// CoreAnimation saca así un derecho send-once de un puerto suyo para cada commit síncrono (encode_sync_request): sin
+		// esta rutina (MIG_BAD_ID) el commit no quedaba programado y abortaba («Assertion failed: (scheduled)»), y con él
+		// loginwindow, SecurityAgent y cualquier app al mostrar su primera ventana. Los nombres son globales: el derecho
+		// extraído lleva el mismo nombre que el puerto.
+		uint32_t nm, how; memcpy(&nm, req + 32, 4); memcpy(&how, req + 36, 4);
+		int rp = port_rpid(nm);
+		if (rp < 0) { n = reply_begin(rep, &h, 15 /* KERN_INVALID_NAME */); break; }
+		if ((how == 20 || how == 21 || how == 16) && rp != (int32_t)getpid()) { n = reply_begin(rep, &h, 17 /* KERN_INVALID_RIGHT */); break; }
+		uint8_t disp = how == 21 || how == 18 ? 18 : how == 16 ? 16 : how == 17 || how == 19 || how == 20 ? 17 : 0;
+		if (!disp) { n = reply_begin(rep, &h, 4 /* KERN_INVALID_ARGUMENT */); break; }
+		n = reply_port(rep, &h, nm, disp);
 		break;
 	}
 	case 3229: {                                                  // mach_port_set_context(task, name, context)
