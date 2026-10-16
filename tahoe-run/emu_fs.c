@@ -143,6 +143,7 @@ static uint32_t guest_dev(dev_t d) {
 
 // Resuelve una ruta absoluta del programa bajo TAHOE_ROOT (salvo /dev, del anfitrión).
 static const char* resolve(const char* guest, char* buf, size_t cap) {
+	guest += tahoe_resolve_skip(guest);
 	if (tahoe_root && guest[0] == '/' && !tahoe_host_passthrough(guest)) { snprintf(buf, cap, "%s%s", tahoe_root, guest); return buf; }
 	return tahoe_dev_alias(guest, buf, cap);                                                // /dev: siempre el del anfitrión (el de la raíz está vacío)
 }
@@ -1341,6 +1342,7 @@ static long bsd_fsctl(struct ctx* c) {
 static long bsd_openat(struct ctx* c) {
 	char path[4096], full[4200];
 	if (safe_string(c->a[1], path, sizeof path) != 0) return -D_EFAULT;
+	tahoe_resolve_strip(path);
 	int dfd = (int)c->a[0];
 	if (dfd == -2) dfd = AT_FDCWD;
 	int flags = darwin_open_flags((int)c->a[2]);

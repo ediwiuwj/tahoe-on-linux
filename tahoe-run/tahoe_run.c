@@ -11,6 +11,7 @@
 //
 // Hito actual: arrancar dyld y ver qué pide. Todo el código es propio (sin código de Darling).
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
@@ -598,6 +599,7 @@ long open_symlink(int dfd, const char* p, int dflags, int lflags, long fd) {
 static long bsd_open(struct ctx* c) {
 	char path[4096], full[4200];
 	if (safe_string(c->a[0], path, sizeof path) != 0) return -14;          // EFAULT
+	tahoe_resolve_strip(path);
 	if (!strcmp(path, "/dev/console")) {                                  // sin consola real dentro del entorno
 		// diagnóstico: si existe /dev/shm/tahoe-console, la consola es ese archivo (lo que launchd y otros escriben ahí)
 		if (access("/dev/shm/tahoe-console", W_OK) == 0) {
@@ -808,8 +810,33 @@ static long proc_signal_call(struct ctx* c) {
 	if (r != 0) return -darwin_errno(errno);
 	return terminate ? sig : 0;                                            // proc_terminate devuelve la señal enviada
 }
+// proc_listpids (PROC_INFO_CALL_LISTPIDS): pids de los procesos de este arranque, filtrados por tipo (todos, grupo, uid, uid
+// real, padre). Sin búfer devuelve el tamaño necesario. Sin ella, MacBuddy (Asistente de configuración) no podía mirar qué
+// procesos hay, caía en sus comprobaciones antiguas y decidía «configuración inicial» aunque el sistema ya estuviera
+// configurado: loginwindow intentaba lanzar el Asistente en vez de mostrar la ventana de inicio de sesión.
+static long proc_listpids(struct ctx* c) {
+	int type = (int)c->a[1]; uint32_t info = (uint32_t)c->a[2];
+	uint64_t buf = c->a[4]; size_t cap = (size_t)c->a[5] / 4;
+	DIR* d = opendir("/proc"); struct dirent* de;
+	size_t n = 0, total = 0;
+	while (d && (de = readdir(d))) {
+		int pid = atoi(de->d_name);
+		if (pid <= 0) continue;
+		struct pinfo pi;
+		if (proc_snapshot(pid, &pi) != 0) continue;
+		int keep = type == 1 || (type == 2 && (uint32_t)pi.pgid == info) || (type == 4 && (uint32_t)pi.uid == info) ||
+		           (type == 5 && (uint32_t)pi.ruid == info) || (type == 6 && (uint32_t)pi.ppid == info);
+		if (!keep) continue;
+		total++;
+		if (buf && n < cap) { int32_t v = pid; if (safe_write(buf + n * 4, &v, 4) != 4) { closedir(d); return -D_EFAULT; } n++; }
+	}
+	if (d) closedir(d);
+	if (!buf || !cap) return (long)((total + 16) * 4);     // como XNU: una estimación con margen
+	return (long)(n * 4);
+}
 static long bsd_proc_info(struct ctx* c) {
 	if ((int)c->a[0] == 15) return 0;
+	if ((int)c->a[0] == 1) return proc_listpids(c);
 	if ((int)c->a[0] == 7 || ((int)c->a[0] >= 0x11 && (int)c->a[0] <= 0x14)) return proc_signal_call(c);
 	if ((int)c->a[0] == 5 || (int)c->a[0] == 8) return 0;                 // SETCONTROL / DIRTYCONTROL: sin efecto
 	if ((int)c->a[0] == 9) {                                              // PIDRUSAGE: contadores a cero

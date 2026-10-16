@@ -678,6 +678,7 @@ static int read_strv(uint64_t addr, char*** out, int max) {
 
 // Ruta del programa (vista de macOS) -> ruta real en el host.
 static void host_path(const char* guest, char* out, size_t cap) {
+	guest += tahoe_resolve_skip(guest);
 	if (tahoe_root && guest[0] == '/' && !tahoe_host_passthrough(guest)) { snprintf(out, cap, "%s%s", tahoe_root, guest); return; }
 	snprintf(out, cap, "%s", guest);
 }
@@ -861,7 +862,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	nargv[k++] = (char*)g_dyld_path;
 	nargv[k++] = hpath;
 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
-	char** nenv = calloc(ec + 13 + 8 + 9, sizeof(char*));
+	char** nenv = calloc(ec + 15 + 8 + 9, sizeof(char*));
 	int e = 0;
 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
 	char b1[4300], b2[4300];
@@ -879,6 +880,10 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (getenv("TAHOE_OSK_FILE")) { snprintf(b8, sizeof b8, "TAHOE_OSK_FILE=%s", getenv("TAHOE_OSK_FILE")); nenv[e++] = b8; }
 	static char b9[600];
 	if (getenv("TAHOE_SMBIOS_FILE")) { snprintf(b9, sizeof b9, "TAHOE_SMBIOS_FILE=%s", getenv("TAHOE_SMBIOS_FILE")); nenv[e++] = b9; }
+	static char b10[600];                                   // argumentos de arranque (boot-args): para todos los procesos
+	if (getenv("TAHOE_BOOTARGS")) { snprintf(b10, sizeof b10, "TAHOE_BOOTARGS=%s", getenv("TAHOE_BOOTARGS")); nenv[e++] = b10; }
+	static char b11[64];                                    // identidad PCI de la GPU emulada (emu_iokit.inc)
+	if (getenv("TAHOE_GPU")) { snprintf(b11, sizeof b11, "TAHOE_GPU=%s", getenv("TAHOE_GPU")); nenv[e++] = b11; }
 	if (getenv("TAHOE_FD2LOG")) nenv[e++] = (char*)"TAHOE_FD2LOG=1";
 	if (getenv("TAHOE_DEBUG_NOREBOOT")) nenv[e++] = (char*)"TAHOE_DEBUG_NOREBOOT=1";   // modo depuración (ver emu_iokit.inc)
 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
@@ -1581,7 +1586,17 @@ static long bsd_ulock_wake(struct ctx* c) {
 	return n > 0 ? 0 : -D_ENOENT;
 }
 
+// ptrace: no hay depuradores dentro del emulador. PT_DENY_ATTACH (31, «que nadie me depure») y PT_TRACE_ME (0) se aceptan
+// sin efecto; SecurityAgent (la ventana de inicio de sesión) sale con «Unable to deny attach» si PT_DENY_ATTACH falla.
+// El resto (adjuntarse a otro proceso, leer su memoria...) no se admite: EPERM, como con un proceso protegido.
+static long bsd_ptrace(struct ctx* c) {
+	int req = (int)c->a[0];
+	if (req == 31 || req == 0) return 0;
+	return -1;                                              // EPERM
+}
+
 void emu_proc_init(void) {
+	reg_bsd(26, bsd_ptrace);
 	reg_bsd(515, bsd_ulock_wait); reg_bsd(516, bsd_ulock_wake); reg_bsd(544, bsd_ulock_wait2);
 	reg_bsd(550, bsd_map_with_linking);
 	reg_bsd(96, bsd_setpriority); reg_bsd(100, bsd_getpriority);

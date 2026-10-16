@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 #include <sys/types.h>
 #include <ucontext.h>
 
@@ -112,6 +113,16 @@ void cred_env(char* out, size_t cap);
 void emu_cred_init(void);
 void emu_fs_xattr_init(void);
 int tahoe_host_passthrough(const char* p);
+// XNU (macOS 15+) admite «/.resolve/<opciones>/ruta»: opciones de resolución (como las de openat2) dentro de la propia
+// ruta. El Asistente de configuración mira así /private/var/db/.AppleSetupDone; sin entenderlas, el archivo «no existía»
+// y loginwindow lanzaba el Asistente en vez de la ventana de inicio de sesión. Aquí se quitan (las opciones se ignoran).
+static inline size_t tahoe_resolve_skip(const char* p) {
+	if (strncmp(p, "/.resolve/", 10)) return 0;
+	size_t k = 10;
+	while (p[k] >= '0' && p[k] <= '9') k++;
+	return (k > 10 && p[k] == '/') ? k : 0;
+}
+static inline void tahoe_resolve_strip(char* p) { size_t k = tahoe_resolve_skip(p); if (k) memmove(p, p + k, strlen(p + k) + 1); }
 const char* tahoe_dev_alias(const char* p, char* buf, size_t cap);
 void memfd_reopen(void);
 int fsevents_open(void);
