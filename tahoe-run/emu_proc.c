@@ -456,6 +456,9 @@ static void on_dump(int sig, siginfo_t* si, void* v) {
 		if ((nr >> 24) == 2 && (num == 5 || num == 398 || num == 463 || num == 464)) {   // open / openat: la ruta
 			char path[256] = ""; safe_read(num >= 463 ? a[1] : a[0], path, sizeof path - 1); path[255] = 0;
 			k += snprintf(ln + k, sizeof ln - k, " \"%s\"", path);
+		} else if ((nr >> 24) == 1 && num == 47) {                 // mach_msg2: opciones y puerto de recepción
+			uint64_t a5 = 0; safe_read((uint64_t)&c->a[5], &a5, 8);
+			k += snprintf(ln + k, sizeof ln - k, " args=%lx,%lx,%lx recibe en 0x%x", a[0], a[1], a[2], (uint32_t)(a5 >> 32));
 		} else k += snprintf(ln + k, sizeof ln - k, " args=%lx,%lx,%lx", a[0], a[1], a[2]);
 		logf_("%s\n", ln);
 	} else {
@@ -483,6 +486,7 @@ static void on_dump_all(int sig, siginfo_t* si, void* v) {
 	(void)sig;
 	char sel = tahoe_selector_get();
 	tahoe_selector_set(0);
+	port_dump_queues();                                         // puertos con mensajes en cola y sus conjuntos
 	long me = syscall(SYS_gettid);
 	DIR* d = opendir("/proc/self/task");
 	struct dirent* e;
@@ -590,6 +594,7 @@ void diag_dump_threads(void) {
 	if (done || !diag_target()) return;
 	done = 1;
 	tahoe_sigaction(SIGRTMIN + 4, on_dump);
+	port_dump_queues();                                          // puertos de este proceso con mensajes, y sus conjuntos
 	DIR* d = opendir("/proc/self/task");
 	if (!d) return;
 	long me = syscall(SYS_gettid);
@@ -1176,7 +1181,7 @@ static void wl_defer_owned_locked(struct wl_state* w) {
 static pthread_mutex_t wq_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wq_pool_cv = PTHREAD_COND_INITIALIZER;
 static struct wq_job* wq_queue_head; static struct wq_job** wq_queue_tail = &wq_queue_head;
-static int wq_live, wq_idle;
+static int wq_live, wq_idle, wq_nq;   // hilos vivos, hilos libres esperando, trabajos en cola
 
 // first: primer servicio de este hilo (libpthread inicializa su pthread_t). exit_thread: en vez de trabajo, la llamada de
 // salida de XNU (nkevents = -1, WORKQ_EXIT_THREAD_NKEVENT) para que libpthread retire el hilo de su lista y lo termine.
@@ -1241,7 +1246,7 @@ static void* wq_main(void* p) {
 		pthread_mutex_lock(&wq_pool_lock);
 		job = NULL;
 		for (;;) {
-			if (wq_queue_head) { job = wq_queue_head; wq_queue_head = job->next; if (!wq_queue_head) wq_queue_tail = &wq_queue_head; break; }
+			if (wq_queue_head) { job = wq_queue_head; wq_queue_head = job->next; if (!wq_queue_head) wq_queue_tail = &wq_queue_head; wq_nq--; break; }
 			struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
 			dl.tv_sec += WQ_IDLE_MS / 1000; dl.tv_nsec += (WQ_IDLE_MS % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
 			wq_idle++;
@@ -1265,12 +1270,15 @@ static void wq_spawn_job(struct wq_job* j) {
 	static int max_hilos;
 	if (!max_hilos) { const char* e = getenv("TAHOE_WQ_MAX"); max_hilos = e && atoi(e) > 0 ? atoi(e) : WQ_MAX_HILOS; }
 	pthread_mutex_lock(&wq_pool_lock);
-	if (wq_idle > 0 || wq_live >= max_hilos) {                     // un hilo libre la atiende, o espera turno
-		if (!wq_idle) {                                            // sin hilos libres: la petición espera (una línea por segundo)
+	// Un hilo libre la atiende, o espera turno. Los libres se cuentan descontando los trabajos ya encolados: un hilo
+	// despertado no deja de contar como libre hasta que retoma el candado, y dos peticiones seguidas iban a la cola para
+	// un único hilo libre; si la primera bloqueaba (una llamada síncrona al propio proceso), la segunda no salía nunca.
+	if (wq_nq < wq_idle || wq_live >= max_hilos) {
+		if (wq_nq >= wq_idle) {                                    // sin hilos libres: la petición espera (una línea por segundo)
 			static time_t ult; time_t now = time(NULL);
 			if (now != ult) { ult = now; logf_("    hilos de cola: %d en uso (máximo), la petición espera\n", wq_live); }
 		}
-		*wq_queue_tail = j; wq_queue_tail = &j->next;
+		*wq_queue_tail = j; wq_queue_tail = &j->next; wq_nq++;
 		pthread_cond_signal(&wq_pool_cv);
 		pthread_mutex_unlock(&wq_pool_lock);
 		return;

@@ -1109,6 +1109,22 @@ int port_unguard(uint32_t name, uint64_t guard) {
 	if (r) logf_("    guarda: <%d> mach_port_unguard(0x%x, 0x%lx) falla %d (contexto 0x%lx, guardado %d)\n", (int)getpid(), name, guard, r, old, gd);
 	return r;
 }
+// Diagnóstico (volcado de hilos): los puertos de este proceso con mensajes en cola y los conjuntos en que están; y sus
+// conjuntos con la cuenta que llevan. Un mensaje encolado en un puerto de un conjunto en el que espera un hilo que no se
+// despierta es un aviso perdido.
+void port_dump_queues(void) {
+	int32_t me = (int32_t)getpid();
+	lock();
+	for (int i = 0; i < (int)shm->hiwater; i++) {
+		struct sport* q = &shm->ports[i];
+		if (!q->used || q->rpid != me || (!q->count && !q->is_set)) continue;
+		char sets[160] = ""; int o = 0;
+		for (int j = 0; j < NSETS && q->sets[j] && o < (int)sizeof sets - 12; j++) o += snprintf(sets + o, sizeof sets - o, " 0x%x", q->sets[j]);
+		if (q->is_set) logf_("    PUERTOS <%d>: conjunto 0x%x cuenta=%u cv=%u\n", (int)me, q->name, q->count, q->cv);
+		else logf_("    PUERTOS <%d>: 0x%x con %u mensajes, en conjuntos:%s\n", (int)me, q->name, q->count, o ? sets : " ninguno");
+	}
+	unlock();
+}
 // Puertos con derecho de recepción de este proceso (mach_port_names): nombre y tipo (RECEIVE|SEND o PORT_SET).
 int port_list_owned(uint32_t* names, uint32_t* types, int max) {
 	int n = 0;

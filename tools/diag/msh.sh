@@ -8,7 +8,8 @@
 #   STACKS=<proceso>  errores de sus syscalls con ruta, pilas al bloquearse o caer
 #   ALL=1             con STACKS: todas sus syscalls y trampas Mach
 #   MACH=1            traza de mensajes Mach, workloops e hilos de las colas (MT, WL, THR)
-#   WL=1              solo la de workloops (WL, WLQ, THR): para carreras que la traza Mach completa tapa
+#   WL=1              solo la de workloops (WL, WLQ, THR): para carreras que la traza Mach completa tapa; WL='<proc>...'
+#                     solo en esos procesos
 #   IOK=1             traza de IOKit
 #   NS=1              cada aviso MACH_NOTIFY_NO_SENDERS: puerto, quién lo recibe y quién soltó el último derecho
 #   SR='<proc>...'    en esos procesos, cada cambio en la cuenta de derechos de envío (SR: puerto, quién, ±n, total)
@@ -26,7 +27,7 @@ rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stack
 [ -n "$STACKS" ] && echo "$STACKS" > /dev/shm/tahoe-stacks
 [ -n "$ALL" ] && touch /dev/shm/tahoe-stacks-all
 [ -n "$MACH" ] && touch /dev/shm/tahoe-mach-trace
-[ -n "$WL" ] && touch /dev/shm/tahoe-wl-trace
+[ -n "$WL" ] && { if [ "$WL" = 1 ]; then touch /dev/shm/tahoe-wl-trace; else echo "$WL" > /dev/shm/tahoe-wl-trace; fi; }
 [ -n "$IOK" ] && touch /dev/shm/tahoe-iokit-trace
 [ -n "$NS" ] && touch /dev/shm/tahoe-ns-trace
 [ -n "$SR" ] && echo "$SR" > /dev/shm/tahoe-sr-trace
