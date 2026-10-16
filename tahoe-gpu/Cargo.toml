@@ -9,6 +9,7 @@ license = "MIT"
 ash = "0.38"
 rspirv = "0.12"
 libc = "0.2"
+llvm-bitcode = "0.4"
 
 [profile.release]
 opt-level = 3
