@@ -5,17 +5,25 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 **En pausa desde el 14 de octubre de 2026.** Cómo retomarlo: README, «Cómo retomarlo».
 
 ## Por dónde seguir
-1. **Pantalla (punto 4 de abajo)**: WindowServer rellena la pantalla de negro y dibuja el cursor, pero la ventana de
-   inicio de sesión no aparece. loginwindow pasa los primeros ~7 min esperando a lsd, que en cada arranque vuelve a
-   registrar todos los programas (en el disco mecánico tarda; su base de datos sí se guarda). A los 11 min loginwindow
-   sigue en `_LSCopyServerStore` esperando a lsd (pide la base de datos y lsd no responde). Siguiente: qué hace lsd a
-   los 10–11 min (`ESPERA=60 STACKS=lsd tools/diag/hang.sh true lsd 600`, con `/dev/shm/tahoe-msg-trace` = «lsd
-   loginwindow») y por qué rehace la base de datos en cada arranque.
+1. **Pantalla (punto 4 de abajo)**: loginwindow ya llega a pedir la ventana de inicio de sesión (SecurityAgent arranca y
+   trabaja), pero WindowServer aborta en cuanto hay una ventana que presentar: en macOS 26 las ventanas se presentan con
+   IOPresentment, que necesita un dispositivo de presentación (AppleGraphicsDeviceControl + IOAccelerator +
+   IOPresentmentClient, «display pipe»). El framebuffer clásico solo le sirve para el fondo y el cursor. Siguiente:
+   emular ese dispositivo de presentación (primera pieza del driver gráfico propio, punto 5): que acepte las superficies
+   que compone WindowServer y las copie a la memoria de vídeo. El primer fallo es `ioPresentmentOpenServiceForID` con el
+   ID de registro del framebuffer. Registros útiles: `log show` de WindowServer/loginwindow/SecurityAgent dentro de macOS.
 2. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
 3. Lo demás, en la lista de abajo.
 
 
 ## Hecho recientemente
+- Camino hasta la ventana de inicio de sesión: loginwindow ya no intenta lanzar el Asistente de configuración
+  (`/.resolve/<opciones>/ruta`, la sintaxis de XNU con la que el Asistente mira `.AppleSetupDone`, no se entendía),
+  `proc_listpids` implementado, `ptrace(PT_DENY_ATTACH)` aceptado (SecurityAgent salía con «Unable to deny attach»),
+  las propiedades que se escriben en IOKit se guardan (IOFBConfig: CoreDisplay ya elige el modo 1280×800), el
+  framebuffer se llama IONDRVFramebuffer (con «Intel» en el nombre CoreDisplay usaba IOPresentment desde el arranque),
+  entradas de memoria nuevas (`MAP_MEM_NAMED_CREATE`, la memoria compartida de HID) y `TAHOE_BOOTARGS` para los
+  argumentos de arranque.
 - loginwindow ya no se cae al terminar de arrancar: un puerto podía estar en 8 conjuntos como mucho y loginwindow (un modo
   de runloop por cada cosa que espera) necesitaba más; abortaba con «Unable to insert wake up port into port set» y
   WindowServer se cerraba con él, en bucle. Ahora 32. Con eso WindowServer y loginwindow aguantan 15 minutos seguidos.
