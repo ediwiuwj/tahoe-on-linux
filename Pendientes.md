@@ -5,18 +5,24 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 **En pausa desde el 14 de octubre de 2026.** Cómo retomarlo: README, «Cómo retomarlo».
 
 ## Por dónde seguir
-1. **Pantalla (punto 4 de abajo)**: WindowServer compone por software en el framebuffer; loginwindow, SecurityAgent y
-   WindowServer aguantan; SecurityAgent monta la interfaz de inicio de sesión (LoginUIKit); la pantalla está online. Pero
-   WindowServer rechaza las ventanas antes del inicio de sesión: «App … cannot order in untagged windows before login»
-   (`CGXOrderWindowListSpaceSwitchOptions`: la ventana debe llevar `kCGSPermittedBeforeLoginTagBit`, bit 30 de sus
-   etiquetas, que cualquier conexión puede poner). Siguiente: saber qué app es (punto de ruptura en 0x7ff809551541,
-   `PEEK=~rax` da el nombre) y por qué no pone esa etiqueta.
-2. **`diskutil list` en la Recovery** se cuelga a menudo (hoy 2 de 3 veces, igual con el binario anterior): mirar con
+1. **Teclado y ratón** (punto 8 de abajo): ya se ve la pantalla de inicio de sesión (usuario y campo de contraseña,
+   a los ~8 minutos de arrancar). Falta poder escribir la contraseña: WindowServer recibe la entrada de hidd
+   (IOHIDEventSystem), que busca servicios `IOHIDEventService` en IOKit y lee sus eventos de una cola compartida
+   (IOHIDEventServiceUserClient). Plan: publicar un teclado y un puntero absoluto (como la tableta USB de QEMU) y que
+   tahoe-view mande las teclas y el ratón a esa cola.
+2. **`diskutil list` en la Recovery** se cuelga a veces (mucho menos tras arreglar los hilos de cola): mirar con
    `tools/diag/discos.sh`.
 3. Lo demás, en la lista de abajo.
 
 
 ## Hecho recientemente
+- **Pantalla de inicio de sesión visible.** Tres arreglos: (1) los hilos de cola encolaban dos trabajos para un solo
+  hilo libre, y si el primero se bloqueaba llamando al propio proceso el segundo no salía nunca (configd se quedaba sin
+  responder y con él diskarbitrationd, StorageKit, diskutil y SecurityAgent); (2) la respuesta del núcleo emulado en
+  `mach_msg2` iba en 1 KB de pila e `io_connect_method` devuelve hasta 4 KB: SecurityAgent desbordaba la pila y moría
+  (loginwindow salía detrás: «AuthorizationRef doesn't have a username»); (3) métodos de IOSurface que CoreVideo repetía
+  sin fin al fallar (SetValue 9, SetPurgeable 0x14, SetBulkAttachments 0x1b, SetCoreVideoBridgedKeys 0x39, 0x2b).
+  Diagnóstico nuevo: un SIGABRT del propio tahoe-run deja la pila del emulador en el registro (`addr2line`).
 - LaunchServices (lsd) ya guarda su base de datos: antes no podía («could not write out system content database») y en
   cada arranque volvía a registrar todas las apps (de 5 a 30 minutos de espera, y la pantalla de inicio llegaba cuando
   quería). Causas: `fgetattrlist` estaba con el número de `fsetattrlist`, `setattrlist` rechazaba la clase de protección

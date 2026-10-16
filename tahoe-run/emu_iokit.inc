@@ -1518,7 +1518,7 @@ static int32_t sf_fill(const struct sf_ent* e, uint8_t* out, uint32_t want, uint
 	return 0;
 }
 static int32_t uc_iosurface(struct uc_call* c) {
-	uint32_t want = *c->noutband;
+	uint32_t want = *c->noutband, want_s = *c->nsout;
 	*c->noutband = 0; *c->nsout = 0;
 	switch (c->selector) {
 	case 0: {                                                          // crear
@@ -1545,6 +1545,14 @@ static int32_t uc_iosurface(struct uc_call* c) {
 		if (!e->used || e->id != id) return kIOReturnNotFound;
 		return sf_fill(e, c->outband, want, c->noutband);
 	}
+	// Valores y metadatos de una superficie (IOSurfaceSetValue 9, IOSurfaceClientSetBulkAttachments 0x1b,
+	// IOSurfaceClientSetCoreVideoBridgedKeys 0x39) y el ajuste de la conexión 0x2b (ioSurfaceConnectInternal): se aceptan
+	// sin guardarlos. SecurityAgent (CoreVideo, el fondo de la ventana de inicio de sesión) los repetía sin fin al fallar.
+	case 9: { uint32_t n = want < 4 ? want : 4; memset(c->outband, 0, n); *c->noutband = n; return 0; }
+	case 0x1b: case 0x39: case 0x2b: return 0;
+	case 0x14:                                                         // IOSurfaceClientSetPurgeable(ID, estado) -> estado anterior
+		if (want_s >= 1) { c->sout[0] = 0; *c->nsout = 1; }           // kIOSurfacePurgeableNonVolatile
+		return 0;
 	case 0x29: return 0;                                               // IOSurfaceSharedEventRemoveEventListener: no hay
 	                                                                   // oyentes (SecurityAgent abortaba si fallaba)
 	case 0xd: {
