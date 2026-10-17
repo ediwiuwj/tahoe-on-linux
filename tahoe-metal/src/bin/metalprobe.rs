@@ -50,6 +50,9 @@ fn main() {
         if std::env::args().nth(1).as_deref() == Some("computo") {
             std::process::exit(computo(d));
         }
+        if std::env::args().nth(1).as_deref() == Some("render") {
+            std::process::exit(render(d));
+        }
         std::process::exit(0);
     }
 }
@@ -113,5 +116,109 @@ fn computo(d: Id) -> i32 {
         println!("command buffer: estado {st}; valores[0]={} valores[999]={} valores[1000]={}", v[0], v[999], v[1000]);
         println!("cómputo: {}; copia (blit): {}", if bien { "CORRECTO" } else { "MAL" }, if bien_copia { "CORRECTA" } else { "MAL" });
         if bien && bien_copia { 0 } else { 5 }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MTLClearColor {
+    r: f64,
+    g: f64,
+    b: f64,
+    a: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MTLRegion {
+    x: u64,
+    y: u64,
+    z: u64,
+    w: u64,
+    h: u64,
+    d: u64,
+}
+
+/// Render de punta a punta con la API de Metal y shaders de QuartzCore: se limpia a rojo un BGRA8 de 64×64 y se dibuja el
+/// triángulo (-1,-1) (1,-1) (-1,1) con std_vert0_lpf y attachment_clear_frag_lpf (escribe 0): abajo a la izquierda debe
+/// quedar 0 y arriba a la derecha, rojo.
+fn render(d: Id) -> i32 {
+    const RUTA: &str = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib";
+    // SAFETY: d es un MTLDevice; las clases de descriptores son las de Metal; firmas del protocolo.
+    unsafe {
+        let mut err: Id = std::ptr::null_mut();
+        let lib: Id = objc::m2(d, "newLibraryWithFile:error:", objc::nsstring(RUTA), &mut err as *mut Id);
+        if lib.is_null() {
+            println!("biblioteca: nil");
+            return 3;
+        }
+        let vf: Id = objc::m1(lib, "newFunctionWithName:", objc::nsstring("std_vert0_lpf"));
+        let ff: Id = objc::m1(lib, "newFunctionWithName:", objc::nsstring("attachment_clear_frag_lpf"));
+        let pd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLRenderPipelineDescriptor"), "alloc"), "init");
+        objc::m1::<Id, ()>(pd, "setVertexFunction:", vf);
+        objc::m1::<Id, ()>(pd, "setFragmentFunction:", ff);
+        let ca0: Id = objc::m1(objc::m0::<Id>(pd, "colorAttachments"), "objectAtIndexedSubscript:", 0u64);
+        objc::m1::<u64, ()>(ca0, "setPixelFormat:", 80);
+        let vd: Id = objc::m0(objc::clase("MTLVertexDescriptor"), "vertexDescriptor");
+        let attrs: Id = objc::m0(vd, "attributes");
+        for (i, f, o) in [(0u64, 31u64, 0u64), (1, 29, 0), (3, 31, 16)] {
+            let a: Id = objc::m1(attrs, "objectAtIndexedSubscript:", i);
+            objc::m1::<u64, ()>(a, "setFormat:", f);
+            objc::m1::<u64, ()>(a, "setOffset:", o);
+            objc::m1::<u64, ()>(a, "setBufferIndex:", 0);
+        }
+        let lo: Id = objc::m1(objc::m0::<Id>(vd, "layouts"), "objectAtIndexedSubscript:", 0u64);
+        objc::m1::<u64, ()>(lo, "setStride:", 32);
+        objc::m1::<Id, ()>(pd, "setVertexDescriptor:", vd);
+        let p: Id = objc::m2(d, "newRenderPipelineStateWithDescriptor:error:", pd, &mut err as *mut Id);
+        if p.is_null() {
+            println!("pipeline de render: nil ({})", objc::texto(if err.is_null() { err } else { objc::m0(err, "localizedDescription") }));
+            return 4;
+        }
+        println!("pipeline de render: bien");
+        let td: Id = {
+            let f: unsafe extern "C" fn(Id, objc::Sel, u64, u64, u64, i8) -> Id = std::mem::transmute(objc::objc_msgSend as *const ());
+            f(objc::clase("MTLTextureDescriptor"), objc::sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, 64, 64, 0)
+        };
+        objc::m1::<u64, ()>(td, "setUsage:", 5);
+        let tex: Id = objc::m1(d, "newTextureWithDescriptor:", td);
+        if tex.is_null() {
+            println!("textura: nil");
+            return 5;
+        }
+        let vs: [f32; 24] = [-1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let vb: Id = objc::m3(d, "newBufferWithBytes:length:options:", vs.as_ptr(), 96u64, 0u64);
+        let mut ident = [0f32; 16];
+        for i in 0..4 {
+            ident[i * 4 + i] = 1.0;
+        }
+        let rp: Id = objc::m0(objc::clase("MTLRenderPassDescriptor"), "renderPassDescriptor");
+        let a0: Id = objc::m1(objc::m0::<Id>(rp, "colorAttachments"), "objectAtIndexedSubscript:", 0u64);
+        objc::m1::<Id, ()>(a0, "setTexture:", tex);
+        objc::m1::<u64, ()>(a0, "setLoadAction:", 2);
+        objc::m1::<u64, ()>(a0, "setStoreAction:", 1);
+        objc::m1::<MTLClearColor, ()>(a0, "setClearColor:", MTLClearColor { r: 1.0, g: 0.0, b: 0.0, a: 1.0 });
+        let q: Id = objc::m0(d, "newCommandQueue");
+        let cb: Id = objc::m0(q, "commandBuffer");
+        let enc: Id = objc::m1(cb, "renderCommandEncoderWithDescriptor:", rp);
+        objc::m1::<Id, ()>(enc, "setRenderPipelineState:", p);
+        objc::m3::<Id, u64, u64, ()>(enc, "setVertexBuffer:offset:atIndex:", vb, 0, 0);
+        objc::m3::<*const f32, u64, u64, ()>(enc, "setVertexBytes:length:atIndex:", ident.as_ptr(), 64, 2);
+        objc::m3::<u64, u64, u64, ()>(enc, "drawPrimitives:vertexStart:vertexCount:", 3, 0, 3);
+        objc::m0::<()>(enc, "endEncoding");
+        objc::m0::<()>(cb, "commit");
+        objc::m0::<()>(cb, "waitUntilCompleted");
+        let st: u64 = objc::m0(cb, "status");
+        let mut px = vec![0u8; 64 * 64 * 4];
+        {
+            let f: unsafe extern "C" fn(Id, objc::Sel, *mut u8, u64, MTLRegion, u64) = std::mem::transmute(objc::objc_msgSend as *const ());
+            f(tex, objc::sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), px.as_mut_ptr(), 256, MTLRegion { x: 0, y: 0, z: 0, w: 64, h: 64, d: 1 }, 0);
+        }
+        let p = |x: usize, y: usize| -> [u8; 4] { px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].try_into().unwrap() };
+        let (ai, ad) = (p(8, 56), p(56, 8));
+        println!("command buffer: estado {st}; abajo a la izquierda BGRA {ai:?}; arriba a la derecha {ad:?}");
+        let bien = ai == [0, 0, 0, 0] && ad == [0, 0, 255, 255];
+        println!("render: {}", if bien { "CORRECTO" } else { "MAL" });
+        if bien { 0 } else { 6 }
     }
 }

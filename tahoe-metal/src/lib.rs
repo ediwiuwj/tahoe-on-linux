@@ -8,6 +8,7 @@
 pub mod canal;
 pub mod clases;
 pub mod objc;
+pub mod render;
 
 use std::ffi::c_void;
 use std::io::Write;
@@ -254,6 +255,7 @@ extern "C" fn registrar() {
         let meta = objc::object_getClass(cls);
         objc::metodo(meta, "resolveInstanceMethod:", resolver as *const c_void, "c@::");
         objc::objc_registerClassPair(cls);
+        render::registrar(cls);
     }
     clases::registrar();
     registro("TahoeMTLDevice registrada (madre _MTLDevice)");

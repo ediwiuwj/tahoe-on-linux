@@ -12,6 +12,7 @@ use crate::vk::{err, Gpu, Res};
 pub struct Motor {
     pub gpu: Gpu,
     pub(crate) pool: vk::CommandPool,
+    fijo: std::sync::OnceLock<vk::Sampler>,
 }
 
 /// Buffer de Metal: memoria compartida (memfd) que ven a la vez la CPU, macOS y la GPU.
@@ -95,7 +96,7 @@ impl Motor {
         let ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         // SAFETY: dispositivo válido.
         let pool = unsafe { gpu.device.create_command_pool(&ci, None) }.map_err(err("vkCreateCommandPool"))?;
-        Ok(Motor { gpu, pool })
+        Ok(Motor { gpu, pool, fijo: std::sync::OnceLock::new() })
     }
 
     /// Graba y ejecuta órdenes, esperando a que acaben.
@@ -151,6 +152,17 @@ impl Motor {
         })
     }
 
+    /// Sampler para los samplers constantes de los shaders (lineal y sujeto al borde) mientras su estado de 64 bits no
+    /// se decodifique; uno por motor.
+    pub fn sampler_fijo(&self) -> Res<vk::Sampler> {
+        if let Some(s) = self.fijo.get() {
+            return Ok(*s);
+        }
+        let s = self.sampler(true)?;
+        let _ = self.fijo.set(s);
+        Ok(s)
+    }
+
     /// Alineación que piden los desplazamientos de un storage buffer.
     pub fn alineacion_buffer(&self) -> u64 {
         self.gpu.props.limits.min_storage_buffer_offset_alignment
@@ -182,6 +194,32 @@ impl Motor {
 
     /// Textura de cualquier forma: `prof` para 3D, `capas` para arrays (en cubos, número de cubos).
     pub fn textura_forma(&self, forma: Forma, ancho: u32, alto: u32, prof: u32, capas: u32, formato: vk::Format) -> Res<Textura> {
+        self.textura_completa(forma, ancho, alto, prof, capas, 1, formato)
+    }
+
+    /// Usos que la GPU admite para un formato con tiling óptimo (sampled, storage, color attachment).
+    fn usos_formato(&self, formato: vk::Format) -> vk::ImageUsageFlags {
+        // SAFETY: dispositivo físico de esta instancia.
+        let p = unsafe { self.gpu.instance.get_physical_device_format_properties(self.gpu.phys, formato) }.optimal_tiling_features;
+        let mut u = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        if p.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE) {
+            u |= vk::ImageUsageFlags::SAMPLED;
+        }
+        if p.contains(vk::FormatFeatureFlags::STORAGE_IMAGE) {
+            u |= vk::ImageUsageFlags::STORAGE;
+        }
+        if p.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT) {
+            u |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        }
+        if p.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT) {
+            u |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        }
+        u
+    }
+
+    /// Textura de cualquier forma y con `niveles` niveles de mipmap; los usos, los que admita el formato.
+    #[allow(clippy::too_many_arguments)]
+    pub fn textura_completa(&self, forma: Forma, ancho: u32, alto: u32, prof: u32, capas: u32, niveles: u32, formato: vk::Format) -> Res<Textura> {
         let d = &self.gpu.device;
         let bpp = match formato {
             vk::Format::R32G32B32A32_SFLOAT | vk::Format::R32G32B32A32_UINT | vk::Format::R32G32B32A32_SINT => 16,
@@ -189,7 +227,7 @@ impl Motor {
             vk::Format::R8G8B8A8_UNORM | vk::Format::B8G8R8A8_UNORM | vk::Format::R32_SFLOAT | vk::Format::R32_UINT => 4,
             vk::Format::R16_SFLOAT => 2,
             vk::Format::R8_UNORM => 1,
-            f => return Err(format!("formato {f:?} sin tamaño conocido")),
+            f => crate::formatos::bytes_de(f).ok_or_else(|| format!("formato {f:?} sin tamaño conocido"))?,
         };
         let (tipo, vista_t) = match forma {
             Forma::D1 => (vk::ImageType::TYPE_1D, vk::ImageViewType::TYPE_1D),
@@ -211,18 +249,19 @@ impl Motor {
                 .image_type(tipo)
                 .format(formato)
                 .extent(vk::Extent3D { width: ancho, height: alto, depth: prof })
-                .mip_levels(1)
+                .mip_levels(niveles.max(1))
                 .array_layers(capas)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+                .usage(self.usos_formato(formato))
                 .initial_layout(vk::ImageLayout::UNDEFINED);
             let image = d.create_image(&ci, None).map_err(err("vkCreateImage"))?;
             let req = d.get_image_memory_requirements(image);
             let ty = self.gpu.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL).ok_or("sin memoria para la imagen")?;
             let mem = d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty), None).map_err(err("vkAllocateMemory"))?;
             d.bind_image_memory(image, mem, 0).map_err(err("vkBindImageMemory"))?;
-            let sr = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(capas);
+            let aspecto = crate::formatos::aspecto(formato);
+            let sr = vk::ImageSubresourceRange::default().aspect_mask(aspecto).level_count(niveles.max(1)).layer_count(capas);
             let vista = d.create_image_view(&vk::ImageViewCreateInfo::default().image(image).view_type(vista_t).format(formato).subresource_range(sr), None).map_err(err("vkCreateImageView"))?;
             let t = Textura { ancho, alto, prof, capas, formato, bpp, image, mem, vista };
             // todas las texturas viven en GENERAL (se leen, muestrean y escriben sin más transiciones)
@@ -232,6 +271,58 @@ impl Motor {
             })?;
             Ok(t)
         }
+    }
+
+    /// Copia de una región entre una textura y un buffer (subir: buffer → textura). `fila` en texeles (0: justa).
+    #[allow(clippy::too_many_arguments)]
+    pub fn copiar_region(&self, t: &Textura, b: &Buffer, b_off: u64, fila: u32, nivel: u32, capa: u32, origen: [i32; 3], tam: [u32; 3], subir: bool) -> Res<()> {
+        let region = [vk::BufferImageCopy::default()
+            .buffer_offset(b_off)
+            .buffer_row_length(fila)
+            .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(crate::formatos::aspecto(t.formato)).mip_level(nivel).base_array_layer(capa).layer_count(1))
+            .image_offset(vk::Offset3D { x: origen[0], y: origen[1], z: origen[2] })
+            .image_extent(vk::Extent3D { width: tam[0].max(1), height: tam[1].max(1), depth: tam[2].max(1) })];
+        self.una_vez(|d, cb| {
+            // SAFETY: objetos válidos durante la grabación.
+            unsafe {
+                if subir {
+                    d.cmd_copy_buffer_to_image(cb, b.buf, t.image, vk::ImageLayout::GENERAL, &region);
+                } else {
+                    d.cmd_copy_image_to_buffer(cb, t.image, vk::ImageLayout::GENERAL, b.buf, &region);
+                }
+            }
+        })
+    }
+
+    /// Sampler de un MTLSamplerDescriptor (ver protocolo::tipo::SAMPLER).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sampler_desc(&self, min: u32, mag: u32, mip: u32, dir: [u32; 3], normalizadas: bool, aniso: u32, lod: [f32; 2], borde: u32) -> Res<vk::Sampler> {
+        let filtro = |f: u32| if f == 1 { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
+        let a = |x: u32| crate::formatos::direccion(x);
+        let aniso_ok = aniso > 1 && self.gpu.props.limits.max_sampler_anisotropy > 1.0;
+        let mut ci = vk::SamplerCreateInfo::default()
+            .min_filter(filtro(min))
+            .mag_filter(filtro(mag))
+            .mipmap_mode(if mip == 2 { vk::SamplerMipmapMode::LINEAR } else { vk::SamplerMipmapMode::NEAREST })
+            .address_mode_u(a(dir[0]))
+            .address_mode_v(a(dir[1]))
+            .address_mode_w(a(dir[2]))
+            .anisotropy_enable(aniso_ok)
+            .max_anisotropy((aniso as f32).min(self.gpu.props.limits.max_sampler_anisotropy))
+            .min_lod(lod[0])
+            .max_lod(if mip == 0 { 0.25 } else { lod[1] })
+            .unnormalized_coordinates(!normalizadas)
+            .border_color(match borde {
+                1 => vk::BorderColor::FLOAT_OPAQUE_BLACK,
+                2 => vk::BorderColor::FLOAT_OPAQUE_WHITE,
+                _ => vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+            });
+        if !normalizadas {
+            // coordenadas sin normalizar: Vulkan pide un solo nivel y sujetar al borde
+            ci = ci.min_lod(0.0).max_lod(0.0).mipmap_mode(vk::SamplerMipmapMode::NEAREST).anisotropy_enable(false).address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE).address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        }
+        // SAFETY: dispositivo válido.
+        unsafe { self.gpu.device.create_sampler(&ci, None) }.map_err(err("vkCreateSampler"))
     }
 
     /// Copia entre una textura y un buffer (subir: buffer → textura).

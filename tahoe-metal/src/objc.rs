@@ -30,7 +30,11 @@ extern "C" {
     pub fn objc_getProtocol(name: *const c_char) -> *mut c_void;
     pub fn class_addProtocol(cls: Class, proto: *mut c_void) -> Bool;
     pub fn objc_msgSend();
+    pub fn objc_msgSend_stret();
     pub fn objc_msgSendSuper();
+    pub fn class_getInstanceMethod(cls: Class, s: Sel) -> *mut c_void;
+    pub fn method_getImplementation(m: *mut c_void) -> Imp;
+    pub fn method_setImplementation(m: *mut c_void, imp: Imp) -> Imp;
 }
 
 /// Selector por nombre.
@@ -85,6 +89,15 @@ pub unsafe fn m3<A, B, C, R>(obj: Id, s: &str, a: A, b: B, c: C) -> R {
     let f: unsafe extern "C" fn(Id, Sel, A, B, C) -> R = std::mem::transmute(objc_msgSend as *const ());
     f(obj, sel(s), a, b, c)
 }
+/// Mensaje que devuelve una estructura de más de 16 bytes (en x86_64 va por objc_msgSend_stret).
+///
+/// # Safety
+/// Ver `m0`.
+pub unsafe fn m0_stret<R>(obj: Id, s: &str) -> R {
+    let f: unsafe extern "C" fn(Id, Sel) -> R = std::mem::transmute(objc_msgSend_stret as *const ());
+    f(obj, sel(s))
+}
+
 /// Mensaje a la superclase `sup` (la implementación de la clase madre): sin argumentos.
 ///
 /// # Safety

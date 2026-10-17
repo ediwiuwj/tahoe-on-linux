@@ -45,6 +45,8 @@ impl Canal {
 pub struct Gpu {
     pub canal: Mutex<Canal>,
     pub info: Info,
+    /// ruta de la memoria de una IOSurface con «%u» en lugar de su ID (propiedad TahoeSurfacePath)
+    pub ruta_superficies: String,
 }
 
 static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
@@ -70,7 +72,9 @@ pub fn gpu_ya() -> Option<&'static Gpu> {
 
 fn conectar(puerto: u32) -> std::io::Result<Gpu> {
     // el puerto de initWithAcceleratorPort: no siempre es el servicio: se busca el IOAccelerator de tahoe-run
-    let ruta = buscar_servicio("TahoeAccelerator")
+    let servicio = buscar_servicio("TahoeAccelerator");
+    let ruta_superficies = servicio.and_then(|s| propiedad_texto(s, "TahoeSurfacePath")).unwrap_or_default();
+    let ruta = servicio
         .and_then(|s| propiedad_texto(s, "TahoeGPUSocket"))
         .or_else(|| propiedad_texto(puerto, "TahoeGPUSocket"))
         .ok_or_else(|| std::io::Error::other("no encuentro TahoeGPUSocket en el IOAccelerator"))?;
@@ -79,7 +83,7 @@ fn conectar(puerto: u32) -> std::io::Result<Gpu> {
     e.u32(protocolo::VERSION);
     let r = c.pedir(tipo::HOLA, &e.0)?;
     let info = Info::leer(&mut Lector::new(&r))?;
-    Ok(Gpu { canal: Mutex::new(c), info })
+    Ok(Gpu { canal: Mutex::new(c), info, ruta_superficies })
 }
 
 /// El primer servicio de IOKit de esa clase (IOServiceGetMatchingService(IOServiceMatching(clase))).

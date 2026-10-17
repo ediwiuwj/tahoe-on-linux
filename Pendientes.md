@@ -152,14 +152,28 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    de hardware o poco usados (texturas de 16384, argument buffers tier 2 —los Mac con Intel solo tienen tier 1—,
    escritura en buffers desde vertex shaders y raster order groups). Un driver Vulkan propio no daría lo que no tiene
    el hardware, así que **no se toca el driver del sistema**: lo que falte se emula en Rust en nuestro lado.
-   Plan, todo en Rust:
-   - `tahoe-gpu/` (Linux, `ash`): el dispositivo, memoria compartida sin copias (memfd importado con
-     VK_EXT_external_memory_host: probado, 1 millón de enteros en 1,6 ms), lector de `.metallib` (los 180 shaders de
-     CoreAnimation: AIR 2.8, bitcode LLVM). Siguiente: leer el bitcode (crate `llvm-bitcode`) y traducir AIR a SPIR-V
-     (`rspirv`), empezando por los kernels y los vertex/fragment de CoreAnimation.
-   - Driver Metal dentro de macOS (`tahoe-metal`, Rust compilado para macOS: ver `tools/macos-rs/LEEME.md`): un
-     IOAccelerator con `MetalPluginName` en el registro, el bundle con su `NSPrincipalClass` (el MTLDevice) y el
-     camino de órdenes hasta tahoe-gpu (user client de IOKit → tahoe-run → socket con memfd).
+   Los cinco pasos, todo en Rust:
+   1. **Traductor AIR → SPIR-V** (`tahoe-gpu/src/air`): hecho. Lector de bitcode, intérprete de referencia, SCCP,
+      control de flujo estructurado («Beyond Relooper»; la máquina de estados queda para CFG irreducibles), texturas de
+      todas las formas, atómicas, SIMD-group y quad (con shuffles: la GPU no tiene aritmética de subgrupos), bfloat16.
+      QuartzCore: 156/156 válidos con spirv-val (las 24 restantes son de GPU de Apple: imageblocks, render_target).
+      Banco GPU contra CPU (`tahoe-gpu probar`): en una muestra de 339 kernels de macOS, 169 dan lo mismo en la GPU y
+      en el intérprete. Falta: punteros en memoria (argument buffers), visible_function_table, imageblocks.
+   2. **macOS ve una GPU Metal**: hecho. Con `TAHOE_METAL`, tahoe-run publica un IOAccelerator con
+      `MetalPluginName` y lleva `/System/Library/Extensions/TahoeMetal.bundle` a nuestro bundle;
+      `MTLCreateSystemDefaultDevice()` devuelve `TahoeMTLDevice` «Tahoe GPU (Intel(R) HD Graphics 4400)». Canal:
+      socket Unix con el servidor de GPU (`tahoe-gpu servir`, el único proceso con Vulkan) y memoria compartida en
+      `/dev/shm` (buffers e IOSurfaces).
+   3. **Driver Metal** (`tahoe-metal`, ver su LEEME): cómputo de punta a punta dentro de macOS (un kernel de un
+      metallib del sistema llena un buffer en la HD 4400 y un blit lo copia: correcto). Hecho también: texturas
+      (normales y sobre IOSurface), samplers, pipelines de render con vertex descriptor, mezcla y function constants
+      (interceptando MTLFunctionConstantValues), encoders de render (el motor dibuja bien con shaders de QuartzCore,
+      `tahoe-gpu probar-render`). Falta probar el render desde macOS y lo que pida CoreAnimation.
+   4. **WindowServer/CoreAnimation por la GPU**: con `TAHOE_METAL`, WindowServer ya carga el driver y se conecta, pero
+      compone por software: CoreDisplay aún no asocia la pantalla al acelerador (IOPresentment/AGDC, ver
+      `CoreDisplay::UseIOPresentment`, `GPU::UpdateAcceleratorForMetal`).
+   5. **Metal 2 completo**: lo que quede (argument buffers, samplers constantes de 64 bits, offsets de buffer sin
+      alinear, cull mode dinámico, profundidad/estarcido, MSAA...), y pruebas con apps.
 6. **Sesión gráfica**: con ella, `screencapture`, `osascript` y `pbcopy` (hoy se caen por no haber sesión).
 7. **Servicios que fallan al arrancar**: mobileassetd, softwareupdate; apsd se cae en bucle («ProductType» nil);
    relanzados en bucle: cryptexd, watchdogd, diskmanagementstartup, triald_system, cupsd. Muchas preferencias de

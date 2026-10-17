@@ -100,6 +100,8 @@ pub enum Carga {
 
 pub struct ColorPase<'a> {
     pub textura: &'a Textura,
+    pub nivel: u32,
+    pub capa: u32,
     pub carga: Carga,
     pub guardar: bool,
 }
@@ -243,7 +245,17 @@ impl Motor {
                 .collect();
             let guardar: Vec<bool> = colores.iter().map(|c| c.guardar).collect();
             let pase = pase_compatible(d, &formatos, &cargas, &guardar)?;
-            let vistas: Vec<vk::ImageView> = colores.iter().map(|c| c.textura.vista).collect();
+            // vistas de un nivel y una capa (las de los attachments no pueden abarcar más)
+            let mut vistas: Vec<vk::ImageView> = Vec::new();
+            for c in colores {
+                let sr = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).base_mip_level(c.nivel).level_count(1).base_array_layer(c.capa).layer_count(1);
+                let v = d
+                    .create_image_view(&vk::ImageViewCreateInfo::default().image(c.textura.image).view_type(vk::ImageViewType::TYPE_2D).format(c.textura.formato).subresource_range(sr), None)
+                    .map_err(err("vkCreateImageView"))?;
+                vistas.push(v);
+            }
+            let (ancho, alto) = (ancho >> colores[0].nivel, alto >> colores[0].nivel);
+            let (ancho, alto) = (ancho.max(1), alto.max(1));
             let fb = d.create_framebuffer(&vk::FramebufferCreateInfo::default().render_pass(pase).attachments(&vistas).width(ancho).height(alto).layers(1), None).map_err(err("vkCreateFramebuffer"))?;
             let limpiar: Vec<vk::ClearValue> = colores
                 .iter()
@@ -279,6 +291,9 @@ impl Motor {
                                 d.destroy_descriptor_pool(pool, None);
                                 d.destroy_framebuffer(fb, None);
                                 d.destroy_render_pass(pase, None);
+                                for v in &vistas {
+                                    d.destroy_image_view(*v, None);
+                                }
                                 return Err(format!("falta el recurso del binding {b} ({})", if k == 0 { "vertex" } else { "fragment" }));
                             }
                         }
@@ -324,6 +339,9 @@ impl Motor {
             d.destroy_descriptor_pool(pool, None);
             d.destroy_framebuffer(fb, None);
             d.destroy_render_pass(pase, None);
+            for v in vistas {
+                d.destroy_image_view(v, None);
+            }
             r
         }
     }

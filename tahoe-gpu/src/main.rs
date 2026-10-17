@@ -15,10 +15,12 @@
 //!   intérprete de la CPU con las mismas entradas, y compara.
 
 mod air;
+mod formatos;
 mod informe;
 mod metallib;
 mod motor;
 mod probar;
+mod probar_render;
 mod protocolo;
 mod render;
 mod prueba;
@@ -37,6 +39,7 @@ fn main() {
         "traducir" => traducir(std::env::args().skip(2).collect()),
         "probar" => probar::probar(std::env::args().skip(2).collect()),
         "servir" => servir::servir(std::env::args().skip(2).collect()),
+        "probar-render" => probar_render::probar_render(std::env::args().skip(2).collect()),
         _ => {
             eprintln!("uso: tahoe-gpu informe | prueba | metallib <archivo> | extraer <archivo> <función> <salida.bc> | air <archivo> [función] | traducir <archivo> [función] [carpeta] | probar <archivo> <kernel> [ancho alto] | servir <socket>");
             std::process::exit(2);

@@ -40,7 +40,7 @@ pub struct MTLSize {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct NSRange {
     pub loc: u64,
     pub len: u64,
@@ -68,11 +68,17 @@ pub struct Clases {
 }
 
 static CLASES: OnceLock<Clases> = OnceLock::new();
+/// Todas las clases creadas aquí (para encontrar el estado de un objeto por su clase).
+static TODAS: std::sync::Mutex<Vec<(usize, isize)>> = std::sync::Mutex::new(Vec::new());
+
+fn desplazamiento(cls: Class) -> Option<isize> {
+    TODAS.lock().ok()?.iter().find(|(c, _)| *c == cls as usize).map(|x| x.1)
+}
 /// El MTLDevice del proceso (sin retener: vive lo que el proceso).
 pub static DISPOSITIVO: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static IDS: AtomicU32 = AtomicU32::new(1);
 
-fn nuevo_id() -> u32 {
+pub(crate) fn nuevo_id() -> u32 {
     IDS.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -80,11 +86,11 @@ pub fn clases() -> &'static Clases {
     CLASES.get().expect("clases sin registrar")
 }
 
-type Metodo = (&'static str, Imp, &'static str);
+pub type Metodo = (&'static str, Imp, &'static str);
 
 /// Crea y registra una clase hija de NSObject con esos protocolos y métodos (más dealloc y el registro de lo que no
 /// tiene).
-fn nueva_clase(nombre: &str, protocolos: &[&str], metodos: &[Metodo]) -> Clase {
+pub fn nueva_clase(nombre: &str, protocolos: &[&str], metodos: &[Metodo]) -> Clase {
     let c = std::ffi::CString::new(nombre).unwrap();
     // SAFETY: clase nueva con NSObject de madre; los métodos llevan sus firmas.
     unsafe {
@@ -105,12 +111,15 @@ fn nueva_clase(nombre: &str, protocolos: &[&str], metodos: &[Metodo]) -> Clase {
         objc::metodo(cls, "forwardInvocation:", reenviar as *const c_void, "v@:@");
         objc::objc_registerClassPair(cls);
         let off = ivar_getOffset(class_getInstanceVariable(cls, c"_tahoe".as_ptr()));
+        if let Ok(mut t) = TODAS.lock() {
+            t.push((cls as usize, off));
+        }
         Clase { cls, off }
     }
 }
 
 /// Objeto nuevo (+1, como los new*) con su estado.
-fn crear<T: Any>(c: &Clase, estado: T) -> Id {
+pub fn crear<T: Any>(c: &Clase, estado: T) -> Id {
     let caja: Box<Box<dyn Any>> = Box::new(Box::new(estado));
     // SAFETY: alloc/init de NSObject; el ivar _tahoe es de 8 bytes en `off`.
     unsafe {
@@ -125,12 +134,10 @@ pub fn estado<T: Any>(o: Id) -> Option<&'static mut T> {
     if o.is_null() {
         return None;
     }
-    let cs = clases();
     // SAFETY: si la clase es una de las nuestras, el ivar está en su desplazamiento.
     unsafe {
-        let cls = objc::object_getClass(o);
-        let c = [&cs.cola, &cs.buffer, &cs.biblioteca, &cs.funcion, &cs.pipeline, &cs.cb, &cs.computo, &cs.blit].into_iter().find(|c| c.cls == cls)?;
-        let p = *(o.cast::<u8>().offset(c.off) as *mut *mut Box<dyn Any>);
+        let off = desplazamiento(objc::object_getClass(o))?;
+        let p = *(o.cast::<u8>().offset(off) as *mut *mut Box<dyn Any>);
         if p.is_null() {
             return None;
         }
@@ -139,12 +146,10 @@ pub fn estado<T: Any>(o: Id) -> Option<&'static mut T> {
 }
 
 extern "C-unwind" fn dealloc(this: Id, cmd: Sel) {
-    let cs = clases();
     // SAFETY: objeto de una de nuestras clases; super dealloc es el de NSObject.
     unsafe {
-        let cls = objc::object_getClass(this);
-        if let Some(c) = [&cs.cola, &cs.buffer, &cs.biblioteca, &cs.funcion, &cs.pipeline, &cs.cb, &cs.computo, &cs.blit].into_iter().find(|c| c.cls == cls) {
-            let pp = this.cast::<u8>().offset(c.off) as *mut *mut Box<dyn Any>;
+        if let Some(off) = desplazamiento(objc::object_getClass(this)) {
+            let pp = this.cast::<u8>().offset(off) as *mut *mut Box<dyn Any>;
             if !(*pp).is_null() {
                 drop(Box::from_raw(*pp));
                 *pp = std::ptr::null_mut();
@@ -171,7 +176,7 @@ extern "C-unwind" fn reenviar(this: Id, _cmd: Sel, inv: Id) {
     registro(&format!("sin implementar: -[{} {}]", objc::nombre_clase(objc::clase_de(this)), objc::nombre_sel(s)));
 }
 
-fn retener(o: Id) -> Id {
+pub(crate) fn retener(o: Id) -> Id {
     if o.is_null() {
         return o;
     }
@@ -179,7 +184,7 @@ fn retener(o: Id) -> Id {
     unsafe { objc::m0(o, "retain") }
 }
 
-fn soltar(o: Id) {
+pub(crate) fn soltar(o: Id) {
     if !o.is_null() {
         // SAFETY: objeto retenido antes.
         unsafe { objc::m0::<()>(o, "release") }
@@ -187,7 +192,7 @@ fn soltar(o: Id) {
 }
 
 /// NSError con un mensaje, en un parámetro de salida `NSError**` (si lo hay).
-fn poner_error(salida: *mut Id, msg: &str) {
+pub(crate) fn poner_error(salida: *mut Id, msg: &str) {
     registro(&format!("error: {msg}"));
     if salida.is_null() {
         return;
@@ -200,24 +205,24 @@ fn poner_error(salida: *mut Id, msg: &str) {
     }
 }
 
-fn pedir(t: u32, cuerpo: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn pedir(t: u32, cuerpo: &[u8]) -> Result<Vec<u8>, String> {
     let g = canal::gpu_ya().ok_or("sin servidor de GPU")?;
     let mut c = g.canal.lock().map_err(|_| "canal envenenado")?;
     c.pedir(t, cuerpo).map_err(|e| e.to_string())
 }
 
-fn liberar_en_servidor(cl: u32, id: u32) {
+pub(crate) fn liberar_en_servidor(cl: u32, id: u32) {
     let mut e = Escritor::default();
     e.u32(cl).u32(id);
     let _ = pedir(tipo::LIBERAR, &e.0);
 }
 
-extern "C-unwind" fn dispositivo(_this: Id, _cmd: Sel) -> Id {
+pub(crate) extern "C-unwind" fn dispositivo(_this: Id, _cmd: Sel) -> Id {
     DISPOSITIVO.load(Ordering::Relaxed)
 }
 
 /// label y setLabel: comunes (el estado lleva `etiqueta`).
-trait ConEtiqueta {
+pub(crate) trait ConEtiqueta {
     fn etiqueta(&mut self) -> &mut Id;
 }
 macro_rules! etiqueta_de {
@@ -230,11 +235,11 @@ macro_rules! etiqueta_de {
     };
 }
 
-extern "C-unwind" fn etiqueta<T: ConEtiqueta + Any>(this: Id, _cmd: Sel) -> Id {
+pub(crate) extern "C-unwind" fn etiqueta<T: ConEtiqueta + Any>(this: Id, _cmd: Sel) -> Id {
     estado::<T>(this).map(|e| *e.etiqueta()).unwrap_or(std::ptr::null_mut())
 }
 
-extern "C-unwind" fn poner_etiqueta<T: ConEtiqueta + Any>(this: Id, _cmd: Sel, l: Id) {
+pub(crate) extern "C-unwind" fn poner_etiqueta<T: ConEtiqueta + Any>(this: Id, _cmd: Sel, l: Id) {
     if let Some(e) = estado::<T>(this) {
         let viejo = *e.etiqueta();
         // SAFETY: copia de un NSString.
@@ -243,8 +248,8 @@ extern "C-unwind" fn poner_etiqueta<T: ConEtiqueta + Any>(this: Id, _cmd: Sel, l
     }
 }
 
-extern "C-unwind" fn nada(_this: Id, _cmd: Sel) {}
-extern "C-unwind" fn nada1(_this: Id, _cmd: Sel, _a: Id) {}
+pub(crate) extern "C-unwind" fn nada(_this: Id, _cmd: Sel) {}
+pub(crate) extern "C-unwind" fn nada1(_this: Id, _cmd: Sel, _a: Id) {}
 
 // ------------------------------------------------------------------ cola
 
@@ -352,7 +357,7 @@ extern "C-unwind" fn buffer_modificado(_this: Id, _cmd: Sel, _r: NSRange) {}
 // ------------------------------------------------------------------ biblioteca y funciones
 
 pub struct Biblioteca {
-    id: u32,
+    pub(crate) id: u32,
     nombres: Vec<String>,
     etiqueta: Id,
 }
@@ -397,8 +402,10 @@ pub unsafe fn bytes_de_dispatch_data(d: Id) -> Vec<u8> {
 }
 
 pub struct Funcion {
-    biblioteca: Id,
-    nombre: String,
+    pub(crate) biblioteca: Id,
+    pub(crate) nombre: String,
+    /// function constants dadas (newFunctionWithName:constantValues:error:): ya serializadas para el servidor
+    pub(crate) constantes: Vec<u8>,
     etiqueta: Id,
 }
 etiqueta_de!(Funcion);
@@ -417,7 +424,7 @@ extern "C-unwind" fn biblioteca_funcion(this: Id, _cmd: Sel, nombre: Id) -> Id {
         registro(&format!("newFunctionWithName:{n}: no está en la biblioteca"));
         return std::ptr::null_mut();
     }
-    crear(&clases().funcion, Funcion { biblioteca: retener(this), nombre: n, etiqueta: std::ptr::null_mut() })
+    crear(&clases().funcion, Funcion { biblioteca: retener(this), nombre: n, constantes: Vec::new(), etiqueta: std::ptr::null_mut() })
 }
 
 extern "C-unwind" fn biblioteca_nombres(this: Id, _cmd: Sel) -> Id {
@@ -596,8 +603,8 @@ extern "C-unwind" fn cb_tiempo(_this: Id, _cmd: Sel) -> f64 {
 }
 
 pub struct Encoder {
-    cb: Id,
-    etiqueta: Id,
+    pub(crate) cb: Id,
+    pub(crate) etiqueta: Id,
 }
 etiqueta_de!(Encoder);
 
@@ -608,7 +615,7 @@ impl Drop for Encoder {
     }
 }
 
-fn ordenes(enc: Id) -> Option<&'static mut Escritor> {
+pub(crate) fn ordenes(enc: Id) -> Option<&'static mut Escritor> {
     let e = estado::<Encoder>(enc)?;
     Some(&mut estado::<CommandBuffer>(e.cb)?.ordenes)
 }
