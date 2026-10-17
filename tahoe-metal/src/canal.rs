@@ -50,8 +50,8 @@ pub struct Gpu {
 static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
 
 /// La GPU del proceso (conecta la primera vez, con el servicio del IOAccelerator).
-pub fn gpu(servicio: u32) -> Option<&'static Gpu> {
-    GPU.get_or_init(|| match conectar(servicio) {
+pub fn gpu(puerto: u32) -> Option<&'static Gpu> {
+    GPU.get_or_init(|| match conectar(puerto) {
         Ok(g) => {
             registro(&format!("conectado al servidor de GPU: {:?}", g.info));
             Some(g)
@@ -68,14 +68,36 @@ pub fn gpu_ya() -> Option<&'static Gpu> {
     GPU.get().and_then(|g| g.as_ref())
 }
 
-fn conectar(servicio: u32) -> std::io::Result<Gpu> {
-    let ruta = propiedad_texto(servicio, "TahoeGPUSocket").ok_or_else(|| std::io::Error::other("el IOAccelerator no tiene TahoeGPUSocket"))?;
+fn conectar(puerto: u32) -> std::io::Result<Gpu> {
+    // el puerto de initWithAcceleratorPort: no siempre es el servicio: se busca el IOAccelerator de tahoe-run
+    let ruta = buscar_servicio("TahoeAccelerator")
+        .and_then(|s| propiedad_texto(s, "TahoeGPUSocket"))
+        .or_else(|| propiedad_texto(puerto, "TahoeGPUSocket"))
+        .ok_or_else(|| std::io::Error::other("no encuentro TahoeGPUSocket en el IOAccelerator"))?;
     let mut c = Canal::conectar(&ruta).map_err(|e| std::io::Error::other(format!("{ruta}: {e}")))?;
     let mut e = Escritor::default();
     e.u32(protocolo::VERSION);
     let r = c.pedir(tipo::HOLA, &e.0)?;
     let info = Info::leer(&mut Lector::new(&r))?;
     Ok(Gpu { canal: Mutex::new(c), info })
+}
+
+/// El primer servicio de IOKit de esa clase (IOServiceGetMatchingService(IOServiceMatching(clase))).
+fn buscar_servicio(clase: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(clase).ok()?;
+    // SAFETY: funciones de IOKit con sus firmas; IOServiceGetMatchingService consume el diccionario.
+    unsafe {
+        let iokit = dlopen(c"/System/Library/Frameworks/IOKit.framework/IOKit".as_ptr(), 2);
+        let coincide = dlsym(iokit, c"IOServiceMatching".as_ptr());
+        let buscar = dlsym(iokit, c"IOServiceGetMatchingService".as_ptr());
+        if coincide.is_null() || buscar.is_null() {
+            return None;
+        }
+        let coincide: extern "C" fn(*const c_char) -> Id = std::mem::transmute(coincide);
+        let buscar: extern "C" fn(u32, Id) -> u32 = std::mem::transmute(buscar);
+        let s = buscar(0, coincide(c.as_ptr()));
+        (s != 0).then_some(s)
+    }
 }
 
 /// Propiedad de texto de una entrada del registro de IOKit (IORegistryEntryCreateCFProperty).
