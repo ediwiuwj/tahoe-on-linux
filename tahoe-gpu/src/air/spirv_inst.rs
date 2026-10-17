@@ -5,6 +5,18 @@ use super::*;
 
 /// Traduce el punto de entrada `e` del módulo.
 pub fn traducir(m: &Module, e: &Entrada, op: &Opciones) -> Res<Traduccion> {
+    // estructurado si se puede; si el CFG no se deja (irreducible...), máquina de estados
+    if std::env::var_os("TAHOE_MAQUINA").is_none() {
+        match traducir_modo(m, e, op, true) {
+            Ok(t) => return Ok(t),
+            Err(err) if err.starts_with("estructura: ") => {}
+            Err(err) => return Err(err),
+        }
+    }
+    traducir_modo(m, e, op, false)
+}
+
+fn traducir_modo(m: &Module, e: &Entrada, op: &Opciones, estructurado: bool) -> Res<Traduccion> {
     let esp = fc::especializar(m, &op.constantes)?;
     let f = inline::inline_todo(m, e.funcion)?;
     let an = sccp::analizar(m, &f, &esp.memoria, &esp.definidas);
@@ -53,6 +65,11 @@ pub fn traducir(m: &Module, e: &Entrada, op: &Opciones) -> Res<Traduccion> {
         privadas: HashMap::new(),
         globales: HashMap::new(),
         multi: reach > 1,
+        estructurado,
+        sin_terminador: false,
+        var_destino: 0,
+        n_lazos: 0,
+        cabeceras_lazo: Vec::new(),
         vars: HashMap::new(),
         var_estado: 0,
         etiquetas: HashMap::new(),
@@ -105,7 +122,7 @@ pub fn traducir(m: &Module, e: &Entrada, op: &Opciones) -> Res<Traduccion> {
     let varyings = t.varyings_out.clone();
     let atributos = t.atributos.clone();
     let spirv = t.b.module().assemble();
-    Ok(Traduccion { spirv, etapa: e.etapa, enlaces, varyings, atributos, colores, bloques: reach, maquina_de_estados: reach > 1, subgrupos: t.usa_subgrupos })
+    Ok(Traduccion { spirv, etapa: e.etapa, enlaces, varyings, atributos, colores, bloques: reach, maquina_de_estados: reach > 1 && !estructurado, subgrupos: t.usa_subgrupos })
 }
 
 fn nombre_air<'a>(m: &'a Module, f: &Function, callee: ValueId) -> &'a str {
@@ -150,6 +167,10 @@ impl Tr<'_> {
             for &bb in &orden {
                 self.bloque(bb)?;
             }
+        } else if self.estructurado {
+            let cero = self.cu(0);
+            self.b.store(self.var_destino, cero, None, []).unwrap();
+            self.emitir_estructurado().map_err(|e| format!("estructura: {e}"))?;
         } else {
             // máquina de estados: entrada → cabecera (bucle) → switch sobre el bloque → caso → fusión → continuar
             let cab = self.b.id();
@@ -216,6 +237,7 @@ impl Tr<'_> {
         }
         let pu = self.ptr_t(StorageClass::Function, self.t_u32);
         self.var_estado = self.b.variable(pu, None, StorageClass::Function, None);
+        self.var_destino = self.b.variable(pu, None, StorageClass::Function, None);
         // bloque de definición de cada valor y usos fuera de él
         let mut def_bloque: HashMap<ValueId, usize> = HashMap::new();
         for (bi, blk) in f.blocks.iter().enumerate() {
@@ -596,6 +618,9 @@ impl Tr<'_> {
             }
             let es_term = matches!(ins.inst, Inst::Br(_) | Inst::CondBr { .. } | Inst::Switch { .. } | Inst::Ret(_) | Inst::Unreachable);
             if es_term {
+                if self.sin_terminador {
+                    return Ok(());
+                }
                 self.terminador(bb, &ins.inst)?;
                 return Ok(());
             }
@@ -944,3 +969,5 @@ pub(super) fn operandos(i: &Inst) -> Vec<ValueId> {
 
 #[path = "spirv_ops.rs"]
 mod ops;
+#[path = "spirv_estructura.rs"]
+mod estructura;

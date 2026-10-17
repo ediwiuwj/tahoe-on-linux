@@ -147,6 +147,14 @@ struct Tr<'a> {
     globales: HashMap<usize, Word>,
     // control de flujo
     multi: bool,
+    /// control de flujo estructurado (si no, máquina de estados)
+    estructurado: bool,
+    /// `bloque` se para antes del terminador (lo emite el estructurador)
+    sin_terminador: bool,
+    /// destino de las salidas de varios niveles del estructurador
+    var_destino: Word,
+    n_lazos: u32,
+    cabeceras_lazo: Vec<Word>,
     vars: HashMap<ValueId, Word>,
     var_estado: Word,
     etiquetas: HashMap<usize, Word>,

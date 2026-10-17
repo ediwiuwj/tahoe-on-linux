@@ -123,7 +123,7 @@ fn traducir(a: Vec<String>) -> vk::Res<()> {
     let carpeta = a.get(2);
     let d = std::fs::read(ruta).map_err(|e| format!("{ruta}: {e}"))?;
     let b = metallib::Biblioteca::leer(&d)?;
-    let (mut bien, mut mal) = (0, 0);
+    let (mut bien, mut mal, mut maquinas) = (0, 0, 0usize);
     let mut errores: std::collections::BTreeMap<String, usize> = Default::default();
     for f in b.funciones.iter().filter(|f| solo.is_none_or(|n| *n == f.nombre)) {
         let r = air::ir::leer(b.bitcode(f)?).and_then(|m| {
@@ -133,6 +133,7 @@ fn traducir(a: Vec<String>) -> vk::Res<()> {
         match r {
             Ok(t) => {
                 bien += 1;
+                maquinas += t.maquina_de_estados as usize;
                 if let Some(c) = carpeta {
                     let bytes: Vec<u8> = t.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
                     std::fs::write(format!("{c}/{}.spv", f.nombre), bytes).map_err(|e| e.to_string())?;
@@ -154,7 +155,7 @@ fn traducir(a: Vec<String>) -> vk::Res<()> {
             }
         }
     }
-    println!("{bien} traducidas, {mal} con error");
+    println!("{bien} traducidas ({maquinas} con máquina de estados), {mal} con error");
     let mut v: Vec<_> = errores.into_iter().collect();
     v.sort_by(|x, y| y.1.cmp(&x.1));
     for (e, n) in v.iter().take(25) {
