@@ -613,7 +613,7 @@ static long bsd_open(struct ctx* c) {
 	int flags = darwin_open_flags((int)c->a[1]);
 	long fd = -1;
 	if (tahoe_root && path[0] == '/' && !tahoe_host_passthrough(path)) {
-		snprintf(full, sizeof full, "%s%s", tahoe_root, path);
+		if (!tahoe_metal_path(path, full, sizeof full)) snprintf(full, sizeof full, "%s%s", tahoe_root, path);
 		fd = open_symlink(AT_FDCWD, full, (int)c->a[1], flags, syscall(SYS_open, full, flags, (int)c->a[2]));
 		if (fd < 0 && ((flags & O_CREAT) || !tahoe_host_passthrough(path))) goto done;   // fuera de /dev, solo la raíz de macOS
 	}

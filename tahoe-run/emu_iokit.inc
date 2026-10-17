@@ -705,6 +705,24 @@ static void io_init(void) {
 	// Sin IOAccelerator: no hay driver Metal para esta GPU (la HD 4400 no tiene driver en macOS 26), y un acelerador sin
 	// "MetalPluginName" deja a CoreDisplay sin dispositivo Metal y a WindowServer cayendo al iniciar las pantallas. Sin
 	// acelerador, como en una máquina virtual sin GPU, WindowServer compone por software en el framebuffer.
+	// Con TAHOE_METAL (driver Metal de tahoe-run, tahoe-metal): un IOAccelerator cuyo MetalPluginName es el bundle
+	// TahoeMetal (lo pone en /System/Library/Extensions el overlay de emu_fs.c). Metal lo encuentra al enumerar los
+	// IOAccelerator, carga el bundle y crea su clase principal. Sin TAHOE_METAL no hay acelerador (ver arriba).
+	if (getenv("TAHOE_METAL")) {
+		int ta = ent_add(gpu, "TahoeAccelerator", "TahoeAccelerator", "IORegistryEntry IOService IOAccelerator TahoeAccelerator", "", PL_SERVICE, 1);
+		p_str(ta, "IOClass", "TahoeAccelerator");
+		p_str(ta, "IOProviderClass", "IOPCIDevice");
+		p_str(ta, "IOMatchCategory", "IOAccelerator");
+		p_str(ta, "MetalPluginName", "TahoeMetal");
+		p_str(ta, "MetalPluginClassName", "TahoeMTLDevice");
+		p_str(ta, "model", "Tahoe GPU (Vulkan)");
+		p_num(ta, "IOAccelIndex", 0, 32);
+		p_num(ta, "IOAccelRevision", 2, 32);
+		// socket del servidor de GPU (tahoe-gpu servir, en Linux): el driver le manda los comandos
+		char sock[256];
+		snprintf(sock, sizeof sock, "%s", getenv("TAHOE_GPU_SOCK") ? getenv("TAHOE_GPU_SOCK") : "/dev/shm/tahoe-gpu.sock");
+		p_str(ta, "TahoeGPUSocket", strdup(sock));
+	}
 	int dcon = ent_add(accel, "display0", "IODisplayConnect", "IORegistryEntry IOService", "", PL_SERVICE, 0);
 	p_str(dcon, "IOClass", "IODisplayConnect");
 	int disp = ent_add(dcon, "AppleDisplay", "IODisplay", "IORegistryEntry IOService", "", PL_SERVICE, 1);

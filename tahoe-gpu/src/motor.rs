@@ -11,14 +11,14 @@ use crate::vk::{err, Gpu, Res};
 
 pub struct Motor {
     pub gpu: Gpu,
-    pool: vk::CommandPool,
+    pub(crate) pool: vk::CommandPool,
 }
 
 /// Buffer de Metal: memoria compartida (memfd) que ven a la vez la CPU, macOS y la GPU.
 pub struct Buffer {
     pub ptr: *mut u8,
     pub len: usize,
-    buf: vk::Buffer,
+    pub(crate) buf: vk::Buffer,
     mem: vk::DeviceMemory,
 }
 
@@ -59,7 +59,7 @@ pub struct Textura {
     pub capas: u32,
     pub formato: vk::Format,
     pub bpp: u32,
-    image: vk::Image,
+    pub(crate) image: vk::Image,
     mem: vk::DeviceMemory,
     pub vista: vk::ImageView,
 }
@@ -74,6 +74,8 @@ pub struct PipelineComputo {
 /// Lo que se enlaza en un despacho, por binding.
 pub enum Enlazado<'a> {
     Buffer(&'a Buffer),
+    /// buffer desde un desplazamiento (setBuffer:offset:atIndex:); alineado a minStorageBufferOffsetAlignment
+    BufferDesde(&'a Buffer, u64),
     Textura(&'a Textura),
     Sampler(vk::Sampler),
 }
@@ -138,6 +140,20 @@ impl Motor {
             d.bind_buffer_memory(buf, mem, 0).map_err(err("vkBindBufferMemory"))?;
             Ok(Buffer { ptr, len, buf, mem })
         }
+    }
+
+    /// Copia entre buffers (blit de Metal: copyFromBuffer:...toBuffer:...).
+    pub fn copiar_buffer(&self, de: &Buffer, de_off: u64, a: &Buffer, a_off: u64, len: u64) -> Res<()> {
+        let r = [vk::BufferCopy::default().src_offset(de_off).dst_offset(a_off).size(len)];
+        self.una_vez(|d, cb| {
+            // SAFETY: objetos válidos durante la grabación.
+            unsafe { d.cmd_copy_buffer(cb, de.buf, a.buf, &r) }
+        })
+    }
+
+    /// Alineación que piden los desplazamientos de un storage buffer.
+    pub fn alineacion_buffer(&self) -> u64 {
+        self.gpu.props.limits.min_storage_buffer_offset_alignment
     }
 
     /// Buffer nuevo en un memfd propio (para pruebas).
@@ -297,6 +313,7 @@ impl Motor {
             for &(b, ty) in &p.enlaces {
                 match recursos.get(&b) {
                     Some(Enlazado::Buffer(buf)) => binfos.push((b, ty, vk::DescriptorBufferInfo::default().buffer(buf.buf).range(vk::WHOLE_SIZE))),
+                    Some(Enlazado::BufferDesde(buf, off)) => binfos.push((b, ty, vk::DescriptorBufferInfo::default().buffer(buf.buf).offset(*off).range(vk::WHOLE_SIZE))),
                     Some(Enlazado::Textura(t)) => iinfos.push((b, ty, vk::DescriptorImageInfo::default().image_view(t.vista).image_layout(vk::ImageLayout::GENERAL))),
                     Some(Enlazado::Sampler(s)) => iinfos.push((b, ty, vk::DescriptorImageInfo::default().sampler(*s))),
                     None => return Err(format!("falta el recurso del binding {b}")),

@@ -76,6 +76,9 @@ pub struct Opciones {
     pub constantes: HashMap<u32, V>,
     /// Locations de los varyings por nombre (las del vertex shader, para enlazar el fragment).
     pub varyings: HashMap<String, u32>,
+    /// Descriptor set de los recursos (en un pipeline de render, uno por etapa: en Metal el buffer 0 del vertex shader
+    /// y el del fragment shader son distintos).
+    pub set: u32,
 }
 
 // ---------------------------------------------------------------- valores traducidos
@@ -169,6 +172,8 @@ struct Tr<'a> {
     usa_subgrupos: bool,
     /// Capacidades que piden los recursos usados (Sampled1D, SampledCubeArray...).
     capacidades: Vec<Capability>,
+    /// descriptor set de los recursos (Opciones::set)
+    set: u32,
     /// Base de los punteros que cruzan bloques (la variable guarda solo el desplazamiento).
     bases: HashMap<ValueId, Base>,
     /// Valores que son siempre la misma textura o sampler (phi/select con la textura nula): se resuelven sin variable.
@@ -401,7 +406,7 @@ impl<'a> Tr<'a> {
                 };
                 let pt = self.ptr_t(StorageClass::StorageBuffer, st);
                 let v = self.var_global(pt, StorageClass::StorageBuffer, None);
-                self.b.decorate(v, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+                self.b.decorate(v, Decoration::DescriptorSet, [Operand::LiteralBit32(self.set)]);
                 self.b.decorate(v, Decoration::Binding, [Operand::LiteralBit32(i)]);
                 self.buffers.insert(i, v);
                 self.interfaz.push(v);

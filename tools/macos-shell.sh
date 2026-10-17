@@ -64,6 +64,15 @@ SMBIOS="${TAHOE_SMBIOS_FILE:-$HOME/.config/tahoe-run/smbios.json}"
 # Argumentos de arranque de macOS (NVRAM boot-args y kern.bootargs), p. ej. TAHOE_BOOTARGS="useIOP=0".
 [ -n "$TAHOE_BOOTARGS" ] && OSK_ENV+=(TAHOE_BOOTARGS="$TAHOE_BOOTARGS")
 [ -n "$TAHOE_GPU" ] && OSK_ENV+=(TAHOE_GPU="$TAHOE_GPU")          # otra identidad PCI para la GPU emulada
+# Driver Metal (tahoe-metal): carpeta del anfitrión con TahoeMetal.bundle; con ella macOS ve un IOAccelerator con ese driver.
+# Con él arranca también el servidor de GPU de Linux (tahoe-gpu servir, Vulkan), al que el driver manda los comandos por
+# el socket TAHOE_GPU_SOCK (por omisión /dev/shm/tahoe-gpu-<uid>.sock).
+GPU_SRV=
+if [ -n "$TAHOE_METAL" ]; then
+	OSK_ENV+=(TAHOE_METAL="$(readlink -f "$TAHOE_METAL")")
+	TAHOE_GPU_SOCK="${TAHOE_GPU_SOCK:-/dev/shm/tahoe-gpu-$(id -u).sock}"
+	OSK_ENV+=(TAHOE_GPU_SOCK="$TAHOE_GPU_SOCK")
+fi
 MACOS_ENV=(PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root USER=root LOGNAME=root SHELL=/bin/bash
 	TERM="${TERM:-xterm-256color}" LANG="${LANG:-es_ES.UTF-8}"
 	TAHOE_ROOT="$ROOT" TAHOE_CACHE_DIR="$CACHE" TAHOE_LOGFILE="$LOG" "${DEBUG_ENV[@]}" "${OSK_ENV[@]}")
@@ -90,6 +99,7 @@ stop_launchd() {
 	[ -n "$STARTED" ] || return
 	kill -9 "$L" $(pgrep -P "$U" 2>/dev/null) 2>/dev/null   # al morir el PID 1 del espacio, el núcleo termina a todos sus procesos
 	[ -n "$VIEW" ] && kill "$VIEW" 2>/dev/null
+	[ -n "$GPU_SRV" ] && kill "$GPU_SRV" 2>/dev/null && rm -f "$TAHOE_GPU_SOCK"
 	if [ -n "$REGION" ]; then                         # memoria de vídeo y superficies de este arranque (RAM en /dev/shm)
 		local id=${REGION#/dev/shm/tahoe-ports-}
 		rm -f "/dev/shm/tahoe-fb-$id" "/dev/shm/tahoe-fbcursor-$id" "/dev/shm/tahoe-surfaces-$id" /dev/shm/tahoe-surf-*-"$id"
@@ -99,7 +109,15 @@ stop_launchd() {
 }
 trap stop_launchd EXIT
 trap 'exit 130' INT TERM HUP                       # para que también se limpie al interrumpir
+start_gpu_server() {
+	[ -n "$TAHOE_METAL" ] || return
+	local srv="$TOOLS/../tahoe-gpu/target/release/tahoe-gpu"
+	if [ ! -x "$srv" ]; then echo "falta $srv: compila tahoe-gpu (cargo build --release)" >&2; return; fi
+	rm -f "$TAHOE_GPU_SOCK"
+	"$srv" servir "$TAHOE_GPU_SOCK" < /dev/null >> "$LOG.gpu" 2>&1 & GPU_SRV=$!
+}
 if [ -z "$L" ]; then
+	start_gpu_server
 	rm -f /dev/shm/tahoe-guard-stop
 	"$TOOLS/mem_guard.sh" & GUARD=$!
 	setsid env -i "${MACOS_ENV[@]}" TAHOE_FD2LOG=1 \
@@ -130,6 +148,8 @@ if [ -n "$WITH_VIEW" ]; then
 fi
 
 T=$(ls /proc/$L/task | grep -vx "$L" | head -1)       # un hilo vivo: con el principal terminado, /proc/<pid>/ns no se abre
+# TAHOE_TRACE_SHELL=1: traza completa de las llamadas al sistema solo de la shell y de lo que lance (no de todo el arranque)
+TRACE_ENV=(); [ -n "$TAHOE_TRACE_SHELL" ] && TRACE_ENV=(TAHOE_TRACE=1)
 nsenter --target "${T:-$L}" --user --mount --pid --preserve-credentials -- \
-	env -i "${MACOS_ENV[@]}" TAHOE_PORTS="$REGION" TAHOE_PORTS_OWNER="${REGION#/dev/shm/tahoe-ports-}" \
+	env -i "${MACOS_ENV[@]}" "${TRACE_ENV[@]}" TAHOE_PORTS="$REGION" TAHOE_PORTS_OWNER="${REGION#/dev/shm/tahoe-ports-}" \
 	"$RUN" "${SHELL_ARGS[@]}"

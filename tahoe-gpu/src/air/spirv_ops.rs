@@ -1260,7 +1260,7 @@ impl Tr<'_> {
         let it = self.b.type_image(muestra, dim, 0, arreglo as u32, ms as u32, if escritura { 2 } else { 1 }, ImageFormat::Unknown, None);
         let pt = self.ptr_t(StorageClass::UniformConstant, it);
         let v = self.var_global(pt, StorageClass::UniformConstant, None);
-        self.b.decorate(v, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+        self.b.decorate(v, Decoration::DescriptorSet, [Operand::LiteralBit32(self.set)]);
         let binding = if escritura { BIND_TEXTURA_ESCRITURA } else { BIND_TEXTURA } + idx;
         self.b.decorate(v, Decoration::Binding, [Operand::LiteralBit32(binding)]);
         if escritura {
@@ -1279,7 +1279,7 @@ impl Tr<'_> {
         }
         let pt = self.ptr_t(StorageClass::UniformConstant, self.t_sampler);
         let v = self.var_global(pt, StorageClass::UniformConstant, None);
-        self.b.decorate(v, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+        self.b.decorate(v, Decoration::DescriptorSet, [Operand::LiteralBit32(self.set)]);
         let (binding, recurso) = match s {
             Smp::Arg(i) => (BIND_SAMPLER + i, Recurso::Sampler { indice: i }),
             Smp::Fijo(g) => {

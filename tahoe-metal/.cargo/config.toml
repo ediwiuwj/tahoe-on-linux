@@ -1,0 +1,10 @@
+# Se compila para macOS (x86_64) sin Xcode ni el SDK de Apple: ver tools/macos-rs/LEEME.md. Las descripciones .tbd de las
+# bibliotecas de macOS se buscan en ~/.cache/tahoe-tbd (build.rs).
+[build]
+target = "x86_64-apple-darwin"
+
+[target.x86_64-apple-darwin]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld64.lld",
+             "-C", "link-arg=-platform_version", "-C", "link-arg=macos", "-C", "link-arg=11.0", "-C", "link-arg=26.0",
+             "-C", "link-arg=-arch", "-C", "link-arg=x86_64"]

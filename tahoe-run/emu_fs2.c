@@ -23,6 +23,7 @@ static long rpath(uint64_t addr, char* out, size_t cap) {
 	char g[4096];
 	if (safe_string(addr, g, sizeof g) != 0) return -D_EFAULT;
 	tahoe_resolve_strip(g);
+	if (tahoe_metal_path(g, out, cap)) return 0;
 	if (tahoe_root && g[0] == '/' && !tahoe_host_passthrough(g)) snprintf(out, cap, "%s%s", tahoe_root, g);
 	else { char al[64]; snprintf(out, cap, "%s", tahoe_dev_alias(g, al, sizeof al)); }
 	return 0;
@@ -235,6 +236,7 @@ static long apath(uint64_t addr, char* out, size_t cap) {
 	char g[4096];
 	if (safe_string(addr, g, sizeof g) != 0) return -D_EFAULT;
 	tahoe_resolve_strip(g);
+	if (tahoe_metal_path(g, out, cap)) return 0;
 	if (tahoe_root && g[0] == '/' && !tahoe_host_passthrough(g)) snprintf(out, cap, "%s%s", tahoe_root, g);
 	else { char al[64]; snprintf(out, cap, "%s", tahoe_dev_alias(g, al, sizeof al)); }
 	return 0;

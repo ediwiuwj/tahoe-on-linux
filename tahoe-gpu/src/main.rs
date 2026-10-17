@@ -19,7 +19,10 @@ mod informe;
 mod metallib;
 mod motor;
 mod probar;
+mod protocolo;
+mod render;
 mod prueba;
+mod servir;
 mod shaders;
 mod vk;
 
@@ -33,8 +36,9 @@ fn main() {
         "air" => leer_air(std::env::args().skip(2).collect()),
         "traducir" => traducir(std::env::args().skip(2).collect()),
         "probar" => probar::probar(std::env::args().skip(2).collect()),
+        "servir" => servir::servir(std::env::args().skip(2).collect()),
         _ => {
-            eprintln!("uso: tahoe-gpu informe | prueba | metallib <archivo> | extraer <archivo> <función> <salida.bc> | air <archivo> [función] | traducir <archivo> [función] [carpeta] | probar <archivo> <kernel> [ancho alto]");
+            eprintln!("uso: tahoe-gpu informe | prueba | metallib <archivo> | extraer <archivo> <función> <salida.bc> | air <archivo> [función] | traducir <archivo> [función] [carpeta] | probar <archivo> <kernel> [ancho alto] | servir <socket>");
             std::process::exit(2);
         }
     };

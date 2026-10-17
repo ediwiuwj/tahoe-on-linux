@@ -113,6 +113,39 @@ static uint64_t sysvol_mnt(size_t i) {                                  // id de
 	return id[i];
 }
 int sys_volume_present(int k) { return k >= 0 && (size_t)k < NSYSVOL && sysvol_mnt((size_t)k) != 0; }
+// Driver Metal de tahoe-run (tahoe-metal): con TAHOE_METAL=<carpeta del anfitrión con TahoeMetal.bundle>, las rutas de
+// macOS /System/Library/Extensions/TahoeMetal.bundle[/...] llevan a esa carpeta (sin distinguir mayúsculas, como APFS).
+// macOS ve el bundle donde Metal busca los drivers (MetalPluginName del IOAccelerator) y su copia no se toca. (Un overlayfs
+// sobre /System/Library/Extensions no vale: con la copia de macOS en un ext4 con casefold, overlayfs rechaza sus archivos.)
+#define METAL_GUEST "/System/Library/Extensions/TahoeMetal.bundle"
+int tahoe_metal_path(const char* guest, char* out, size_t cap) {
+	static const char* dir; static int known;
+	if (!known) { known = 1; dir = getenv("TAHOE_METAL"); if (dir && !*dir) dir = NULL; }
+	size_t n = sizeof METAL_GUEST - 1;
+	if (!dir || strncasecmp(guest, METAL_GUEST, n) || (guest[n] && guest[n] != '/')) return 0;
+	snprintf(out, cap, "%s/TahoeMetal.bundle%s", dir, guest + n);
+	return 1;
+}
+// Lo inverso: una ruta del anfitrión dentro de la carpeta de TAHOE_METAL -> la de macOS (F_GETPATH, getattrlist...).
+int tahoe_metal_guest(const char* host, char* out, size_t cap) {
+	const char* dir = getenv("TAHOE_METAL");
+	char pre[4200];
+	if (!dir || !*dir) return 0;
+	size_t n = (size_t)snprintf(pre, sizeof pre, "%s/TahoeMetal.bundle", dir);
+	if (strncmp(host, pre, n) || (host[n] && host[n] != '/')) return 0;
+	snprintf(out, cap, "%s%s", METAL_GUEST, host + n);
+	return 1;
+}
+// st_dev de la carpeta de TAHOE_METAL: para macOS es el volumen del sistema, como el resto de /System.
+static dev_t metal_overlay_dev(void) {
+	static dev_t d; static int known;
+	if (!known) {
+		known = 1; d = (dev_t)-1;
+		struct stat st;
+		if (getenv("TAHOE_METAL") && stat(getenv("TAHOE_METAL"), &st) == 0) d = st.st_dev;
+	}
+	return d;
+}
 void sys_volumes_mount(void) {                                         // en el PID 1 del arranque, antes que nada de macOS
 	if (!tahoe_root) return;
 	uint64_t r = mnt_id_of(AT_FDCWD, tahoe_root, 0);
@@ -137,13 +170,14 @@ static void vol_fix(struct stat* s, int dfd, const char* p, int fl) {
 }
 static uint32_t guest_dev(dev_t d) {
 	for (size_t k = 0; k < NSYSVOL; k++) if (d == sys_volumes[k].mark) return darwin_dev(EMU_DISK_MAJOR, sys_volumes[k].minor);
-	if (tahoe_root && d == root_dev()) return darwin_dev(EMU_DISK_MAJOR, ROOT_VOLUME_MINOR);
+	if (tahoe_root && (d == root_dev() || d == metal_overlay_dev())) return darwin_dev(EMU_DISK_MAJOR, ROOT_VOLUME_MINOR);
 	return darwin_dev(major(d), minor(d));
 }
 
 // Resuelve una ruta absoluta del programa bajo TAHOE_ROOT (salvo /dev, del anfitrión).
 static const char* resolve(const char* guest, char* buf, size_t cap) {
 	guest += tahoe_resolve_skip(guest);
+	if (tahoe_metal_path(guest, buf, cap)) return buf;
 	if (tahoe_root && guest[0] == '/' && !tahoe_host_passthrough(guest)) { snprintf(buf, cap, "%s%s", tahoe_root, guest); return buf; }
 	return tahoe_dev_alias(guest, buf, cap);                                                // /dev: siempre el del anfitrión (el de la raíz está vacío)
 }
@@ -568,7 +602,7 @@ static long bsd_fcntl(struct ctx* c) {
 		const char* p = path;
 		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
 		if (rl && !strncmp(path, tahoe_root, rl) && (path[rl] == '/' || path[rl] == '\0')) p = path[rl] ? path + rl : "/";    // quitar la raíz de macOS
-		char gp[4400]; snprintf(gp, sizeof gp, "%s", p);
+		char gp[4400]; if (!tahoe_metal_guest(path, gp, sizeof gp)) snprintf(gp, sizeof gp, "%s", p);
 		if (cmd != 102) fl_canon(gp, sizeof gp);                        // F_GETPATH: con firmlinks; F_GETPATH_NOFIRMLINK: sin ellos
 		if (trace_all) logf_("    F_GETPATH(fd=%d) = \"%s\"\n", fd, gp);
 		return safe_write(c->a[2], gp, strlen(gp) + 1) > 0 ? 0 : -D_EFAULT;
@@ -885,7 +919,7 @@ static long bsd_getattrlist(struct ctx* c) {
 		const char* rp = realpath(rpth, real) ? real : p;
 		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
 		if (rl && !strncmp(rp, tahoe_root, rl) && (rp[rl] == '/' || rp[rl] == '\0')) rp += rl;
-		snprintf(gp2, sizeof gp2, "%s", rp[0] ? rp : "/");
+		if (!tahoe_metal_guest(rp, gp2, sizeof gp2)) snprintf(gp2, sizeof gp2, "%s", rp[0] ? rp : "/");
 		char nofirm[4096]; snprintf(nofirm, sizeof nofirm, "%s", gp2);       // ATTR_CMNEXT_NOFIRMLINKPATH: la del volumen de datos
 		fl_canon(gp2, sizeof gp2);
 		const char* base = strrchr(gp2, '/');
@@ -949,7 +983,7 @@ static long bsd_getattrlist(struct ctx* c) {
 		const char* rp = realpath(rpv, real) ? real : p;
 		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
 		if (rl && !strncmp(rp, tahoe_root, rl) && (rp[rl] == '/' || rp[rl] == '\0')) rp += rl;
-		snprintf(gpath, sizeof gpath, "%s", rp[0] ? rp : "/");
+		if (!tahoe_metal_guest(rp, gpath, sizeof gpath)) snprintf(gpath, sizeof gpath, "%s", rp[0] ? rp : "/");
 		fl_canon(gpath, sizeof gpath);
 		PUTREF(gpath);
 	}
@@ -1305,7 +1339,7 @@ static long bsd_fgetattrlist(struct ctx* c) {
 	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
 	if (rl && !strncmp(path, tahoe_root, rl) && (path[rl] == '/' || path[rl] == '\0')) p = path[rl] ? path + rl : "/";
 	static __thread char gp[4400];
-	snprintf(gp, sizeof gp, "%s", p);
+	if (!tahoe_metal_guest(path, gp, sizeof gp)) snprintf(gp, sizeof gp, "%s", p);
 	struct ctx c2 = *c;
 	c2.a[0] = (uint64_t)(uintptr_t)gp;                             // mismos argumentos que getattrlist, con la ruta en a[0]
 	return bsd_getattrlist(&c2);
@@ -1401,7 +1435,7 @@ static long bsd_openat(struct ctx* c) {
 	long fd = -1;
 	if (!strcmp(path, "/dev/fsevents")) { int f = fsevents_open(); return f < 0 ? -2 : f; }
 	if (tahoe_root && path[0] == '/' && !tahoe_host_passthrough(path)) {
-		snprintf(full, sizeof full, "%s%s", tahoe_root, path);
+		if (!tahoe_metal_path(path, full, sizeof full)) snprintf(full, sizeof full, "%s%s", tahoe_root, path);
 		fd = open_symlink(dfd, full, (int)c->a[2], flags, syscall(SYS_openat, dfd, full, flags, (int)c->a[3]));
 	}
 	if (fd < 0 && (!tahoe_root || path[0] != '/' || tahoe_host_passthrough(path))) { char al[64]; const char* q = tahoe_dev_alias(path, al, sizeof al); fd = open_symlink(dfd, q, (int)c->a[2], flags, syscall(SYS_openat, dfd, q, flags, (int)c->a[3])); }

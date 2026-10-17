@@ -30,7 +30,8 @@ static int sa_in(const uint8_t* d, uint32_t len, uint8_t* out, socklen_t* outlen
 		size_t pl = len - 2 < sizeof un.sun_path - 1 ? len - 2 : sizeof un.sun_path - 1;
 		char g[128] = { 0 };
 		memcpy(g, d + 2, pl);
-		if (g[0] == '/' && tahoe_root) snprintf(un.sun_path, sizeof un.sun_path, "%s%s", tahoe_root, g);
+		// como con los archivos, /dev es el del anfitrión (p. ej. el socket de tahoe-gpu en /dev/shm, el driver Metal)
+		if (g[0] == '/' && tahoe_root && !tahoe_host_passthrough(g)) snprintf(un.sun_path, sizeof un.sun_path, "%s%s", tahoe_root, g);
 		else memcpy(un.sun_path, g, pl);
 		memcpy(out, &un, sizeof un);
 		*outlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(un.sun_path) + 1);

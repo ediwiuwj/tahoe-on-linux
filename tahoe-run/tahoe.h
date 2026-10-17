@@ -25,6 +25,8 @@ void reg_mach(unsigned num, emu_fn fn);
 
 // Utilidades
 void logf_(const char* fmt, ...);
+int tahoe_metal_path(const char* guest, char* out, size_t cap);   // driver Metal (TAHOE_METAL): emu_fs.c
+int tahoe_metal_guest(const char* host, char* out, size_t cap);
 int darwin_errno(int linux_errno);
 int darwin_open_flags(int darwin_flags);
 long open_symlink(int dfd, const char* p, int dflags, int lflags, long fd);   // O_SYMLINK de Darwin

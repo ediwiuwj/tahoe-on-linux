@@ -82,6 +82,7 @@ fn traducir_modo(m: &Module, e: &Entrada, op: &Opciones, estructurado: bool) -> 
         usa_demote: false,
         usa_subgrupos: false,
         capacidades: Vec::new(),
+        set: op.set,
         bases: HashMap::new(),
         fijos: HashMap::new(),
         wg_size: None,

@@ -707,6 +707,7 @@ static int read_strv(uint64_t addr, char*** out, int max) {
 // Ruta del programa (vista de macOS) -> ruta real en el host.
 static void host_path(const char* guest, char* out, size_t cap) {
 	guest += tahoe_resolve_skip(guest);
+	if (tahoe_metal_path(guest, out, cap)) return;
 	if (tahoe_root && guest[0] == '/' && !tahoe_host_passthrough(guest)) { snprintf(out, cap, "%s%s", tahoe_root, guest); return; }
 	snprintf(out, cap, "%s", guest);
 }
@@ -890,7 +891,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	nargv[k++] = (char*)g_dyld_path;
 	nargv[k++] = hpath;
 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
-	char** nenv = calloc(ec + 15 + 8 + 9, sizeof(char*));
+	char** nenv = calloc(ec + 17 + 8 + 9, sizeof(char*));
 	int e = 0;
 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
 	char b1[4300], b2[4300];
@@ -912,6 +913,10 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (getenv("TAHOE_BOOTARGS")) { snprintf(b10, sizeof b10, "TAHOE_BOOTARGS=%s", getenv("TAHOE_BOOTARGS")); nenv[e++] = b10; }
 	static char b11[64];                                    // identidad PCI de la GPU emulada (emu_iokit.inc)
 	if (getenv("TAHOE_GPU")) { snprintf(b11, sizeof b11, "TAHOE_GPU=%s", getenv("TAHOE_GPU")); nenv[e++] = b11; }
+	static char b12[4300];                                  // driver Metal de tahoe-run (emu_fs.c, emu_iokit.inc)
+	if (getenv("TAHOE_METAL")) { snprintf(b12, sizeof b12, "TAHOE_METAL=%s", getenv("TAHOE_METAL")); nenv[e++] = b12; }
+	static char b13[300];
+	if (getenv("TAHOE_GPU_SOCK")) { snprintf(b13, sizeof b13, "TAHOE_GPU_SOCK=%s", getenv("TAHOE_GPU_SOCK")); nenv[e++] = b13; }
 	if (getenv("TAHOE_FD2LOG")) nenv[e++] = (char*)"TAHOE_FD2LOG=1";
 	if (getenv("TAHOE_DEBUG_NOREBOOT")) nenv[e++] = (char*)"TAHOE_DEBUG_NOREBOOT=1";   // modo depuración (ver emu_iokit.inc)
 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
