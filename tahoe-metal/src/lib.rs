@@ -198,6 +198,17 @@ extern "C-unwind" fn resolver(_cls: Class, _cmd: Sel, s: Sel) -> Bool {
 
 /// Crea la clase TahoeMTLDevice al cargar el bundle (antes de que NSBundle pida la clase principal).
 extern "C" fn registrar() {
+    // depuración: con /private/var/tmp/tahoe-metal.traza, libobjc apunta durante 90 s los mensajes del proceso (qué pide
+    // a Metal un programa como WindowServer, también lo que hereda _MTLDevice y no pasa por el registro de lo que falta)
+    if std::path::Path::new("/private/var/tmp/tahoe-metal.traza").exists() {
+        // SAFETY: función de libobjc sin precondiciones.
+        unsafe { objc::instrumentObjcMessageSends(1) };
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(90));
+            // SAFETY: ídem.
+            unsafe { objc::instrumentObjcMessageSends(0) };
+        });
+    }
     let base = objc::clase("_MTLDevice");
     if base.is_null() {
         for n in ["NSObject", "_MTLDevice", "MTLIOAccelDevice", "MTLIGAccelDevice", "_MTLCommandQueue", "MTLCompiler", "NSBundle"] {

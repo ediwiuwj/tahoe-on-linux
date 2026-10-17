@@ -164,14 +164,30 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
       `MTLCreateSystemDefaultDevice()` devuelve `TahoeMTLDevice` «Tahoe GPU (Intel(R) HD Graphics 4400)». Canal:
       socket Unix con el servidor de GPU (`tahoe-gpu servir`, el único proceso con Vulkan) y memoria compartida en
       `/dev/shm` (buffers e IOSurfaces).
-   3. **Driver Metal** (`tahoe-metal`, ver su LEEME): cómputo de punta a punta dentro de macOS (un kernel de un
-      metallib del sistema llena un buffer en la HD 4400 y un blit lo copia: correcto). Hecho también: texturas
-      (normales y sobre IOSurface), samplers, pipelines de render con vertex descriptor, mezcla y function constants
-      (interceptando MTLFunctionConstantValues), encoders de render (el motor dibuja bien con shaders de QuartzCore,
-      `tahoe-gpu probar-render`). Falta probar el render desde macOS y lo que pida CoreAnimation.
-   4. **WindowServer/CoreAnimation por la GPU**: con `TAHOE_METAL`, WindowServer ya carga el driver y se conecta, pero
-      compone por software: CoreDisplay aún no asocia la pantalla al acelerador (IOPresentment/AGDC, ver
-      `CoreDisplay::UseIOPresentment`, `GPU::UpdateAcceleratorForMetal`).
+   3. **Driver Metal** (`tahoe-metal`, ver su LEEME): cómputo y render de punta a punta dentro de macOS (`metalprobe
+      computo` y `metalprobe render`: un kernel de un metallib del sistema llena un buffer, y un triángulo con shaders
+      de QuartzCore sale CORRECTO en la HD 4400). Hecho: buffers, bibliotecas, function constants (interceptando
+      MTLFunctionConstantValues), pipelines de cómputo y de render con vertex descriptor y mezcla, texturas (normales y
+      sobre IOSurface), samplers, encoders de cómputo, blit y render. `registryID` es el ID en IOKit del IOAccelerator
+      (CoreDisplay busca el dispositivo con `MTLCopyDeviceForRegistryID`). Traza de depuración: con
+      `/private/var/tmp/tahoe-metal.traza`, libobjc apunta en `/tmp/msgSends-<pid>` cada par clase/selector que usa el
+      proceso (90 s). Los shaders de WindowServer y CoreDisplay ya se traducen: SkyLight 28/31 (faltan los 3 «InPlace»,
+      que leen el color de destino, `air.render_target`) y CoreDisplay 4/4.
+   4. **WindowServer/CoreAnimation por la GPU**: WindowServer carga el driver, crea el dispositivo y pregunta sus
+      capacidades, pero no lo usa. Lo que decide (SkyLight/CoreDisplay de macOS 26):
+      - `WSSystemCanCompositeWithMetal`: hay Metal si algún dispositivo de `MTLCopyAllDevices` responde NO a
+        `isHeadless` (el nuestro ya lo hace) y entonces se activa el compositor Metal;
+      - pero cada pantalla usa `WSGetCompositorForAccelerator(acelerador de la pantalla)`, y con acelerador 0 es el
+        compositor por software. Nuestra pantalla es un framebuffer virtual (VFB) hecho a partir del IONDRVFramebuffer:
+        hereda el acelerador de su pantalla madre, que no tiene (puerto 0), y `IOAccelCreateSurface` falla;
+      - en macOS 26 solo quedan dos caminos de pantalla: VFB e **IOPresentment** (`CoreDisplay::UseIOPresentment`,
+        el de los Mac Intel). CoreDisplay ya encuentra el TahoeAccelerator al recorrer los IOAccelerator y busca
+        debajo un `IOPresentmentClient`; el MetalDevice de cada pantalla sale de su acelerador
+        (`CoreDisplay::CreateMetalDevice` → `IORegistryEntryGetRegistryEntryID` → `MTLCopyDeviceForRegistryID`).
+      **Siguiente**: emular IOPresentment en tahoe-run (un `IOPresentmentClient` bajo el TahoeAccelerator, el AGDC
+      en la lista del GPUWrangler y las transacciones de display pipe: `DisplayPipeTransactionSetPlaneIOSurface` da la
+      IOSurface que hay que mostrar, que el servidor de GPU ya comparte en `/dev/shm`, y tahoe-view la enseñaría).
+      Es el camino que usa macOS en los Intel y deja componer a WindowServer con el compositor Metal.
    5. **Metal 2 completo**: lo que quede (argument buffers, samplers constantes de 64 bits, offsets de buffer sin
       alinear, cull mode dinámico, profundidad/estarcido, MSAA...), y pruebas con apps.
 6. **Sesión gráfica**: con ella, `screencapture`, `osascript` y `pbcopy` (hoy se caen por no haber sesión).

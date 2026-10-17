@@ -35,6 +35,9 @@ extern "C" {
     pub fn class_getInstanceMethod(cls: Class, s: Sel) -> *mut c_void;
     pub fn method_getImplementation(m: *mut c_void) -> Imp;
     pub fn method_setImplementation(m: *mut c_void, imp: Imp) -> Imp;
+    /// Apunta en /tmp/msgSends-<pid> cada mensaje que no está en la caché de métodos (en la práctica, cada par clase y
+    /// selector la primera vez).
+    pub fn instrumentObjcMessageSends(si: Bool);
 }
 
 /// Selector por nombre.
