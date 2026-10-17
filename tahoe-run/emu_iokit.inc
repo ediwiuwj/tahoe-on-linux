@@ -722,6 +722,11 @@ static void io_init(void) {
 		char sock[256];
 		snprintf(sock, sizeof sock, "%s", getenv("TAHOE_GPU_SOCK") ? getenv("TAHOE_GPU_SOCK") : "/dev/shm/tahoe-gpu.sock");
 		p_str(ta, "TahoeGPUSocket", strdup(sock));
+		// memoria de las IOSurface de este arranque (el servidor de GPU la proyecta para las texturas sobre IOSurface):
+		// la ruta de cada una con %u en vez del ID
+		char sp[200];
+		snprintf(sp, sizeof sp, "/dev/shm/tahoe-surf-%%u-%s", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
+		p_str(ta, "TahoeSurfacePath", strdup(sp));
 	}
 	int dcon = ent_add(accel, "display0", "IODisplayConnect", "IORegistryEntry IOService", "", PL_SERVICE, 0);
 	p_str(dcon, "IOClass", "IODisplayConnect");
