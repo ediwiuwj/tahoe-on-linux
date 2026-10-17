@@ -53,7 +53,10 @@ fn info() -> canal::protocolo::Info {
 }
 
 extern "C-unwind" fn registry_id(_this: Id, _cmd: Sel) -> u64 {
-    info().registry_id
+    match canal::gpu_ya() {
+        Some(g) if g.id_registro != 0 => g.id_registro,
+        _ => info().registry_id,
+    }
 }
 
 extern "C-unwind" fn max_buffer(_this: Id, _cmd: Sel) -> u64 {
@@ -255,9 +258,10 @@ extern "C" fn registrar() {
         let meta = objc::object_getClass(cls);
         objc::metodo(meta, "resolveInstanceMethod:", resolver as *const c_void, "c@::");
         objc::objc_registerClassPair(cls);
+        // las de render usan las básicas (clases()): primero éstas
+        clases::registrar();
         render::registrar(cls);
     }
-    clases::registrar();
     registro("TahoeMTLDevice registrada (madre _MTLDevice)");
 }
 

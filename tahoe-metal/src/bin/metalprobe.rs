@@ -147,11 +147,13 @@ fn render(d: Id) -> i32 {
     // SAFETY: d es un MTLDevice; las clases de descriptores son las de Metal; firmas del protocolo.
     unsafe {
         let mut err: Id = std::ptr::null_mut();
+        eprintln!("render: biblioteca...");
         let lib: Id = objc::m2(d, "newLibraryWithFile:error:", objc::nsstring(RUTA), &mut err as *mut Id);
         if lib.is_null() {
             println!("biblioteca: nil");
             return 3;
         }
+        eprintln!("render: funciones...");
         let vf: Id = objc::m1(lib, "newFunctionWithName:", objc::nsstring("std_vert0_lpf"));
         let ff: Id = objc::m1(lib, "newFunctionWithName:", objc::nsstring("attachment_clear_frag_lpf"));
         let pd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLRenderPipelineDescriptor"), "alloc"), "init");
@@ -170,6 +172,7 @@ fn render(d: Id) -> i32 {
         let lo: Id = objc::m1(objc::m0::<Id>(vd, "layouts"), "objectAtIndexedSubscript:", 0u64);
         objc::m1::<u64, ()>(lo, "setStride:", 32);
         objc::m1::<Id, ()>(pd, "setVertexDescriptor:", vd);
+        eprintln!("render: pipeline...");
         let p: Id = objc::m2(d, "newRenderPipelineStateWithDescriptor:error:", pd, &mut err as *mut Id);
         if p.is_null() {
             println!("pipeline de render: nil ({})", objc::texto(if err.is_null() { err } else { objc::m0(err, "localizedDescription") }));
@@ -181,6 +184,7 @@ fn render(d: Id) -> i32 {
             f(objc::clase("MTLTextureDescriptor"), objc::sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, 64, 64, 0)
         };
         objc::m1::<u64, ()>(td, "setUsage:", 5);
+        eprintln!("render: textura...");
         let tex: Id = objc::m1(d, "newTextureWithDescriptor:", td);
         if tex.is_null() {
             println!("textura: nil");
@@ -198,16 +202,20 @@ fn render(d: Id) -> i32 {
         objc::m1::<u64, ()>(a0, "setLoadAction:", 2);
         objc::m1::<u64, ()>(a0, "setStoreAction:", 1);
         objc::m1::<MTLClearColor, ()>(a0, "setClearColor:", MTLClearColor { r: 1.0, g: 0.0, b: 0.0, a: 1.0 });
+        eprintln!("render: cola...");
         let q: Id = objc::m0(d, "newCommandQueue");
         let cb: Id = objc::m0(q, "commandBuffer");
+        eprintln!("render: encoder...");
         let enc: Id = objc::m1(cb, "renderCommandEncoderWithDescriptor:", rp);
         objc::m1::<Id, ()>(enc, "setRenderPipelineState:", p);
         objc::m3::<Id, u64, u64, ()>(enc, "setVertexBuffer:offset:atIndex:", vb, 0, 0);
         objc::m3::<*const f32, u64, u64, ()>(enc, "setVertexBytes:length:atIndex:", ident.as_ptr(), 64, 2);
         objc::m3::<u64, u64, u64, ()>(enc, "drawPrimitives:vertexStart:vertexCount:", 3, 0, 3);
         objc::m0::<()>(enc, "endEncoding");
+        eprintln!("render: commit...");
         objc::m0::<()>(cb, "commit");
         objc::m0::<()>(cb, "waitUntilCompleted");
+        eprintln!("render: leer...");
         let st: u64 = objc::m0(cb, "status");
         let mut px = vec![0u8; 64 * 64 * 4];
         {

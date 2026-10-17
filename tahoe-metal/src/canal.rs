@@ -47,6 +47,9 @@ pub struct Gpu {
     pub info: Info,
     /// ruta de la memoria de una IOSurface con «%u» en lugar de su ID (propiedad TahoeSurfacePath)
     pub ruta_superficies: String,
+    /// ID en el registro de IOKit del IOAccelerator (0 si no se encuentra): es el registryID del dispositivo, el que
+    /// CoreDisplay busca con MTLCopyDeviceForRegistryID a partir del acelerador de la pantalla
+    pub id_registro: u64,
 }
 
 static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
@@ -55,7 +58,7 @@ static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
 pub fn gpu(puerto: u32) -> Option<&'static Gpu> {
     GPU.get_or_init(|| match conectar(puerto) {
         Ok(g) => {
-            registro(&format!("conectado al servidor de GPU: {:?}", g.info));
+            registro(&format!("conectado al servidor de GPU: {:?}; registryID {:#x}", g.info, g.id_registro));
             Some(g)
         }
         Err(e) => {
@@ -74,6 +77,7 @@ fn conectar(puerto: u32) -> std::io::Result<Gpu> {
     // el puerto de initWithAcceleratorPort: no siempre es el servicio: se busca el IOAccelerator de tahoe-run
     let servicio = buscar_servicio("TahoeAccelerator");
     let ruta_superficies = servicio.and_then(|s| propiedad_texto(s, "TahoeSurfacePath")).unwrap_or_default();
+    let id_registro = servicio.map(id_en_registro).unwrap_or(0);
     let ruta = servicio
         .and_then(|s| propiedad_texto(s, "TahoeGPUSocket"))
         .or_else(|| propiedad_texto(puerto, "TahoeGPUSocket"))
@@ -83,7 +87,7 @@ fn conectar(puerto: u32) -> std::io::Result<Gpu> {
     e.u32(protocolo::VERSION);
     let r = c.pedir(tipo::HOLA, &e.0)?;
     let info = Info::leer(&mut Lector::new(&r))?;
-    Ok(Gpu { canal: Mutex::new(c), info, ruta_superficies })
+    Ok(Gpu { canal: Mutex::new(c), info, ruta_superficies, id_registro })
 }
 
 /// El primer servicio de IOKit de esa clase (IOServiceGetMatchingService(IOServiceMatching(clase))).
@@ -101,6 +105,25 @@ fn buscar_servicio(clase: &str) -> Option<u32> {
         let buscar: extern "C" fn(u32, Id) -> u32 = std::mem::transmute(buscar);
         let s = buscar(0, coincide(c.as_ptr()));
         (s != 0).then_some(s)
+    }
+}
+
+/// ID de una entrada del registro de IOKit (IORegistryEntryGetRegistryEntryID), 0 si falla.
+fn id_en_registro(entrada: u32) -> u64 {
+    // SAFETY: función de IOKit con su firma.
+    unsafe {
+        let iokit = dlopen(c"/System/Library/Frameworks/IOKit.framework/IOKit".as_ptr(), 2);
+        let f = dlsym(iokit, c"IORegistryEntryGetRegistryEntryID".as_ptr());
+        if f.is_null() {
+            return 0;
+        }
+        let f: extern "C" fn(u32, *mut u64) -> c_int = std::mem::transmute(f);
+        let mut id = 0u64;
+        if f(entrada, &mut id) == 0 {
+            id
+        } else {
+            0
+        }
     }
 }
 
