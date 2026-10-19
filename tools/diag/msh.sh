@@ -8,25 +8,38 @@
 #   STACKS=<proceso>  errores de sus syscalls con ruta, pilas al bloquearse o caer
 #   ALL=1             con STACKS: todas sus syscalls y trampas Mach
 #   MACH=1            traza de mensajes Mach, workloops e hilos de las colas (MT, WL, THR)
+#   WL=1              solo la de workloops (WL, WLQ, THR): para carreras que la traza Mach completa tapa; WL='<proc>...'
+#                     solo en esos procesos
 #   IOK=1             traza de IOKit
+#   NS=1              cada aviso MACH_NOTIFY_NO_SENDERS: puerto, quién lo recibe y quién soltó el último derecho
+#   SR='<proc>...'    en esos procesos, cada cambio en la cuenta de derechos de envío (SR: puerto, quién, ±n, total)
 #   CONSOLA=1         lo que se escribe en /dev/console (launchd anota ahí sus errores) se imprime al final
 #   BRK='dir dir...'  int3 en esas direcciones (hex) del proceso de STACKS: registra los registros al pasar (BRK)
-#   PEEK='expr...'    con BRK: lee 8 bytes en cada dirección o registro+desplazamiento (p. ej. rdi+0x50)
+#   BRKP='<proc>...'  los BRK en esos procesos en vez de en el de STACKS (sin el resto del diagnóstico, que ralentiza)
+#   PEEK='expr...'    con BRK: lee 8 bytes en cada dirección o registro+desplazamiento (p. ej. rdi+0x50); con * delante
+#                     (*rcx+0x10) muestra además el texto al que apunta ese valor (cadenas C, CFString constantes)
 #   TAHOE_RUN=<bin>   otro binario de tahoe-run (comparar versiones)
 #   TAHOE_DEPURAR=0   arranque normal; por omisión se usa el modo depuración (macos-shell.sh --depurar), en el que
 #                     recoveryosd no reinicia si falla, para poder seguir mirando)
 DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
-rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stacks /dev/shm/tahoe-stacks-all /dev/shm/tahoe-mach-trace /dev/shm/tahoe-iokit-trace /dev/shm/tahoe-console
+rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stacks /dev/shm/tahoe-stacks-all /dev/shm/tahoe-mach-trace /dev/shm/tahoe-wl-trace /dev/shm/tahoe-iokit-trace /dev/shm/tahoe-console /dev/shm/tahoe-ns-trace /dev/shm/tahoe-sr-trace /dev/shm/tahoe-brk-who
 [ -n "$STACKS" ] && echo "$STACKS" > /dev/shm/tahoe-stacks
 [ -n "$ALL" ] && touch /dev/shm/tahoe-stacks-all
 [ -n "$MACH" ] && touch /dev/shm/tahoe-mach-trace
+[ -n "$WL" ] && { if [ "$WL" = 1 ]; then touch /dev/shm/tahoe-wl-trace; else echo "$WL" > /dev/shm/tahoe-wl-trace; fi; }
 [ -n "$IOK" ] && touch /dev/shm/tahoe-iokit-trace
+[ -n "$NS" ] && touch /dev/shm/tahoe-ns-trace
+[ -n "$SR" ] && echo "$SR" > /dev/shm/tahoe-sr-trace
 [ -n "$CONSOLA" ] && : > /dev/shm/tahoe-console
 [ -n "$BRK" ] && printf "%s\n" $BRK > /dev/shm/tahoe-break
+[ -n "$BRKP" ] && echo "$BRKP" > /dev/shm/tahoe-brk-who
 [ -n "$PEEK" ] && printf "%s\n" $PEEK > /dev/shm/tahoe-peek
-TAHOE_RUN="${TAHOE_RUN:-}" TAHOE_LOGFILE="$D/msh.log" TAHOE_BOOT_WAIT="${2:-12}" timeout -s TERM -k 5 "${3:-60}" nice -n 10 \
+G="${TMPDIR:-/tmp}/tahoe-guard.log"; g0=$(wc -l < "$G" 2>/dev/null || echo 0)
+TAHOE_RUN="${TAHOE_RUN:-}" TAHOE_LOGFILE="$D/msh.log" TAHOE_BOOT_WAIT="${2:-12}" timeout -s TERM -k 5 "${3:-60}" \
 	"$DIAG/../macos-shell.sh" --launchd $([ "${TAHOE_DEPURAR:-1}" = 0 ] || echo --depurar) -c "$1" < /dev/null 2>&1
 echo "[salida=$?]"
+# si el guardián de memoria cortó el arranque, decirlo (si no, parece que los procesos desaparecen sin más)
+tail -n +$((g0 + 1)) "$G" 2>/dev/null | sed 's/^/*** /'
 [ -n "$CONSOLA" ] && { echo "--- consola ---"; cat /dev/shm/tahoe-console; cp /dev/shm/tahoe-console "$D/consola.log"; rm -f /dev/shm/tahoe-console; }
 "$DIAG/clean.sh"

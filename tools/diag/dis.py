@@ -4,10 +4,13 @@
 # TAHOE_ROOT: sistema de macOS extraído (por omisión ~/macos26/base/macOS Base System).
 import glob, os, struct, subprocess, sys, tempfile
 ROOT = os.environ.get("TAHOE_ROOT", os.path.expanduser("~/macos26/base/macOS Base System"))
-B = os.path.join(ROOT, "System/Library/dyld/dyld_shared_cache_x86_64")
+B = next((os.path.join(ROOT, c) for c in ("System/Library/dyld/dyld_shared_cache_x86_64",       # Recovery
+          "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h",    # macOS completo
+          "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64")
+          if os.path.exists(os.path.join(ROOT, c))), None) or sys.exit("no encuentro la caché de dyld en " + ROOT)
 va = int(sys.argv[1], 16); n = int(sys.argv[2]) if len(sys.argv) > 2 else 200
 for fn in [B] + sorted(glob.glob(B + ".[0-9]*")):
-    if fn.endswith(".map") or fn.endswith("symbols"): continue
+    if fn.endswith((".map", "symbols", ".atlas")): continue
     f = open(fn, 'rb'); h = f.read(0x200)
     mo, mc = struct.unpack_from('<II', h, 0x10)                  # mappingOffset, mappingCount
     f.seek(mo)
