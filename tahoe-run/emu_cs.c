@@ -75,20 +75,17 @@ static int64_t slice_offset(int fd) {
 		if (be32(h + 8 + i * 20) == 0x01000007) return be32(h + 8 + i * 20 + 8);
 	return -1;
 }
+#define CS_WHOLE 0xffffffffu                                    // «ranura» especial: la firma completa
 // Busca en la firma del ejecutable el blob de la ranura indicada. Devuelve malloc() con el blob (cabecera incluida).
-static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
-	char path[4096];
-	if (exe_host_path(pid, path, sizeof path) != 0) return NULL;
-	int fd = open(path, O_RDONLY | O_CLOEXEC);
-	if (fd < 0) return NULL;
+static uint8_t* cs_blob_fd(int fd, uint32_t slot, uint32_t* len) {
 	uint8_t h[4096];
 	uint64_t base = 0;
-	if (pread(fd, h, sizeof h, 0) < 32) { close(fd); return NULL; }
+	if (pread(fd, h, sizeof h, 0) < 32) return NULL;
 	if (be32(h) == 0xcafebabe) {                              // binario universal: rebanada x86_64
 		uint32_t nf = be32(h + 4);
 		for (uint32_t i = 0; i < nf && 8 + (i + 1) * 20 <= sizeof h; i++)
 			if (be32(h + 8 + i * 20) == 0x01000007) { base = be32(h + 8 + i * 20 + 8); break; }
-		if (!base || pread(fd, h, sizeof h, (off_t)base) < 32) { close(fd); return NULL; }
+		if (!base || pread(fd, h, sizeof h, (off_t)base) < 32) return NULL;
 	}
 	uint8_t* out = NULL;
 	if (rd32(h) == 0xfeedfacf) {
@@ -104,6 +101,11 @@ static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
 					uint8_t* sb = malloc(dsz);
 					if (sb && dsz >= 12 && pread(fd, sb, dsz, (off_t)(base + doff)) == (ssize_t)dsz && be32(sb) == 0xfade0cc0) {
 						uint32_t count = be32(sb + 8);
+						if (slot == CS_WHOLE) {                          // la firma entera (SuperBlob), para CS_OPS_BLOB
+							uint32_t tl = be32(sb + 4);
+							if (tl >= 12 && tl <= dsz && (out = malloc(tl))) { memcpy(out, sb, tl); *len = tl; }
+							count = 0;
+						}
 						for (uint32_t k = 0; k < count && 12 + (k + 1) * 8 <= dsz; k++) {
 							uint32_t type = be32(sb + 12 + k * 8), bo = be32(sb + 12 + k * 8 + 4);
 							if (type != slot || bo + 8 > dsz) continue;
@@ -122,8 +124,27 @@ static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
 		}
 		free(lc);
 	}
+	return out;
+}
+static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
+	char path[4096];
+	if (exe_host_path(pid, path, sizeof path) != 0) return NULL;
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return NULL;
+	uint8_t* out = cs_blob_fd(fd, slot, len);
 	close(fd);
 	return out;
+}
+// ¿Lleva el archivo firma de plataforma de Apple? Como en CS_OPS_STATUS: firmado, sin Team ID y no ad hoc. 1 sí, 0 no,
+// -1 sin firma. Para fcntl F_GETSIGSINFO (emu_fs.c).
+int cs_file_platform(int fd) {
+	uint32_t len = 0;
+	uint8_t* cd = cs_blob_fd(fd, 0, &len);
+	if (!cd || len < 44 || be32(cd) != 0xfade0c02) { free(cd); return -1; }
+	uint32_t team = len >= 52 && be32(cd + 8) >= 0x20200 ? be32(cd + 48) : 0;
+	int r = !team && !(be32(cd + 12) & 0x2u);
+	free(cd);
+	return r;
 }
 
 // LC_UUID del ejecutable de macOS de un proceso (p_uuid de proc_pidinfo): logd lo anota en cada mensaje para encontrar después
@@ -239,14 +260,38 @@ static long copy_token(const uint8_t* blob, uint32_t len, uint64_t uaddr, uint64
 // Núcleo común de csops y csops_audittoken. pid 0 = el propio proceso.
 static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
 	switch (op) {
-	case 0: {                                                    // CS_OPS_STATUS: sin banderas (como un binario sin restricciones)
-		uint32_t zero = 0;
+	case 0: {                                                    // CS_OPS_STATUS
+		// Como XNU tras validar la firma al cargar: CS_VALID | CS_SIGNED más las banderas del CodeDirectory (hardened
+		// runtime, hard, kill, ad hoc...); con derechos, CS_ENTITLEMENTS_VALIDATED; y los binarios de Apple (firmados y sin
+		// Team ID) son de plataforma (CS_PLATFORM_BINARY | CS_DYLD_PLATFORM), como los que AMFI reconoce. Sin firma, 0.
+		// securityd comprueba con esto la firma dinámica de sus clientes (SecCodeCheckValidity: sin CS_VALID, «guest
+		// invalid» y el llavero del sistema no se desbloquea) y shortcuts exige ser binario de plataforma.
+		uint32_t st = 0, len = 0;
 		if (usize < 4) return -D_EINVAL;
-		return safe_write(uaddr, &zero, 4) == 4 ? 0 : -D_EFAULT;
+		uint8_t* cd = cs_blob(pid, 0, &len);
+		if (cd && len >= 44 && be32(cd) == 0xfade0c02) {
+			st = 0x00000001u | 0x20000000u;                          // CS_VALID | CS_SIGNED
+			st |= be32(cd + 12) & (0x2u | 0x100u | 0x200u | 0x800u | 0x1000u | 0x2000u | 0x10000u | 0x20000u);
+			uint32_t team = len >= 52 && be32(cd + 8) >= 0x20200 ? be32(cd + 48) : 0;
+			if (!team && !(st & 0x2u)) st |= 0x04000000u | 0x02000000u;   // CS_PLATFORM_BINARY | CS_DYLD_PLATFORM
+			uint32_t el = 0; uint8_t* ent = cs_blob(pid, 5, &el);
+			if (ent) st |= 0x4000u;                                  // CS_ENTITLEMENTS_VALIDATED
+			free(ent);
+		}
+		free(cd);
+		return safe_write(uaddr, &st, 4) == 4 ? 0 : -D_EFAULT;
 	}
 	case 7: case 16: {                                           // ENTITLEMENTS_BLOB (XML, ranura 5) / DER_ENTITLEMENTS_BLOB (ranura 7)
 		uint32_t len = 0;
 		uint8_t* b = cs_blob(pid, op == 7 ? 5 : 7, &len);
+		long r = copy_token(b, len, uaddr, usize);
+		free(b);
+		return r;
+	}
+	case 10: {                                                   // BLOB: la firma entera (SuperBlob embebido), como cs_blob_get
+		uint32_t len = 0;
+		uint8_t* b = cs_blob(pid, CS_WHOLE, &len);
+		if (!b) return -D_EINVAL;                                 // sin firma
 		long r = copy_token(b, len, uaddr, usize);
 		free(b);
 		return r;

@@ -8,11 +8,12 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <sys/sysinfo.h>
 
 #include "tahoe.h"
 
-enum kind { K_INT, K_QUAD, K_STR, K_BOOT };
+enum kind { K_INT, K_QUAD, K_STR, K_BOOT, K_LOADAVG, K_SWAP, K_FSIDS };
 struct entry {
 	const char* name;
 	int mib[2];
@@ -20,6 +21,39 @@ struct entry {
 	long long ival;
 	const char* sval;
 };
+
+// Identidad del equipo (SMBIOS): modelo, placa, número de serie, MLB, UUID y ROM generados con macserial de OpenCore para
+// esta instalación (tools/smbios.sh) y guardados fuera del repositorio; TAHOE_SMBIOS_FILE apunta al JSON. Sin archivo, los
+// valores de siempre (un MacBookPro16,1 ficticio).
+const char* smbios(const char* key, const char* def) {
+	static char buf[2048]; static int cargado;
+	if (!cargado) {
+		cargado = 1;
+		const char* p = getenv("TAHOE_SMBIOS_FILE");
+		FILE* f = p ? fopen(p, "r") : NULL;
+		if (f) { size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f); }
+	}
+	static char val[8][128]; static int k;
+	char pat[64]; snprintf(pat, sizeof pat, "\"%s\"", key);
+	const char* q = strstr(buf, pat);
+	if (!q) return def;
+	q = strchr(q + strlen(pat), ':'); if (!q) return def;
+	q = strchr(q, '"'); if (!q) return def;
+	const char* e = strchr(q + 1, '"'); if (!e || e - q - 1 >= 127) return def;
+	char* v = val[k++ % 8];
+	memcpy(v, q + 1, (size_t)(e - q - 1)); v[e - q - 1] = 0;
+	return v;
+}
+// Tipo de placa (target-type, hw.target) de cada modelo admitido por macOS 26 en Intel.
+const char* smbios_target(int ap) {
+	const char* m = smbios("modelo", "MacBookPro16,1");
+	static const struct { const char *m, *t, *ap; } t[] = {
+		{ "MacBookPro16,1", "J152F", "J152fAP" }, { "MacBookPro16,4", "J152F", "J152fAP" }, { "MacBookPro16,2", "J214K", "J214kAP" },
+		{ "MacBookPro16,3", "J223", "J223AP" }, { "iMac20,1", "J185", "J185AP" }, { "iMac20,2", "J185F", "J185fAP" }, { "MacPro7,1", "J160", "J160AP" },
+	};
+	for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) if (!strcmp(m, t[i].m)) return ap ? t[i].ap : t[i].t;
+	return ap ? "J152fAP" : "J152F";
+}
 
 #define CTL_KERN 1
 #define CTL_HW 6
@@ -40,6 +74,11 @@ static struct entry table[] = {
 	{ "kern.usrstack64", { CTL_KERN, 59 }, K_QUAD, (long long)STACK_TOP, NULL },
 	{ "kern.osversion", { CTL_KERN, 65 }, K_STR, 0, "25G83" },
 	{ "kern.boottime", { CTL_KERN, 21 }, K_BOOT, 0, NULL },
+	{ "vm.loadavg", { 2, 2 }, K_LOADAVG, 0, NULL },                  // CTL_VM, VM_LOADAVG: getloadavg (iostat, uptime, top)
+	{ "vm.swapusage", { 2, 5 }, K_SWAP, 0, NULL },                   // CTL_VM, VM_SWAPUSAGE: struct xsw_usage (top, sysctl)
+	{ "sysctl.proc_cputype", { 0, 0x7300 }, K_INT, 0x01000007, NULL },  // con el pid detrás: tipo de CPU de ese proceso (top)
+	{ "kern.procname", { CTL_KERN, 62 }, K_STR, 0, "" },             // KERN_PROCNAME: nombre del proceso (setproctitle lo escribe)
+	{ "vfs.generic.vfsidlist", { 3, 0x7100 }, K_FSIDS, 0, NULL },       // fsid_t de cada montaje (KernelEventAgent)
 	{ "kern.bootargs", { CTL_KERN, 0x7000 }, K_STR, 0, "" },
 	{ "kern.osproductversion", { CTL_KERN, 0x7001 }, K_STR, 0, "26.6.2" },
 	{ "kern.osproductversionextra", { CTL_KERN, 0x7002 }, K_STR, 0, "" },
@@ -75,7 +114,7 @@ static struct entry table[] = {
 	{ "security.mac.amfi.allow_only_platform_code", { 201, 0x7213 }, K_INT, 0, NULL },
 	{ "vm.shared_region_pivot", { 201, 0x7214 }, K_INT, 0, NULL },
 	{ "hw.mempath", { 201, 0x7300 }, K_STR, 0, "" },
-	{ "kern.bootsessionuuid", { 201, 0x7215 }, K_STR, 0, boot_session },   // UUID de esta sesión de arranque (el boot_id de Linux)
+	{ "kern.bootsessionuuid", { 201, 0x7215 }, K_STR, 0, boot_session },   // UUID de esta sesión de arranque (boot_session_mix)
 	{ "kern.hv_support", { 201, 0x7216 }, K_INT, 0, NULL },                  // sin Hypervisor.framework
 	{ "kern.hv_vmm_present", { 201, 0x7217 }, K_INT, 0, NULL },
 	{ "vm.darkwake_mode", { 201, 0x7218 }, K_INT, 0, NULL },
@@ -83,14 +122,14 @@ static struct entry table[] = {
 	{ "security.mac.sandbox.sentinel", { 201, 0x721e }, K_STR, 0, sb_sentinel },
 	{ "kern.hostid", { CTL_KERN, 11 }, K_INT, 0, NULL },
 	{ "kern.safeboot", { CTL_KERN, 66 }, K_INT, 0, NULL },
-	{ "hw.target", { 201, 0x721a }, K_STR, 0, "J152fAP" },              // MobileGestalt (HWModelStr) lo usa: el del MacBookPro16,1
+	{ "hw.target", { 201, 0x721a }, K_STR, 0, "J152fAP" },              // MobileGestalt (HWModelStr) lo usa: el del modelo (smbios_target)
 	{ "hw.osenvironment", { 201, 0x721b }, K_STR, 0, "" },
 	{ "hw.use_kernelmanagerd", { 201, 0x721c }, K_INT, 1, NULL },
 	{ "hw.willshutdown", { 201, 0x721d }, K_INT, 0, NULL },
 	{ "kern.netboot", { CTL_KERN, 40 }, K_INT, 0, NULL },
 	{ "security.mac.lockdown_mode_state", { 200, 1 }, K_INT, 0, NULL },
 	{ "hw.machine", { CTL_HW, 1 }, K_STR, 0, "x86_64" },
-	{ "hw.model", { CTL_HW, 2 }, K_STR, 0, "MacBookPro16,1" },
+	{ "hw.model", { CTL_HW, 2 }, K_STR, 0, "MacBookPro16,1" },     // o el de smbios.json
 	{ "hw.ncpu", { CTL_HW, 3 }, K_INT, -1, NULL },            // -1: se rellena al iniciar
 	{ "hw.byteorder", { CTL_HW, 4 }, K_INT, 1234, NULL },
 	{ "hw.physmem", { CTL_HW, 5 }, K_INT, -2, NULL },
@@ -393,6 +432,9 @@ static long sysctl_meta(struct ctx* c, int op, const int* oid, uint32_t len) {
 	case K_INT:  kind |= CTLTYPE_INT; fmt = "I"; break;
 	case K_QUAD: kind |= CTLTYPE_QUAD; fmt = "Q"; break;
 	case K_STR:  kind |= CTLTYPE_STRING; fmt = "A"; break;
+	case K_LOADAVG: kind |= CTLTYPE_STRUCT; fmt = "S,loadavg"; break;
+	case K_SWAP: kind |= CTLTYPE_STRUCT; fmt = "S,xsw_usage"; break;
+	case K_FSIDS: kind |= CTLTYPE_STRUCT; fmt = "S,fsid"; break;
 	default:     kind |= CTLTYPE_STRUCT; fmt = "S,timeval"; break;
 	}
 	memcpy(b, &kind, 4);
@@ -401,11 +443,42 @@ static long sysctl_meta(struct ctx* c, int op, const int* oid, uint32_t len) {
 	return sc_out(c, b, 4 + fl);
 }
 
+// kern.bootsessionuuid distinto en cada arranque de tahoe-run: el boot_id de Linux no cambia hasta reiniciar el PC, y con
+// él cientos de arranques de prueba eran para macOS una sola sesión de días. logd marca cada archivo del registro con este
+// UUID, y «log show --last 1m» tenía que leer el almacén entero (750 MB proyectados, más de 90 s). Se mezcla en la parte
+// final (nodo) el identificador del arranque, TAHOE_PORTS_OWNER, común a todos sus procesos; los primeros 8 caracteres
+// (el centinela del sandbox) quedan como estaban.
+static void boot_session_mix(void) {
+	static int done;
+	const char* t = getenv("TAHOE_PORTS_OWNER");
+	if (done || !t || strlen(boot_session) < 36) return;
+	done = 1;
+	uint64_t h = 1469598103934665603ULL;                          // FNV-1a de 64 bits
+	for (const char* q = t; *q; q++) { h ^= (uint8_t)*q; h *= 1099511628211ULL; }
+	char node[13]; snprintf(node, sizeof node, "%012llX", (unsigned long long)(h & 0xffffffffffffULL));
+	memcpy(boot_session + 24, node, 12);
+}
 long bsd_sysctl(struct ctx* c) {
 	int mib[16];
+	boot_session_mix();
 	uint32_t n = (uint32_t)c->a[1];
 	if (n == 0 || n > 16 || safe_read(c->a[0], mib, n * 4) != (ssize_t)(n * 4)) return -D_EINVAL;
 
+	// vfs.generic: sistemas de archivos que tiene el núcleo (getvfsbyname). VFS_MAXTYPENUM (1) y VFS_CONF (2, struct vfsconf:
+	// reservado, nombre[15], typenum, refcount, flags, 2 reservados = 40 bytes). Son los que tahoe-run sabe presentar o montar,
+	// con los mismos números de tipo que statfs (emu_fs.c): mount_tmpfs ve así que tmpfs ya está y no intenta cargar su kext.
+	if (n >= 3 && mib[0] == 3 && mib[1] == 0 && (mib[2] == 1 || (mib[2] == 2 && n == 4))) {
+		static const struct { const char* name; int typenum; } vfs[] = { { "devfs", 0x13 }, { "apfs", 0x18 }, { "tmpfs", 0x1d } };
+		if (mib[2] == 1) { int32_t max = 0x1e; return sc_out(c, &max, 4); }
+		for (size_t i = 0; i < sizeof vfs / sizeof vfs[0]; i++) if (vfs[i].typenum == mib[3]) {
+			uint8_t vc[40] = { 0 };
+			strncpy((char*)vc + 4, vfs[i].name, 14);
+			memcpy(vc + 20, &vfs[i].typenum, 4);
+			int32_t refs = 1; memcpy(vc + 24, &refs, 4);
+			return sc_out(c, vc, sizeof vc);
+		}
+		return -45;                                        // ENOTSUP: no hay sistema de archivos con ese número (como XNU)
+	}
 	if (n >= 3 && mib[0] == 1 && mib[1] == 14) {         // kern.proc.*: KERN_PROC_ALL (0), KERN_PROC_PID (1)
 		uint8_t one[648];
 		if (n == 4 && mib[2] == 1) {
@@ -475,6 +548,25 @@ long bsd_sysctl(struct ctx* c) {
 		if (trace_all || 1) logf_("    sysctl: nombre desconocido \"%s\"\n", name);
 		return -D_ENOENT;
 	}
+	if (n == 3 && mib[0] == 0 && mib[1] == 0x7300) {     // sysctl.proc_cputype.<pid>: todos los procesos son x86_64 aquí
+		char pp[32]; snprintf(pp, sizeof pp, "/proc/%d", mib[2]);
+		if (mib[2] < 0 || access(pp, F_OK) != 0) return -D_ESRCH;
+		int v = 0x01000007;                                  // CPU_TYPE_X86_64
+		return sc_out(c, &v, sizeof v);
+	}
+	if (n == 2 && mib[0] == CTL_KERN && mib[1] == 62) {     // kern.procname: la escritura (setproctitle) se acepta sin más
+		if (c->a[4] && !c->a[2]) return 0;
+		char av[1024]; size_t al = 0;
+		const char* nm = "";
+		if (guest_argv(getpid(), av, sizeof av, &al) > 0) { nm = strrchr(av, '/'); nm = nm ? nm + 1 : av; }
+		char b[17] = { 0 }; strncpy(b, nm, 16);              // MAXCOMLEN
+		return sc_out(c, b, strlen(b) + 1);
+	}
+	if (n == 2 && mib[0] == 3 && mib[1] == 0x7100) {      // vfs.generic.vfsidlist: fsid_t[] de los montajes, como getfsstat
+		uint32_t ids[2 * 32];
+		int k = vfs_fsids(ids, 32);
+		return sc_out(c, ids, (size_t)k * 8);
+	}
 	if (n == 2 && mib[0] == CTL_KERN && mib[1] == 0x7005) {   // kern.osvariant_status: lectura y escritura como XNU
 		if (c->a[4]) {
 			uint64_t v = 0;
@@ -494,7 +586,32 @@ long bsd_sysctl(struct ctx* c) {
 			switch (e->kind) {
 			case K_INT:  { int v = (int)e->ival; return sc_out(c, &v, sizeof v); }
 			case K_QUAD: { long long v = e->ival; return sc_out(c, &v, sizeof v); }
-			case K_STR:  return sc_out(c, e->sval, strlen(e->sval) + 1);
+			case K_STR: {
+				const char* v = e->sval;
+				if (e->mib[0] == CTL_HW && e->mib[1] == 2) v = smbios("modelo", v);   // hw.model
+				else if (!strcmp(e->name, "hw.target")) v = smbios_target(1);
+				else if (!strcmp(e->name, "kern.bootargs") && getenv("TAHOE_BOOTARGS")) v = getenv("TAHOE_BOOTARGS");   // como la NVRAM
+				return sc_out(c, v, strlen(v) + 1);
+			}
+			case K_LOADAVG: {                                   // struct loadavg { fixpt_t ldavg[3]; long fscale; }, FSCALE = 1 << 11
+				double l[3] = { 0, 0, 0 };
+				FILE* f = fopen("/proc/loadavg", "r");
+				if (f) { if (fscanf(f, "%lf %lf %lf", &l[0], &l[1], &l[2]) != 3) l[0] = l[1] = l[2] = 0; fclose(f); }
+				uint8_t la[24] = { 0 };
+				for (int i = 0; i < 3; i++) { uint32_t v = (uint32_t)(l[i] * 2048); memcpy(la + i * 4, &v, 4); }
+				long long fs = 2048; memcpy(la + 16, &fs, 8);
+				return sc_out(c, la, sizeof la);
+			}
+			case K_SWAP: {                                      // struct xsw_usage { u64 total, avail, used; u32 pagesize; boolean_t encrypted; }
+				unsigned long long tot = 0, fr = 0; char l[128];
+				FILE* f = fopen("/proc/meminfo", "r");
+				if (f) { while (fgets(l, sizeof l, f)) { sscanf(l, "SwapTotal: %llu", &tot); sscanf(l, "SwapFree: %llu", &fr); } fclose(f); }
+				uint8_t x[32] = { 0 };
+				uint64_t v[3] = { tot * 1024, fr * 1024, (tot - fr) * 1024 }; uint32_t pg = 4096, enc = 1;
+				memcpy(x, v, 24); memcpy(x + 24, &pg, 4); memcpy(x + 28, &enc, 4);
+				return sc_out(c, x, sizeof x);
+			}
+			case K_FSIDS: break;                                // se responde antes (vfs.generic.vfsidlist)
 			case K_BOOT: {
 				struct timespec up, now;
 				clock_gettime(CLOCK_BOOTTIME, &up);

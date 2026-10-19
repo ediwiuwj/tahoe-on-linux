@@ -30,7 +30,8 @@ static int sa_in(const uint8_t* d, uint32_t len, uint8_t* out, socklen_t* outlen
 		size_t pl = len - 2 < sizeof un.sun_path - 1 ? len - 2 : sizeof un.sun_path - 1;
 		char g[128] = { 0 };
 		memcpy(g, d + 2, pl);
-		if (g[0] == '/' && tahoe_root) snprintf(un.sun_path, sizeof un.sun_path, "%s%s", tahoe_root, g);
+		// como con los archivos, /dev es el del anfitrión (p. ej. el socket de tahoe-gpu en /dev/shm, el driver Metal)
+		if (g[0] == '/' && tahoe_root && !tahoe_host_passthrough(g)) snprintf(un.sun_path, sizeof un.sun_path, "%s%s", tahoe_root, g);
 		else memcpy(un.sun_path, g, pl);
 		memcpy(out, &un, sizeof un);
 		*outlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(un.sun_path) + 1);
@@ -100,6 +101,7 @@ static long kev_socket(void) {
 	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) return err();
 	if (sv[0] >= KEV_MAX_FD) { close(sv[0]); close(sv[1]); return -24; /* EMFILE */ }
 	fcntl(sv[1], F_SETFD, FD_CLOEXEC);
+	sv[1] = fd_hi(sv[1]);
 	struct stat st; fstat(sv[0], &st);
 	if (kev_ino[sv[0]] && kev_peer[sv[0]] > 0) close(kev_peer[sv[0]]);   // un socket de eventos anterior ya cerrado
 	kev_ino[sv[0]] = st.st_ino; kev_peer[sv[0]] = sv[1];
@@ -199,6 +201,7 @@ static long fsev_ioctl(int fd, uint32_t req, uint64_t arg, int* handled) {
 	if ((req & 0xff) == 1) {                                  // FSEVENTS_CLONE(event_list*, num_events, queue_depth, int* fd)
 		uint64_t a[3]; if (safe_read(arg, a, 24) != 24) return -D_EFAULT;
 		int p[2]; if (pipe(p) < 0) return err();
+		p[1] = fd_hi(p[1]);                                   // extremo interno: fuera del alcance del programa
 		if (p[0] < FSEV_MAX_FD) { fsev_fd[p[0]] = 2; fsev_keep[p[0]] = p[1]; }
 		fcntl(p[1], F_SETFD, FD_CLOEXEC);
 		int32_t nfd = p[0];
@@ -466,8 +469,9 @@ static long net_recvmsg(struct ctx* c) {
 	m.msg_name = d.name ? l : NULL; m.msg_namelen = d.name ? sizeof l : 0;
 	m.msg_iov = (struct iovec*)d.iov; m.msg_iovlen = (size_t)d.iovlen;
 	m.msg_control = d.control ? cbuf : NULL; m.msg_controllen = d.control ? sizeof cbuf : 0;
-	static __thread uint8_t icin[65536], icout[65536 + 20];
-	struct iovec iv1 = { icin, sizeof icin };
+	TLS_LAZY(uint8_t, icin, 65536);
+	TLS_LAZY(uint8_t, icout, 65536 + 20);
+	struct iovec iv1 = { icin, 65536 };
 	int icmp = is_icmp((int)c->a[0]);
 	if (icmp) { m.msg_iov = &iv1; m.msg_iovlen = 1; }
 	long r = recvmsg((int)c->a[0], &m, msg_flags((int)c->a[2]) & ~MSG_NOSIGNAL);
