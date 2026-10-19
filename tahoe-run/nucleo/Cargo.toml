@@ -1,0 +1,17 @@
+[package]
+name = "nucleo"
+version = "0.1.0"
+edition = "2021"
+description = "Partes del núcleo emulado de tahoe-run escritas en Rust (enlazadas como biblioteca estática)"
+license = "MIT"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+# Pruebas: cargo test --lib (el perfil de pruebas no admite panic = "abort" en la biblioteca estática).
+# Se ejecuta dentro del manejador de SIGSYS de tahoe-run: sin desenrollado de pila (un pánico aborta el proceso, como un
+# fallo de C, pero con mensaje) y sin la biblioteca estándar en la biblioteca enlazada (las pruebas sí la usan).
+[profile.release]
+panic = "abort"
+opt-level = 2
+debug = true
