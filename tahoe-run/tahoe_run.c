@@ -11,6 +11,7 @@
 //
 // Hito actual: arrancar dyld y ver qué pide. Todo el código es propio (sin código de Darling).
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
@@ -21,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/prctl.h>
@@ -46,7 +48,9 @@
 #endif
 
 #define COMMPAGE     0x00007fffffe00000UL
-#define DYLD_SLIDE   0x00007ffc00000000UL
+// dyld se carga por debajo de la región compartida (0x7ff800000000-0x7ffffe600000 en XNU): la caché de un macOS completo
+// (principal + 6 subcachés) la llena casi entera.
+#define DYLD_SLIDE   0x00007ff000000000UL
 #define STACK_SIZE   (8UL << 20)
 
 int trace_all;
@@ -101,7 +105,7 @@ static int memfd = -1;
 static void memfd_init(void) {
 	int fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
 	if (fd < 0) DIE("no puedo abrir /proc/self/mem: %s", strerror(errno));
-	memfd = fcntl(fd, F_DUPFD_CLOEXEC, 1000);
+	memfd = fcntl(fd, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE);
 	close(fd);
 	if (memfd < 0) DIE("no puedo reservar el descriptor de /proc/self/mem: %s", strerror(errno));
 }
@@ -262,7 +266,9 @@ static void map_one(const char* path) {
 				// algo del proceso ya ocupa esa dirección (ASLR): reintentar sin aleatorización
 				setenv("TAHOE_REEXEC", "1", 1);
 				personality(personality(0xffffffff) | ADDR_NO_RANDOMIZE);
-				execve("/proc/self/exe", g_argv, environ);
+				// por su ruta y no por /proc/self/exe: si no, Linux llama al proceso "exe" y las herramientas que buscan
+				// tahoe-run (limpieza, guardián de memoria, diagnóstico) dejan de verlo
+				execve(g_self_exe ? g_self_exe : "/proc/self/exe", g_argv, environ);
 			}
 			DIE("mmap de la caché falló en 0x%lx (+0x%lx): %s", m[i].addr, m[i].size, strerror(errno));
 		}
@@ -316,9 +322,17 @@ static void map_dynamic_region(const char* main_path) {
 	memcpy(p, "dyld_data    v3", 16);
 	*(uint64_t*)(p + 16) = (uint64_t)st.st_dev;                   // fsid
 	*(uint64_t*)(p + 24) = (uint64_t)st.st_ino;                   // fsobjid
-	*(uint32_t*)(p + 32) = 0;                                     // _osCryptexPathOffset: sin cryptex
 	*(uint32_t*)(p + 36) = 80;                                    // _cachePathOffset = sizeof(DynamicRegion)
 	strlcpy_((char*)p + 80, main_path, maxsize - 80);
+	// En un macOS completo la caché viene en el cryptex del sistema (montado en Preboot): launchd anota también su raíz
+	// (_osCryptexPathOffset), que dyld antepone a las rutas que busca fuera de la caché. En la Recovery no hay cryptex: 0.
+	static const char cryptex[] = "/System/Volumes/Preboot/Cryptexes/OS";
+	uint32_t coff = 0;
+	if (!strncmp(cache_guest_path, cryptex, sizeof cryptex - 1) && cache_guest_path[sizeof cryptex - 1] == '/') {
+		coff = 80 + (uint32_t)strlen(main_path) + 1;
+		if (coff + sizeof cryptex <= maxsize) memcpy(p + coff, cryptex, sizeof cryptex); else coff = 0;
+	}
+	*(uint32_t*)(p + 32) = coff;                                  // _osCryptexPathOffset
 	mprotect(p, maxsize, PROT_READ);
 }
 
@@ -336,6 +350,7 @@ static void map_cache(const char* main_path) {
 
 // ---------------------------------------------------------------- commpage (macOS 26, x86_64)
 // Diseño tomado de osfmk/i386/cpu_capabilities.h de XNU 12377.
+uint64_t tsc_hz;                                         // frecuencia del TSC medida (setup_commpage)
 static uint64_t tsc_hz_estimate(void) {
 	struct timespec a, b;
 	clock_gettime(CLOCK_MONOTONIC, &a);
@@ -362,7 +377,21 @@ static void setup_commpage(void) {
 	*(uint64_t*)(p + 0x38) = (uint64_t)sysconf(_SC_PHYS_PAGES) * (uint64_t)sysconf(_SC_PAGESIZE);
 	p[0x4D] = 12; p[0x4E] = 12;                          // desplazamientos de página (4 KiB)
 	// nanotime: ns = ns_base + (((tsc - tsc_base) << shift) * scale >> 32)
-	uint64_t hz = tsc_hz_estimate();
+	// La frecuencia del TSC se mide una vez (30 ms de espera activa) y se guarda en /dev/shm/tahoe-tsc-hz para los demás
+	// procesos: medirla en cada arranque costaba 30 ms de CPU por proceso (dos por servicio: xpcproxy y el programa), y
+	// en el arranque de macOS, con decenas de procesos a la vez, alargaba la avalancha de servicios.
+	uint64_t hz = 0;
+	{
+		char b[32] = ""; int f = open("/dev/shm/tahoe-tsc-hz", O_RDONLY | O_CLOEXEC);
+		if (f >= 0) { ssize_t n = read(f, b, sizeof b - 1); close(f); if (n > 0) { b[n] = 0; hz = strtoull(b, NULL, 10); } }
+		if (hz < 100000000ULL || hz > 10000000000ULL) {          // sin guardar o absurda: medir y guardar
+			hz = tsc_hz_estimate();
+			char tmp[64]; snprintf(tmp, sizeof tmp, "/dev/shm/tahoe-tsc-hz.%d", (int)getpid());
+			f = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+			if (f >= 0) { int n = snprintf(b, sizeof b, "%lu\n", (unsigned long)hz); if (write(f, b, (size_t)n) == n) { close(f); rename(tmp, "/dev/shm/tahoe-tsc-hz"); } else { close(f); unlink(tmp); } }
+		}
+	}
+	tsc_hz = hz;
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	*(uint64_t*)(p + 0x50) = __builtin_ia32_rdtsc();
@@ -384,7 +413,10 @@ struct seg64 { uint32_t cmd, cmdsize; char segname[16]; uint64_t vmaddr, vmsize,
 
 struct image { uint64_t mh; uint64_t entry; uint32_t filetype; uint64_t hi; };
 
+static char prog_name[64] = "?";                      // programa de macOS de este proceso (para el registro)
+static double lm_ms(const struct timespec* a) { struct timespec b; clock_gettime(CLOCK_MONOTONIC, &b); return (b.tv_sec - a->tv_sec) * 1e3 + (b.tv_nsec - a->tv_nsec) / 1e6; }
 static void load_macho(const char* path, uint64_t slide, struct image* out) {
+	struct timespec lm0; clock_gettime(CLOCK_MONOTONIC, &lm0); double t_map = 0, t_dsmos = 0, t_prot = 0;   // diagnóstico de velocidad
 	int fd = open(path, O_RDONLY);
 	if (fd < 0) DIE("no puedo abrir %s: %s", path, strerror(errno));
 	uint64_t base_off = 0;
@@ -416,10 +448,15 @@ static void load_macho(const char* path, uint64_t slide, struct image* out) {
 			uint64_t maplen = round_up(s->filesize);
 			int prot = s->initprot & 7;
 			if (s->filesize) {
+				struct timespec q; clock_gettime(CLOCK_MONOTONIC, &q);
 				void* p = mmap((void*)addr, maplen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, base_off + s->fileoff);
 				if (p == MAP_FAILED) DIE("%s: mmap de %s en 0x%lx falló: %s", path, s->segname, addr, strerror(errno));
 				if (s->vmsize > s->filesize && maplen > s->filesize) memset((void*)(addr + s->filesize), 0, maplen - s->filesize);
+				t_map += lm_ms(&q); clock_gettime(CLOCK_MONOTONIC, &q);
+				if (s->flags & 0x8) dsmos_unprotect((uint8_t*)addr, s->fileoff, s->filesize, path);   // SG_PROTECTED_VERSION_1
+				t_dsmos += lm_ms(&q); clock_gettime(CLOCK_MONOTONIC, &q);
 				mprotect((void*)addr, maplen, prot);
+				t_prot += lm_ms(&q);
 			}
 			if (round_up(s->vmsize) > maplen) {
 				void* p = mmap((void*)(addr + maplen), round_up(s->vmsize) - maplen, prot ? prot : PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
@@ -440,7 +477,10 @@ static void load_macho(const char* path, uint64_t slide, struct image* out) {
 	free(cmds);
 	close(fd);
 	if (!out->mh) DIE("%s: no se encontró el segmento __TEXT", path);
+	if (access("/dev/shm/tahoe-log-time", F_OK) == 0)
+		logf_("    carga <%d> %s: %.1f ms (mmap %.1f, dsmos %.1f, mprotect %.1f)\n", (int)getpid(), strrchr(path, '/') ? strrchr(path, '/') + 1 : path, lm_ms(&lm0), t_map, t_dsmos, t_prot);
 	LOG("<%d> cargado %-28s mh=0x%lx entrada=0x%lx tipo=%u\n", (int)getpid(), strrchr(path, '/') ? strrchr(path, '/') + 1 : path, out->mh, out->entry, out->filetype);
+	if (out->filetype == 2) snprintf(prog_name, sizeof prog_name, "%s", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
 }
 
 // ---------------------------------------------------------------- pila inicial
@@ -491,7 +531,21 @@ typedef emu_fn bsd_fn;
 
 // BSD: devuelven >= 0 o -errno_de_Darwin
 extern void ports_cleanup(void);
-static long bsd_exit(struct ctx* c)  { if (trace_all || getpid() == 1) logf_("    exit(%d) <%d>\n", (int)c->a[0], getpid()); ports_cleanup(); _exit((int)c->a[0]); }
+// Medida del coste de la emulación (diagnóstico de velocidad): llamadas atendidas por clase y ciclos del TSC dentro del
+// manejador (on_sigsys); se registran al salir, junto a la CPU del proceso.
+static uint64_t sc_count[4], sc_cycles;
+// Cada salida queda en el registro (una línea): sin ella, un servicio que termina por su cuenta desaparece sin rastro.
+static void show_frames(struct ctx* c);
+// exit: con error y en un proceso de STACKS, también los marcos de quien sale (para saber por qué).
+static long bsd_exit(struct ctx* c)  {
+	struct rusage ru; getrusage(RUSAGE_SELF, &ru);       // y la CPU que gastó: el coste de los servicios que se relanzan
+	                                                     // y cuántas llamadas atendió y el tiempo dentro del manejador
+	logf_("    fin <%d> [%s] exit(%d) cpu=%.2fs llamadas bsd=%lu mach=%lu manejador=%.2fs\n", getpid(), prog_name, (int)c->a[0],
+	      ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6,
+	      (unsigned long)sc_count[2], (unsigned long)sc_count[1], tsc_hz ? (double)sc_cycles / (double)tsc_hz : 0.0);
+	if ((int)c->a[0] != 0 && diag_target()) show_frames(c);
+	ports_cleanup(); _exit((int)c->a[0]);
+}
 static long bsd_getpid(struct ctx* c) { (void)c; return getpid(); }
 static long bsd_issetugid(struct ctx* c) { (void)c; return 0; }
 static long bsd_write(struct ctx* c) {
@@ -513,6 +567,7 @@ static long bsd_read(struct ctx* c) {
 	return r < 0 ? -darwin_errno(errno) : r;
 }
 static long bsd_close(struct ctx* c) {
+	if ((int)c->a[0] >= FD_INTERNAL_BASE) return -9;                 // EBADF: descriptores del emulador (ver fd_hi)
 	long r = syscall(SYS_close, c->a[0]);
 	return r < 0 ? -darwin_errno(errno) : r;
 }
@@ -531,11 +586,20 @@ int darwin_open_flags(int f) {
 	if (f & 0x100000) o |= O_DIRECTORY;
 	if (f & 0x400000) o |= O_DSYNC;
 	if (f & 0x1000000) o |= O_CLOEXEC;
+	if (f & 0x200000) o |= O_NOFOLLOW;               // O_SYMLINK: ver open_symlink
 	return o;
+}
+// O_SYMLINK (0x200000) de Darwin: si la ruta es un enlace simbólico, se abre el propio enlace (ditto lo usa para copiar
+// enlaces que no apuntan a nada). Con O_NOFOLLOW Linux da ELOOP; entonces se abre el enlace con O_PATH (vale para fstat,
+// readlinkat y fchown, que es lo que se hace con él).
+long open_symlink(int dfd, const char* p, int dflags, int lflags, long fd) {
+	if (fd >= 0 || !(dflags & 0x200000) || errno != ELOOP) return fd;
+	return syscall(SYS_openat, dfd, p, O_PATH | O_NOFOLLOW | (lflags & O_CLOEXEC));
 }
 static long bsd_open(struct ctx* c) {
 	char path[4096], full[4200];
 	if (safe_string(c->a[0], path, sizeof path) != 0) return -14;          // EFAULT
+	tahoe_resolve_strip(path);
 	if (!strcmp(path, "/dev/console")) {                                  // sin consola real dentro del entorno
 		// diagnóstico: si existe /dev/shm/tahoe-console, la consola es ese archivo (lo que launchd y otros escriben ahí)
 		if (access("/dev/shm/tahoe-console", W_OK) == 0) {
@@ -549,8 +613,8 @@ static long bsd_open(struct ctx* c) {
 	int flags = darwin_open_flags((int)c->a[1]);
 	long fd = -1;
 	if (tahoe_root && path[0] == '/' && !tahoe_host_passthrough(path)) {
-		snprintf(full, sizeof full, "%s%s", tahoe_root, path);
-		fd = syscall(SYS_open, full, flags, (int)c->a[2]);
+		if (!tahoe_metal_path(path, full, sizeof full)) snprintf(full, sizeof full, "%s%s", tahoe_root, path);
+		fd = open_symlink(AT_FDCWD, full, (int)c->a[1], flags, syscall(SYS_open, full, flags, (int)c->a[2]));
 		if (fd < 0 && ((flags & O_CREAT) || !tahoe_host_passthrough(path))) goto done;   // fuera de /dev, solo la raíz de macOS
 	}
 	if (fd < 0) { char al[64]; fd = syscall(SYS_open, tahoe_dev_alias(path, al, sizeof al), flags, (int)c->a[2]); }
@@ -561,15 +625,17 @@ done:
 // guarded_pwrite_np(fd, guard*, búfer, tamaño, desplazamiento): pwrite; la guarda no se comprueba.
 static long bsd_guarded_pwrite(struct ctx* c) { long r = pwrite((int)c->a[0], (const void*)c->a[2], c->a[3], (off_t)c->a[4]); return r < 0 ? -darwin_errno(errno) : r; }
 static long bsd_proc_info(struct ctx* c);
-// proc_info_extended_id(callnum, pid, flags, ext_id_type, ext_id, flavor, arg, buffer, buffersize): proc_info con una
-// comprobación de identidad extra (uniqueid/versión) que aquí no hace falta.
+// proc_info_extended_id(callnum, pid, flavor, flags, ext_id, arg, buffer, buffersize): proc_info con una comprobación de
+// identidad extra (flags PIF_COMPARE_*: versión o uniqueid del pid en ext_id) que aquí no hace falta. Los dos últimos van
+// en la pila. La usa proc_pidpath_audittoken (airportd la pide de cada cliente XPC: si falla, rechaza la conexión y el
+// cliente reconecta sin parar, decenas de miles de líneas de registro por minuto).
 static long bsd_proc_info_ext(struct ctx* c) {
 	struct ctx c2 = *c;
 	c2.a[0] = c->a[0]; c2.a[1] = c->a[1];
-	c2.a[2] = c->a[5];                                   // flavor
-	c2.a[3] = ctx_arg(c, 6);                             // arg
-	c2.a[4] = ctx_arg(c, 7);                             // buffer
-	c2.a[5] = ctx_arg(c, 8);                             // buffersize
+	c2.a[2] = c->a[2];                                   // flavor
+	c2.a[3] = c->a[5];                                   // arg
+	c2.a[4] = ctx_arg(c, 6);                             // buffer
+	c2.a[5] = ctx_arg(c, 7);                             // buffersize
 	return bsd_proc_info(&c2);
 }
 // open_dprotected_np(ruta, oflags, clase, dpflags, mode): como open; la clase de protección de datos no existe aquí.
@@ -585,7 +651,15 @@ static long bsd_getlogin(struct ctx* c) {
 	return safe_write(c->a[0], u, sizeof u) == (ssize_t)sizeof u ? 0 : -14;
 }
 static long bsd_enotsup(struct ctx* c) { (void)c; return -45; }   // ENOTSUP: funciones que este sistema no ofrece (personas)
-static long bsd_eperm(struct ctx* c) { (void)c; return -1; }      // EPERM: reboot desde dentro no apaga el anfitrión
+// reboot(howto): solo launchd (pid 1 del espacio de procesos del arranque) apaga o reinicia. Aquí eso es terminar el
+// arranque: al salir el pid 1, Linux termina todos los procesos de su espacio (el anfitrión no se toca). launchd aborta si
+// reboot() vuelve con error (assertion en launchd + 284047), así que no vuelve. Los demás reciben EPERM, como un no-root.
+static long bsd_reboot(struct ctx* c) {
+	if (getpid() != 1) return -1;
+	logf_("    reinicio pedido (reboot howto=0x%lx) por <%d> [%s]: fin del arranque\n", (unsigned long)c->a[0], getpid(), prog_name);
+	ports_cleanup();
+	_exit(0);
+}
 // guarded_open_np(ruta, guard*, guardflags, oflags, mode): como open; la guarda se ignora.
 static long bsd_guarded_open(struct ctx* c) {
 	struct ctx c2 = *c;
@@ -640,6 +714,13 @@ static long bsd_abort_with_payload(struct ctx* c) {
 	show_frames(c);
 	_exit(134);
 }
+// os_fault_with_payload(espacio, código, carga, tamaño, motivo, banderas): un fallo que se informa sin terminar (libxpc,
+// LaunchServices...). Se anota como abort_with_payload y se sigue.
+static long bsd_os_fault_with_payload(struct ctx* c) {
+	show_payload("os_fault_with_payload", c->a[0], c->a[1], c->a[2], c->a[3], c->a[4]);
+	show_frames(c);
+	return 0;
+}
 static long bsd_terminate_with_payload(struct ctx* c) {
 	show_payload("terminate_with_payload", c->a[1], c->a[2], c->a[3], c->a[4], c->a[5]);
 	show_frames(c);
@@ -647,6 +728,9 @@ static long bsd_terminate_with_payload(struct ctx* c) {
 }
 // csrctl: consulta de SIP. op 0 = CSR_SYSCALL_CHECK; 0 significa "permitido" (como con SIP desactivado).
 static long bsd_csrctl(struct ctx* c) { (void)c; return 0; }
+// system_override(plazo, banderas): launchd quita o repone la limitación de CPU y de E/S del sistema (al arrancar o
+// parar servicios en masa). En Linux no hay esa limitación: se acepta sin efecto. Si falla (ENOSYS), launchd aborta.
+static long bsd_system_override(struct ctx* c) { (void)c; return 0; }
 // proc_info: dyld usa la llamada 15 (SET_DYLD_IMAGES) para informar al kernel de las imágenes cargadas.
 // Datos de un proceso desde /proc (nativo). El nombre es el del ejecutable de macOS (tahoe-run <caché> <dyld> <exe>).
 struct pinfo { int pid, ppid, pgid, status, uid, gid, ruid, rgid, svuid, svgid, nfiles; char comm[17], name[33]; uint64_t start_sec, start_usec; };
@@ -733,8 +817,33 @@ static long proc_signal_call(struct ctx* c) {
 	if (r != 0) return -darwin_errno(errno);
 	return terminate ? sig : 0;                                            // proc_terminate devuelve la señal enviada
 }
+// proc_listpids (PROC_INFO_CALL_LISTPIDS): pids de los procesos de este arranque, filtrados por tipo (todos, grupo, uid, uid
+// real, padre). Sin búfer devuelve el tamaño necesario. Sin ella, MacBuddy (Asistente de configuración) no podía mirar qué
+// procesos hay, caía en sus comprobaciones antiguas y decidía «configuración inicial» aunque el sistema ya estuviera
+// configurado: loginwindow intentaba lanzar el Asistente en vez de mostrar la ventana de inicio de sesión.
+static long proc_listpids(struct ctx* c) {
+	int type = (int)c->a[1]; uint32_t info = (uint32_t)c->a[2];
+	uint64_t buf = c->a[4]; size_t cap = (size_t)c->a[5] / 4;
+	DIR* d = opendir("/proc"); struct dirent* de;
+	size_t n = 0, total = 0;
+	while (d && (de = readdir(d))) {
+		int pid = atoi(de->d_name);
+		if (pid <= 0) continue;
+		struct pinfo pi;
+		if (proc_snapshot(pid, &pi) != 0) continue;
+		int keep = type == 1 || (type == 2 && (uint32_t)pi.pgid == info) || (type == 4 && (uint32_t)pi.uid == info) ||
+		           (type == 5 && (uint32_t)pi.ruid == info) || (type == 6 && (uint32_t)pi.ppid == info);
+		if (!keep) continue;
+		total++;
+		if (buf && n < cap) { int32_t v = pid; if (safe_write(buf + n * 4, &v, 4) != 4) { closedir(d); return -D_EFAULT; } n++; }
+	}
+	if (d) closedir(d);
+	if (!buf || !cap) return (long)((total + 16) * 4);     // como XNU: una estimación con margen
+	return (long)(n * 4);
+}
 static long bsd_proc_info(struct ctx* c) {
 	if ((int)c->a[0] == 15) return 0;
+	if ((int)c->a[0] == 1) return proc_listpids(c);
 	if ((int)c->a[0] == 7 || ((int)c->a[0] >= 0x11 && (int)c->a[0] <= 0x14)) return proc_signal_call(c);
 	if ((int)c->a[0] == 5 || (int)c->a[0] == 8) return 0;                 // SETCONTROL / DIRTYCONTROL: sin efecto
 	if ((int)c->a[0] == 9) {                                              // PIDRUSAGE: contadores a cero
@@ -792,8 +901,8 @@ static long bsd_shared_region_check_np(struct ctx* c) {
 
 static bsd_fn bsd_table[BSD_NAMES_N] = {
 	[1] = bsd_exit, [3] = bsd_read, [4] = bsd_write, [6] = bsd_close, [20] = bsd_getpid,
-	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [336] = bsd_proc_info,
-	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_eperm, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
+	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [454] = bsd_system_override, [336] = bsd_proc_info,
+	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_reboot, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload, [529] = bsd_os_fault_with_payload,
 };
 
 
@@ -877,6 +986,9 @@ static mach_fn mach_table[MACH_NAMES_N] = {
 	[10] = mach_vm_allocate_trap, [12] = mach_vm_deallocate_trap, [15] = mach_vm_map_trap,
 	[18] = mach_nop_success, [88] = mach_not_supported, [19] = mach_nop_success, [21] = mach_nop_success, [24] = mach_nop_success, [25] = mach_nop_success,
 	[89] = mach_timebase_info_trap,
+	// macx_triggers(alto, bajo, flags, puerto): launchd activa al arrancar la compactación del compresor de memoria y el
+	// intercambio (SWAP_COMPACT_ENABLE 0x20) y comprueba el resultado. La memoria la gestiona Linux: éxito sin efecto.
+	[51] = mach_nop_success,
 	[14] = mach_vm_protect_trap, [11] = mach_vm_purgable_trap,
 	[26] = mach_reply_port_trap, [27] = mach_thread_self_trap, [28] = mach_task_self_trap, [29] = mach_host_self_trap,
 };
@@ -901,9 +1013,29 @@ static void log_call(const char* kind, uint32_t num, const char* name, struct ct
 	logf_("  [%s] <%d:%d> %s %u %s(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", verdict, getpid(), (int)(syscall(SYS_gettid) - getpid()), kind, num, name ? name : "?", c->a[0], c->a[1], c->a[2], c->a[3]);
 }
 
+// Diagnóstico: con /dev/shm/tahoe-watch-path (un texto), todos los procesos anotan las llamadas que crean, escriben, borran o
+// renombran una ruta que lo contenga (para saber quién toca un archivo: el llavero del sistema se convertía en -db).
+static void watch_path_call(unsigned num, struct ctx* c, long r) {
+	static int on = -1; static char want[128];
+	if (on < 0) { FILE* f = fopen("/dev/shm/tahoe-watch-path", "r"); on = 0; if (f) { if (fgets(want, sizeof want, f)) { want[strcspn(want, "\n")] = 0; on = want[0] != 0; } fclose(f); } }
+	if (!on) return;
+	int p1 = -1, p2 = -1;
+	switch (num) {
+	case 5: case 398: if (!(c->a[1] & 0x603)) return; p1 = 0; break;          // open/open_nocancel para escribir o crear
+	case 463: if (!(c->a[2] & 0x603)) return; p1 = 1; break;                   // openat
+	case 10: p1 = 0; break; case 472: p1 = 1; break;                           // unlink / unlinkat
+	case 128: p1 = 0; p2 = 1; break; case 465: case 488: p1 = 1; p2 = 3; break; // rename / renameat / renameatx_np
+	default: return;
+	}
+	char a[300] = "", b[300] = "";
+	safe_string(c->a[p1], a, sizeof a); if (p2 >= 0) safe_string(c->a[p2], b, sizeof b);
+	if (!strstr(a, want) && !strstr(b, want)) return;
+	logf_("    VIGILA <%d:%ld> %s bsd %u \"%s\"%s%s%s -> %ld\n", (int)getpid(), (long)syscall(SYS_gettid), prog_name, num, a, p2 >= 0 ? " -> \"" : "", b, p2 >= 0 ? "\"" : "", r);
+}
 static void on_sigsys(int sig, siginfo_t* si, void* v) {
 	(void)sig;
 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;   // dentro del manejador, las syscalls van directas a Linux
+	uint64_t t_in = __builtin_ia32_rdtsc();
 	ucontext_t* uc = v;
 	greg_t* g = uc->uc_mcontext.gregs;
 	if (si->si_code != SYS_USER_DISPATCH) DIE("SIGSYS inesperado (si_code=%d) en rip=0x%llx", si->si_code, (unsigned long long)g[REG_RIP]);
@@ -922,10 +1054,11 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 			char v[24]; if (r < 0 && r > -4096 && !c.raw_ret) snprintf(v, sizeof v, "E%-4ld", -r); else snprintf(v, sizeof v, "=%lx", r);
 			log_call("bsd", num, name, &c, v);
 			int pa = -1;                                         // argumento con ruta: open, access, readlink, stat, lstat, getattrlist...
-			if (num == 5 || num == 398 || num == 33 || num == 58 || num == 338 || num == 340 || num == 220 || num == 136 || num == 10 || num == 128) pa = 0;
+			if (num == 5 || num == 398 || num == 33 || num == 58 || num == 338 || num == 340 || num == 220 || num == 136 || num == 10 || num == 128 || num == 345) pa = 0;
 			else if (num == 463 || num == 464 || num == 469 || num == 470 || num == 466) pa = 1;
 			if (pa >= 0) { char path[200] = ""; if (safe_read(c.a[pa], path, sizeof path - 1) > 0) { path[199] = 0; logf_("        ruta: \"%s\"\n", path); } }
 		}
+		watch_path_call(num, &c, r);
 		if (c.raw_ret) { g[REG_RAX] = (uint64_t)r; g[REG_EFL] &= ~1UL; }
 		else if (r < 0 && r > -4096) { g[REG_RAX] = -r; g[REG_EFL] |= 1; }   // error: rax = errno, CF = 1
 		else { g[REG_RAX] = r; g[REG_EFL] &= ~1UL; if (c.has_ret2) g[REG_RDX] = c.ret2; }
@@ -953,6 +1086,8 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 		g[REG_RAX] = (uint64_t)-1;
 	}
 	t_cur = NULL;
+	__atomic_add_fetch(&sc_count[cls & 3], 1, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&sc_cycles, __builtin_ia32_rdtsc() - t_in, __ATOMIC_RELAXED);
 	selector = SYSCALL_DISPATCH_FILTER_BLOCK;
 }
 
@@ -973,7 +1108,36 @@ void reenable_dispatch(void) {
 extern __thread uint32_t g_thread_port;
 static __thread void* alt_stack;
 // El hilo del invitado terminó y su función del anfitrión va a volver: se quita el despacho de syscalls y la pila alterna.
+// Sube el límite de descriptores del anfitrión si hace falta para la zona del emulador (un servicio de launchd hereda el que
+// le fijó su plist, p. ej. 256 o 4096, con el que F_DUPFD por encima de FD_INTERNAL_BASE fallaría).
+void fd_limit_raise(void) {
+	struct rlimit rl;
+	if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur >= FD_INTERNAL_LIMIT) return;
+	if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < FD_INTERNAL_LIMIT) rl.rlim_max = FD_INTERNAL_LIMIT;   // root puede subirlo
+	rl.rlim_cur = FD_INTERNAL_LIMIT;
+	if (setrlimit(RLIMIT_NOFILE, &rl) != 0) { getrlimit(RLIMIT_NOFILE, &rl); rl.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_NOFILE, &rl); }
+}
+int fd_hi(int fd) {
+	if (fd < 0 || fd >= FD_INTERNAL_BASE) return fd;
+	int fl = fcntl(fd, F_GETFD);
+	int n = fcntl(fd, (fl >= 0 && (fl & FD_CLOEXEC)) ? F_DUPFD_CLOEXEC : F_DUPFD, FD_INTERNAL_BASE);
+	if (n < 0) return fd;
+	close(fd);
+	return n;
+}
+static __thread struct { void** slot; size_t size; } tls_lazies[16];
+static __thread int n_tls_lazies;
+void* tls_lazy(void** slot, size_t size) {
+	if (*slot) return *slot;
+	void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED) DIE("tls_lazy: mmap de %zu bytes: %s", size, strerror(errno));
+	*slot = p;
+	if (n_tls_lazies < 16) { tls_lazies[n_tls_lazies].slot = slot; tls_lazies[n_tls_lazies].size = size; n_tls_lazies++; }
+	return p;
+}
 void guest_thread_done(void) {
+	for (int i = 0; i < n_tls_lazies; i++) { munmap(*tls_lazies[i].slot, tls_lazies[i].size); *tls_lazies[i].slot = NULL; }
+	n_tls_lazies = 0;
 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
 	prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF, 0, 0, 0);
 	if (alt_stack) { stack_t ss = { .ss_flags = SS_DISABLE }; sigaltstack(&ss, NULL); munmap(alt_stack, 1 << 18); alt_stack = NULL; }
@@ -1002,7 +1166,11 @@ void __attribute__((noreturn)) enter_guest_thread(uint64_t rip, uint64_t rsp, ui
 static void on_sigill(int sig, siginfo_t* si, void* v) {
 	(void)sig; (void)si;
 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
-	logf_("    SIGILL <%d>\n", getpid());
+	{
+		const uint8_t* ip = (const uint8_t*)((ucontext_t*)v)->uc_mcontext.gregs[REG_RIP]; uint8_t b[4] = { 0 };
+		safe_read((uint64_t)ip, b, 4);
+		logf_("    SIGILL <%d> hilo %ld rip=%p (%02x %02x %02x %02x)\n", getpid(), (long)syscall(SYS_gettid), (void*)ip, b[0], b[1], b[2], b[3]);
+	}
 	diag_crash(v);
 	diag_dump_threads();
 	_exit(132);
@@ -1078,16 +1246,21 @@ static void install_dispatch(void) {
 		DIE("PR_SET_SYSCALL_USER_DISPATCH: %s (hace falta Linux >= 5.11)", strerror(errno));
 }
 
-// Número de CPU: libsystem_pthread, libsystem_malloc y libdispatch lo leen con "sidt [rsp-0x10]" y se quedan con los
+// Número de CPU: libsystem_pthread, libsystem_malloc y libdispatch lo leen con "sidt [rsp-0x10]" (o, según cómo se compiló la
+// caché, "sidt [rbp-0x10]", p. ej. en la del macOS completo) y se quedan con los
 // 12 bits bajos del límite de la IDT, porque XNU pone en cada CPU límite = 0x1000 + número de CPU (mp_desc.c). En Linux
 // el límite es 0xfff, así que salía la CPU 4095 y libdispatch indexaba su montón por CPU fuera de rango. Sin UMIP la
 // instrucción no se puede atrapar, de modo que en nuestra copia privada de la caché se cambia por una de igual tamaño,
-// "and dword [rsp-0x10], 0": límite & 0xfff = 0, la CPU 0, válida siempre (solo cambia el reparto por CPU).
+// "and dword [rsp-0x10], 0" / "and dword [rbp-0x10], 0": límite & 0xfff = 0, la CPU 0, válida siempre (solo cambia el
+// reparto por CPU).
 static void patch_cpu_number(void) {
 	const uint64_t cache = 0x7ff800000000UL;
 	uint32_t io = *(uint32_t*)(cache + 0x1c0), ic = *(uint32_t*)(cache + 0x1c4);
 	static const char* libs[] = { "/libdispatch.dylib", "/libsystem_malloc.dylib", "/libsystem_pthread.dylib" };
-	static const uint8_t sidt[5] = { 0x0f, 0x01, 0x4c, 0x24, 0xf0 }, repl[5] = { 0x83, 0x64, 0x24, 0xf0, 0x00 };
+	static const struct { uint8_t len, sidt[5], repl[5]; } pat[] = {
+		{ 5, { 0x0f, 0x01, 0x4c, 0x24, 0xf0 }, { 0x83, 0x64, 0x24, 0xf0, 0x00 } },   // sidt [rsp-0x10]
+		{ 4, { 0x0f, 0x01, 0x4d, 0xf0 },       { 0x83, 0x65, 0xf0, 0x00 } },         // sidt [rbp-0x10]
+	};
 	int patched = 0;
 	for (uint32_t i = 0; i < ic && i < 10000; i++) {
 		uint64_t mh = *(uint64_t*)(cache + io + i * 32ULL);
@@ -1102,10 +1275,13 @@ static void patch_cpu_number(void) {
 			if (sg->cmd == 0x19 && !strcmp(sg->segname, "__TEXT")) {
 				uint8_t* a = (uint8_t*)sg->vmaddr; uint64_t n = sg->vmsize;
 				for (uint64_t off = 0; off + 5 <= n; off++) {
-					if (a[off] != 0x0f || memcmp(a + off, sidt, 5) != 0) continue;
+					if (a[off] != 0x0f || a[off + 1] != 0x01) continue;
+					int k = -1;
+					for (int j = 0; j < (int)(sizeof pat / sizeof pat[0]); j++) if (!memcmp(a + off, pat[j].sidt, pat[j].len)) k = j;
+					if (k < 0) continue;
 					uint64_t pg = ((uint64_t)a + off) & ~(uint64_t)(PAGE - 1);
 					if (mprotect((void*)pg, PAGE * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) continue;
-					memcpy(a + off, repl, 5);
+					memcpy(a + off, pat[k].repl, pat[k].len);
 					mprotect((void*)pg, PAGE * 2, PROT_READ | PROT_EXEC);
 					patched++;
 				}
@@ -1140,10 +1316,11 @@ int main(int argc, char** argv, char** envp) {
 		return 2;
 	}
 	g_argv = argv;
-	{ int f = fcntl(2, F_DUPFD_CLOEXEC, 900); if (f >= 0) logfd = f; }
+	fd_limit_raise();                                   // antes de reservar descriptores en la zona del emulador
+	{ int f = fcntl(2, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE); if (f >= 0) logfd = f; }
 	if (getenv("TAHOE_LOGFILE")) {          // los procesos hijos escriben su registro en un archivo común
 		int f = open(getenv("TAHOE_LOGFILE"), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-		if (f >= 0) { int g = fcntl(f, F_DUPFD_CLOEXEC, 900); close(f); if (g >= 0) logfd = g; }
+		if (f >= 0) { int g = fcntl(f, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE); close(f); if (g >= 0) logfd = g; }
 	}
 	tahoe_root = getenv("TAHOE_ROOT");
 	trace_all = getenv("TAHOE_TRACE") != NULL;
@@ -1152,18 +1329,24 @@ int main(int argc, char** argv, char** envp) {
 	static char self[4096];
 	ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
 	g_self_exe = sl > 0 ? (self[sl] = 0, self) : argv[0];
-	// execve relanza tahoe-run: TAHOE_ARGV0 permite que argv[0] del programa no sea su ruta
-	const char* argv0 = getenv("TAHOE_ARGV0");
-	if (argv0) { argv[3] = (char*)argv0; unsetenv("TAHOE_ARGV0"); }
-	map_cache(cache);
-	patch_cpu_number();
+	// Fases del arranque de este proceso (diagnóstico de velocidad, con /dev/shm/tahoe-log-time): ms de cada una.
+	struct timespec ft[8]; int nft = 0;
+#define FASE() clock_gettime(CLOCK_MONOTONIC, &ft[nft++])
+	FASE();
+	if (getpid() == 1) sys_volumes_mount();                      // launchd: antes de que macOS mire sus volúmenes
+	map_cache(cache); FASE();
+	patch_cpu_number(); FASE();
 	LOG("caché mapeada en 0x%lx\n", CACHE_BASE);
-	setup_commpage();
+	setup_commpage(); FASE();
 	struct image di, ei;
 	load_macho(dyld, DYLD_SLIDE, &di);
-	load_macho(exe, 0, &ei);
+	load_macho(exe, 0, &ei); FASE();
 	diag_breakpoints();                                          // /dev/shm/tahoe-break en el proceso de /dev/shm/tahoe-stacks
 	if (di.filetype != 7) DIE("%s no es un MH_DYLINKER", dyld);
+	// execve relanza tahoe-run: TAHOE_ARGV0 permite que argv[0] del programa no sea su ruta. Se aplica después de mapear la
+	// caché: si allí hay que relanzarse sin ASLR (g_argv), el programa a cargar tiene que seguir en argv[3].
+	const char* argv0 = getenv("TAHOE_ARGV0");
+	if (argv0) { argv[3] = (char*)argv0; unsetenv("TAHOE_ARGV0"); }
 	char real[4096];
 	if (!realpath(exe, real)) snprintf(real, sizeof real, "%s", exe);
 	// el programa debe ver su ruta como macOS (/bin/ls), no la del host
@@ -1203,7 +1386,13 @@ int main(int argc, char** argv, char** envp) {
 		{ 423, 334 }, { 464, 463 }, { 542, 540 }, { 543, 541 },
 	};
 	for (size_t i = 0; i < sizeof alias / sizeof alias[0]; i++) if (bsd_table[alias[i].normal] && !bsd_table[alias[i].nocancel]) bsd_table[alias[i].nocancel] = bsd_table[alias[i].normal];
-	install_dispatch();
+	install_dispatch(); FASE();
+#define MS(a, b) ((ft[b].tv_sec - ft[a].tv_sec) * 1e3 + (ft[b].tv_nsec - ft[a].tv_nsec) / 1e6)
+	if (access("/dev/shm/tahoe-log-time", F_OK) == 0)
+		logf_("    arranque <%d>: caché %.1f ms, cpu %.1f, commpage %.1f, mach-o %.1f, resto %.1f, total %.1f\n", (int)getpid(),
+		      MS(0, 1), MS(1, 2), MS(2, 3), MS(3, 4), MS(4, 5), MS(0, 5));
+#undef MS
+#undef FASE
 	LOG("saltando a dyld (rip=0x%lx rsp=0x%lx)\n", di.entry, sp);
 	enter(di.entry, sp);
 }

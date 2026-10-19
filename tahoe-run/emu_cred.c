@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "tahoe.h"
 
@@ -17,13 +19,35 @@ static uint32_t ruid, euid, svuid, rgid, egid, svgid;
 static uint32_t groups[NGROUPS_MAX_];
 static int ngroups = 1;                       // como root: grupo 0
 
+// Sesión de auditoría (BSM de XNU): auid (usuario de la sesión de inicio, -1 = ninguno), asid (identificador de la
+// sesión), banderas y máscara. Se heredan como las credenciales. launchd y sus servicios están en la sesión del sistema;
+// setaudit_addr con AU_ASSIGN_ASID crea una nueva (loginwindow / SessionCreate para la sesión de la consola). Los
+// servicios distinguen así las sesiones de usuario: launchservicesd guarda una por asid y aborta si la ve dos veces.
+#define AU_DEFAULT_ASID 100000u                                  // primera sesión asignada por XNU (ASSIGNED_ASID_MIN)
+static uint32_t au_auid = (uint32_t)-1, au_asid = AU_DEFAULT_ASID, au_mask[2];
+static uint64_t au_flags;
+uint32_t cred_auid(void) { return au_auid; }
+uint32_t cred_asid(void) { return au_asid; }
 uint32_t cred_euid(void) { return euid; }
 uint32_t cred_egid(void) { return egid; }
 
-// TAHOE_CRED=ruid,euid,svuid,rgid,egid,svgid,g1,g2...
+// Sesión para el próximo hijo de posix_spawn (acción de puerto PSPA_AU_SESSION: launchd arranca así los LaunchAgents en
+// la sesión gráfica sin unirse él). 0 = la del padre. La fija bsd_posix_spawn y la quita al terminar.
+static uint32_t spawn_asid;
+static int ses_get(uint32_t asid, uint8_t out[0x30]);
+void cred_spawn_session(uint32_t asid) { spawn_asid = asid; }
+
+// TAHOE_CRED=ruid,euid,svuid,rgid,egid,svgid,g1,g2.../auid,asid,máscara,máscara,banderas
 void cred_env(char* out, size_t cap) {
 	int k = snprintf(out, cap, "TAHOE_CRED=%u,%u,%u,%u,%u,%u", ruid, euid, svuid, rgid, egid, svgid);
 	for (int i = 0; i < ngroups && k > 0 && (size_t)k < cap; i++) k += snprintf(out + k, cap - (size_t)k, ",%u", groups[i]);
+	uint32_t auid = au_auid, asid = au_asid, m0 = au_mask[0], m1 = au_mask[1]; uint64_t fl = au_flags;
+	uint8_t a[0x30];
+	if (spawn_asid && spawn_asid != au_asid) {                       // el hijo entra en esa sesión con sus datos (como XNU)
+		asid = spawn_asid;
+		if (ses_get(spawn_asid, a) == 0) { memcpy(&auid, a, 4); memcpy(&m0, a + 4, 4); memcpy(&m1, a + 8, 4); memcpy(&fl, a + 40, 8); }
+	}
+	if (k > 0 && (size_t)k < cap) snprintf(out + k, cap - (size_t)k, "/%u,%u,%u,%u,%llu", auid, asid, m0, m1, (unsigned long long)fl);   // /sesión de auditoría
 }
 static void cred_load(void) {
 	const char* v = getenv("TAHOE_CRED");
@@ -35,6 +59,127 @@ static void cred_load(void) {
 	ruid = (uint32_t)x[0]; euid = (uint32_t)x[1]; svuid = (uint32_t)x[2]; rgid = (uint32_t)x[3]; egid = (uint32_t)x[4]; svgid = (uint32_t)x[5];
 	ngroups = 0;
 	for (int i = 6; i < n; i++) groups[ngroups++] = (uint32_t)x[i];
+	const char* a = strchr(getenv("TAHOE_CRED"), '/');
+	if (a) { unsigned long long f = 0; unsigned u = 0, s = 0, m0 = 0, m1 = 0;
+		if (sscanf(a + 1, "%u,%u,%u,%u,%llu", &u, &s, &m0, &m1, &f) >= 2) { au_auid = u; au_asid = s; au_mask[0] = m0; au_mask[1] = m1; au_flags = f; } }
+}
+// getaudit_addr / setaudit_addr (auditinfo_addr_t, 0x30 bytes): auid, máscara (2×u32), terminal (24 bytes), asid (+36)
+// y banderas (+40). AU_ASSIGN_ASID (-1) en asid pide una sesión nueva: se le da un número propio (sesión base + pid, único
+// mientras viva quien la creó). Solo root cambia la sesión.
+// Registro de sesiones compartido por todo el arranque (como la tabla de sesiones de XNU): asid -> auditinfo_addr (0x30
+// bytes) del que la creó o la cambió. launchd pregunta por una sesión ajena con auditon(A_GETSINFO_ADDR) para montar el
+// dominio de la sesión gráfica (comprueba su auid y que tenga AU_SESSION_FLAG_HAS_GRAPHIC_ACCESS). Archivo en /dev/shm
+// con huecos fijos: hueco = asid % SES_N, sondeo lineal.
+#define SES_N 512
+static int ses_fd(void) {
+	static int fd = -2;
+	if (fd == -2) {
+		char p[160];
+		snprintf(p, sizeof p, "/dev/shm/tahoe.%s.sesiones", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
+		fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+		if (fd >= 0 && ftruncate(fd, SES_N * 0x30) != 0) { close(fd); fd = -1; }
+	}
+	return fd;
+}
+static void ses_put(const uint8_t a[0x30]) {
+	int fd = ses_fd(); if (fd < 0) return;
+	uint32_t asid; memcpy(&asid, a + 36, 4);
+	for (uint32_t k = 0; k < SES_N; k++) {
+		uint32_t slot = (asid + k) % SES_N, cur = 0; uint8_t e[0x30];
+		if (pread(fd, e, sizeof e, slot * 0x30) == (ssize_t)sizeof e) memcpy(&cur, e + 36, 4);
+		if (cur == 0 || cur == asid) { if (pwrite(fd, a, 0x30, slot * 0x30) != 0x30) {} return; }
+	}
+}
+static int ses_get(uint32_t asid, uint8_t out[0x30]) {
+	int fd = ses_fd(); if (fd < 0 || !asid) return -1;
+	for (uint32_t k = 0; k < SES_N; k++) {
+		uint32_t slot = (asid + k) % SES_N, cur = 0;
+		if (pread(fd, out, 0x30, slot * 0x30) != 0x30) return -1;
+		memcpy(&cur, out + 36, 4);
+		if (cur == asid) return 0;
+		if (cur == 0) return -1;
+	}
+	return -1;
+}
+static uint8_t au_tid[24];                                       // terminal de la sesión (solo para el registro)
+static void ses_mine(uint8_t a[0x30]) {
+	memset(a, 0, 0x30);
+	memcpy(a, &au_auid, 4); memcpy(a + 4, au_mask, 8); memcpy(a + 12, au_tid, 24); memcpy(a + 36, &au_asid, 4); memcpy(a + 40, &au_flags, 8);
+}
+static long b_getaudit_addr(struct ctx* c) {
+	uint8_t a[0x30] = { 0 };
+	memcpy(a, &au_auid, 4); memcpy(a + 4, au_mask, 8); memcpy(a + 36, &au_asid, 4); memcpy(a + 40, &au_flags, 8);
+	return safe_write(c->a[0], a, c->a[1] < sizeof a ? c->a[1] : sizeof a) < 0 ? -D_EFAULT : 0;
+}
+static long b_setaudit_addr(struct ctx* c) {
+	uint8_t a[0x30] = { 0 };
+	if (c->a[1] < sizeof a || safe_read(c->a[0], a, sizeof a) != sizeof a) return -D_EINVAL;
+	if (euid != 0) return -D_EPERM;
+	uint32_t auid, asid; uint64_t fl;
+	memcpy(&auid, a, 4); memcpy(&asid, a + 36, 4); memcpy(&fl, a + 40, 8);
+	au_auid = auid; memcpy(au_mask, a + 4, 8); au_flags = fl;
+	au_asid = asid == (uint32_t)-1 ? AU_DEFAULT_ASID + (uint32_t)getpid() : asid;
+	memcpy(a + 36, &au_asid, 4);
+	memcpy(au_tid, a + 12, 24);
+	ses_put(a);                                                     // la sesión queda registrada para auditon
+	safe_write(c->a[0], a, sizeof a);                               // como XNU: devuelve el asid asignado
+	return 0;
+}
+// Puertos de sesión de auditoría (como audit_session.c de XNU): un objeto del núcleo por asid, el mismo nombre para todos
+// los procesos de la sesión. launchd los usa para la sesión gráfica de un usuario: recoveryosd o loginwindow crean una
+// sesión nueva (setaudit_addr con AU_ASSIGN_ASID) y le pasan su puerto; launchd se une a ella (audit_session_join) para
+// montar el dominio gui/<uid> y arrancar ahí los LaunchAgents de tipo Aqua.
+// audit_session_self(): puerto de la sesión propia.
+static long b_audit_session_self(struct ctx* c) { (void)c; return kobj_make(KO_AUDIT_SESSION, (int32_t)au_asid); }
+// audit_session_join(puerto): pasa a esa sesión y devuelve su asid. La sesión conserva el auid de este proceso (aquí la
+// sesión es solo el asid; el auid lo fija quien la crea con setaudit_addr).
+static long b_audit_session_join(struct ctx* c) {
+	int type; int32_t asid;
+	if (!kobj_lookup((uint32_t)c->a[0], &type, &asid) || type != KO_AUDIT_SESSION) return -D_EINVAL;
+	au_asid = (uint32_t)asid;
+	return asid;
+}
+// audit_session_port(asid, *puerto): puerto de la sesión asid.
+static long b_audit_session_port(struct ctx* c) {
+	uint32_t name = kobj_make(KO_AUDIT_SESSION, (int32_t)(uint32_t)c->a[0]);
+	if (!name) return -D_ENOMEM;
+	return safe_write(c->a[1], &name, 4) == 4 ? 0 : -D_EFAULT;
+}
+// auditon(orden, datos, tamaño): consultas sobre sesiones. A_GETSINFO_ADDR (32): datos de la sesión ai_asid (de este
+// proceso o del registro); A_GETPINFO_ADDR (28): auditpinfo_addr del propio proceso; A_GETSFLAGS/A_SETSFLAGS (39/40):
+// banderas de la sesión propia. El resto (política, condición, colas...) responde 0 sin efecto, como antes.
+static long b_auditon(struct ctx* c) {
+	int cmd = (int)c->a[0]; uint64_t data = c->a[1]; uint32_t len = (uint32_t)c->a[2];
+	uint8_t a[0x30];
+	switch (cmd) {
+	case 32: {
+		uint32_t asid;
+		if (len < 0x30 || safe_read(data + 36, &asid, 4) != 4) return -D_EINVAL;
+		if (asid == au_asid || asid == (uint32_t)-1 || asid == 0) ses_mine(a);
+		else if (ses_get(asid, a) != 0) return -D_EINVAL;
+		return safe_write(data, a, 0x30) == 0x30 ? 0 : -D_EFAULT;
+	}
+	case 28: {                                                      // auditpinfo_addr: pid (4) + auditinfo_addr
+		int32_t pid;
+		if (len < 0x34 || safe_read(data, &pid, 4) != 4) return -D_EINVAL;
+		if (pid != (int32_t)getpid()) return -D_EINVAL;
+		ses_mine(a);
+		return safe_write(data + 4, a, 0x30) == 0x30 ? 0 : -D_EFAULT;
+	}
+	case 39: return len >= 8 && safe_write(data, &au_flags, 8) == 8 ? 0 : -D_EINVAL;
+	case 40: {
+		uint64_t f; if (len < 8 || safe_read(data, &f, 8) != 8) return -D_EINVAL;
+		au_flags = f; ses_mine(a); ses_put(a);
+		return 0;
+	}
+	default: return 0;
+	}
+}
+static long b_getauid(struct ctx* c) { return safe_write(c->a[0], &au_auid, 4) == 4 ? 0 : -D_EFAULT; }
+static long b_setauid(struct ctx* c) {
+	uint32_t v; if (safe_read(c->a[0], &v, 4) != 4) return -D_EFAULT;
+	if (euid != 0) return -D_EPERM;
+	au_auid = v; return 0;
 }
 
 #define D_EPERM 1
@@ -100,10 +245,40 @@ static long b_setgroups(struct ctx* c) {
 // initgroups(n, lista, uid de gmuid): como setgroups (el núcleo guarda además el uid de pertenencia externa)
 static long b_initgroups(struct ctx* c) { return b_setgroups(c); }
 
+// identitysvc(opcode, mensaje): el resolutor de identidades externas del núcleo (kern_credential.c). opendirectoryd se
+// registra como resolutor (KAUTH_EXTLOOKUP_REGISTER 0) y sus hilos trabajadores esperan en el núcleo peticiones de
+// traducción uid/gid <-> GUID (KAUTH_EXTLOOKUP_WORKER 2, con RESULT 1 para devolver la anterior). Aquí el núcleo nunca
+// pregunta (los permisos los decide Linux), así que el trabajador duerme hasta una señal, como en XNU sin peticiones.
+// Las cachés de identidades (GET/SET_CACHE_SIZES 8/16, CLEAR_CACHES 32) son las de XNU por omisión, sin efecto.
+// Sin esta llamada opendirectoryd reintentaba el registro sin parar (CPU al 100%).
+#include <unistd.h>
+static long b_identitysvc(struct ctx* c) {
+	uint32_t op = (uint32_t)c->a[0];
+	if (op == 0) return euid == 0 ? 0 : -D_EPERM;                          // REGISTER: solo root
+	if (op & 4) return 0;                                                   // DEREGISTER
+	if (op & 8) {                                                           // GET_CACHE_SIZES: struct kauth_cache_sizes
+		uint32_t sz[2] = { 100, 100 };                                      // kcs_group_size, kcs_id_size (XNU por omisión)
+		return safe_write(c->a[1], sz, sizeof sz) == (ssize_t)sizeof sz ? 0 : -D_EFAULT;
+	}
+	if (op & (16 | 32)) return euid == 0 ? 0 : -D_EPERM;                     // SET_CACHE_SIZES / CLEAR_CACHES
+	if (op & 2) { pause(); return -4; }                                     // WORKER: sin peticiones; EINTR al llegar una señal
+	if (op & 1) return 0;                                                   // RESULT suelto: nada pendiente
+	return -D_EINVAL;
+}
+
 void emu_cred_init(void) {
 	cred_load();
+	// La sesión propia, en el registro si aún no está: casi todas se heredan (TAHOE_CRED) sin pasar por setaudit_addr, y
+	// securityd pregunta por la del cliente (auditon A_GETSINFO_ADDR) al darle servicio; sin ella respondía EINVAL a todo
+	// cliente de otra sesión (la shell, sus programas) y SecKeychainCreate, certtool... fallaban con errSecParam.
+	uint8_t a[0x30];
+	if (ses_get(au_asid, a) != 0) { ses_mine(a); ses_put(a); }
 	reg_bsd(24, b_getuid); reg_bsd(25, b_geteuid); reg_bsd(47, b_getgid); reg_bsd(43, b_getegid);
 	reg_bsd(23, b_setuid); reg_bsd(183, b_seteuid); reg_bsd(181, b_setgid); reg_bsd(182, b_setegid);
 	reg_bsd(126, b_setreuid); reg_bsd(127, b_setregid);
 	reg_bsd(79, b_getgroups); reg_bsd(80, b_setgroups); reg_bsd(243, b_initgroups);
+	reg_bsd(293, b_identitysvc);
+	reg_bsd(357, b_getaudit_addr); reg_bsd(358, b_setaudit_addr); reg_bsd(353, b_getauid); reg_bsd(354, b_setauid);
+	reg_bsd(351, b_auditon);
+	reg_bsd(428, b_audit_session_self); reg_bsd(429, b_audit_session_join); reg_bsd(432, b_audit_session_port);
 }
