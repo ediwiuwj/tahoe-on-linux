@@ -22,6 +22,8 @@ static long err(void) { return -darwin_errno(errno); }
 static long rpath(uint64_t addr, char* out, size_t cap) {
 	char g[4096];
 	if (safe_string(addr, g, sizeof g) != 0) return -D_EFAULT;
+	tahoe_resolve_strip(g);
+	if (tahoe_metal_path(g, out, cap)) return 0;
 	if (tahoe_root && g[0] == '/' && !tahoe_host_passthrough(g)) snprintf(out, cap, "%s%s", tahoe_root, g);
 	else { char al[64]; snprintf(out, cap, "%s", tahoe_dev_alias(g, al, sizeof al)); }
 	return 0;
@@ -36,7 +38,6 @@ static long bsd_chmod(struct ctx* c)  { PATH1(p, 0); RET(chmod(p, (mode_t)c->a[1
 // daría EINVAL/EPERM. launchd lo hace con sus sockets y servicios; se acepta sin efecto.
 static long chown_result(long r) { if (r < 0 && (errno == EINVAL || errno == EPERM)) return 0; return r < 0 ? err() : 0; }
 static long bsd_chown(struct ctx* c)  { PATH1(p, 0); return chown_result(chown(p, (uid_t)c->a[1], (gid_t)c->a[2])); }
-static long bsd_ret0(struct ctx* c) { (void)c; return 0; }
 #include <sys/xattr.h>
 static long bsd_fchflags(struct ctx* c) { uint32_t v = (uint32_t)c->a[1]; fsetxattr((int)c->a[0], "user.tahoe.flags", &v, 4, 0); return 0; }   // sin soporte de xattr: se acepta igual
 static long bsd_chflags(struct ctx* c) { PATH1(p, 0); uint32_t v = (uint32_t)c->a[1]; lsetxattr(p, "user.tahoe.flags", &v, 4, 0); return 0; }
@@ -56,11 +57,18 @@ static long bsd_truncate(struct ctx* c) { PATH1(p, 0); RET(truncate(p, (off_t)c-
 static long bsd_mkfifo(struct ctx* c) { PATH1(p, 0); RET(mkfifo(p, (mode_t)c->a[1])); }
 static long bsd_rename(struct ctx* c) { PATH1(a, 0); PATH1(b, 1); RET(rename(a, b)); }
 static long bsd_link(struct ctx* c)   { PATH1(a, 0); PATH1(b, 1); RET(link(a, b)); }
-static long bsd_symlink(struct ctx* c) {      // el destino del enlace se guarda tal cual; solo la ruta del enlace va a la raíz
-	char tgt[4096];
+// Destino de un enlace simbólico nuevo: el kernel de Linux lo sigue por su cuenta, así que un destino absoluto de macOS
+// (/tmp, /usr/lib/...) se guarda dentro de la raíz; readlink lo devuelve sin ese prefijo (emu_fs.c, guest_link_target).
+static void host_link_target(const char* t, char* out, size_t cap) {
+	if (tahoe_root && t[0] == '/' && !tahoe_host_passthrough(t)) snprintf(out, cap, "%s%s", tahoe_root, t);
+	else snprintf(out, cap, "%s", t);
+}
+static long bsd_symlink(struct ctx* c) {
+	char tgt[4096], ht[4400];
 	if (safe_string(c->a[0], tgt, sizeof tgt) != 0) return -D_EFAULT;
 	PATH1(l, 1);
-	RET(symlink(tgt, l));
+	host_link_target(tgt, ht, sizeof ht);
+	RET(symlink(ht, l));
 }
 static long bsd_fchmod(struct ctx* c) { RET(fchmod((int)c->a[0], (mode_t)c->a[1])); }
 static long bsd_fchown(struct ctx* c) { return chown_result(fchown((int)c->a[0], (uid_t)c->a[1], (gid_t)c->a[2])); }
@@ -76,7 +84,21 @@ static long bsd_flock(struct ctx* c) {        // LOCK_SH 1, LOCK_EX 2, LOCK_NB 4
 }
 static long bsd_getdtablesize(struct ctx* c) { (void)c; return 10240; }
 static long bsd_readv(struct ctx* c)  { RET(readv((int)c->a[0], (const struct iovec*)c->a[1], (int)c->a[2])); }
-static long bsd_writev(struct ctx* c) { RET(writev((int)c->a[0], (const struct iovec*)c->a[1], (int)c->a[2])); }
+// writev; en un proceso de STACKS, lo que escribe en su salida de errores también va al registro (NSLog y los mensajes de
+// AppKit antes de salir van ahí, y el proceso que lo lanzó suele tenerla en /dev/null).
+static long bsd_writev(struct ctx* c) {
+	if ((int)c->a[0] == 2 && diag_target()) {
+		const struct iovec* v = (const struct iovec*)c->a[1];
+		char t[1024]; size_t k = 0;
+		for (int i = 0; i < (int)c->a[2] && i < 8 && k < sizeof t - 1; i++) {
+			size_t n = v[i].iov_len < sizeof t - 1 - k ? v[i].iov_len : sizeof t - 1 - k;
+			if (safe_read((uint64_t)v[i].iov_base, t + k, n) == (ssize_t)n) k += n;
+		}
+		t[k] = 0;
+		logf_("    stderr <%d>: %s%s", (int)getpid(), t, k && t[k - 1] == '\n' ? "" : "\n");
+	}
+	RET(writev((int)c->a[0], (const struct iovec*)c->a[1], (int)c->a[2]));
+}
 static long bsd_utimes(struct ctx* c) {       // struct timeval de Darwin: {i64 segundos, i32 microsegundos, pad}
 	PATH1(p, 0);
 	struct timespec ts[2];
@@ -102,8 +124,16 @@ static long bsd_getgroups(struct ctx* c) {
 	return r;
 }
 static long bsd_ok(struct ctx* c) { (void)c; return 0; }                // setgroups/setuid/setgid...: ya somos el usuario efectivo
-// select(nfds, readfds, writefds, exceptfds, timeval*)
-static long bsd_select(struct ctx* c) {
+// select(nfds, readfds, writefds, exceptfds, timeval*) y pselect(..., timespec*, sigmask*): el fd_set de Darwin es el mismo
+// mapa de bits (int32 por palabra) que el de Linux. pselect se diferencia en el plazo (timespec) y en la máscara de señales
+// durante la espera, que aquí se lee y se ignora: tahoe-run aún no entrega señales al invitado (ver bsd_pthread_sigmask).
+static long do_select(struct ctx* c, int ts);
+static long bsd_select(struct ctx* c) { return do_select(c, 0); }
+static long bsd_pselect(struct ctx* c) {
+	if (c->a[5]) { uint32_t m; if (safe_read(c->a[5], &m, 4) != 4) return -D_EFAULT; }
+	return do_select(c, 1);
+}
+static long do_select(struct ctx* c, int ts) {
 	int n = (int)c->a[0];
 	if (n < 0 || n > 1024) return -D_EINVAL;
 	size_t bytes = ((size_t)n + 7) / 8;
@@ -118,9 +148,10 @@ static long bsd_select(struct ctx* c) {
 	if (c->a[4]) {
 		uint8_t t[16];
 		if (safe_read(c->a[4], t, 16) != 16) return -D_EFAULT;
-		int64_t s; int32_t us;
-		memcpy(&s, t, 8); memcpy(&us, t + 8, 4);
-		tv.tv_sec = s; tv.tv_usec = us; tp = &tv;
+		int64_t s; int32_t us; int64_t ns;
+		memcpy(&s, t, 8); memcpy(&us, t + 8, 4); memcpy(&ns, t + 8, 8);
+		tv.tv_sec = s; tv.tv_usec = ts ? (suseconds_t)(ns / 1000) : us; tp = &tv;   // timespec: {i64 s, i64 ns}
+		if (ts && ns % 1000 && tv.tv_usec < 999999) tv.tv_usec++;                  // no esperar menos de lo pedido
 	}
 	int r = select(n, have[0] ? &sets[0] : NULL, have[1] ? &sets[1] : NULL, have[2] ? &sets[2] : NULL, tp);
 	if (r < 0) return err();
@@ -131,10 +162,81 @@ static long bsd_select(struct ctx* c) {
 
 // ---- variantes *at: el descriptor de directorio AT_FDCWD de Darwin es -2
 static int dfd(uint64_t v) { return (int)v == -2 ? AT_FDCWD : (int)v; }
+static long apath(uint64_t addr, char* out, size_t cap);
+
+// setattrlist(ruta, attrlist*, búfer, tamaño, opciones) / fsetattrlist(fd, ...) / setattrlistat(dirfd, ruta, ..., opciones):
+// atributos comunes que se pueden cambiar (ditto los usa al copiar). El búfer va sin longitud, en orden de bit, alineado a 4.
+// Fechas: modificación y acceso con utimensat; creación, cambio, copia y alta no existen en Linux (se aceptan sin efecto).
+// FinderInfo como el atributo extendido com.apple.FinderInfo; banderas como chflags; propietario como chown (sin efecto si el
+// uid no existe aquí); permisos como chmod. Volumen, directorio, archivo y fork no se pueden cambiar: EINVAL, como XNU.
+static long setattr_common(const char* hp, int nofollow, uint64_t alp, uint64_t buf, uint64_t size) {
+	uint32_t al[6];
+	if (safe_read(alp, al, sizeof al) != (ssize_t)sizeof al) return -D_EFAULT;
+	uint32_t common = al[1];
+	// también EXTENDED_SECURITY (ACL), UUID, GRPUUID y DATA_PROTECT_FLAGS (clase de protección): se aceptan sin efecto (en
+	// Linux no hay ACL de macOS ni cifrado por archivo). lsd los fija al guardar su base de datos; con EINVAL no la guardaba
+	// y volvía a registrar todas las apps en cada arranque.
+	const uint32_t known = 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x10000 | 0x20000 | 0x40000 |
+	                       0x400000 | 0x800000 | 0x1000000 | 0x10000000 | 0x40000000;
+	if (al[2] || al[3] || al[4] || al[5] || (common & ~known)) {
+		logf_("    setattrlist: atributos no modificables common=0x%x vol=0x%x dir=0x%x file=0x%x fork=0x%x\n", common, al[2], al[3], al[4], al[5]);
+		return -D_EINVAL;
+	}
+	uint8_t b[512]; size_t n = size < sizeof b ? (size_t)size : sizeof b, o = 0;
+	if (n && safe_read(buf, b, n) != (ssize_t)n) return -D_EFAULT;
+	struct timespec ts[2] = { { 0, UTIME_OMIT }, { 0, UTIME_OMIT } };
+	uint32_t uid = (uint32_t)-1, gid = (uint32_t)-1, mode = 0, flags = 0; const uint8_t* fi = NULL;
+#define NEED(k) do { if (o + (k) > n) return -D_EINVAL; } while (0)
+#define TS(t) do { int64_t s_, ns_; memcpy(&s_, b + o, 8); memcpy(&ns_, b + o + 8, 8); (t).tv_sec = s_; (t).tv_nsec = ns_; } while (0)
+	if (common & 0x100) { NEED(4); o += 4; }                            // SCRIPT
+	if (common & 0x200) { NEED(16); o += 16; }                          // CRTIME
+	if (common & 0x400) { NEED(16); TS(ts[1]); o += 16; }               // MODTIME
+	if (common & 0x800) { NEED(16); o += 16; }                          // CHGTIME
+	if (common & 0x1000) { NEED(16); TS(ts[0]); o += 16; }              // ACCTIME
+	if (common & 0x2000) { NEED(16); o += 16; }                         // BKUPTIME
+	if (common & 0x4000) { NEED(32); fi = b + o; o += 32; }             // FNDRINFO
+	if (common & 0x8000) { NEED(4); memcpy(&uid, b + o, 4); o += 4; }   // OWNERID
+	if (common & 0x10000) { NEED(4); memcpy(&gid, b + o, 4); o += 4; }  // GRPID
+	if (common & 0x20000) { NEED(4); memcpy(&mode, b + o, 4); o += 4; } // ACCESSMASK
+	if (common & 0x40000) { NEED(4); memcpy(&flags, b + o, 4); o += 4; }// FLAGS
+	if (common & 0x400000) { NEED(8); o += 8; }                         // EXTENDED_SECURITY (attrreference_t)
+	if (common & 0x800000) { NEED(16); o += 16; }                       // UUID
+	if (common & 0x1000000) { NEED(16); o += 16; }                      // GRPUUID
+	if (common & 0x10000000) { NEED(16); o += 16; }                     // ADDEDTIME
+	if (common & 0x40000000) { NEED(4); o += 4; }                       // DATA_PROTECT_FLAGS
+#undef NEED
+#undef TS
+	struct stat st;
+	if ((nofollow ? lstat(hp, &st) : stat(hp, &st)) != 0) return err();
+	int link = S_ISLNK(st.st_mode);
+	if (common & (0x8000 | 0x10000)) { long r = chown_result(nofollow ? lchown(hp, uid, gid) : chown(hp, uid, gid)); if (r) return r; }
+	if ((common & 0x20000) && !link && chmod(hp, mode & 07777) != 0) return err();
+	if (common & 0x40000) lsetxattr(hp, "user.tahoe.flags", &flags, 4, 0);
+	if (fi) {
+		static const uint8_t zero[32];
+		if (memcmp(fi, zero, 32)) lsetxattr(hp, "user.com.apple.FinderInfo", fi, 32, 0);
+		else lremovexattr(hp, "user.com.apple.FinderInfo");             // FinderInfo a cero: XNU borra el atributo
+	}
+	if ((common & (0x400 | 0x1000)) && utimensat(AT_FDCWD, hp, ts, nofollow ? AT_SYMLINK_NOFOLLOW : 0) != 0) return err();
+	return 0;
+}
+static long bsd_setattrlist(struct ctx* c) { PATH1(p, 0); return setattr_common(p, (c->a[4] & (1 | 0x800)) != 0, c->a[1], c->a[2], c->a[3]); }
+static long bsd_fsetattrlist(struct ctx* c) {
+	char p[64]; snprintf(p, sizeof p, "/proc/self/fd/%d", (int)c->a[0]);
+	return setattr_common(p, 0, c->a[1], c->a[2], c->a[3]);
+}
+static long bsd_setattrlistat(struct ctx* c) {
+	char g[4400], p[4500]; long e = apath(c->a[1], g, sizeof g); if (e) return e;
+	int d = dfd(c->a[0]);
+	if (g[0] != '/' && d != AT_FDCWD) snprintf(p, sizeof p, "/proc/self/fd/%d/%s", d, g); else snprintf(p, sizeof p, "%s", g);
+	return setattr_common(p, (c->a[5] & (1 | 0x800)) != 0, c->a[2], c->a[3], c->a[4]);
+}
 // Ruta relativa al dirfd o absoluta -> bajo la raíz si es absoluta
 static long apath(uint64_t addr, char* out, size_t cap) {
 	char g[4096];
 	if (safe_string(addr, g, sizeof g) != 0) return -D_EFAULT;
+	tahoe_resolve_strip(g);
+	if (tahoe_metal_path(g, out, cap)) return 0;
 	if (tahoe_root && g[0] == '/' && !tahoe_host_passthrough(g)) snprintf(out, cap, "%s%s", tahoe_root, g);
 	else { char al[64]; snprintf(out, cap, "%s", tahoe_dev_alias(g, al, sizeof al)); }
 	return 0;
@@ -150,13 +252,14 @@ static long bsd_renameatx(struct ctx* c) {      // flags de Darwin: RENAME_SWAP 
 static long bsd_unlinkat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(unlinkat(dfd(c->a[0]), p, (c->a[2] & 0x180) ? AT_REMOVEDIR : 0)); }   // AT_REMOVEDIR = 0x80, AT_REMOVEDIR_DATALESS = 0x100 (rm -r)
 static long bsd_mkdirat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(mkdirat(dfd(c->a[0]), p, (mode_t)c->a[2])); }
 static long bsd_symlinkat(struct ctx* c) {
-	char tgt[4096], l[4400];
+	char tgt[4096], ht[4400], l[4400];
 	if (safe_string(c->a[0], tgt, sizeof tgt) != 0) return -D_EFAULT;
 	long e = apath(c->a[2], l, sizeof l); if (e) return e;
-	RET(symlinkat(tgt, dfd(c->a[1]), l));
+	host_link_target(tgt, ht, sizeof ht);
+	RET(symlinkat(ht, dfd(c->a[1]), l));
 }
 static long bsd_fchmodat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(fchmodat(dfd(c->a[0]), p, (mode_t)c->a[2], 0)); }
-static long bsd_fchownat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; return chown_result(fchownat(dfd(c->a[0]), p, (uid_t)c->a[2], (gid_t)c->a[3], (c->a[4] & 0x20) ? AT_SYMLINK_NOFOLLOW : 0)); }
+static long bsd_fchownat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; return chown_result(fchownat(dfd(c->a[0]), p, (uid_t)c->a[2], (gid_t)c->a[3], (c->a[4] & (0x20 | 0x800)) ? AT_SYMLINK_NOFOLLOW : 0)); }
 static long bsd_linkat(struct ctx* c) { char a[4400], b[4400]; long e; if ((e = apath(c->a[1], a, sizeof a)) || (e = apath(c->a[3], b, sizeof b))) return e; RET(linkat(dfd(c->a[0]), a, dfd(c->a[2]), b, 0)); }
 
 // poll(fds, n, ms): struct pollfd igual que en Linux; cambian POLLWRNORM (Darwin 0x4 = POLLOUT, Linux 0x100) y POLLWRBAND
@@ -185,14 +288,16 @@ static long bsd_poll(struct ctx* c) {
 void emu_fs2_init(void) {
 	reg_bsd(230, bsd_poll); reg_bsd(417, bsd_poll);   // poll / poll_nocancel
 	reg_bsd(465, bsd_renameat); reg_bsd(488, bsd_renameatx); reg_bsd(472, bsd_unlinkat); reg_bsd(475, bsd_mkdirat);
+	reg_bsd(221, bsd_setattrlist); reg_bsd(229, bsd_fsetattrlist); reg_bsd(524, bsd_setattrlistat);
 	reg_bsd(474, bsd_symlinkat); reg_bsd(467, bsd_fchmodat); reg_bsd(468, bsd_fchownat); reg_bsd(471, bsd_linkat);
 	reg_bsd(136, bsd_mkdir); reg_bsd(137, bsd_rmdir); reg_bsd(10, bsd_unlink); reg_bsd(15, bsd_chmod);
-	reg_bsd(364, bsd_lchown); reg_bsd(34, bsd_chflags); reg_bsd(35, bsd_fchflags); reg_bsd(351, bsd_ret0);   // lchown; chflags/fchflags/auditon sin efecto
+	reg_bsd(364, bsd_lchown); reg_bsd(34, bsd_chflags); reg_bsd(35, bsd_fchflags);   // lchown; chflags/fchflags (auditon está en emu_cred.c)
 	reg_bsd(234, bsd_no_xattr); reg_bsd(142, bsd_gethostuuid);
 	reg_bsd(16, bsd_chown); reg_bsd(254, bsd_lchown); reg_bsd(200, bsd_truncate); reg_bsd(132, bsd_mkfifo);
 	reg_bsd(128, bsd_rename); reg_bsd(9, bsd_link); reg_bsd(57, bsd_symlink);
 	reg_bsd(124, bsd_fchmod); reg_bsd(123, bsd_fchown); reg_bsd(201, bsd_ftruncate); reg_bsd(95, bsd_fsync);
 	reg_bsd(131, bsd_flock); reg_bsd(89, bsd_getdtablesize); reg_bsd(120, bsd_readv); reg_bsd(121, bsd_writev);
-	reg_bsd(138, bsd_utimes); reg_bsd(286, bsd_gettid); reg_bsd(79, bsd_getgroups); reg_bsd(93, bsd_select);
+	reg_bsd(138, bsd_utimes); reg_bsd(286, bsd_gettid); reg_bsd(79, bsd_getgroups); reg_bsd(93, bsd_select); reg_bsd(394, bsd_pselect);
+	reg_bsd(203, bsd_ok); reg_bsd(204, bsd_ok);                 // mlock/munlock: sin intercambio a disco, no hay que fijar nada
 	reg_bsd(80, bsd_ok); reg_bsd(23, bsd_ok); reg_bsd(181, bsd_ok); reg_bsd(182, bsd_ok); reg_bsd(183, bsd_ok);
 }
