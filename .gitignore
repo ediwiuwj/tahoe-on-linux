@@ -17,6 +17,7 @@ target-*/
 # tahoe-run
 tahoe-run/tahoe-run
 tahoe-run/sysnames.h
+tahoe-run/bf_pi.h
 
 # Binarios y volcados locales de tahoe-run (comparaciones A/B y copias de trabajo)
 tahoe-run/tahoe-run.*
