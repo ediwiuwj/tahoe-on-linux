@@ -10,9 +10,18 @@ target/
 __pycache__/
 *.pyc
 
+# Rust: target/ y los directorios de compilación alternativos (target-b/)
+target/
+target-*/
+
 # tahoe-run
 tahoe-run/tahoe-run
 tahoe-run/sysnames.h
+
+# Binarios y volcados locales de tahoe-run (comparaciones A/B y copias de trabajo)
+tahoe-run/tahoe-run.*
+tahoe-run/*.orig
+tahoe-run/*.rej
 
 # Volcados de diagnóstico locales
 tahoe-run/ss.out
