@@ -54,7 +54,14 @@ static void set_remove(struct sport* p, uint32_t set) {
 	for (int j = 0; j < NSETS && p->sets[j]; j++) if (p->sets[j] != set) p->sets[n++] = p->sets[j];
 	for (int j = n; j < NSETS && p->sets[j]; j++) p->sets[j] = 0;
 }
-struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint64_t spill; uint8_t data[MSGSZ - 40]; };   // sauid/sasid: sesión de auditoría del remitente   // spill: datos fuera de línea en un archivo aparte (nucleo_desborde_*), 0 = en la ranura
+// Una ranura de la cola de mensajes. `total` es el tamaño del mensaje con sus datos fuera de línea (cabecera + OOL):
+// con hasta 32 descriptores de 4 GiB puede pasar de 4 GiB, así que la cuenta va en 64 bits (como el size_t del núcleo de
+// XNU, donde además el tamaño que se copia al usuario es solo el del mensaje: los datos fuera de línea van aparte, cada
+// descriptor lleva el suyo). `size` es solo el mensaje: lo que ve el receptor en su búfer, porque los datos fuera de línea
+// van a memoria aparte, como en XNU. La cabecera de la ranura mide 48 bytes; el tamaño de la ranura sigue siendo MSGSZ.
+// sauid/sasid: sesión de auditoría del remitente   // spill: datos fuera de línea en un archivo aparte (nucleo_desborde_*), 0 = en la ranura
+struct mslot { uint64_t total; uint32_t next, size, spid, suid, sgid, sauid, sasid; uint64_t spill; uint8_t data[MSGSZ - 48]; };
+_Static_assert(sizeof(struct mslot) == MSGSZ && offsetof(struct mslot, total) == 0 && offsetof(struct mslot, spill) == 40 && offsetof(struct mslot, data) == 48, "mslot");
 // Derechos que el núcleo tiene que vigilar para avisar cuando muere su dueño (ver "notificaciones" más abajo):
 //  sonce: un proceso tiene un derecho send-once (normalmente, la respuesta que debe a quien le pidió algo);
 //  dnreq: un proceso pidió MACH_NOTIFY_DEAD_NAME sobre un puerto (aviso al puerto `notify` cuando muera);
@@ -805,7 +812,7 @@ static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 	uint32_t idx = shm->free_head;
 	struct mslot* q = &shm->msgs[idx - 1];
 	shm->free_head = q->next;
-	q->next = 0; q->size = size; q->total = (uint32_t)total; q->spill = spill;
+	q->next = 0; q->size = size; q->total = total; q->spill = spill;   // total es de 64 bits: la cabecera más los datos fuera de línea
 	q->spid = kernel ? 0 : (uint32_t)getpid(); q->suid = kernel ? 0 : cred_euid(); q->sgid = kernel ? 0 : cred_egid();
 	q->sauid = kernel ? (uint32_t)-1 : cred_auid(); q->sasid = kernel ? 0 : cred_asid();   // para el trailer de auditoría del receptor
 	if (!kernel) msg_rights_locked(msg, size, RIGHTS_SEND, dest);
@@ -846,7 +853,12 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 		if (src) {
 			uint32_t idx = src->head;
 			struct mslot* q = &shm->msgs[idx - 1];
-			if (large && limit && q->total > limit) {                       // MACH_RCV_LARGE: no se consume; se informa del tamaño necesario
+			// MACH_RCV_LARGE: no se consume; se informa del tamaño necesario. Como en XNU, el tamaño que hay que
+			// cubrir es el mensaje (ipc_kmsg_copyout_size), sin los datos fuera de línea: el receptor recibe el mensaje en su
+			// búfer y los datos OOL en memoria aparte (aquí se materializan más abajo), así que el búfer solo tiene que
+			// caber el mensaje. Comparar con el total (cabecera + OOL) hacía que un mensaje con datos grandes nunca
+			// se pudiera recibir con RCV_LARGE (el receptor ampliaba el búfer y el total seguía cabiendo: bucle).
+			if (large && limit && q->size > limit) {                        // MACH_RCV_LARGE: no se consume; se informa del tamaño necesario
 				uint8_t* h = malloc(q->size ? q->size : 1);
 				memcpy(h, q->data, q->size);
 				*size = q->size; *out = h;
@@ -862,9 +874,17 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			}
 			msg_rights_locked(q->data, q->size, RIGHTS_RECV, src->name);
 			for (int j = 0; j < NSETS; j++) if (src->sets[j]) { struct sport* s = find_locked(src->sets[j]); if (s && s->count) s->count--; }
-			uint32_t sz = q->size, tot = q->total; uint64_t spill = q->spill;
+			uint32_t sz = q->size; uint64_t tot = q->total, spill = q->spill;   // tot es de 64 bits: el mensaje con sus datos OOL
 			if (sender) { sender[0] = q->spid; sender[1] = q->suid; sender[2] = q->sgid; sender[3] = q->sauid; sender[4] = q->sasid; }
-			uint8_t* m = malloc(tot ? tot : 1);
+			uint8_t* m = malloc(tot ? (size_t)tot : 1);
+			if (!m) {                                           // un mensaje de más de 4 GiB puede no caber en la memoria del proceso
+				logf_("    puertos: no hay memoria para un mensaje de %lu bytes\n", (unsigned long)tot);
+				if (spill) nucleo_desborde_borrar(tag, spill);
+				q->spill = 0;
+				q->next = shm->free_head; shm->free_head = idx;
+				unlock();
+				return MACH_RCV_INVALID_DATA_;
+			}
 			memcpy(m, q->data, spill ? sz : tot);
 			q->spill = 0;
 			q->next = shm->free_head; shm->free_head = idx;
@@ -880,11 +900,12 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			// materializar los descriptores OOL en memoria nueva de este proceso
 			uint32_t ooff[32], olen[32];
 			int nool = ool_scan(m, sz, ooff, olen, 32);
-			uint32_t pos = sz;
+			uint64_t pos = sz;                                     // de 64 bits: los datos OOL pueden sumar más de 4 GiB
 			for (int i = 0; i < nool; i++) {
 				uint64_t addr = 0;
 				if (olen[i]) {
-					void* mem = mmap(NULL, (olen[i] + 4095u) & ~4095u, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+					size_t dim = ((size_t)olen[i] + 4095) & ~(size_t)4095;
+					void* mem = mmap(NULL, dim, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 					if (mem != MAP_FAILED) { memcpy(mem, m + pos, olen[i]); addr = (uint64_t)mem; }
 				}
 				memcpy(m + ooff[i], &addr, 8);
