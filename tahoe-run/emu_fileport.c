@@ -35,7 +35,11 @@ static void fp_sockname(struct sockaddr_un* a, socklen_t* len, int pid) {
 	memset(a, 0, sizeof *a);
 	a->sun_family = AF_UNIX;
 	const char* tag = getenv("TAHOE_PORTS_OWNER");
+	// snprintf devuelve la longitud que habría escrito, mayor que el búfer si trunca: si el nombre no cabe, el
+	// longitud apuntaría fuera de sun_path y el par se leería más allá del búfer.
 	int n = snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "tahoe.%s.fp.%d", tag ? tag : "x", pid);
+	if (n < 0) n = 0;
+	if ((size_t)n >= sizeof a->sun_path - 1) n = (int)(sizeof a->sun_path - 2);
 	*len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
 static int fp_local(uint32_t name) {

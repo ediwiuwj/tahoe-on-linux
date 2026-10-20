@@ -309,6 +309,7 @@ static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
 		else {                                                   // cabecera falsa {0, longitud total} y la cadena detrás
 			uint32_t sl = (uint32_t)strlen(s) + 1, tot = sl + 8;
 			uint8_t* b = malloc(tot);
+			if (!b) { free(cd); return -D_ENOMEM; }        // sin memoria: se avisa, sin escribir en NULL
 			memset(b, 0, 8); uint32_t bl = htonl(tot); memcpy(b + 4, &bl, 4); memcpy(b + 8, s, sl);
 			r = copy_token(b, tot, uaddr, usize);
 			free(b);

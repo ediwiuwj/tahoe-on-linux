@@ -275,6 +275,7 @@ static long bsd_poll(struct ctx* c) {
 	uint32_t n = (uint32_t)c->a[1];
 	if (n > 4096) return -D_EINVAL;
 	struct pollfd* p = calloc(n ? n : 1, sizeof *p);
+	if (n && !p) return -D_ENOMEM;                               // sin memoria: se avisa, sin escribir en NULL
 	if (n && safe_read(c->a[0], p, n * sizeof *p) != (ssize_t)(n * sizeof *p)) { free(p); return -D_EFAULT; }
 	for (uint32_t i = 0; i < n; i++) p[i].events = ev_to_linux(p[i].events);
 	int r = poll(p, n, (int)c->a[2]);
