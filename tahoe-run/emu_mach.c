@@ -10,7 +10,6 @@
 #include <sys/syscall.h>
 #include <pthread.h>
 #include <errno.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
