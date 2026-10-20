@@ -86,7 +86,11 @@ static int shm_host_name(uint64_t addr, char* out, size_t cap) {
 	char g[256];
 	(void)port_exists(0);                       // fuerza la creación/apertura de la región compartida (fija TAHOE_PORTS_OWNER)
 	if (safe_string(addr, g, sizeof g) != 0) return -1;
-	char* o = out + snprintf(out, cap, "/dev/shm/tahoe.%s.", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
+	// snprintf devuelve la longitud que habría escrito, que es mayor que el búfer si trunca: el puntero quedaría
+	// fuera de él y el terminador se escribiría fuera. Con el prefijo largo se devuelve error antes de eso.
+	int n = snprintf(out, cap, "/dev/shm/tahoe.%s.", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
+	if (n < 0 || n >= (int)cap) return -1;
+	char* o = out + n;
 	for (char* s = g; *s && o < out + cap - 1; s++) *o++ = (*s == '/') ? '_' : *s;
 	*o = 0;
 	return 0;
