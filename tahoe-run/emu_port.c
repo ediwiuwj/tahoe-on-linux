@@ -860,6 +860,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			// se pudiera recibir con RCV_LARGE (el receptor ampliaba el búfer y el total seguía cabiendo: bucle).
 			if (large && limit && q->size > limit) {                        // MACH_RCV_LARGE: no se consume; se informa del tamaño necesario
 				uint8_t* h = malloc(q->size ? q->size : 1);
+				if (!h) { unlock(); return MACH_RCV_INVALID_DATA_; }        // sin memoria: se avisa, sin copiar a NULL
 				memcpy(h, q->data, q->size);
 				*size = q->size; *out = h;
 				unlock();
