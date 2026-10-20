@@ -274,23 +274,31 @@ static void kev_out(int layout, uint8_t* b, const struct kev* k);
 #define NOTE_ABSOLUTE_ 0x8u
 #define NOTE_MACHTIME_ 0x100u
 static int timer_clock(const struct kev* k) { return ((k->fflags & NOTE_ABSOLUTE_) && !(k->fflags & NOTE_MACHTIME_)) ? CLOCK_REALTIME : CLOCK_MONOTONIC; }
-static long timer_ns(const struct kev* k) {
+// Convierte el plazo del knote a nanosegundos. Devuelve 0 o ERANGE si el valor no cabe: XNU usa os_mul_overflow y
+// devuelve ERANGE (kern_event.c:1463, 1483, 1555), sin dejar el temporizador puesto. Un plazo 0 es legítimo (el
+// temporizador vence de inmediato), así que no se confunde con el desbordamiento.
+static int timer_ns(const struct kev* k, long* out) {
 	uint32_t f = k->fflags;
 	long v = (long)k->data;
-	if (f & NOTE_MACHTIME_) return v;
-	if (f & 1) return v * 1000000000L;     // NOTE_SECONDS
-	if (f & 2) return v * 1000L;           // NOTE_USECONDS
-	if (f & 4) return v;                   // NOTE_NSECONDS
-	return v * 1000000L;                   // por omisión, milisegundos
+	long r;
+	if (f & NOTE_MACHTIME_) { *out = v; return 0; }                     // ya está en nanosegundos
+	long mul = (f & 1) ? 1000000000L : (f & 2) ? 1000L : (f & 4) ? 1L : 1000000L;   // NOTE_SECONDS / NOTE_USECONDS / NOTE_NSECONDS / por omisión, milisegundos
+	if (__builtin_mul_overflow(v, mul, &r)) return D_ERANGE;            // el plazo no cabe
+	*out = r;
+	return 0;
 }
-static void timer_arm(int fd, const struct kev* k) {
+// Arma el temporizador. Devuelve 0 o un errno de Darwin (ERANGE si el plazo no cabe, como en XNU).
+static int timer_arm(int fd, const struct kev* k) {
 	uint64_t junk; while (read(fd, &junk, 8) == 8) {}                 // vencimientos viejos fuera
-	long ns = timer_ns(k);
+	long ns;
+	int e = timer_ns(k, &ns);
+	if (e) return e;                                                  // ERANGE: el plazo desbordaba, no se arma
 	if (ns <= 0) ns = 1;                                               // 0 desarmaría el timerfd: vencer ya
 	struct itimerspec it = { .it_value = { ns / 1000000000L, ns % 1000000000L } };
 	int abs_ = (k->fflags & NOTE_ABSOLUTE_) != 0;
 	if (!abs_ && !(k->flags & EV_ONESHOT)) it.it_interval = it.it_value;
 	timerfd_settime(fd, abs_ ? TFD_TIMER_ABSTIME : 0, &it, NULL);
+	return 0;
 }
 
 // Un knote deshabilitado deja de contar en el registro de su descriptor (si no, un fd legible despertaría sin parar).
@@ -402,13 +410,17 @@ static int apply(int kq, const struct kev* c) {
 		}
 		case EVFILT_TIMER: {
 			n->fd = fd_hi(timerfd_create(timer_clock(c), TFD_NONBLOCK | TFD_CLOEXEC));
+			// Si el fd no se pudo crear, el knote se registra con fd = -1: nunca dispara y el cliente cree que lo tiene
+			// registrado, sin error. XNU falla el kevent al registrar, así que aquí se deshace el knote y se devuelve ENOMEM.
+			if (n->fd < 0) { drop(n); return D_ENOMEM; }
 			n->tclock = timer_clock(c);
-			timer_arm(n->fd, c);
+			{ int e = timer_arm(n->fd, c); if (e) { drop(n); return e; } }   // ERANGE si el plazo no cabe
 			n->owns_fd = 1;
 			break;
 		}
 		case EVFILT_USER:
 			n->fd = fd_hi(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+			if (n->fd < 0) { drop(n); return D_ENOMEM; }   // sin fd no hay knote (idem EVFILT_TIMER)
 			n->owns_fd = 1;
 			n->k.fflags &= NOTE_FFLAGSMASK;
 			break;
@@ -497,7 +509,7 @@ static int apply(int kq, const struct kev* c) {
 					int old = n->fd, nf = fd_hi(timerfd_create(timer_clock(c), TFD_NONBLOCK | TFD_CLOEXEC));
 					if (nf >= 0) { n->fd = nf; n->tclock = timer_clock(c); sync_fd(kq, old); close(old); }
 				}
-				timer_arm(n->fd, c);
+				{ int e = timer_arm(n->fd, c); if (e) return e; }     // ERANGE si el plazo no cabe
 			}
 			if (!(c->flags & EV_DISABLE)) knote_set_enabled(n, 1);   // EV_ADD implica activar salvo EV_DISABLE
 		}
