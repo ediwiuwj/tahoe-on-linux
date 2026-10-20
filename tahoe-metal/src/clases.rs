@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 use crate::canal::{self, protocolo};
-use crate::objc::{self, Class, Id, Imp, Sel};
+use crate::objc::{self, Bool, Class, Id, Imp, Sel};
 use crate::registro;
 use protocolo::{clase, orden, tipo, Escritor, Lector};
 
@@ -268,6 +268,12 @@ pub fn nueva_cola() -> Id {
     crear(&clases().cola, Cola { etiqueta: std::ptr::null_mut() })
 }
 
+/// getGPUPriority / getBackgroundGPUPriority (MTLGPUPriority): aquí no hay planificador de citas; el servidor de GPU
+/// ejecuta lo que llega en orden. Se contesta la prioridad sin especificar (0), que es lo neutro.
+extern "C-unwind" fn cola_gpu_prioridad(_this: Id, _cmd: Sel) -> u64 {
+    0
+}
+
 extern "C-unwind" fn cola_command_buffer(this: Id, _cmd: Sel) -> Id {
     let cb = crear(&clases().cb, CommandBuffer { cola: retener(this), ordenes: Escritor::default(), al_acabar: Vec::new(), al_programar: Vec::new(), estado: 0, error: std::ptr::null_mut(), etiqueta: std::ptr::null_mut() });
     // command buffer autoliberado, como en Metal
@@ -337,6 +343,11 @@ extern "C-unwind" fn buffer_length(this: Id, _cmd: Sel) -> u64 {
 extern "C-unwind" fn buffer_allocated(this: Id, _cmd: Sel) -> u64 {
     estado::<Buffer>(this).map(|b| b.proyectado as u64).unwrap_or(0)
 }
+/// setPurgeableState: (MTLPurgeableState): la memoria la tiene el servidor de GPU y no se puede purgar; se acepta
+/// el cambio de estado y se dice que la memoria sigue ahí.
+extern "C-unwind" fn buffer_purgeable(_this: Id, _cmd: Sel, _estado: u64) -> Bool {
+    1
+}
 extern "C-unwind" fn buffer_gpu_address(this: Id, _cmd: Sel) -> u64 {
     estado::<Buffer>(this).map(|b| b.ptr as u64).unwrap_or(0)
 }
@@ -374,14 +385,23 @@ pub fn nueva_biblioteca(datos: &[u8], error: *mut Id) -> Id {
     let id = nuevo_id();
     let mut e = Escritor::default();
     e.u32(id).bytes(datos);
+    // La biblioteca se vuelca a disco: sirve para reproducir la cadena del cliente real sin arrancarlo.
+    let volcado = format!("/private/var/tmp/biblioteca-{}.metallib", std::process::id());
+    if std::fs::write(&volcado, datos).is_ok() {
+        crate::registro(&format!("biblioteca: {} bytes (volcada en {volcado})", datos.len()));
+    } else {
+        crate::registro(&format!("biblioteca: {} bytes", datos.len()));
+    }
     match pedir(tipo::BIBLIOTECA, &e.0) {
         Ok(r) => {
             let mut l = Lector::new(&r);
             let n = l.u32().unwrap_or(0);
-            let nombres = (0..n).filter_map(|_| l.texto().ok()).collect();
+            let nombres: Vec<String> = (0..n).filter_map(|_| l.texto().ok()).collect();
+            crate::registro(&format!("biblioteca: {} funciones{}", n,crate::nombre_de_muestra(&nombres)));
             crear(&clases().biblioteca, Biblioteca { id, nombres, etiqueta: std::ptr::null_mut() })
         }
         Err(er) => {
+            crate::registro(&format!("biblioteca: {er}"));
             poner_error(error, &format!("biblioteca: {er}"));
             std::ptr::null_mut()
         }
@@ -421,7 +441,11 @@ extern "C-unwind" fn biblioteca_funcion(this: Id, _cmd: Sel, nombre: Id) -> Id {
     let n = objc::texto(nombre);
     let Some(b) = estado::<Biblioteca>(this) else { return std::ptr::null_mut() };
     if !b.nombres.iter().any(|x| *x == n) {
-        registro(&format!("newFunctionWithName:{n}: no está en la biblioteca"));
+        let mut lista = String::new();
+        for x in b.nombres.iter().take(12) {
+            lista.push_str(&format!("«{x}» "));
+        }
+        registro(&format!("newFunctionWithName:{n}: no está en la biblioteca ({}) [{}]", b.nombres.len(), lista));
         return std::ptr::null_mut();
     }
     crear(&clases().funcion, Funcion { biblioteca: retener(this), nombre: n, constantes: Vec::new(), etiqueta: std::ptr::null_mut() })
@@ -563,7 +587,10 @@ extern "C-unwind" fn cb_commit(this: Id, _cmd: Sel) {
     });
     let Some(c) = estado::<CommandBuffer>(this) else { return };
     match r {
-        Ok(()) => c.estado = 4,
+        Ok(()) => {
+            registro(&format!("command buffer: ok ({} órdenes)", c.ordenes.0.len()));
+            c.estado = 4
+        }
         Err(er) => {
             registro(&format!("command buffer: {er}"));
             c.estado = 5;
@@ -701,6 +728,8 @@ pub fn registrar() {
         ("commandBuffer", cola_command_buffer as Imp, "@@:"),
         ("commandBufferWithUnretainedReferences", cola_command_buffer as Imp, "@@:"),
         ("insertDebugCaptureBoundary", nada as Imp, "v@:"),
+        ("getGPUPriority", cola_gpu_prioridad as Imp, "Q@:"),
+        ("getBackgroundGPUPriority", cola_gpu_prioridad as Imp, "Q@:"),
     ];
     comunes(&mut cola);
     etiquetas!(cola, Cola);
@@ -708,6 +737,7 @@ pub fn registrar() {
         ("contents", buffer_contents as Imp, "^v@:"),
         ("length", buffer_length as Imp, "Q@:"),
         ("allocatedSize", buffer_allocated as Imp, "Q@:"),
+        ("setPurgeableState:", buffer_purgeable as Imp, "c@:Q"),
         ("gpuAddress", buffer_gpu_address as Imp, "Q@:"),
         ("resourceOptions", buffer_opciones as Imp, "Q@:"),
         ("storageMode", buffer_storage as Imp, "Q@:"),

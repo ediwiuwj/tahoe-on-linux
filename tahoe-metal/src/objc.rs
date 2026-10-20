@@ -35,6 +35,20 @@ extern "C" {
     pub fn class_getInstanceMethod(cls: Class, s: Sel) -> *mut c_void;
     pub fn method_getImplementation(m: *mut c_void) -> Imp;
     pub fn method_setImplementation(m: *mut c_void, imp: Imp) -> Imp;
+    pub fn protocol_copyMethodDescriptionList(
+        proto: *mut c_void,
+        requerido: Bool,
+        instancia: Bool,
+        cuenta: *mut u32,
+    ) -> *mut DescripcionMetodo;
+}
+
+/// Descripción de un método de un protocolo (como la devuelve `protocol_copyMethodDescriptionList`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DescripcionMetodo {
+    pub nombre: Sel,
+    pub tipos: *const c_char,
 }
 
 /// Selector por nombre.
@@ -145,12 +159,10 @@ pub fn texto(s: Id) -> String {
 }
 
 /// Añade un método a la clase (o a la metaclase, para los de clase).
-pub fn metodo(cls: Class, nombre: &str, imp: Imp, tipos: &str) {
+pub fn metodo(cls: Class, nombre: &str, imp: Imp, tipos: &str) -> Bool {
     let t = CString::new(tipos).unwrap();
     // SAFETY: clase en construcción; el runtime copia los tipos.
-    unsafe {
-        class_addMethod(cls, sel(nombre), imp, t.as_ptr());
-    }
+    unsafe { class_addMethod(cls, sel(nombre), imp, t.as_ptr()) }
 }
 
 /// Clase de un objeto (nil si el objeto es nil).
@@ -164,4 +176,22 @@ pub fn clase_de(o: Id) -> Class {
 
 pub fn es_nulo(p: *const c_void) -> bool {
     p.is_null()
+}
+
+/// Si el objeto tiene ese método.
+pub fn responde_instancia(o: Id, nombre: &str) -> bool {
+    if o.is_null() {
+        return false;
+    }
+    // SAFETY: objeto de Objective-C.
+    unsafe { m1::<Sel, Bool>(o, "respondsToSelector:", sel(nombre)) != 0 }
+}
+
+/// Si la clase tiene ese método de clase (+nombre).
+pub fn responde_clase(cls: Class, nombre: &str) -> bool {
+    if cls.is_null() {
+        return false;
+    }
+    // SAFETY: la clase es un objeto; respondsToSelector: sobre ella mira los métodos de clase.
+    unsafe { m1::<Sel, Bool>(cls.cast(), "respondsToSelector:", sel(nombre)) != 0 }
 }

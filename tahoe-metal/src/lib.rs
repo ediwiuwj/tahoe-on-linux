@@ -9,6 +9,7 @@ pub mod canal;
 pub mod clases;
 pub mod objc;
 pub mod render;
+pub mod stubs;
 
 use std::ffi::c_void;
 use std::io::Write;
@@ -26,6 +27,16 @@ pub fn registro(s: &str) {
 }
 
 static MADRE: OnceLock<usize> = OnceLock::new();
+
+/// Muestra de los primeros nombres de una biblioteca, para el registro.
+pub fn nombre_de_muestra(nombres: &[String]) -> String {
+    if nombres.is_empty() {
+        return String::new();
+    }
+    let n = nombres.len().min(6);
+    let lista: Vec<String> = nombres[..n].iter().map(|s| format!("«{s}»")).collect();
+    format!(" (muestra: {})", lista.join(" "))
+}
 
 fn madre() -> Class {
     *MADRE.get().unwrap_or(&0) as Class
@@ -89,7 +100,10 @@ extern "C-unwind" fn biblioteca_datos(_this: Id, _cmd: Sel, datos: Id, error: *m
 }
 fn biblioteca_ruta(ruta: &str, error: *mut Id) -> Id {
     match std::fs::read(ruta) {
-        Ok(v) => clases::nueva_biblioteca(&v, error),
+        Ok(v) => {
+            registro(&format!("biblioteca de archivo: {ruta} ({} bytes)", v.len()));
+            clases::nueva_biblioteca(&v, error)
+        }
         Err(e) => {
             registro(&format!("biblioteca {ruta}: {e}"));
             std::ptr::null_mut()
@@ -129,6 +143,90 @@ extern "C-unwind" fn no(_this: Id, _cmd: Sel) -> Bool {
 }
 extern "C-unwind" fn trabajo_recomendado(_this: Id, _cmd: Sel) -> u64 {
     1 << 30
+}
+
+// ------------------------------------------------------------------ valores del dispositivo (protocolo MTLDevice)
+extern "C-unwind" fn max_transfer(_this: Id, _cmd: Sel) -> u64 {
+    8_000_000_000
+}
+extern "C-unwind" fn arquitectura(_this: Id, _cmd: Sel) -> Id {
+    objc::nsstring("applegpu_gt2")
+}
+extern "C-unwind" fn cero_u64(_this: Id, _cmd: Sel) -> u64 {
+    0
+}
+extern "C-unwind" fn uno_u64(_this: Id, _cmd: Sel) -> u64 {
+    1
+}
+extern "C-unwind" fn cero_u32(_this: Id, _cmd: Sel) -> u32 {
+    0
+}
+extern "C-unwind" fn frecuencia(_this: Id, _cmd: Sel) -> u64 {
+    1_000_000_000
+}
+extern "C-unwind" fn nulo_dev(_this: Id, _cmd: Sel) -> Id {
+    std::ptr::null_mut()
+}
+/// Alineación de texturas lineales y de buffer de textura: Intel pide 256 bytes de fila.
+extern "C-unwind" fn alineacion(_this: Id, _cmd: Sel, _formato: u64) -> u64 {
+    256
+}
+/// supportsTextureSampleCount: 1, 2 y 4 (el servidor decide luego si el formato lo admite).
+extern "C-unwind" fn muestras(_this: Id, _cmd: Sel, n: u64) -> Bool {
+    matches!(n, 1 | 2 | 4) as Bool
+}
+extern "C-unwind" fn no_con_u64(_this: Id, _cmd: Sel, _v: u64) -> Bool {
+    0
+}
+extern "C-unwind" fn no_con_bool(_this: Id, _cmd: Sel, _v: i8) {}
+/// sampleTimestamps:gpuTimestamp: marcas de tiempo de la CPU y la GPU (nanosegundos).
+extern "C-unwind" fn marcas(_this: Id, _cmd: Sel, cpu: *mut u64, gpu: *mut u64) {
+    let ahora = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // SAFETY: punteros de salida del protocolo.
+    unsafe {
+        if !cpu.is_null() {
+            *cpu = ahora;
+        }
+        if !gpu.is_null() {
+            *gpu = ahora;
+        }
+    }
+}
+/// newCommandQueueWithDescriptor: la cola no usa nada del descriptor.
+extern "C-unwind" fn nueva_cola_desc(this: Id, _cmd: Sel, _d: Id) -> Id {
+    nueva_cola(this, objc::sel("newCommandQueue"))
+}
+/// newDefaultLibrary: el default.metallib del paquete principal (o nil si no hay).
+extern "C-unwind" fn biblioteca_defecto(_this: Id, _cmd: Sel) -> Id {
+    // SAFETY: NSBundle y sus métodos existen con Foundation, que Metal ya carga.
+    unsafe {
+        let paquete: Id = objc::m0(objc::clase("NSBundle"), "mainBundle");
+        biblioteca_de_paquete(paquete)
+    }
+}
+extern "C-unwind" fn biblioteca_defecto_paquete(_this: Id, _cmd: Sel, paquete: Id, error: *mut Id) -> Id {
+    let r = biblioteca_de_paquete(paquete);
+    if r.is_null() {
+        clases::poner_error(error, "default.metallib no está en el paquete");
+    }
+    r
+}
+fn biblioteca_de_paquete(paquete: Id) -> Id {
+    if paquete.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: paquete es un NSBundle.
+    let ruta: Id = unsafe { objc::m0(paquete, "resourcePath") };
+    if ruta.is_null() {
+        registro("newDefaultLibrary: el paquete no tiene resourcePath");
+        return std::ptr::null_mut();
+    }
+    let p = format!("{}/default.metallib", objc::texto(ruta));
+    registro(&format!("newDefaultLibrary: {p}"));
+    biblioteca_ruta(&p, std::ptr::null_mut())
 }
 /// supportsFamily: las de Mac de Metal 2 (MTLGPUFamilyMac1 = 2001, Mac2 = 2002, Common1-2 = 3001-3002).
 extern "C-unwind" fn familia(_this: Id, _cmd: Sel, f: i64) -> Bool {
@@ -205,6 +303,9 @@ extern "C" fn registrar() {
     }
     let _ = MADRE.set(base as usize);
     let nombre_c = c"TahoeMTLDevice";
+    // Las clases de Metal (cola, buffer, biblioteca, función...) se registran antes: render::registrar las usa
+    // (añade métodos a la biblioteca y al command buffer).
+    clases::registrar();
     // SAFETY: clase nueva con una madre existente; los métodos llevan las firmas de sus tipos.
     unsafe {
         let cls = objc::objc_allocateClassPair(base, nombre_c.as_ptr(), 0);
@@ -237,6 +338,50 @@ extern "C" fn registrar() {
             ("isRemovable", no as *const c_void, "c@:"),
             ("supportsFamily:", familia as *const c_void, "c@:q"),
             ("supportsFeatureSet:", feature_set as *const c_void, "c@:Q"),
+            // Valores del protocolo: los reales que el servidor puede sostener.
+            ("maxTransferRate", max_transfer as *const c_void, "Q@:"),
+            ("architecture", arquitectura as *const c_void, "@@:"),
+            ("location", cero_u64 as *const c_void, "Q@:"),
+            ("locationNumber", cero_u64 as *const c_void, "Q@:"),
+            ("peerGroupID", cero_u64 as *const c_void, "Q@:"),
+            ("peerCount", cero_u32 as *const c_void, "I@:"),
+            ("peerIndex", cero_u32 as *const c_void, "I@:"),
+            ("currentAllocatedSize", cero_u64 as *const c_void, "Q@:"),
+            ("maximumConcurrentCompilationTaskCount", uno_u64 as *const c_void, "Q@:"),
+            ("queryTimestampFrequency", frecuencia as *const c_void, "Q@:"),
+            ("argumentBuffersSupport", cero_u64 as *const c_void, "Q@:"),
+            ("readWriteTextureSupport", cero_u64 as *const c_void, "Q@:"),
+            ("counterSets", nulo_dev as *const c_void, "@@:"),
+            ("areBarycentricCoordsSupported", no as *const c_void, "c@:"),
+            ("areProgrammableSamplePositionsSupported", no as *const c_void, "c@:"),
+            ("areRasterOrderGroupsSupported", no as *const c_void, "c@:"),
+            ("isDepth24Stencil8PixelFormatSupported", no as *const c_void, "c@:"),
+            ("supports32BitFloatFiltering", si as *const c_void, "c@:"),
+            ("supports32BitMSAA", no as *const c_void, "c@:"),
+            ("supportsBCTextureCompression", si as *const c_void, "c@:"),
+            ("supportsCounterSampling:", no_con_u64 as *const c_void, "c@:Q"),
+            ("supportsDynamicLibraries", no as *const c_void, "c@:"),
+            ("supportsFunctionPointers", no as *const c_void, "c@:"),
+            ("supportsFunctionPointersFromRender", no as *const c_void, "c@:"),
+            ("supportsPlacementSparse", no as *const c_void, "c@:"),
+            ("supportsPrimitiveMotionBlur", no as *const c_void, "c@:"),
+            ("supportsPullModelInterpolation", no as *const c_void, "c@:"),
+            ("supportsQueryTextureLOD", si as *const c_void, "c@:"),
+            ("supportsRasterizationRateMapWithLayerCount:", no_con_u64 as *const c_void, "c@:Q"),
+            ("supportsRaytracing", no as *const c_void, "c@:"),
+            ("supportsRaytracingFromRender", no as *const c_void, "c@:"),
+            ("supportsRenderDynamicLibraries", no as *const c_void, "c@:"),
+            ("supportsShaderBarycentricCoordinates", no as *const c_void, "c@:"),
+            ("supportsTextureSampleCount:", muestras as *const c_void, "c@:Q"),
+            ("supportsVertexAmplificationCount:", no_con_u64 as *const c_void, "c@:Q"),
+            ("minimumLinearTextureAlignmentForPixelFormat:", alineacion as *const c_void, "Q@:Q"),
+            ("minimumTextureBufferAlignmentForPixelFormat:", alineacion as *const c_void, "Q@:Q"),
+            ("shouldMaximizeConcurrentCompilation", no as *const c_void, "c@:"),
+            ("setShouldMaximizeConcurrentCompilation:", no_con_bool as *const c_void, "v@:c"),
+            ("sampleTimestamps:gpuTimestamp:", marcas as *const c_void, "v@:^Q^Q"),
+            ("newCommandQueueWithDescriptor:", nueva_cola_desc as *const c_void, "@@:@"),
+            ("newDefaultLibrary", biblioteca_defecto as *const c_void, "@@:"),
+            ("newDefaultLibraryWithBundle:error:", biblioteca_defecto_paquete as *const c_void, "@@:@^@"),
         ] {
             objc::metodo(cls, n, imp, t);
         }
@@ -256,8 +401,10 @@ extern "C" fn registrar() {
         objc::metodo(meta, "resolveInstanceMethod:", resolver as *const c_void, "c@::");
         objc::objc_registerClassPair(cls);
         render::registrar(cls);
+        // Y el resto del protocolo MTLDevice, con stubs que devuelven nil/0 en vez de caer en la implementación
+        // abstracta de Apple (que lanza una excepción y mata al cliente).
+        stubs::registrar(cls);
     }
-    clases::registrar();
     registro("TahoeMTLDevice registrada (madre _MTLDevice)");
 }
 

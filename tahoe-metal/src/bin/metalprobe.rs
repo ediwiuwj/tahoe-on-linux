@@ -53,7 +53,298 @@ fn main() {
         if std::env::args().nth(1).as_deref() == Some("render") {
             std::process::exit(render(d));
         }
+        if std::env::args().nth(1).as_deref() == Some("funciones") {
+            std::process::exit(funciones(d));
+        }
+        if std::env::args().nth(1).as_deref() == Some("descriptor") {
+            std::process::exit(descriptor(d));
+        }
+        if std::env::args().nth(1).as_deref() == Some("plano") {
+            std::process::exit(plano(d));
+        }
+        if std::env::args().nth(1).as_deref() == Some("cadena") {
+            std::process::exit(cadena(d));
+        }
         std::process::exit(0);
+    }
+}
+
+/// Recorrido completo con cualquier metallib: carga la biblioteca, pide dos funciones por descriptor (como hace
+/// CoreAnimation), crea el pipeline de render, ejecuta un pase con un triángulo y comprueba la imagen resultante.
+/// Es el test de regresión del driver: uso: metalprobe cadena <metallib> [vertice] [fragmento].
+fn cadena(d: Id) -> i32 {
+    let args: Vec<String> = std::env::args().collect();
+    let ruta = args.get(2).cloned().unwrap_or_default();
+    if ruta.is_empty() {
+        println!("uso: metalprobe cadena <metallib> [vertice] [fragmento]");
+        return 1;
+    }
+    unsafe {
+        let mut err: Id = std::ptr::null_mut();
+        let lib: Id = objc::m2(d, "newLibraryWithFile:error:", objc::nsstring(&ruta), &mut err as *mut Id);
+        if lib.is_null() {
+            println!("biblioteca {ruta}: nil");
+            return 3;
+        }
+        let nombres: Id = objc::m0(lib, "functionNames");
+        let n: u64 = objc::m0(nombres, "count");
+        let todos: Vec<String> = (0..n).map(|i| objc::texto(objc::m1(nombres, "objectAtIndex:", i))).collect();
+        println!("biblioteca {ruta}: {n} funciones");
+        // Los shaders pedidos: los da la orden, o los primeros con «vert» y «frag» en el nombre.
+        let (vn, fnn) = match (args.get(3), args.get(4)) {
+            (Some(v), Some(f)) => (v.clone(), f.clone()),
+            _ => (
+                todos.iter().find(|s| s.contains("vert")).cloned().unwrap_or_default(),
+                todos.iter().find(|s| s.contains("frag")).cloned().unwrap_or_default(),
+            ),
+        };
+        println!("shaders: vertice={vn} fragmento={fnn}");
+        if vn.is_empty() || fnn.is_empty() {
+            println!("no hay shaders de vértice/fragmento en la biblioteca");
+            return 4;
+        }
+        // La función, por descriptor (como hace CoreAnimation en macOS 26: alloc + setName:).
+        let por_descriptor = |lib: Id, nombre: &str| -> Id {
+            let desc: Id = objc::m0(objc::clase("MTLFunctionDescriptor"), "alloc");
+            objc::m1::<Id, ()>(desc, "setName:", objc::nsstring(nombre));
+            objc::m2(lib, "newFunctionWithDescriptor:error:", desc, std::ptr::null_mut::<Id>())
+        };
+        let vf = por_descriptor(lib, &vn);
+        let ff = por_descriptor(lib, &fnn);
+        println!("funciones: vertex={} fragment={}", if vf.is_null() { "nil" } else { "ok" }, if ff.is_null() { "nil" } else { "ok" });
+        if vf.is_null() || ff.is_null() {
+            return 5;
+        }
+        // El pipeline de render.
+        let pd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLRenderPipelineDescriptor"), "alloc"), "init");
+        objc::m1::<Id, ()>(pd, "setVertexFunction:", vf);
+        objc::m1::<Id, ()>(pd, "setFragmentFunction:", ff);
+        let ca0: Id = objc::m1(objc::m0::<Id>(pd, "colorAttachments"), "objectAtIndexedSubscript:", 0u64);
+        objc::m1::<u64, ()>(ca0, "setPixelFormat:", 80);
+        let p: Id = objc::m2(d, "newRenderPipelineStateWithDescriptor:error:", pd, &mut err as *mut Id);
+        if p.is_null() {
+            println!("pipeline: nil ({})", objc::texto(if err.is_null() { err } else { objc::m0(err, "localizedDescription") }));
+            return 6;
+        }
+        println!("pipeline: ok");
+        // Un pase sobre una textura BGRA8 de 64x64, con un triángulo.
+        let td: Id = {
+            let f: unsafe extern "C" fn(Id, objc::Sel, u64, u64, u64, i8) -> Id = std::mem::transmute(objc::objc_msgSend as *const ());
+            f(objc::clase("MTLTextureDescriptor"), objc::sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, 64, 64, 0)
+        };
+        objc::m1::<u64, ()>(td, "setUsage:", 5);
+        let tex: Id = objc::m1(d, "newTextureWithDescriptor:", td);
+        if tex.is_null() {
+            println!("textura: nil");
+            return 7;
+        }
+        let vs: [f32; 24] = [-1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let vb: Id = objc::m3(d, "newBufferWithBytes:length:options:", vs.as_ptr(), 96u64, 0u64);
+        let mut ident = [0f32; 16];
+        for i in 0..4 {
+            ident[i * 4 + i] = 1.0;
+        }
+        let rp: Id = objc::m0(objc::clase("MTLRenderPassDescriptor"), "renderPassDescriptor");
+        let a0: Id = objc::m1(objc::m0::<Id>(rp, "colorAttachments"), "objectAtIndexedSubscript:", 0u64);
+        objc::m1::<Id, ()>(a0, "setTexture:", tex);
+        objc::m1::<u64, ()>(a0, "setLoadAction:", 2);
+        objc::m1::<u64, ()>(a0, "setStoreAction:", 1);
+        objc::m1::<MTLClearColor, ()>(a0, "setClearColor:", MTLClearColor { r: 1.0, g: 0.0, b: 0.0, a: 1.0 });
+        let q: Id = objc::m0(d, "newCommandQueue");
+        let cb: Id = objc::m0(q, "commandBuffer");
+        let enc: Id = objc::m1(cb, "renderCommandEncoderWithDescriptor:", rp);
+        objc::m1::<Id, ()>(enc, "setRenderPipelineState:", p);
+        objc::m3::<Id, u64, u64, ()>(enc, "setVertexBuffer:offset:atIndex:", vb, 0, 0);
+        objc::m3::<*const f32, u64, u64, ()>(enc, "setVertexBytes:length:atIndex:", ident.as_ptr(), 64, 2);
+        objc::m3::<u64, u64, u64, ()>(enc, "drawPrimitives:vertexStart:vertexCount:", 3, 0, 3);
+        objc::m0::<()>(enc, "endEncoding");
+        objc::m0::<()>(cb, "commit");
+        objc::m0::<()>(cb, "waitUntilCompleted");
+        let st: u64 = objc::m0(cb, "status");
+        let mut px = vec![0u8; 64 * 64 * 4];
+        {
+            let f: unsafe extern "C" fn(Id, objc::Sel, *mut u8, u64, MTLRegion, u64) = std::mem::transmute(objc::objc_msgSend as *const ());
+            f(tex, objc::sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), px.as_mut_ptr(), 256, MTLRegion { x: 0, y: 0, z: 0, w: 64, h: 64, d: 1 }, 0);
+        }
+        let punto = |x: usize, y: usize| -> [u8; 4] { px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].try_into().unwrap() };
+        let (ai, ad) = (punto(8, 56), punto(56, 8));
+        println!("command buffer: estado {st}; abajo a la izquierda BGRA {ai:?}; arriba a la derecha {ad:?}");
+        // El triángulo cubre media pantalla: se dibuja algo y el resto es el color de limpieza.
+        let dibuja = px.chunks(4).any(|p| p != [0, 0, 0, 255] && p != [0, 0, 0, 0]);
+        println!("cadena: {}", if dibuja { "CORRECTA" } else { "VACÍA" });
+        if dibuja { 0 } else { 8 }
+    }
+}
+
+/// Reproduce lo que hace el compositor: la biblioteca de CoreAnimation, sus shaders de plano (plane__vertex y
+/// plane_color_fragment) pedidos por descriptor, el pipeline de render, un pase y el commit.
+fn plano(d: Id) -> i32 {
+    const RUTA: &str = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib";
+    unsafe {
+        let mut err: Id = std::ptr::null_mut();
+        let lib: Id = objc::m2(d, "newLibraryWithFile:error:", objc::nsstring(RUTA), &mut err as *mut Id);
+        if lib.is_null() {
+            println!("biblioteca: nil");
+            return 3;
+        }
+        // La función, por descriptor (como el compositor).
+        let por_descriptor = |lib: Id, nombre: &str| -> Id {
+            let desc: Id = objc::m0(objc::clase("MTLFunctionDescriptor"), "alloc");
+            objc::m1::<Id, ()>(desc, "setName:", objc::nsstring(nombre));
+            objc::m2(lib, "newFunctionWithDescriptor:error:", desc, std::ptr::null_mut::<Id>())
+        };
+        let vf = por_descriptor(lib, "plane__vertex");
+        let ff = por_descriptor(lib, "plane_color_fragment");
+        println!("funciones: vertex={} fragment={}", if vf.is_null() { "nil" } else { "ok" }, if ff.is_null() { "nil" } else { "ok" });
+        if vf.is_null() || ff.is_null() {
+            return 4;
+        }
+        // El pipeline.
+        let pd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLRenderPipelineDescriptor"), "alloc"), "init");
+        objc::m1::<Id, ()>(pd, "setVertexFunction:", vf);
+        objc::m1::<Id, ()>(pd, "setFragmentFunction:", ff);
+        let ca0: Id = objc::m1(objc::m0::<Id>(pd, "colorAttachments"), "objectAtIndexedSubscript:", 0u64);
+        objc::m1::<u64, ()>(ca0, "setPixelFormat:", 80);
+        let p: Id = objc::m2(d, "newRenderPipelineStateWithDescriptor:error:", pd, &mut err as *mut Id);
+        if p.is_null() {
+            println!("pipeline: nil ({})", objc::texto(if err.is_null() { err } else { objc::m0(err, "localizedDescription") }));
+            return 5;
+        }
+        println!("pipeline: ok");
+        // Un pase de render sobre una textura BGRA8 de 64x64.
+        let td: Id = {
+            let f: unsafe extern "C" fn(Id, objc::Sel, u64, u64, u64, i8) -> Id = std::mem::transmute(objc::objc_msgSend as *const ());
+            f(objc::clase("MTLTextureDescriptor"), objc::sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, 64, 64, 0)
+        };
+        objc::m1::<u64, ()>(td, "setUsage:", 5);
+        let tex: Id = objc::m1(d, "newTextureWithDescriptor:", td);
+        if tex.is_null() {
+            println!("textura: nil");
+            return 6;
+        }
+        let rp: Id = objc::m0(objc::clase("MTLRenderPassDescriptor"), "renderPassDescriptor");
+        let a0: Id = objc::m1(objc::m0::<Id>(rp, "colorAttachments"), "objectAtIndexedSubscript:", 0u64);
+        objc::m1::<Id, ()>(a0, "setTexture:", tex);
+        objc::m1::<u64, ()>(a0, "setLoadAction:", 2);
+        objc::m1::<u64, ()>(a0, "setStoreAction:", 1);
+        let q: Id = objc::m0(d, "newCommandQueue");
+        let cb: Id = objc::m0(q, "commandBuffer");
+        let enc: Id = objc::m1(cb, "renderCommandEncoderWithDescriptor:", rp);
+        objc::m1::<Id, ()>(enc, "setRenderPipelineState:", p);
+        objc::m0::<()>(enc, "endEncoding");
+        objc::m0::<()>(cb, "commit");
+        objc::m0::<()>(cb, "waitUntilCompleted");
+        println!("command buffer: estado {}", objc::m0::<u64>(cb, "status"));
+        0
+    }
+}
+
+/// Los métodos de MTLFunctionDescriptor (clase e instancia) y un intento de crear uno: el compositor carga sus shaders
+/// por descriptor, así que hay que saber cómo se hace.
+fn descriptor(_d: Id) -> i32 {
+    unsafe {
+        let clase = objc::clase("MTLFunctionDescriptor");
+        if clase.is_null() {
+            println!("no está MTLFunctionDescriptor");
+            return 7;
+        }
+        println!("MTLFunctionDescriptor: clase={}", objc::nombre_clase(clase));
+        // métodos de clase
+        let cm = objc::responde_clase(clase, "functionDescriptorWithName:");
+        println!("  +functionDescriptorWithName: {}", if cm { "existe" } else { "no existe" });
+        let cm2 = objc::responde_clase(clase, "new");
+        println!("  +new: {}", if cm2 { "existe" } else { "no existe" });
+        // candidatos: de clase y de instancia
+        for s in [
+            "functionDescriptorWithName:",
+            "descriptorWithName:",
+            "newFunctionDescriptorWithName:",
+        ] {
+            println!("  clase +{s}: {}", objc::responde_clase(clase, s));
+        }
+        let desc: Id = objc::m0(clase, "alloc");
+        for s in [
+            "functionName",
+            "name",
+            "setFunctionName:",
+            "setName:",
+            "constantValues",
+            "setConstantValues:",
+            "specializationConstants",
+            "setSpecializationConstants:",
+            "label",
+            "setLabel:",
+            "initWithFunctionName:",
+            "initWithName:",
+        ] {
+            println!("  instancia -{s}: {}", objc::responde_clase(objc::object_getClass(desc), s) || objc::responde_instancia(desc, s));
+        }
+        // intentos, uno por orden; si uno lanza una excepción de Objective-C el programa muere, así que se prueban
+        // por separado desde la línea de órdenes.
+        let modo = std::env::args().nth(2).unwrap_or_default();
+        match modo.as_str() {
+            "nombre" => {
+                // En macOS 26 el descriptor se crea con alloc/init y el nombre se pone con setName:.
+                let desc: Id = objc::m0(clase, "alloc");
+                objc::m1::<Id, ()>(desc, "setName:", objc::nsstring("std_vert0_lpf"));
+                let nombre: Id = objc::m0(desc, "name");
+                println!("descriptor: nombre={} clase={}", objc::texto(nombre), objc::nombre_clase(objc::object_getClass(desc)));
+                let lib: Id = objc::m2(
+                    _d,
+                    "newLibraryWithFile:error:",
+                    objc::nsstring("/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib"),
+                    std::ptr::null_mut::<Id>(),
+                );
+                if !lib.is_null() {
+                    let f: Id = objc::m2(lib, "newFunctionWithDescriptor:error:", desc, std::ptr::null_mut::<Id>());
+                    println!("función por descriptor: {}", if f.is_null() { "nil" } else { "ok" });
+                }
+            }
+            "alloc" => {
+                let desc: Id = objc::m0(clase, "alloc");
+                println!("alloc: {}", if desc.is_null() { "nil" } else { "ok" });
+            }
+            _ => {
+                println!("uso: metalprobe descriptor [nombre|alloc]");
+            }
+        }
+        0
+    }
+}
+
+/// Prueba de las funciones de una biblioteca: los nombres que da, y si se pueden crear por nombre y por descriptor
+/// (esto es lo que hace el compositor con los shaders de CoreAnimation).
+fn funciones(d: Id) -> i32 {
+    const RUTA: &str = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib";
+    unsafe {
+        let mut err: Id = std::ptr::null_mut();
+        let lib: Id = objc::m2(d, "newLibraryWithFile:error:", objc::nsstring(RUTA), &mut err as *mut Id);
+        if lib.is_null() {
+            println!("biblioteca: nil");
+            return 3;
+        }
+        let nombres: Id = objc::m0(lib, "functionNames");
+        let n: u64 = objc::m0(nombres, "count");
+        println!("funciones en la biblioteca: {n}");
+        for i in 0..n.min(24) {
+            let nm: Id = objc::m1(nombres, "objectAtIndex:", i);
+            let s = objc::texto(nm);
+            let f: Id = objc::m2(lib, "newFunctionWithName:constantValues:error:", nm, std::ptr::null_mut::<Id>());
+            println!("  «{s}» -> {}", if f.is_null() { "nil" } else { "ok" });
+        }
+        // Por descriptor: el descriptor lo crea Metal (MTLFunctionDescriptor). En macOS 26 el nombre está en «name».
+        let clase = objc::clase("MTLFunctionDescriptor");
+        if clase.is_null() {
+            println!("no está MTLFunctionDescriptor");
+            return 7;
+        }
+        let desc: Id = objc::m0(clase, "alloc");
+        objc::m1::<Id, ()>(desc, "setName:", objc::nsstring("std_vert0_lpf"));
+        let nombre: Id = objc::m0(desc, "name");
+        println!("descriptor: clase={} nombre={}", objc::nombre_clase(objc::object_getClass(desc)), objc::texto(nombre));
+        let f: Id = objc::m2(lib, "newFunctionWithDescriptor:error:", desc, &mut err as *mut Id);
+        println!("función por descriptor: {}", if f.is_null() { "nil" } else { "ok" });
+        0
     }
 }
 

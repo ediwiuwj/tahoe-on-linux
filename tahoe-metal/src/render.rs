@@ -64,6 +64,7 @@ pub struct ClasesRender {
     pub sampler: Clase,
     pub pipeline: Clase,
     pub encoder: Clase,
+    pub profundidad: Clase,
 }
 
 static CLASES: OnceLock<ClasesRender> = OnceLock::new();
@@ -208,6 +209,50 @@ extern "C-unwind" fn tex_no(_this: Id, _cmd: Sel) -> Bool {
     0
 }
 
+/// Bytes por píxel de los formatos de píxel más usados (MTLPixelFormat). Los que no están, 4.
+fn bytes_por_pixel(formato: u64) -> u64 {
+    match formato {
+        1 => 1,      // A8Unorm
+        10 => 1,     // R8Unorm
+        12 => 1,     // R8Snorm
+        14 => 1,     // R8Uint
+        16 => 1,     // R8Sint
+        20 => 2,     // R16Unorm
+        28 => 2,     // R16Float
+        30 => 2,     // RG8Unorm
+        40 => 4,     // R32Uint
+        44 => 4,     // R32Float
+        50 => 4,     // RG16Unorm
+        70 => 4,     // RGBA8Unorm
+        71 => 4,     // RGBA8Unorm_sRGB
+        72 => 4,     // RGBA8Snorm
+        80 => 4,     // BGRA8Unorm
+        81 => 4,     // BGRA8Unorm_sRGB
+        90 => 8,     // RGBA16Unorm
+        100 => 8,    // RGBA32Float
+        _ => 4,
+    }
+}
+
+/// allocatedSize: los bytes que ocupa la textura, con todos sus niveles.
+fn tex_allocado(this: Id, _cmd: Sel) -> u64 {
+    let Some(t) = estado::<Textura>(this) else { return 0 };
+    let bpp = bytes_por_pixel(t.formato);
+    let mut total = 0u64;
+    for nivel in 0..t.niveles.max(1) {
+        let w = (t.ancho >> nivel).max(1);
+        let h = (t.alto >> nivel).max(1);
+        let d = (t.prof >> nivel).max(1);
+        total += w * h * d * bpp;
+    }
+    total * t.capas.max(1)
+}
+
+/// setPurgeableState: (MTLPurgeableState): la memoria la tiene el servidor de GPU; se acepta y sigue ahí.
+extern "C-unwind" fn tex_purgeable(_this: Id, _cmd: Sel, _estado: u64) -> Bool {
+    1
+}
+
 fn subir(this: Id, r: MTLRegion, nivel: u64, capa: u64, p: *const u8, bpr: u64, bpi: u64) {
     let Some(t) = estado::<Textura>(this) else { return };
     let tam = if r.d > 1 { bpi * r.d } else { bpr * r.h.max(1) } as usize;
@@ -247,6 +292,125 @@ extern "C-unwind" fn tex_obtener_capa(this: Id, _cmd: Sel, p: *mut u8, bpr: u64,
     bajar(this, p, bpr, r, nivel, capa);
 }
 
+// ------------------------------------------------------------------ estado de profundidad y esténcil
+
+/// Lee una propiedad de un descriptor solo si el objeto la implementa.
+///
+/// En macOS 26 los descriptores no son los de iOS: `MTLDepthStencilDescriptor` expone `isDepthWriteEnabled`
+/// (no `depthWriteEnabled`) y lleva el estencil en `frontFaceStencil`/`backFaceStencil` (objetos
+/// `MTLStencilDescriptor`). Preguntar por una propiedad inexistente lanza `NSException` y desde Rust eso aborta
+/// el proceso («Rust cannot catch foreign exceptions»): no se puede capturar. Por eso toda lectura de descriptor
+/// pasa por aquí y usa el valor por defecto cuando el selector no existe.
+fn campo<T: Copy>(o: Id, nombre: &str, por_defecto: T) -> T {
+    if o.is_null() || !objc::responde_instancia(o, nombre) {
+        return por_defecto;
+    }
+    // SAFETY: el objeto implementa el selector y el tipo es el que declara el descriptor.
+    unsafe { objc::m0::<T>(o, nombre) }
+}
+
+/// El estado de profundidad y esténcil de un pipeline (MTLDepthStencilState). Lo crea el compositor para sus pipelines.
+pub struct Profundidad {
+    comparacion: u64,
+    escritura: Bool,
+    formato_profundidad: u64,
+    comparacion_estencil: u64,
+    mascara_estencil: u64,
+    mascara_estencil_delante: u64,
+    mascara_estencil_detras: u64,
+    referencia_estencil_delante: u64,
+    referencia_estencil_detras: u64,
+    formato_estencil: u64,
+    etiqueta: Id,
+}
+con_etiqueta!(Profundidad);
+
+extern "C-unwind" fn prof_comparacion(this: Id, _cmd: Sel) -> u64 {
+    estado::<Profundidad>(this).map(|p| p.comparacion).unwrap_or(0)
+}
+extern "C-unwind" fn prof_escritura(this: Id, _cmd: Sel) -> Bool {
+    estado::<Profundidad>(this).map(|p| p.escritura).unwrap_or(0)
+}
+extern "C-unwind" fn prof_formato_profundidad(this: Id, _cmd: Sel) -> u64 {
+    estado::<Profundidad>(this).map(|p| p.formato_profundidad).unwrap_or(0)
+}
+extern "C-unwind" fn prof_comparacion_estencil(this: Id, _cmd: Sel) -> u64 {
+    estado::<Profundidad>(this).map(|p| p.comparacion_estencil).unwrap_or(0)
+}
+extern "C-unwind" fn prof_mascara_estencil(this: Id, _cmd: Sel) -> u64 {
+    estado::<Profundidad>(this).map(|p| p.mascara_estencil).unwrap_or(0)
+}
+extern "C-unwind" fn prof_mascara_delante(this: Id, _cmd: Sel) -> u64 {
+    estado::<Profundidad>(this).map(|p| p.mascara_estencil_delante).unwrap_or(0)
+}
+extern "C-unwind" fn prof_mascara_detras(this: Id, _cmd: Sel) -> u64 {
+    estado::<Profundidad>(this).map(|p| p.mascara_estencil_detras).unwrap_or(0)
+}
+extern "C-unwind" fn prof_referencia_delante(this: Id, _cmd: Sel) -> u64 {
+    estado::<Profundidad>(this).map(|p| p.referencia_estencil_delante).unwrap_or(0)
+}
+extern "C-unwind" fn prof_referencia_detras(this: Id, _cmd: Sel) -> u64 {
+    estado::<Profundidad>(this).map(|p| p.referencia_estencil_detras).unwrap_or(0)
+}
+extern "C-unwind" fn prof_formato_estencil(this: Id, _cmd: Sel) -> u64 {
+    estado::<Profundidad>(this).map(|p| p.formato_estencil).unwrap_or(0)
+}
+
+/// newDepthStencilStateWithDescriptor: (MTLDepthStencilDescriptor): el estado de profundidad y esténcil del pipeline.
+extern "C-unwind" fn dev_profundidad(_this: Id, _cmd: Sel, d: Id) -> Id {
+    // macOS 26: la escritura de profundidad es `isDepthWriteEnabled` y el estencil vive en
+    // `frontFaceStencil`/`backFaceStencil`; `depthWriteEnabled`, `stencilWriteMask*`, `stencilReferenceValue*` y
+    // `stencilPixelFormat` no existen en este descriptor. Se pregunta antes de leer (ver `campo`).
+    let comparacion = campo(d, "depthCompareFunction", 0u64);
+    let escritura = if objc::responde_instancia(d, "isDepthWriteEnabled") {
+        campo(d, "isDepthWriteEnabled", 0 as Bool)
+    } else {
+        campo(d, "depthWriteEnabled", 0 as Bool)
+    };
+    let formato_profundidad = campo(d, "depthAttachmentPixelFormat", 0u64);
+    let comparacion_estencil = campo(d, "stencilCompareFunction", 0u64);
+    let frente: Id = campo(d, "frontFaceStencil", std::ptr::null_mut());
+    let detras: Id = campo(d, "backFaceStencil", std::ptr::null_mut());
+    let mascara_estencil = campo(d, "stencilWriteMask", 0u64);
+    let mascara_delante = if frente.is_null() {
+        campo(d, "stencilWriteMaskFront", 0u64)
+    } else {
+        campo(frente, "stencilWriteMask", 0u64)
+    };
+    let mascara_detras = if detras.is_null() {
+        campo(d, "stencilWriteMaskBack", 0u64)
+    } else {
+        campo(detras, "stencilWriteMask", 0u64)
+    };
+    let referencia_delante = if frente.is_null() {
+        campo(d, "stencilReferenceValueFront", 0i64) as u64
+    } else {
+        campo(frente, "stencilReferenceValue", 0i64) as u64
+    };
+    let referencia_detras = if detras.is_null() {
+        campo(d, "stencilReferenceValueBack", 0i64) as u64
+    } else {
+        campo(detras, "stencilReferenceValue", 0i64) as u64
+    };
+    let formato_estencil = campo(d, "stencilPixelFormat", 0u64);
+    crear(
+        &clases_render().profundidad,
+        Profundidad {
+            comparacion,
+            escritura,
+            formato_profundidad,
+            comparacion_estencil,
+            mascara_estencil,
+            mascara_estencil_delante: mascara_delante,
+            mascara_estencil_detras: mascara_detras,
+            referencia_estencil_delante: referencia_delante,
+            referencia_estencil_detras: referencia_detras,
+            formato_estencil,
+            etiqueta: std::ptr::null_mut(),
+        },
+    )
+}
+
 // ------------------------------------------------------------------ samplers
 
 pub struct Sampler {
@@ -267,10 +431,17 @@ extern "C-unwind" fn dev_sampler(_this: Id, _cmd: Sel, d: Id) -> Id {
     let mut e = Escritor::default();
     // SAFETY: d es un MTLSamplerDescriptor.
     unsafe {
-        let u = |s: &str| -> u32 { objc::m0::<u64>(d, s) as u32 };
+        let u = |s: &str| -> u32 { campo(d, s, 0u64) as u32 };
         e.u32(id).u32(u("minFilter")).u32(u("magFilter")).u32(u("mipFilter")).u32(u("sAddressMode")).u32(u("tAddressMode")).u32(u("rAddressMode"));
-        e.u32(objc::m0::<Bool>(d, "normalizedCoordinates") as u32).u32(u("maxAnisotropy"));
-        e.u32(objc::m0::<f32>(d, "lodMinClamp").to_bits()).u32(objc::m0::<f32>(d, "lodMaxClamp").to_bits());
+        let norm = if objc::responde_instancia(d, "normalizedCoordinates") {
+            campo(d, "normalizedCoordinates", 0 as Bool) as u32
+        } else {
+            campo(d, "isNormalizedCoordinates", 0 as Bool) as u32
+        };
+        e.u32(norm).u32(u("maxAnisotropy"));
+        let lmin = if objc::responde_instancia(d, "lodMinClamp") { campo(d, "lodMinClamp", 0f32) } else { campo(d, "minLod", 0f32) };
+        let lmax = if objc::responde_instancia(d, "lodMaxClamp") { campo(d, "lodMaxClamp", 0f32) } else { campo(d, "maxLod", 0f32) };
+        e.u32(lmin.to_bits()).u32(lmax.to_bits());
         e.u32(u("compareFunction")).u32(u("borderColor"));
     }
     if let Err(er) = pedir(tipo::SAMPLER, &e.0) {
@@ -390,6 +561,44 @@ extern "C-unwind" fn bib_funcion_constantes(this: Id, cmd: Sel, nombre: Id, valo
     f
 }
 
+/// newFunctionWithDescriptor:error: (MTLFunctionDescriptor): la función por su descriptor, que lleva el nombre y las
+/// function constants. Es la vía que usa el compositor (CoreAnimation) para cargar sus shaders.
+extern "C-unwind" fn bib_funcion_descriptor(this: Id, _cmd: Sel, desc: Id, error: *mut Id) -> Id {
+    // SAFETY: desc es un MTLFunctionDescriptor del protocolo: tiene «functionName» y «constantValues».
+    let (nombre, valores): (Id, Id) = unsafe {
+        let tiene = |s: &str| objc::m1::<Sel, Bool>(desc, "respondsToSelector:", objc::sel(s)) != 0;
+        // En macOS 26 el descriptor lleva el nombre en «name» (en las versiones anteriores, «functionName»).
+        let n: Id = if tiene("name") {
+            objc::m0(desc, "name")
+        } else if tiene("functionName") {
+            objc::m0(desc, "functionName")
+        } else {
+            std::ptr::null_mut()
+        };
+        let v: Id = if tiene("constantValues") { objc::m0(desc, "constantValues") } else { std::ptr::null_mut() };
+        registro(&format!(
+            "newFunctionWithDescriptor: clase={} name={} constantValues={} nombre={}",
+            objc::nombre_clase(objc::object_getClass(desc)),
+            tiene("name"),
+            tiene("constantValues"),
+            if n.is_null() { "(nil)".to_string() } else { objc::texto(n) }
+        ));
+        (if n.is_null() { objc::nsstring("") } else { n }, v)
+    };
+    // SAFETY: newFunctionWithName: de nuestra biblioteca.
+    let f: Id = unsafe { objc::m1(this, "newFunctionWithName:", nombre) };
+    if f.is_null() {
+        poner_error(error, &format!("la biblioteca no tiene «{}»", objc::texto(nombre)));
+        return f;
+    }
+    if !valores.is_null() {
+        if let Some(fs) = estado::<Funcion>(f) {
+            fs.constantes = serializar_constantes(valores);
+        }
+    }
+    f
+}
+
 // ------------------------------------------------------------------ pipeline de render
 
 pub struct PipelineRender {
@@ -429,28 +638,28 @@ fn nuevo_pipeline_render(d: Id, error: *mut Id) -> Id {
     e.u32(id);
     // SAFETY: d es un MTLRenderPipelineDescriptor; sus subobjetos, los del protocolo.
     unsafe {
-        funcion(objc::m0(d, "vertexFunction"), &mut e);
-        funcion(objc::m0(d, "fragmentFunction"), &mut e);
+        funcion(campo(d, "vertexFunction", std::ptr::null_mut()), &mut e);
+        funcion(campo(d, "fragmentFunction", std::ptr::null_mut()), &mut e);
         // atributos y layouts del vertex descriptor
-        let vd: Id = objc::m0(d, "vertexDescriptor");
+        let vd: Id = campo(d, "vertexDescriptor", std::ptr::null_mut());
         let mut atributos = Vec::new();
         let mut layouts = Vec::new();
         if !vd.is_null() {
-            let attrs: Id = objc::m0(vd, "attributes");
+            let attrs: Id = campo(vd, "attributes", std::ptr::null_mut());
             for i in 0..31u64 {
                 let a: Id = objc::m1(attrs, "objectAtIndexedSubscript:", i);
-                let f: u64 = objc::m0(a, "format");
+                let f: u64 = campo(a, "format", 0u64);
                 if f != 0 {
-                    atributos.push((i as u32, f as u32, objc::m0::<u64>(a, "offset") as u32, objc::m0::<u64>(a, "bufferIndex") as u32));
+                    atributos.push((i as u32, f as u32, campo(a, "offset", 0u64) as u32, campo(a, "bufferIndex", 0u64) as u32));
                 }
             }
-            let ls: Id = objc::m0(vd, "layouts");
+            let ls: Id = campo(vd, "layouts", std::ptr::null_mut());
             let mut usados: Vec<u32> = atributos.iter().map(|a| a.3).collect();
             usados.sort();
             usados.dedup();
             for b in usados {
                 let lo: Id = objc::m1(ls, "objectAtIndexedSubscript:", b as u64);
-                layouts.push((b, objc::m0::<u64>(lo, "stride") as u32, objc::m0::<u64>(lo, "stepFunction") as u32));
+                layouts.push((b, campo(lo, "stride", 0u64) as u32, campo(lo, "stepFunction", 0u64) as u32));
             }
         }
         e.u32(atributos.len() as u32);
@@ -462,15 +671,15 @@ fn nuevo_pipeline_render(d: Id, error: *mut Id) -> Id {
             e.u32(b).u32(s).u32(f);
         }
         // colores: hasta el último con formato
-        let cas: Id = objc::m0(d, "colorAttachments");
+        let cas: Id = campo(d, "colorAttachments", std::ptr::null_mut());
         let mut colores = Vec::new();
         for i in 0..8u64 {
             let c: Id = objc::m1(cas, "objectAtIndexedSubscript:", i);
-            let f: u64 = objc::m0(c, "pixelFormat");
-            let u = |s: &str| objc::m0::<u64>(c, s) as u32;
+            let f: u64 = campo(c, "pixelFormat", 0u64);
+            let u = |s: &str| campo(c, s, 0u64) as u32;
             colores.push((
                 f as u32,
-                objc::m0::<Bool>(c, "isBlendingEnabled") as u32,
+                campo(c, "isBlendingEnabled", 0 as Bool) as u32,
                 [u("sourceRGBBlendFactor"), u("destinationRGBBlendFactor"), u("rgbBlendOperation"), u("sourceAlphaBlendFactor"), u("destinationAlphaBlendFactor"), u("alphaBlendOperation")],
                 u("writeMask"),
             ));
@@ -486,11 +695,15 @@ fn nuevo_pipeline_render(d: Id, error: *mut Id) -> Id {
             }
             e.u32(m);
         }
-        e.u32(objc::m0::<u64>(d, "depthAttachmentPixelFormat") as u32).u32(objc::m0::<u64>(d, "inputPrimitiveTopology") as u32);
+        e.u32(campo(d, "depthAttachmentPixelFormat", 0u64) as u32).u32(campo(d, "inputPrimitiveTopology", 0u64) as u32);
     }
     match pedir(tipo::PIPELINE_RENDER, &e.0) {
-        Ok(_) => crear(&clases_render().pipeline, PipelineRender { id, etiqueta: std::ptr::null_mut() }),
+        Ok(_) => {
+            registro("pipeline de render: creado");
+            crear(&clases_render().pipeline, PipelineRender { id, etiqueta: std::ptr::null_mut() })
+        }
         Err(er) => {
+            registro(&format!("pipeline de render: {er}"));
             poner_error(error, &format!("pipeline de render: {er}"));
             std::ptr::null_mut()
         }
@@ -682,6 +895,8 @@ pub fn registrar(dispositivo: Class) {
         ("sampleCount", tex_muestras as Imp, "Q@:"),
         ("usage", tex_uso as Imp, "Q@:"),
         ("storageMode", tex_almacen as Imp, "Q@:"),
+        ("allocatedSize", tex_allocado as Imp, "Q@:"),
+        ("setPurgeableState:", tex_purgeable as Imp, "c@:Q"),
         ("iosurface", tex_superficie as Imp, "^v@:"),
         ("iosurfacePlane", tex_plano as Imp, "Q@:"),
         ("parentTexture", tex_nil as Imp, "@@:"),
@@ -696,6 +911,19 @@ pub fn registrar(dispositivo: Class) {
     etq(&mut textura, clases::etiqueta::<Textura> as Imp, clases::poner_etiqueta::<Textura> as Imp);
     let mut sampler: Vec<Metodo> = vec![];
     etq(&mut sampler, clases::etiqueta::<Sampler> as Imp, clases::poner_etiqueta::<Sampler> as Imp);
+    let mut profundidad: Vec<Metodo> = vec![
+        ("depthCompareFunction", prof_comparacion as Imp, "Q@:"),
+        ("depthWriteEnabled", prof_escritura as Imp, "c@:"),
+        ("depthAttachmentPixelFormat", prof_formato_profundidad as Imp, "Q@:"),
+        ("stencilCompareFunction", prof_comparacion_estencil as Imp, "Q@:"),
+        ("stencilWriteMask", prof_mascara_estencil as Imp, "Q@:"),
+        ("stencilWriteMaskFront", prof_mascara_delante as Imp, "Q@:"),
+        ("stencilWriteMaskBack", prof_mascara_detras as Imp, "Q@:"),
+        ("stencilReferenceValueFront", prof_referencia_delante as Imp, "Q@:"),
+        ("stencilReferenceValueBack", prof_referencia_detras as Imp, "Q@:"),
+        ("stencilPixelFormat", prof_formato_estencil as Imp, "Q@:"),
+    ];
+    etq(&mut profundidad, clases::etiqueta::<Profundidad> as Imp, clases::poner_etiqueta::<Profundidad> as Imp);
     let mut pipeline: Vec<Metodo> = vec![];
     etq(&mut pipeline, clases::etiqueta::<PipelineRender> as Imp, clases::poner_etiqueta::<PipelineRender> as Imp);
     let mut encoder: Vec<Metodo> = vec![
@@ -733,6 +961,7 @@ pub fn registrar(dispositivo: Class) {
         sampler: nueva_clase("TahoeMTLSamplerState", &["MTLSamplerState"], &sampler),
         pipeline: nueva_clase("TahoeMTLRenderPipelineState", &["MTLRenderPipelineState"], &pipeline),
         encoder: nueva_clase("TahoeMTLRenderCommandEncoder", &["MTLRenderCommandEncoder"], &encoder),
+        profundidad: nueva_clase("TahoeMTLDepthStencilState", &["MTLDepthStencilState"], &profundidad),
     };
     let _ = CLASES.set(c);
     // métodos nuevos en clases ya registradas: el dispositivo, la biblioteca y el command buffer
@@ -740,11 +969,13 @@ pub fn registrar(dispositivo: Class) {
         ("newTextureWithDescriptor:", dev_textura as Imp, "@@:@"),
         ("newTextureWithDescriptor:iosurface:plane:", dev_textura_superficie as Imp, "@@:@^vQ"),
         ("newSamplerStateWithDescriptor:", dev_sampler as Imp, "@@:@"),
+        ("newDepthStencilStateWithDescriptor:", dev_profundidad as Imp, "@@:@"),
         ("newRenderPipelineStateWithDescriptor:error:", dev_pipeline_render as Imp, "@@:@^@"),
         ("newRenderPipelineStateWithDescriptor:options:reflection:error:", dev_pipeline_render_opciones as Imp, "@@:@Q^@^@"),
     ] {
         objc::metodo(dispositivo, n, imp, t);
     }
     objc::metodo(clases::clases().biblioteca.cls, "newFunctionWithName:constantValues:error:", bib_funcion_constantes as Imp, "@@:@@^@");
+    objc::metodo(clases::clases().biblioteca.cls, "newFunctionWithDescriptor:error:", bib_funcion_descriptor as Imp, "@@:@^@");
     objc::metodo(clases::clases().cb.cls, "renderCommandEncoderWithDescriptor:", cb_render as Imp, "@@:@");
 }
