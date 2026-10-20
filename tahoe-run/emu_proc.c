@@ -668,12 +668,38 @@ static int darwin_wait_status(int st) {
 	return st;
 }
 
+// Nº de hilos del proceso (solo para el registro): en el hijo de un fork de un proceso multihilo, el estado de los
+// candados que otro hilo pudiera tener cogido sigue ahí, y el hilo que los cogía ya no existe.
+static int thread_count(void) {
+	int n = 0;
+	DIR* d = opendir("/proc/self/task");
+	if (!d) return 0;
+	struct dirent* e;
+	while ((e = readdir(d))) if (e->d_name[0] != '.') n++;
+	closedir(d);
+	return n;
+}
 // fork: se usa el de Linux. La interceptación y la memoria se heredan. Convenio de Darwin: padre rax=pid hijo, rdx=0;
 // hijo rax=pid del padre, rdx=1 (libsyscall devuelve 0 al hijo al ver rdx != 0).
+//
+// El hijo de un fork en un proceso con varios hilos solo puede llamar a funciones async-signal-safe: en el hijo, malloc y
+// los candados no se pueden usar, porque su estado puede haber quedado a medias por el hilo que se copió (POSIX,
+// "fork() in a multithreaded process"). El camino del hijo de aquí lo respeta: el fork se hace con la llamada al sistema
+// cruda (fork(3) ejecutaría manejadores atfork y reservaría memoria) y en el hijo solo se llama a open/dup3/close
+// (memfd_reopen), a un memset (fileport_forked_child) y a prctl (reenable_dispatch): nada de malloc ni de candados.
+//
+// Lo que queda fuera de este fichero: los candados que el emulador toma al despachar la syscall de otro hilo (kq_lock,
+// sig_lock, wls_lock y wlt_lock en emu_kqueue.c; tpol_lock en emu_mach.c; timers_lock en emu_port.c) pueden quedar
+// cogidos en el momento del fork, y entonces el hijo se queda colgado en la primera syscall que los coja. Arreglo
+// pendiente: registrar pthread_atfork en esos módulos (coger los candados antes del fork y soltarlos en el hijo). Lo
+// mismo con las kqueues, que en XNU no se heredan (bsd/man/man2/kqueue.2:119-120: "The queue is not inherited by a child
+// created with fork(2)") y aquí sí: la lista de knotes se copia con la memoria.
 static long bsd_fork(struct ctx* c) {
+	int nthr = trace_all ? thread_count() : 0;
 	long p = syscall(SYS_fork);
 	if (p < 0) return -darwin_errno(errno);
 	if (p == 0) { memfd_reopen(); ports_forked_child(); fileport_forked_child(); reenable_dispatch(); }  // el hijo: su propia memoria, no es el creador
+	if (nthr > 1) logf_("    fork: proceso de %d hilos: el hijo hereda el estado de los candados del emulador\n", nthr);
 	// Convenio de Darwin: hijo rax=pid del padre, rdx=1; padre rax=pid del hijo, rdx=0. libsyscall devuelve 0 al hijo
 	// al ver rdx != 0, y libc ejecuta entonces los manejadores de hijo (reinicio de puertos Mach, hilo principal...).
 	c->has_ret2 = 1;
