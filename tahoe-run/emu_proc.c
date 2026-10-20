@@ -200,6 +200,7 @@ static long bsd_getrusage(struct ctx* c) {
 	if (who != 0 && who != -1) return -D_EINVAL;
 	struct rusage ru;
 	if (getrusage(who == 0 ? RUSAGE_SELF : RUSAGE_CHILDREN, &ru) != 0) return -darwin_errno(errno);
+	ru.ru_maxrss *= 1024;            // Linux: KB -> Darwin: bytes (XNU: getrusage.2, "in bytes")
 	_Static_assert(sizeof ru == 144, "struct rusage de Linux x86_64");
 	return safe_write(c->a[1], &ru, sizeof ru) == (ssize_t)sizeof ru ? 0 : -D_EFAULT;
 }
