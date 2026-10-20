@@ -206,7 +206,7 @@ fn cadena(d: Id) -> i32 {
 /// cobertura en el segundo.
 ///
 /// Con `constante` se pone además la function constant `_shader_state` (un uint4) como pone el compositor: con el
-/// bit 0x80000 del componente 2, el shader fuerza el alfa a 1 en vez de usar el del buffer.
+/// bit 0x80000 del componente 2, el shader escribe en gris (el alfa en los cuatro canales) en vez del color.
 fn plano(d: Id) -> i32 {
     plano_con(d, false)
 }
@@ -229,7 +229,7 @@ fn plano_con(d: Id, constante: bool) -> i32 {
             let desc: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLFunctionDescriptor"), "alloc"), "init");
             objc::m1::<Id, ()>(desc, "setName:", objc::nsstring(nombre));
             if con_constante {
-                // Los valores: un uint4 con el bit 0x80000 en el componente 2 (el shader fuerza el alfa a 1).
+                // Los valores: un uint4 con el bit 0x80000 en el componente 2 (el shader escribe en gris).
                 let valores: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLFunctionConstantValues"), "alloc"), "init");
                 nota(&format!("valores: {}", objc::nombre_clase(objc::object_getClass(valores))));
                 let mut v = [0u32; 4];
@@ -324,7 +324,9 @@ fn plano_con(d: Id, constante: bool) -> i32 {
         println!("command buffer: estado {st}; centro BGRA {:?}; esquina {:?}", punto(32, 32), punto(0, 0));
         // El color de los globals es (1.0, 0.5, 0.25, 0.5): en BGRA8 son B=64, G=128, R=255, A=128.
         // Con la constante puesta, el shader fuerza el alfa a 1 (A=255).
-        let esperado: [u8; 4] = if constante { [64, 128, 255, 255] } else { [64, 128, 255, 128] };
+        // Con la constante puesta, el bit 0x80000 del componente 2 de _shader_state es el de «gris»: el shader
+        // escribe el alfa en los cuatro canales, es decir (0.5, 0.5, 0.5, 0.5) → BGRA (128, 128, 128, 128).
+        let esperado: [u8; 4] = if constante { [128, 128, 128, 128] } else { [64, 128, 255, 128] };
         let bien = punto(32, 32) == esperado && punto(0, 0) == esperado;
         println!("plano{}: {}", if constante { " con constante" } else { "" }, if bien { "CORRECTO" } else { "MAL" });
         if bien { 0 } else { 7 }
