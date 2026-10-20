@@ -186,3 +186,23 @@ void emu_sem_init(void) {
 	reg_bsd(268, bsd_sem_open); reg_bsd(269, bsd_sem_close); reg_bsd(270, bsd_sem_unlink);
 	reg_bsd(271, bsd_sem_wait); reg_bsd(272, bsd_sem_trywait); reg_bsd(273, bsd_sem_post);
 }
+
+// ---- fork: candados de este módulo
+// Se cogen antes del fork y se sueltan después, para que el hijo no herede ninguno cogido (ver tahoe.h). El orden es el
+// global (table_lock -> psem_lock): si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir
+// antes. Ninguno de los dos es recursive ni robust, así que se pueden coger y soltar sin más.
+void emu_sem_fork_lock(void) {
+	pthread_mutex_lock(&table_lock);
+	pthread_mutex_lock(&psem_lock);
+}
+void emu_sem_fork_unlock(void) {
+	pthread_mutex_unlock(&psem_lock);      // al revés que al cogerlos
+	pthread_mutex_unlock(&table_lock);
+}
+// El candado por semáforo (struct sem::m) NO se puede coger aquí: es dinámico (uno por semáforo, creado en sem_create)
+// y el atfork tendría que recorrer la lista, que además cambia con table_lock. En XNU un semáforo con
+// PSYNC_PROCESS_SHARED se comparte entre procesos, así que no es un candado "del emulador" que deba Cogerse en el fork.
+// AVISO (no arreglado, solo documentado): si otro hilo estaba dentro de wait_sem/signal_one/machsem_destroy (con
+// s->m cogido) en el instante del fork, el hijo hereda su copia de ese candado en estado "cogido" y no hay nadie que lo
+// suelte: si el hijo usa ese semáforo se queda colgado. Afecta solo a los semáforos Mach (los POSIX de nombre son
+// compartidos por el kernel de Linux y no tienen este problema).

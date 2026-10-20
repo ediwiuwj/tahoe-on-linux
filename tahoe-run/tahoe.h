@@ -147,6 +147,35 @@ void emu_psynch_init(void);
 void emu_cs_init(void);
 uint32_t sem_create(int value);
 int machsem_destroy(uint32_t name);
+// ---- fork y los candados del emulador
+// Un fork en un proceso con varios hilos deja vivo solo al hilo que lo llama: si otro hilo estaba en mitad de una
+// syscall con un candado del emulador cogido, el hijo hereda ese candado cogido y se queda colgado en su primera
+// syscall que lo necesite (POSIX: en el hijo de un fork solo se pueden usar funciones async-signal-safe). Para evitarlo,
+// antes del fork se cogen TODOS los candados del emulador y después se sueltan, en el padre y en el hijo.
+// El orden en que se cogen es global y no se puede cambiar sin revisar el anidamiento: si el código normal puede tener
+// A cogido y pedir B, no puede haber un hilo con B cogido que pida A, o el fork se cuelga. Las aristas reales del
+// emulador son solo cuatro (análisis en /tmp/opencode/analisis-candados.txt):
+//	kq_lock -> wl_lock, kq_lock -> sig_lock, wlt_lock -> kq_lock, wlt_lock -> wls_lock
+// y el orden que se aplica es por módulos, que cumple las cuatro:
+//	emu_kqueue (wlt, kq, wls, sig, kqr) -> emu_proc (wl, uwait, wq_pool) -> emu_mach (tpol)
+//	-> emu_port (timers) -> emu_fileport (fp) -> emu_psynch (ps) -> emu_sem (table, psem) -> emu_iokit (hidq)
+// OJO: el módulo kqueue va el primero porque el código normal puede tener kq_lock cogido y pedir wl_lock; si el
+// fork cogiera wl_lock antes que kq_lock, un hilo con wl_lock cogido pidiendo kq_lock se cruzaría con el fork.
+// Por eso el fork se hace con el fork() de glibc y no con la syscall cruda: solo el fork() de glibc ejecuta los
+// manejadores de atfork y deja el hijo con la arena de malloc en buen estado.
+void emu_fork_lock_all(void);            // coge todos los candados (manejador "prepare")
+void emu_fork_unlock_all(void);          // los suelta, en orden inverso (manejadores "parent" y "child")
+// Cada módulo aporta la parte que le toca. El orden global se respeta porque emu_fork_lock_all() llama a estos en el
+// orden correcto, y dentro de cada módulo los candados se cogen y sueltan en orden inverso.
+void emu_kqueue_fork_lock(void);  void emu_kqueue_fork_unlock(void);     // wlt_lock, kq_lock, wls_lock, sig_lock, kqr_lock
+void emu_proc_fork_lock(void);   void emu_proc_fork_unlock(void);      // wl_lock, uwait_lock, wq_pool_lock
+void emu_mach_fork_lock(void);   void emu_mach_fork_unlock(void);      // tpol_lock
+void emu_port_fork_lock(void);   void emu_port_fork_unlock(void);      // timers_lock
+void emu_fileport_fork_lock(void); void emu_fileport_fork_unlock(void);// fp_lock
+void emu_psynch_fork_lock(void); void emu_psynch_fork_unlock(void);    // ps_lock
+void emu_sem_fork_lock(void);    void emu_sem_fork_unlock(void);       // table_lock, psem_lock
+void emu_iokit_fork_lock(void);  void emu_iokit_fork_unlock(void);     // hidq_lock
+
 uint32_t alloc_port(void);
 uint32_t tahoe_flags_fd(int fd);
 uint32_t tahoe_flags_path(const char* p);

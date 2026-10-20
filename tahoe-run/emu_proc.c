@@ -685,27 +685,38 @@ static int thread_count(void) {
 	closedir(d);
 	return n;
 }
-// fork: se usa el de Linux. La interceptación y la memoria se heredan. Convenio de Darwin: padre rax=pid hijo, rdx=0;
-// hijo rax=pid del padre, rdx=1 (libsyscall devuelve 0 al hijo al ver rdx != 0).
+// fork: se usa el fork() de glibc, no la llamada al sistema cruda. La interceptación y la memoria se heredan. Convenio de
+// Darwin: padre rax=pid hijo, rdx=0; hijo rax=pid del padre, rdx=1 (libsyscall devuelve 0 al hijo al ver rdx != 0).
 //
 // El hijo de un fork en un proceso con varios hilos solo puede llamar a funciones async-signal-safe: en el hijo, malloc y
 // los candados no se pueden usar, porque su estado puede haber quedado a medias por el hilo que se copió (POSIX,
-// "fork() in a multithreaded process"). El camino del hijo de aquí lo respeta: el fork se hace con la llamada al sistema
-// cruda (fork(3) ejecutaría manejadores atfork y reservaría memoria) y en el hijo solo se llama a open/dup3/close
-// (memfd_reopen), a un memset (fileport_forked_child) y a prctl (reenable_dispatch): nada de malloc ni de candados.
+// "fork() in a multithreaded process"). Con el fork() de glibc esto se resuelve solo: ejecuta los manejadores de
+// pthread_atfork (los nuestros, que cogen y sueltan los candados del emulador, y los internos de glibc, que dejan la
+// arena de malloc del hijo en buen estado) y el hijo sigue con la memoria y los descriptores del padre.
 //
-// Lo que queda fuera de este fichero: los candados que el emulador toma al despachar la syscall de otro hilo (kq_lock,
-// sig_lock, wls_lock y wlt_lock en emu_kqueue.c; tpol_lock en emu_mach.c; timers_lock en emu_port.c) pueden quedar
-// cogidos en el momento del fork, y entonces el hijo se queda colgado en la primera syscall que los coja. Arreglo
-// pendiente: registrar pthread_atfork en esos módulos (coger los candados antes del fork y soltarlos en el hijo). Lo
-// mismo con las kqueues, que en XNU no se heredan (bsd/man/man2/kqueue.2:119-120: "The queue is not inherited by a child
-// created with fork(2)") y aquí sí: la lista de knotes se copia con la memoria.
+// Por eso el fork NO se hace con syscall(SYS_fork): esa llamada no ejecuta ningún manejador, así que el hijo heredaría la
+// arena de malloc a medias (se colgaría en su primer calloc) y los candados del emulador que otro hilo tuviera cogidos
+// (se colgaría en la primera syscall que los coja). Los manejadores se registran una sola vez, con pthread_once: si se
+// registraran varias veces se acumularían y cada fork los ejecutaría todas las veces.
+//
+// En el hijo, el camino es el de siempre: open/dup3/close (memfd_reopen), un memset (fileport_forked_child) y un prctl
+// (reenable_dispatch). En el hijo NO se sueltan los candados a mano: el manejador "child" de pthread_atfork ya lo ha
+// hecho (soltarlos otra vez sería un doble unlock).
+//
+// Lo que queda fuera de este fichero: las kqueues, que en XNU no se heredan (bsd/man/man2/kqueue.2:119-120: "The queue is
+// not inherited by a child created with fork(2)") y aquí sí: la lista de knotes se copia con la memoria.
+static void atfork_prepare(void) { emu_fork_lock_all(); }     // antes del fork: coger todos los candados del emulador
+static void atfork_parent(void) { emu_fork_unlock_all(); }     // en el padre: soltarlos
+static void atfork_child(void) { emu_fork_unlock_all(); }      // en el hijo: soltarlos (los tenía cogidos)
+static void atfork_register(void) { pthread_atfork(atfork_prepare, atfork_parent, atfork_child); }
+static pthread_once_t atfork_once = PTHREAD_ONCE_INIT;
 static long bsd_fork(struct ctx* c) {
 	int nthr = trace_all ? thread_count() : 0;
-	long p = syscall(SYS_fork);
-	if (p < 0) return -darwin_errno(errno);
+	pthread_once(&atfork_once, atfork_register);       // los manejadores de atfork, una sola vez en todo el proceso
+	long p = fork();                                  // fork() de glibc: ejecuta los manejadores de atfork
+	if (p < 0) return -darwin_errno(errno);            // glibc devuelve -1 y pone errno
 	if (p == 0) { memfd_reopen(); ports_forked_child(); fileport_forked_child(); reenable_dispatch(); }  // el hijo: su propia memoria, no es el creador
-	if (nthr > 1) logf_("    fork: proceso de %d hilos: el hijo hereda el estado de los candados del emulador\n", nthr);
+	if (nthr > 1) logf_("    fork: proceso de %d hilos: los candados del emulador se han cogido antes del fork y se han soltado en el padre y en el hijo\n", nthr);
 	// Convenio de Darwin: hijo rax=pid del padre, rdx=1; padre rax=pid del hijo, rdx=0. libsyscall devuelve 0 al hijo
 	// al ver rdx != 0, y libc ejecuta entonces los manejadores de hijo (reinicio de puertos Mach, hilo principal...).
 	c->has_ret2 = 1;
@@ -1771,7 +1782,54 @@ static long bsd_ptrace(struct ctx* c) {
 	return -1;                                              // EPERM
 }
 
+// ---- fork: los candados de este módulo y el orden global de todos
+// Se cogen antes del fork y se sueltan después (en el padre y en el hijo), para que el hijo no herede ninguno cogido
+// (ver tahoe.h). El orden es el global: si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir
+// antes. Los tres son mutex normales (PTHREAD_MUTEX_INITIALIZER: ni recursive ni robust ni error-checking), así que se
+// pueden coger y soltar sin más. wl_lock va antes que uwait_lock y que wq_pool_lock (wl_lock es una hoja: no pide ningún
+// otro candado del emulador mientras lo tiene cogido).
+void emu_proc_fork_lock(void) {
+	pthread_mutex_lock(&wl_lock);
+	pthread_mutex_lock(&uwait_lock);
+	pthread_mutex_lock(&wq_pool_lock);
+}
+void emu_proc_fork_unlock(void) {
+	pthread_mutex_unlock(&wq_pool_lock);      // al revés que al cogerlos
+	pthread_mutex_unlock(&uwait_lock);
+	pthread_mutex_unlock(&wl_lock);
+}
+
+// Los ocho módulos, en el orden global de tahoe.h:
+//	kqueue (wlt, kq, wls, sig, kqr) -> proc (wl, uwait, wq_pool) -> mach (tpol) -> port (timers) -> fileport (fp)
+//	-> psynch (ps) -> sem (table, psem) -> iokit (hidq).
+// Las cuatro aristas reales del grafo de anidamiento (kq->wl, kq->sig, wlt->kq, wlt->wls) se respetan: wlt_lock se coge
+// antes que kq_lock y que wls_lock (dentro del módulo kqueue) y kq_lock antes que wl_lock (módulo proc) y que sig_lock
+// (también módulo kqueue). Los que quedan entre medias (uwait, wq_pool, tpol, timers, fp, ps, table, psem, hidq) son
+// hojas: no piden ningún otro candado del emulador, así que su posición relativa es libre.
+void emu_fork_lock_all(void) {
+	emu_kqueue_fork_lock();
+	emu_proc_fork_lock();
+	emu_mach_fork_lock();
+	emu_port_fork_lock();
+	emu_fileport_fork_lock();
+	emu_psynch_fork_lock();
+	emu_sem_fork_lock();
+	emu_iokit_fork_lock();
+}
+// Al revés que al cogerlos: iokit, sem, psynch, fileport, port, mach, proc, kqueue.
+void emu_fork_unlock_all(void) {
+	emu_iokit_fork_unlock();
+	emu_sem_fork_unlock();
+	emu_psynch_fork_unlock();
+	emu_fileport_fork_unlock();
+	emu_port_fork_unlock();
+	emu_mach_fork_unlock();
+	emu_proc_fork_unlock();
+	emu_kqueue_fork_unlock();
+}
+
 void emu_proc_init(void) {
+	pthread_once(&atfork_once, atfork_register);       // manejadores de atfork del fork, registrados una sola vez
 	tahoe_sigaction(SIGABRT, on_sigabrt);
 	reg_bsd(26, bsd_ptrace);
 	reg_bsd(515, bsd_ulock_wait); reg_bsd(516, bsd_ulock_wake); reg_bsd(544, bsd_ulock_wait2);

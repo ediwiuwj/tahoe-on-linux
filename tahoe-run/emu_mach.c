@@ -81,6 +81,17 @@ static int tpol_get(uint32_t port, uint32_t flavor, uint32_t* v, uint32_t cnt) {
 	pthread_mutex_unlock(&tpol_lock);
 	return ok;
 }
+// ---- fork: candados de este módulo
+// Se cogen antes del fork y se sueltan después (en el padre y en el hijo), para que el hijo no herede ninguno cogido
+// (ver tahoe.h). El orden es el global: si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir
+// antes. tpol_lock es un mutex normal (PTHREAD_MUTEX_INITIALIZER, ni recursive ni robust).
+void emu_mach_fork_lock(void) {
+	pthread_mutex_lock(&tpol_lock);
+}
+void emu_mach_fork_unlock(void) {
+	pthread_mutex_unlock(&tpol_lock);
+}
+
 static size_t reply_begin(uint8_t* r, const struct hdr* req, int32_t retcode) {
 	struct hdr h = { .bits = 0, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = req->id + 100 };
 	memcpy(r, &h, sizeof h);

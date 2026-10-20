@@ -901,3 +901,22 @@ long kq_apply_changes(int layout, uint64_t chg, long n, uint64_t workloop) {
 	if (kq >= 0) wl_put(workloop);
 	return r;
 }
+
+// ---- fork: candados de este módulo
+// Se cogen antes del fork y se sueltan después (en el padre y en el hijo), para que el hijo no herede ninguno cogido
+// (ver tahoe.h). El orden es el global: si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir
+// antes. Todos son mutex normales (PTHREAD_MUTEX_INITIALIZER, ni recursive ni robust).
+void emu_kqueue_fork_lock(void) {
+	pthread_mutex_lock(&wlt_lock);
+	pthread_mutex_lock(&kq_lock);
+	pthread_mutex_lock(&wls_lock);
+	pthread_mutex_lock(&sig_lock);
+	pthread_mutex_lock(&kqr_lock);
+}
+void emu_kqueue_fork_unlock(void) {
+	pthread_mutex_unlock(&kqr_lock);      // al revés que al cogerlos
+	pthread_mutex_unlock(&sig_lock);
+	pthread_mutex_unlock(&wls_lock);
+	pthread_mutex_unlock(&kq_lock);
+	pthread_mutex_unlock(&wlt_lock);
+}

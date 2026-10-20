@@ -1372,6 +1372,18 @@ static long t_mk_destroy(struct ctx* c) {
 	return KERN_OK;
 }
 
+// ---- fork: candados de este módulo
+// Se cogen antes del fork y se sueltan después (en el padre y en el hijo), para que el hijo no herede ninguno cogido
+// (ver tahoe.h). El orden es el global: si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir
+// antes. Solo timers_lock: el candado de la región compartida (shm->lk, de nucleo/src/candado.rs) no es un mutex de
+// glibc y lo gestiona otro sitio. timers_lock es un mutex normal (PTHREAD_MUTEX_INITIALIZER, ni recursive ni robust).
+void emu_port_fork_lock(void) {
+	pthread_mutex_lock(&timers_lock);
+}
+void emu_port_fork_unlock(void) {
+	pthread_mutex_unlock(&timers_lock);
+}
+
 // host_create_mach_voucher_trap(host, recetas*, tamaño, *puerto): los vouchers son nombres de puerto sin contenido
 static long t_voucher_create(struct ctx* c) {
 	uint32_t n = alloc_port();

@@ -2333,3 +2333,13 @@ static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* re
 	*handled = 0;
 	return 0;
 }
+
+// ---- fork: candados de este módulo
+// Se cogen antes del fork y se sueltan después, para que el hijo no herede ninguno cogido (ver tahoe.h). El orden global
+// es el de tahoe.h (hidq_lock va después de table_lock/psem_lock y antes de wq_pool_lock). No es recursive ni robust.
+void emu_iokit_fork_lock(void) {
+	pthread_mutex_lock(&hidq_lock);
+}
+void emu_iokit_fork_unlock(void) {
+	pthread_mutex_unlock(&hidq_lock);
+}

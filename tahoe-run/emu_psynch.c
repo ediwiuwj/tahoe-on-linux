@@ -173,3 +173,15 @@ void emu_psynch_init(void) {
 	reg_bsd(297, bsd_psynch_esrch); reg_bsd(298, bsd_psynch_esrch);
 	reg_bsd(306, bsd_psynch_rw_rdlock); reg_bsd(307, bsd_psynch_rw_wrlock); reg_bsd(308, bsd_psynch_rw_unlock);
 }
+
+// ---- fork: candados de este módulo
+// Se cogen antes del fork y se sueltan después, para que el hijo no herede ninguno cogido (ver tahoe.h). El orden es el
+// global: si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir antes.
+// Este módulo solo tiene ps_lock: es un mutex normal (PTHREAD_MUTEX_INITIALIZER, ni recursive ni robust). Los ps_obj
+// no tienen mutex propio (su pthread_cond_t se espera siempre con ps_lock), así que no hay nada dinámico que coger aquí.
+void emu_psynch_fork_lock(void) {
+	pthread_mutex_lock(&ps_lock);
+}
+void emu_psynch_fork_unlock(void) {
+	pthread_mutex_unlock(&ps_lock);
+}

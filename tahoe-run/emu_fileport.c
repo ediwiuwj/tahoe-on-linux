@@ -137,6 +137,17 @@ static long bsd_fileport_makefd(struct ctx* c) {
 	return fd >= 0 ? fd : -D_EINVAL;   // el dueño ya no lo tiene (o murió): como un puerto que no es un fileport
 }
 
+// ---- fork: candados de este módulo
+// Se cogen antes del fork y se sueltan después (en el padre y en el hijo), para que el hijo no herede ninguno cogido
+// (ver tahoe.h). El orden es el global: si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir
+// antes. fp_lock es un mutex normal (PTHREAD_MUTEX_INITIALIZER, ni recursive ni robust).
+void emu_fileport_fork_lock(void) {
+	pthread_mutex_lock(&fp_lock);
+}
+void emu_fileport_fork_unlock(void) {
+	pthread_mutex_unlock(&fp_lock);
+}
+
 void emu_fileport_init(void) {
 	reg_bsd(430, bsd_fileport_makeport);
 	reg_bsd(431, bsd_fileport_makefd);
