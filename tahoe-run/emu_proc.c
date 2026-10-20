@@ -891,7 +891,8 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	nargv[k++] = (char*)g_dyld_path;
 	nargv[k++] = hpath;
 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
-	char** nenv = calloc(ec + 17 + 8 + 9, sizeof(char*));
+	// 17 de entorno + 1 de credenciales + 8 de puertos especiales + 9 heredados + terminador NULL
+	char** nenv = calloc((size_t)ec + 17 + 1 + 8 + 9 + 1, sizeof(char*));
 	int e = 0;
 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
 	char b1[4300], b2[4300];
@@ -927,6 +928,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	static char inh[9][40];                                          // lo que hereda el hijo (ver ports_inherit_env)
 	int ni = ports_inherit_env(inh, 9);
 	for (int i = 0; i < ni; i++) nenv[e++] = inh[i];
+	nenv[e] = NULL;                 // antes de posix_spawn/execve: execve exige lista terminada en NULL
 	if (trace_all) logf_("    execve(\"%s\") -> relanzando tahoe-run\n", gpath);
 	if (spawn) {
 		posix_spawn_file_actions_t fa;
