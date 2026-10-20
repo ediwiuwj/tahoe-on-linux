@@ -882,7 +882,10 @@ static int spawn_special_n;
 // entorno, antes de que cargue nada del programa. El padre no devuelve el control hasta que el hijo está de verdad
 // parado: un SIGCONT enviado a un proceso que todavía no se ha parado se pierde (su acción por defecto no hace nada) y
 // el hijo quedaría colgado para siempre.
-static int spawn_suspended;                                  // POSIX_SPAWN_START_SUSPENDED en el atributo de spawn
+// El estado de una llamada de spawn pertenece al hilo que la hace (cada hilo del invitado es un hilo de Linux y su
+// syscall se despacha en él), así que va por hilo: si no, dos spawn a la vez se pisan y, sobre todo, un spawn que falla
+// a mitad deja el flag de suspensión puesto y el siguiente spawn suspende su hijo sin que nadie lo haya pedido.
+static __thread int spawn_suspended;                    // POSIX_SPAWN_START_SUSPENDED en el atributo de spawn
 
 __attribute__((constructor)) static void spawn_suspended_child(void) {
 	const char* s = getenv("TAHOE_SPAWN_SUSPENDED");
