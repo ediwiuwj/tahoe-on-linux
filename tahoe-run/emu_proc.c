@@ -82,14 +82,18 @@ static long bsd_gettimeofday(struct ctx* c) {
 }
 // shm_open: sin memoria compartida con nombre; los clientes (libnotify...) tienen ruta alternativa.
 // shm_open/shm_unlink: objetos de memoria compartida POSIX como archivos de /dev/shm con prefijo propio y nombre saneado.
+// Devuelve 0 o un errno de Darwin: ENAMETOOLONG (63) si el nombre no cabe y EFAULT (14) si no se puede leer. En XNU, el
+// segmento de nombre se limita a PSHMNAMLEN = 31 (bsd/sys/posix_shm.h:53) y el copyinstr de pshm_get_name
+// (bsd/kern/posix_shm.c:325) devuelve ENAMETOOLONG si la cadena no cabe.
 static int shm_host_name(uint64_t addr, char* out, size_t cap) {
 	char g[256];
 	(void)port_exists(0);                       // fuerza la creación/apertura de la región compartida (fija TAHOE_PORTS_OWNER)
-	if (safe_string(addr, g, sizeof g) != 0) return -1;
+	if (safe_string(addr, g, sizeof g) != 0) return -14;         // EFAULT: el nombre no se puede leer
+	if (strlen(g) > 31) return -63;                              // ENAMETOOLONG: el nombre es más largo que PSHMNAMLEN
 	// snprintf devuelve la longitud que habría escrito, que es mayor que el búfer si trunca: el puntero quedaría
 	// fuera de él y el terminador se escribiría fuera. Con el prefijo largo se devuelve error antes de eso.
 	int n = snprintf(out, cap, "/dev/shm/tahoe.%s.", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
-	if (n < 0 || n >= (int)cap) return -1;
+	if (n < 0 || n >= (int)cap) return -63;                      // ENAMETOOLONG: el prefijo no cabe en el búfer
 	char* o = out + n;
 	for (char* s = g; *s && o < out + cap - 1; s++) *o++ = (*s == '/') ? '_' : *s;
 	*o = 0;
@@ -97,14 +101,16 @@ static int shm_host_name(uint64_t addr, char* out, size_t cap) {
 }
 static long bsd_shm_open(struct ctx* c) {
 	char h[400];
-	if (shm_host_name(c->a[0], h, sizeof h)) return -D_EFAULT;
+	int e = shm_host_name(c->a[0], h, sizeof h);
+	if (e) return -e;                                            // EFAULT o ENAMETOOLONG, como en XNU
 	int fd = open(h, darwin_open_flags((int)c->a[1]) | O_CLOEXEC, (mode_t)c->a[2]);
 	if (trace_all) logf_("    shm_open -> %s = %d\n", h, fd);
 	return fd < 0 ? -darwin_errno(errno) : fd;
 }
 static long bsd_shm_unlink(struct ctx* c) {
 	char h[400];
-	if (shm_host_name(c->a[0], h, sizeof h)) return -D_EFAULT;
+	int e = shm_host_name(c->a[0], h, sizeof h);
+	if (e) return -e;                                            // EFAULT o ENAMETOOLONG, como en XNU
 	return unlink(h) ? -darwin_errno(errno) : 0;
 }
 // ioctl: no se traduce ninguna petición todavía; 25 = ENOTTY ("no es un terminal"), lo correcto para isatty().
@@ -533,7 +539,7 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
 			      (unsigned long long)g[REG_RCX], (unsigned long long)g[REG_RDX], (unsigned long long)g[REG_RSI], (unsigned long long)g[REG_RDI],
 			      (unsigned long long)g[REG_R8], (unsigned long long)g[REG_R12], (unsigned long long)g[REG_R13], (unsigned long long)g[REG_R14], (unsigned long long)g[REG_R15]);
 			FILE* dr = fopen("/dev/shm/tahoe-dumpreg", "r");      // volcar regiones de memoria a archivos
-			if (dr) { uint64_t a, sz; while (fscanf(dr, "%lx %lx", &a, &sz) == 2) { char fn[128]; snprintf(fn, sizeof fn, "/tmp/tahoe-dump-%d-%lx.bin", (int)getpid(), a); FILE* o = fopen(fn, "w"); if (o) { uint8_t* bb = malloc(sz); if (safe_read(a, bb, sz) == (ssize_t)sz) fwrite(bb, 1, sz, o); free(bb); fclose(o); } } fclose(dr); }
+			if (dr) { uint64_t a, sz; while (fscanf(dr, "%lx %lx", &a, &sz) == 2) { char fn[128]; snprintf(fn, sizeof fn, "/tmp/tahoe-dump-%d-%lx.bin", (int)getpid(), a); FILE* o = fopen(fn, "w"); if (o) { uint8_t* bb = sz && sz <= (1ull << 30) ? malloc(sz) : NULL; if (bb && safe_read(a, bb, sz) == (ssize_t)sz) fwrite(bb, 1, sz, o); free(bb); fclose(o); } } fclose(dr); }
 			FILE* pk = fopen("/dev/shm/tahoe-peek", "r");       // además: valor de 8 bytes en esas direcciones
 			if (pk) { char ln[64]; while (fgets(ln, sizeof ln, pk)) {
 				uint64_t a, v = 0;
@@ -743,6 +749,7 @@ static long bsd_getpeername(struct ctx* c) { (void)c; return -38; }             
 // Lee un array de punteros a cadena del programa (argv o envp).
 static int read_strv(uint64_t addr, char*** out, int max) {
 	char** v = calloc(max + 1, sizeof(char*));
+	if (!v) return -1;
 	int n = 0;
 	for (; addr && n < max; n++) {
 		uint64_t ptr;
@@ -924,6 +931,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (safe_string(pathp, gpath, sizeof gpath) != 0) return -D_EFAULT;
 	char **av, **ev;
 	int ac = read_strv(argvp, &av, 4096), ec = read_strv(envp, &ev, 4096);
+	if (ac < 0 || ec < 0) return -D_ENOMEM;                       // no se pudo reservar la tabla de punteros
 	if (ac == 0) { av[0] = strdup(gpath); ac = 1; }
 	for (int depth = 0; depth < 4; depth++) {
 		host_path(gpath, hpath, sizeof hpath);
@@ -943,6 +951,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 			while (*arg && *arg != ' ' && *arg != '\t') arg++;
 			if (*arg) { *arg++ = 0; while (*arg == ' ' || *arg == '\t') arg++; }
 			char** nv = calloc(ac + 4, sizeof(char*));
+			if (!nv) return -D_ENOMEM;
 			int k = 0;
 			nv[k++] = strdup(interp);
 			if (*arg) nv[k++] = strdup(arg);
@@ -991,6 +1000,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	}
 	// argv de tahoe-run: [self, caché, dyld, programa(host), argumentos del programa...]
 	char** nargv = calloc(ac + 5, sizeof(char*));
+	if (!nargv) return -D_ENOMEM;
 	int k = 0;
 	nargv[k++] = (char*)g_self_exe;
 	nargv[k++] = (char*)g_cache_path;
@@ -999,6 +1009,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
 	// 18 de entorno + 1 de credenciales + 8 de puertos especiales + 9 heredados + terminador NULL
 	char** nenv = calloc((size_t)ec + 18 + 1 + 8 + 9 + 1, sizeof(char*));
+	if (!nenv) return -D_ENOMEM;
 	int e = 0;
 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
 	char b1[4300], b2[4300];
