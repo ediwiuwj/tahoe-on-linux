@@ -414,7 +414,15 @@ static int apply(int kq, const struct kev* c) {
 	if (c->filter == EVFILT_USER) {
 		uint32_t op = c->fflags & NOTE_FFCTRLMASK, v = c->fflags & NOTE_FFLAGSMASK;
 		if (op == NOTE_FFAND) n->k.fflags &= v; else if (op == NOTE_FFOR) n->k.fflags |= v; else if (op == NOTE_FFCOPY) n->k.fflags = v;
-		if ((c->fflags & NOTE_TRIGGER) && n->enabled) { uint64_t one = 1; if (write(n->fd, &one, 8) < 0) {} }
+		// El disparo de EVFILT_USER es estado del filtro, no del registro del descriptor: en XNU, filt_userattach
+		// (bsd/kern/kern_event.c:1932-1939) deja el knote FILTER_ACTIVE si al adjuntarlo iba NOTE_TRIGGER, y
+		// filt_usertouch (kern_event.c:1941-1969) lo vuelve a marcar con cada NOTE_TRIGGER. El EV_DISABLE solo pone
+		// KN_DISABLED y saca el knote de la cola (kern_event.c:4254-4257), pero NO borra el disparo: knote_enqueue no
+		// encola un knote deshabilitado (kern_event.c:7051-7064), así que el evento sale al reactivarlo (EV_ENABLE,
+		// kern_event.c:7190-7193 y knote_apply_touch, 7229-7233). Por eso aquí el disparo se anota siempre, esté el
+		// knote habilitado o no: el estado pegajoso es el contador del eventfd, y al reactivarlo el knote vuelve al
+		// epoll (sync_fd) con el evento pendiente. Antes, un NOTE_TRIGGER con EV_DISABLE se perdía para siempre.
+		if (c->fflags & NOTE_TRIGGER) { uint64_t one = 1; if (n->fd >= 0 && write(n->fd, &one, 8) < 0) {} }
 	}
 	return 0;
 }
