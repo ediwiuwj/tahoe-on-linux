@@ -566,9 +566,12 @@ static long bsd_read(struct ctx* c) {
 	long r = syscall(SYS_read, c->a[0], c->a[1], c->a[2]);
 	return r < 0 ? -darwin_errno(errno) : r;
 }
+extern int kq_close(int fd);   // emu_kqueue.c: al cerrar una kqueue, sus knotes se destruyen (como en XNU)
 static long bsd_close(struct ctx* c) {
-	if ((int)c->a[0] >= FD_INTERNAL_BASE) return -9;                 // EBADF: descriptores del emulador (ver fd_hi)
-	long r = syscall(SYS_close, c->a[0]);
+	int fd = (int)c->a[0];
+	if (fd >= FD_INTERNAL_BASE) return -9;                 // EBADF: descriptores del emulador (ver fd_hi)
+	kq_close(fd);                                           // si era una kqueue, se sueltan sus knotes antes de cerrar
+	long r = syscall(SYS_close, fd);
 	return r < 0 ? -darwin_errno(errno) : r;
 }
 // flags de open de Darwin -> Linux
