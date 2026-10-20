@@ -673,12 +673,29 @@ static long bsd_fork(struct ctx* c) {
 	c->ret2 = (p == 0);
 	return p == 0 ? getppid() : p;
 }
+// wait4(pid, estado, opciones, rusage): las opciones de Darwin y las de Linux no coinciden. Darwin: WNOHANG 0x1,
+// WUNTRACED 0x2, WCONTINUED 0x10 y WNOWAIT 0x20 (bsd/sys/wait.h). Linux: WNOHANG 0x1, WUNTRACED 0x2 y WCONTINUED
+// 0x8, y nada más: su wait4 devuelve EINVAL ante cualquier otro bit (WNOWAIT solo existe en su waitid). WNOWAIT no
+// lo acepta el wait4 de XNU tampoco (solo el waitid), así que se ignora, igual que allí. La struct rusage de
+// Darwin (user64_rusage) ocupa lo mismo que la de Linux (144 bytes: dos timeval de 16 y 14 long), pero su ru_maxrss
+// va en bytes y el de Linux en KB.
 static long bsd_wait4(struct ctx* c) {
 	int st = 0;
-	long r = syscall(SYS_wait4, (int)c->a[0], &st, (int)c->a[2], NULL);
+	int opt = (int)c->a[2];
+	int lopt = 0;
+	if (opt & 0x1) lopt |= WNOHANG;          // WNOHANG: el mismo valor en Darwin y en Linux
+	if (opt & 0x2) lopt |= WUNTRACED;        // WUNTRACED: el mismo valor en Darwin y en Linux
+	if (opt & 0x10) lopt |= WCONTINUED;      // WCONTINUED de Darwin (0x10) -> de Linux (0x8)
+	struct rusage ru; struct rusage* rup = NULL;
+	if (c->a[3]) rup = &ru;
+	long r = syscall(SYS_wait4, (int)c->a[0], &st, lopt, rup);
 	if (r < 0) return -darwin_errno(errno);
 	if (r > 0 && WIFSIGNALED(st)) logf_("    fin <%ld> por la señal %d de Linux (lo recoge %d)\n", r, WTERMSIG(st), (int)getpid());
 	if (c->a[1] && r > 0) { int ds = darwin_wait_status(st); if (safe_write(c->a[1], &ds, 4) != 4) return -D_EFAULT; }
+	if (rup && r > 0) {
+		ru.ru_maxrss *= 1024;               // Linux da KB, Darwin da bytes
+		if (safe_write(c->a[3], &ru, sizeof ru) != (ssize_t)sizeof ru) return -D_EFAULT;
+	}
 	return r;
 }
 static long bsd_pipe(struct ctx* c) {
