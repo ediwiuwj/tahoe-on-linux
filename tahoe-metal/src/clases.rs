@@ -58,6 +58,8 @@ unsafe impl Sync for Clase {}
 
 pub struct Clases {
     pub cola: Clase,
+    pub evento: Clase,
+    pub manejador: Clase,
     pub buffer: Clase,
     pub biblioteca: Clase,
     pub funcion: Clase,
@@ -266,6 +268,80 @@ impl Drop for Cola {
 
 pub fn nueva_cola() -> Id {
     crear(&clases().cola, Cola { etiqueta: std::ptr::null_mut() })
+}
+
+// ------------------------------------------------------------------ evento y manejador de función
+
+/// Un evento (MTLEvent / MTLSharedEvent): aquí solo lleva el valor de señal; no hay sincronización entre
+/// procesos, así que un evento compartido no lo es realmente.
+pub struct Evento {
+    valor: u64,
+    etiqueta: Id,
+}
+etiqueta_de!(Evento);
+
+impl Drop for Evento {
+    fn drop(&mut self) {
+        soltar(self.etiqueta);
+    }
+}
+
+/// El manejador de una función (MTLFunctionHandle): la referencia a la función para llamarla desde el shader.
+pub struct Manejador {
+    funcion: Id,
+    etiqueta: Id,
+}
+etiqueta_de!(Manejador);
+
+impl Drop for Manejador {
+    fn drop(&mut self) {
+        soltar(self.funcion);
+        soltar(self.etiqueta);
+    }
+}
+
+/// Un evento nuevo (MTLEvent / MTLSharedEvent).
+pub fn nuevo_evento() -> Id {
+    crear(&clases().evento, Evento { valor: 0, etiqueta: std::ptr::null_mut() })
+}
+
+/// Un manejador de función nuevo (MTLFunctionHandle).
+pub fn nuevo_manejador(funcion: Id) -> Id {
+    crear(&clases().manejador, Manejador { funcion: retener(funcion), etiqueta: std::ptr::null_mut() })
+}
+
+extern "C-unwind" fn evento_valor(this: Id, _cmd: Sel) -> u64 {
+    estado::<Evento>(this).map(|e| e.valor).unwrap_or(0)
+}
+
+extern "C-unwind" fn evento_valor_poner(this: Id, _cmd: Sel, v: u64) {
+    if let Some(e) = estado::<Evento>(this) {
+        e.valor = v;
+    }
+}
+
+extern "C-unwind" fn manejador_funcion(this: Id, _cmd: Sel) -> Id {
+    estado::<Manejador>(this).map(|m| m.funcion).unwrap_or(std::ptr::null_mut())
+}
+
+/// Llama a un bloque de Objective-C con dos argumentos. El literal de un bloque tiene la función de invocación en
+/// el desplazamiento 16 (isa, flags, reserved, invoke).
+pub fn llamar_bloque_2(bloque: Id, a: Id, b: Id) {
+    if bloque.is_null() {
+        return;
+    }
+    // SAFETY: bloque de Objective-C.
+    unsafe {
+        let p = bloque.cast::<*const c_void>();
+        let invocar: extern "C" fn(Id, Id, Id) = std::mem::transmute(p.offset(2).read());
+        invocar(bloque, a, b);
+    }
+}
+
+/// El command buffer de una cola. Lo usa también `-[MTLDevice newCommandBuffer]`, que da un command buffer sin
+/// que el cliente tenga que crear una cola.
+pub fn command_buffer_de(cola: Id) -> Id {
+    cola_command_buffer(cola, objc::sel("commandBuffer"))
 }
 
 /// getGPUPriority / getBackgroundGPUPriority (MTLGPUPriority): aquí no hay planificador de citas; el servidor de GPU
@@ -724,6 +800,15 @@ pub fn registrar() {
             $v.push(("setLabel:", poner_etiqueta::<$t> as Imp, "v@:@"));
         };
     }
+    let mut evento: Vec<Metodo> = vec![
+        ("signaledValue", evento_valor as Imp, "Q@:"),
+        ("setSignaledValue:", evento_valor_poner as Imp, "v@:Q"),
+    ];
+    comunes(&mut evento);
+    etiquetas!(evento, Evento);
+    let mut manejador: Vec<Metodo> = vec![("function", manejador_funcion as Imp, "@@:")];
+    comunes(&mut manejador);
+    etiquetas!(manejador, Manejador);
     let mut cola: Vec<Metodo> = vec![
         ("commandBuffer", cola_command_buffer as Imp, "@@:"),
         ("commandBufferWithUnretainedReferences", cola_command_buffer as Imp, "@@:"),
@@ -810,6 +895,8 @@ pub fn registrar() {
     etiquetas!(blit, Encoder);
     let c = Clases {
         cola: nueva_clase("TahoeMTLCommandQueue", &["MTLCommandQueue"], &cola),
+        evento: nueva_clase("TahoeMTLEvent", &["MTLEvent", "MTLSharedEvent"], &evento),
+        manejador: nueva_clase("TahoeMTLFunctionHandle", &["MTLFunctionHandle"], &manejador),
         buffer: nueva_clase("TahoeMTLBuffer", &["MTLBuffer"], &buffer),
         biblioteca: nueva_clase("TahoeMTLLibrary", &["MTLLibrary"], &biblioteca),
         funcion: nueva_clase("TahoeMTLFunction", &["MTLFunction"], &funcion),

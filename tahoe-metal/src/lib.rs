@@ -79,6 +79,55 @@ extern "C-unwind" fn nueva_cola(_this: Id, _cmd: Sel) -> Id {
 extern "C-unwind" fn nueva_cola_max(_this: Id, _cmd: Sel, _n: u64) -> Id {
     clases::nueva_cola()
 }
+
+/// newCommandBuffer (MTLDevice): un command buffer sin cola propia. En macOS 26 ningún framework del sistema lo
+/// llama, pero está en el protocolo del runtime: como stub devolvía nil.
+extern "C-unwind" fn nuevo_command_buffer(_this: Id, _cmd: Sel) -> Id {
+    let cola = clases::nueva_cola();
+    if cola.is_null() {
+        return std::ptr::null_mut();
+    }
+    clases::command_buffer_de(cola)
+}
+
+/// Las posiciones de muestreo estándar de MSAA. La extensión Swift de Metal (libswiftMetal) las copia tal cual;
+/// el compositor no usa MSAA.
+const POSICIONES_1: [[f32; 2]; 1] = [[0.5, 0.5]];
+const POSICIONES_2: [[f32; 2]; 2] = [[0.75, 0.75], [0.25, 0.25]];
+const POSICIONES_4: [[f32; 2]; 4] = [[0.375, 0.375], [0.875, 0.875], [0.125, 0.125], [0.625, 0.625]];
+const POSICIONES_8: [[f32; 2]; 8] = [
+    [0.5625, 0.3125], [0.4375, 0.6875], [0.8125, 0.5625], [0.3125, 0.1875],
+    [0.1875, 0.8125], [0.0625, 0.4375], [0.6875, 0.9375], [0.9375, 0.0625],
+];
+const POSICIONES_16: [[f32; 2]; 16] = [
+    [0.5625, 0.3125], [0.4375, 0.5625], [0.5625, 0.8125], [0.1875, 0.3750],
+    [0.7500, 0.4375], [0.9375, 0.6875], [0.3125, 0.1250], [0.6875, 0.9375],
+    [0.0625, 0.5625], [0.4375, 0.9375], [0.0625, 0.3125], [0.8125, 0.4375],
+    [0.8125, 0.8125], [0.1875, 0.6875], [0.1875, 0.0625], [0.5625, 0.0625],
+];
+
+/// getDefaultSamplePositions:count: (MTLDevice): rellena el vector con las posiciones estándar del número de
+/// muestras pedido. Para un número que no sea 1, 2, 4, 8 o 16 se deja el centro.
+extern "C-unwind" fn posiciones_muestreo(_this: Id, _cmd: Sel, destino: *mut [f32; 2], cuenta: u64) {
+    if destino.is_null() {
+        return;
+    }
+    let patron: &[[f32; 2]] = match cuenta {
+        1 => &POSICIONES_1,
+        2 => &POSICIONES_2,
+        4 => &POSICIONES_4,
+        8 => &POSICIONES_8,
+        16 => &POSICIONES_16,
+        _ => &[],
+    };
+    // SAFETY: el cliente reserva `cuenta` posiciones.
+    unsafe {
+        for i in 0..cuenta as usize {
+            let p = patron.get(i).copied().unwrap_or([0.5, 0.5]);
+            *destino.add(i) = p;
+        }
+    }
+}
 extern "C-unwind" fn nuevo_buffer(_this: Id, _cmd: Sel, len: u64, opciones: u64) -> Id {
     clases::nuevo_buffer(len as usize, opciones, None).unwrap_or_else(|e| {
         registro(&format!("newBufferWithLength:{len}: {e}"));
@@ -120,6 +169,88 @@ extern "C-unwind" fn biblioteca_url(_this: Id, _cmd: Sel, url: Id, error: *mut I
 }
 extern "C-unwind" fn pipeline_funcion(_this: Id, _cmd: Sel, f: Id, error: *mut Id) -> Id {
     clases::nuevo_pipeline(f, error)
+}
+
+// ------------------------------------------------------------------ variantes de los pipelines
+//
+// Todas hacen lo mismo que la versión simple: la diferencia es cómo se avisa del resultado (reflexión o bloque de
+// completado) y si el trabajo se hace en segundo plano. Aquí el pipeline se crea en el momento y el bloque de
+// completado se llama de seguida, con el pipeline (o nil) y el error.
+
+/// newComputePipelineStateWithDescriptor:options:reflection:error:
+extern "C-unwind" fn pipeline_computo_descripcion(_this: Id, _cmd: Sel, d: Id, _opciones: u64, reflexion: *mut Id, error: *mut Id) -> Id {
+    if !reflexion.is_null() {
+        // SAFETY: parámetro de salida.
+        unsafe { *reflexion = std::ptr::null_mut() };
+    }
+    let f: Id = render::campo(d, "computeFunction", std::ptr::null_mut());
+    if f.is_null() {
+        clases::poner_error(error, "el descriptor no tiene computeFunction");
+        return std::ptr::null_mut();
+    }
+    clases::nuevo_pipeline(f, error)
+}
+
+/// newComputePipelineStateWithFunction:options:reflection:error:
+extern "C-unwind" fn pipeline_computo_funcion_reflexion(_this: Id, _cmd: Sel, f: Id, _opciones: u64, reflexion: *mut Id, error: *mut Id) -> Id {
+    if !reflexion.is_null() {
+        // SAFETY: parámetro de salida.
+        unsafe { *reflexion = std::ptr::null_mut() };
+    }
+    clases::nuevo_pipeline(f, error)
+}
+
+/// Los tres que avisan con un bloque de completado.
+extern "C-unwind" fn pipeline_computo_funcion_completado(_this: Id, _cmd: Sel, f: Id, manejador: Id) {
+    let mut error: Id = std::ptr::null_mut();
+    let p = clases::nuevo_pipeline(f, &mut error as *mut Id);
+    clases::llamar_bloque_2(manejador, p, error);
+}
+
+extern "C-unwind" fn pipeline_computo_funcion_opciones_completado(_this: Id, _cmd: Sel, f: Id, _opciones: u64, manejador: Id) {
+    pipeline_computo_funcion_completado(_this, _cmd, f, manejador)
+}
+
+extern "C-unwind" fn pipeline_computo_descripcion_completado(_this: Id, _cmd: Sel, d: Id, _opciones: u64, manejador: Id) {
+    let f: Id = render::campo(d, "computeFunction", std::ptr::null_mut());
+    if f.is_null() {
+        clases::llamar_bloque_2(manejador, std::ptr::null_mut(), std::ptr::null_mut());
+        return;
+    }
+    pipeline_computo_funcion_completado(_this, _cmd, f, manejador)
+}
+
+/// newRenderPipelineStateWithDescriptor:completionHandler: y su variante con opciones.
+pub(crate) extern "C-unwind" fn pipeline_render_completado(_this: Id, _cmd: Sel, d: Id, manejador: Id) {
+    let mut error: Id = std::ptr::null_mut();
+    let p = render::nuevo_pipeline_render(d, &mut error as *mut Id);
+    clases::llamar_bloque_2(manejador, p, error);
+}
+
+pub(crate) extern "C-unwind" fn pipeline_render_opciones_completado(_this: Id, _cmd: Sel, d: Id, _opciones: u64, manejador: Id) {
+    pipeline_render_completado(_this, _cmd, d, manejador)
+}
+
+// ------------------------------------------------------------------ eventos y manejadores de función
+
+/// newEvent / newSharedEvent: el objeto con su valor de señal. Aquí no hay sincronización entre procesos, así que
+/// un «evento compartido» no lo es: solo carries el valor.
+pub(crate) extern "C-unwind" fn dev_evento(_this: Id, _cmd: Sel) -> Id {
+    crear_evento()
+}
+
+fn crear_evento() -> Id {
+    clases::nuevo_evento()
+}
+
+/// newSharedEventWithHandle: el mango no se comparte con nadie: se crea un evento nuevo.
+pub(crate) extern "C-unwind" fn dev_evento_manejador(_this: Id, _cmd: Sel, _mango: Id) -> Id {
+    crear_evento()
+}
+
+/// functionHandleWithFunction: y functionHandleWithBinaryFunction:: el manejador de una función.
+pub(crate) extern "C-unwind" fn dev_manejador_funcion(_this: Id, _cmd: Sel, f: Id) -> Id {
+    clases::nuevo_manejador(f)
 }
 
 #[repr(C)]
@@ -322,6 +453,9 @@ extern "C" fn registrar() {
         objc::metodo(cls, "featureProfile", perfil as *const c_void, "Q@:");
         for (n, imp, t) in [
             ("newCommandQueue", nueva_cola as *const c_void, "@@:"),
+            ("newCommandBuffer", nuevo_command_buffer as *const c_void, "@16@0:8"),
+            ("getDefaultSamplePositions:count:", posiciones_muestreo as *const c_void, "v32@0:8^{?=ff}16Q24"),
+            ("maxArgumentBufferSamplerCount", cero_u64 as *const c_void, "Q16@0:8"),
             ("newCommandQueueWithMaxCommandBufferCount:", nueva_cola_max as *const c_void, "@@:Q"),
             ("newBufferWithLength:options:", nuevo_buffer as *const c_void, "@@:QQ"),
             ("newBufferWithBytes:length:options:", nuevo_buffer_datos as *const c_void, "@@:^vQQ"),
@@ -329,6 +463,11 @@ extern "C" fn registrar() {
             ("newLibraryWithFile:error:", biblioteca_archivo as *const c_void, "@@:@^@"),
             ("newLibraryWithURL:error:", biblioteca_url as *const c_void, "@@:@^@"),
             ("newComputePipelineStateWithFunction:error:", pipeline_funcion as *const c_void, "@@:@^@"),
+            ("newComputePipelineStateWithDescriptor:options:reflection:error:", pipeline_computo_descripcion as *const c_void, "@48@0:8@16Q24^@32^@40"),
+            ("newComputePipelineStateWithFunction:options:reflection:error:", pipeline_computo_funcion_reflexion as *const c_void, "@48@0:8@16Q24^@32^@40"),
+            ("newComputePipelineStateWithFunction:completionHandler:", pipeline_computo_funcion_completado as *const c_void, "v32@0:8@16@?24"),
+            ("newComputePipelineStateWithFunction:options:completionHandler:", pipeline_computo_funcion_opciones_completado as *const c_void, "v40@0:8@16Q24@?32"),
+            ("newComputePipelineStateWithDescriptor:options:completionHandler:", pipeline_computo_descripcion_completado as *const c_void, "v40@0:8@16Q24@?32"),
             ("maxThreadsPerThreadgroup", max_hilos as *const c_void, "{MTLSize=QQQ}@:"),
             ("maxThreadgroupMemoryLength", memoria_grupo as *const c_void, "Q@:"),
             ("recommendedMaxWorkingSetSize", trabajo_recomendado as *const c_void, "Q@:"),

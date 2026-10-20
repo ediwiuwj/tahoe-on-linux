@@ -48,6 +48,76 @@ fn chequear(inf: &mut Informe, nombre: &str, f: impl FnOnce() -> Result<(), Stri
     }
 }
 
+/// Un mensaje con cuatro argumentos (los que no cubre el módulo de Objective-C).
+unsafe fn m4<A, B, C, D, R>(obj: Id, s: &str, a: A, b: B, c: C, d: D) -> R {
+    let f: unsafe extern "C" fn(Id, objc::Sel, A, B, C, D) -> R = std::mem::transmute(objc::objc_msgSend as *const ());
+    f(obj, objc::sel(s), a, b, c, d)
+}
+
+/// Cuántos bloques de completado se han llamado.
+static BLOQUES_LLAMADOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+extern "C" fn bloque_invocado(_bloque: Id, _a: Id, _b: Id) {
+    BLOQUES_LLAMADOS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Un bloque de Objective-C de mentira: el driver solo usa la función de invocación (está en el desplazamiento 16
+/// del literal), así que basta con un bloque con esa forma.
+#[repr(C)]
+struct BloqueFalso {
+    isa: *const c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: extern "C" fn(Id, Id, Id),
+    descriptor: *const c_void,
+}
+
+fn bloque_falso() -> Id {
+    let b = Box::into_raw(Box::new(BloqueFalso {
+        isa: std::ptr::null(),
+        flags: 0,
+        reserved: 0,
+        invoke: bloque_invocado,
+        descriptor: std::ptr::null(),
+    }));
+    b as Id
+}
+
+/// La función de cómputo de la biblioteca de CoreRE3D (la misma que usa metalprobe).
+fn funcion_de_computo(d: Id) -> Option<Id> {
+    unsafe {
+        let mut err: Id = std::ptr::null_mut();
+        let ruta = "/System/Library/PrivateFrameworks/CoreRE3DGSFoundation.framework/Versions/A/Resources/default.metallib";
+        let lib = objc::m2::<Id, *mut Id, Id>(d, "newLibraryWithFile:error:", objc::nsstring(ruta), &mut err as *mut Id);
+        if lib.is_null() {
+            return None;
+        }
+        let f = objc::m1::<Id, Id>(lib, "newFunctionWithName:", objc::nsstring("SetValueFloat"));
+        if f.is_null() {
+            return None;
+        }
+        Some(f)
+    }
+}
+
+/// MTLSizeAndAlign: el tamaño y la alineación de un recurso en un heap.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TamanoAlineacion {
+    tamano: u64,
+    alineacion: u64,
+}
+
+/// Una comprobación que solo aplica si el marco de Apple tiene esa clase: si no, se cuenta como saltada.
+fn chequear_si(inf: &mut Informe, nombre: &str, aplica: bool, f: impl FnOnce() -> Result<(), String>) {
+    if !aplica {
+        inf.saltados += 1;
+        println!("  (n/d)   {nombre}: Apple no tiene esa clase");
+        return;
+    }
+    chequear(inf, nombre, f)
+}
+
 /// Una comprobación que depende de que exista un selector en el marco de Apple: si no existe, no es un fallo del
 /// driver, se cuenta como saltada.
 fn comprobar(inf: &mut Informe, nombre: &str, selector: Option<&str>, f: impl FnOnce() -> Result<(), String>) {
@@ -266,6 +336,196 @@ fn main() {
             let st: Id = objc::m1(d, "newDepthStencilStateWithDescriptor:", sd);
             if st.is_null() {
                 return Err("nil".into());
+            }
+            Ok(())
+        });
+        chequear(&mut inf, "command buffer del dispositivo", || {
+            let cb: Id = objc::m0(d, "newCommandBuffer");
+            if cb.is_null() {
+                return Err("nil".into());
+            }
+            if !objc::responde_instancia(cb, "commit") {
+                return Err("no responde a commit".into());
+            }
+            Ok(())
+        });
+        chequear(&mut inf, "tamaño y alineación de buffer en heap", || {
+            let r = objc::m2::<u64, u64, TamanoAlineacion>(d, "heapBufferSizeAndAlignWithLength:options:", 1024, 0);
+            if r.tamano < 1024 {
+                return Err(format!("tamaño {} menor que 1024", r.tamano));
+            }
+            if r.alineacion != 256 {
+                return Err(format!("alineación {} en vez de 256", r.alineacion));
+            }
+            Ok(())
+        });
+        chequear(&mut inf, "tamaño y alineación de textura en heap", || {
+            let td = descriptor_textura2d(252, 64, 64, false);
+            let r = objc::m1::<Id, TamanoAlineacion>(d, "heapTextureSizeAndAlignWithDescriptor:", td);
+            if r.tamano < 64 * 64 * 4 {
+                return Err(format!("tamaño {} menor que 16384", r.tamano));
+            }
+            if r.alineacion != 256 {
+                return Err(format!("alineación {} en vez de 256", r.alineacion));
+            }
+            Ok(())
+        });
+        chequear(&mut inf, "posiciones de muestreo", || {
+            let mut posiciones = [[0.0f32; 2]; 4];
+            objc::m2::<*mut [f32; 2], u64, ()>(d, "getDefaultSamplePositions:count:", posiciones.as_mut_ptr(), 4);
+            if posiciones[0] != [0.375, 0.375] {
+                return Err(format!("primera posición {:?} en vez de [0.375, 0.375]", posiciones[0]));
+            }
+            Ok(())
+        });
+        chequear(&mut inf, "máximo de samplers en argument buffer", || {
+            let n = objc::m0::<u64>(d, "maxArgumentBufferSamplerCount");
+            if n != 0 {
+                return Err(format!("{n} en vez de 0"));
+            }
+            Ok(())
+        });
+        let hay_heap = !objc::clase("MTLHeapDescriptor").is_null();
+        let hay_computo = funcion_de_computo(d).is_some();
+        chequear_si(&mut inf, "heap de memoria", hay_heap, || {
+            let hd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLHeapDescriptor"), "alloc"), "init");
+            if hd.is_null() {
+                return Err("descriptor nil".into());
+            }
+            objc::m1::<u64, ()>(hd, "setSize:", 1024 * 1024);
+            objc::m1::<u64, ()>(hd, "setStorageMode:", 0);
+            let h: Id = objc::m1(d, "newHeapWithDescriptor:", hd);
+            if h.is_null() {
+                return Err("nil".into());
+            }
+            let tam = objc::m0::<u64>(h, "size");
+            if tam != 1024 * 1024 {
+                return Err(format!("tamaño {tam} en vez de 1048576"));
+            }
+            let b: Id = objc::m2::<u64, u64, Id>(h, "newBufferWithLength:options:", 4096, 0);
+            if b.is_null() {
+                return Err("buffer del heap nil".into());
+            }
+            Ok(())
+        });
+        chequear(&mut inf, "fence", || {
+            let f: Id = objc::m0(d, "newFence");
+            if f.is_null() {
+                return Err("nil".into());
+            }
+            Ok(())
+        });
+        let hay_residencia = !objc::clase("MTLResidencySetDescriptor").is_null();
+        chequear_si(&mut inf, "conjunto de residencia", hay_residencia, || {
+            let rd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLResidencySetDescriptor"), "alloc"), "init");
+            if rd.is_null() {
+                return Err("descriptor nil".into());
+            }
+            let mut err: Id = std::ptr::null_mut();
+            let r: Id = objc::m2::<Id, *mut Id, Id>(d, "newResidencySetWithDescriptor:error:", rd, &mut err as *mut Id);
+            if r.is_null() {
+                return Err("nil".into());
+            }
+            let buf: Id = objc::m2::<u64, u64, Id>(d, "newBufferWithLength:options:", 256, 0);
+            // NSMutableArray: +array devuelve un NSArray inmutable y addObject: sobre él lanza excepción.
+            let arr: Id = objc::m0(objc::clase("NSMutableArray"), "array");
+            objc::m1::<Id, ()>(arr, "addObject:", buf);
+            objc::m1::<Id, ()>(r, "addAllObjects:", arr);
+            Ok(())
+        });
+        chequear(&mut inf, "buffer sin copia", || {
+            let datos: [u8; 4] = [1, 2, 3, 4];
+            let enviar4: unsafe extern "C" fn(Id, objc::Sel, *const u8, u64, u64, Id) -> Id =
+                std::mem::transmute(objc::objc_msgSend as *const ());
+            let b: Id = enviar4(d, objc::sel("newBufferWithBytesNoCopy:length:options:deallocator:"), datos.as_ptr(), 4, 0, std::ptr::null_mut());
+            if b.is_null() {
+                return Err("nil".into());
+            }
+            let len = objc::m0::<u64>(b, "length");
+            if len != 4 {
+                return Err(format!("longitud {len} en vez de 4"));
+            }
+            Ok(())
+        });
+        // Eventos y manejadores.
+        chequear(&mut inf, "evento compartido", || {
+            let e: Id = objc::m0(d, "newSharedEvent");
+            if e.is_null() {
+                return Err("nil".into());
+            }
+            objc::m1::<u64, ()>(e, "setSignaledValue:", 42);
+            let v = objc::m0::<u64>(e, "signaledValue");
+            if v != 42 {
+                return Err(format!("valor {v} en vez de 42"));
+            }
+            Ok(())
+        });
+        chequear(&mut inf, "evento con mango", || {
+            let e: Id = objc::m1(d, "newSharedEventWithHandle:", objc::nsstring("mango-de-prueba"));
+            if e.is_null() {
+                return Err("nil".into());
+            }
+            Ok(())
+        });
+        chequear(&mut inf, "manejador de función", || {
+            let b: Id = objc::m2::<u64, u64, Id>(d, "newBufferWithLength:options:", 64, 0);
+            let h: Id = objc::m1(d, "functionHandleWithFunction:", b);
+            if h.is_null() {
+                return Err("nil".into());
+            }
+            Ok(())
+        });
+        // Los pipelines de cómputo y de render, con sus variantes.
+        chequear_si(&mut inf, "pipeline de cómputo por función con opciones", hay_computo, || {
+            let f = funcion_de_computo(d).ok_or("no hay función de cómputo")?;
+            let mut reflexion: Id = std::ptr::null_mut();
+            let mut err: Id = std::ptr::null_mut();
+            let p = unsafe {
+                m4::<Id, u64, *mut Id, *mut Id, Id>(
+                    d,
+                    "newComputePipelineStateWithFunction:options:reflection:error:",
+                    f,
+                    0,
+                    &mut reflexion as *mut Id,
+                    &mut err as *mut Id,
+                )
+            };
+            if p.is_null() {
+                return Err(format!("nil: {}", objc::texto(err)));
+            }
+            Ok(())
+        });
+        chequear_si(&mut inf, "pipeline de cómputo por descriptor", hay_computo, || {
+            let f = funcion_de_computo(d).ok_or("no hay función de cómputo")?;
+            let pd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLComputePipelineDescriptor"), "alloc"), "init");
+            if pd.is_null() {
+                return Err("descriptor nil".into());
+            }
+            objc::m1::<Id, ()>(pd, "setComputeFunction:", f);
+            let mut reflexion: Id = std::ptr::null_mut();
+            let mut err: Id = std::ptr::null_mut();
+            let p = unsafe {
+                m4::<Id, u64, *mut Id, *mut Id, Id>(
+                    d,
+                    "newComputePipelineStateWithDescriptor:options:reflection:error:",
+                    pd,
+                    0,
+                    &mut reflexion as *mut Id,
+                    &mut err as *mut Id,
+                )
+            };
+            if p.is_null() {
+                return Err(format!("nil: {}", objc::texto(err)));
+            }
+            Ok(())
+        });
+        chequear_si(&mut inf, "pipeline de cómputo con bloque de completado", hay_computo, || {
+            let f = funcion_de_computo(d).ok_or("no hay función de cómputo")?;
+            let antes = BLOQUES_LLAMADOS.load(std::sync::atomic::Ordering::SeqCst);
+            objc::m2::<Id, Id, ()>(d, "newComputePipelineStateWithFunction:completionHandler:", f, bloque_falso());
+            let despues = BLOQUES_LLAMADOS.load(std::sync::atomic::Ordering::SeqCst);
+            if despues != antes + 1 {
+                return Err(format!("el bloque se llamó {despues} veces, se esperaba {antes}+1"));
             }
             Ok(())
         });

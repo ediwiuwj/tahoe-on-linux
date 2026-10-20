@@ -60,6 +60,9 @@ pub struct MTLScissorRect {
 }
 
 pub struct ClasesRender {
+    pub heap: Clase,
+    pub fence: Clase,
+    pub residencia: Clase,
     pub textura: Clase,
     pub sampler: Clase,
     pub pipeline: Clase,
@@ -174,6 +177,11 @@ fn nueva_textura(desc: Id, superficie: Id, plano: u64) -> Id {
 }
 
 extern "C-unwind" fn dev_textura(_this: Id, _cmd: Sel, desc: Id) -> Id {
+    nueva_textura(desc, std::ptr::null_mut(), 0)
+}
+
+/// Una textura a partir de su descriptor (la usan el dispositivo y los heaps).
+pub fn textura_de_descriptor(desc: Id) -> Id {
     nueva_textura(desc, std::ptr::null_mut(), 0)
 }
 extern "C-unwind" fn dev_textura_superficie(_this: Id, _cmd: Sel, desc: Id, sup: Id, plano: u64) -> Id {
@@ -301,7 +309,7 @@ extern "C-unwind" fn tex_obtener_capa(this: Id, _cmd: Sel, p: *mut u8, bpr: u64,
 /// `MTLStencilDescriptor`). Preguntar por una propiedad inexistente lanza `NSException` y desde Rust eso aborta
 /// el proceso («Rust cannot catch foreign exceptions»): no se puede capturar. Por eso toda lectura de descriptor
 /// pasa por aquí y usa el valor por defecto cuando el selector no existe.
-fn campo<T: Copy>(o: Id, nombre: &str, por_defecto: T) -> T {
+pub fn campo<T: Copy>(o: Id, nombre: &str, por_defecto: T) -> T {
     if o.is_null() || !objc::responde_instancia(o, nombre) {
         return por_defecto;
     }
@@ -632,7 +640,7 @@ fn funcion(f: Id, e: &mut Escritor) {
     }
 }
 
-fn nuevo_pipeline_render(d: Id, error: *mut Id) -> Id {
+pub fn nuevo_pipeline_render(d: Id, error: *mut Id) -> Id {
     let id = nuevo_id();
     let mut e = Escritor::default();
     e.u32(id);
@@ -873,6 +881,185 @@ extern "C-unwind" fn ren_color(_this: Id, _cmd: Sel, _r: f32, _g: f32, _b: f32, 
 
 // ------------------------------------------------------------------ registro
 
+/// Tamaño y alineación de un recurso dentro de un heap (MTLSizeAndAlign): vuelve en rax:rdx.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TamanoAlineacion {
+    pub tamano: u64,
+    pub alineacion: u64,
+}
+
+/// La alineación que se supone a los recursos de un heap: 256 bytes, como en los heaps de Apple.
+const ALINEACION_HEAP: u64 = 256;
+
+/// heapBufferSizeAndAlignWithLength:options: (MTLDevice): MPS lo llama 7 veces (MPSAutoCache, MPSAutoBuffer,
+/// GetResourceSize) y usa el valor para trocear memoria. No hace falta tocar el servidor de GPU: se devuelve el
+/// tamaño redondeado a la alineación y la alineación.
+extern "C-unwind" fn tamano_buffer_heap(_this: Id, _cmd: Sel, len: u64, _opciones: u64) -> TamanoAlineacion {
+    TamanoAlineacion { tamano: len.div_ceil(ALINEACION_HEAP) * ALINEACION_HEAP, alineacion: ALINEACION_HEAP }
+}
+
+/// heapTextureSizeAndAlignWithDescriptor: (MTLDevice): lo usa MPSDevice_MacOS::SupportsPlugin. El tamaño es el
+/// de la textura entera (todos los niveles) y la alineación, 256.
+extern "C-unwind" fn tamano_textura_heap(_this: Id, _cmd: Sel, d: Id) -> TamanoAlineacion {
+    let (ancho, alto, prof, capas, niveles, formato) = (
+        campo(d, "width", 0u64),
+        campo(d, "height", 0u64),
+        campo(d, "depth", 0u64),
+        campo(d, "arrayLength", 0u64),
+        campo(d, "mipmapLevelCount", 0u64),
+        campo(d, "pixelFormat", 0u64),
+    );
+    let bpp = bytes_por_pixel(formato);
+    let mut total = 0u64;
+    for nivel in 0..niveles.max(1) {
+        let w = (ancho >> nivel).max(1);
+        let h = (alto >> nivel).max(1);
+        let p = (prof >> nivel).max(1);
+        total += w * h * p * bpp;
+    }
+    total *= capas.max(1);
+    TamanoAlineacion { tamano: total.div_ceil(ALINEACION_HEAP) * ALINEACION_HEAP, alineacion: ALINEACION_HEAP }
+}
+
+// ------------------------------------------------------------------ heap, fence y conjunto de residencia
+
+/// Un heap (MTLHeap): la memoria reservada de la que salen buffers y texturas. Aquí solo se lleva la cuenta de lo
+/// ocupado: cada recurso se crea en el servidor de GPU como los del dispositivo.
+pub struct Heap {
+    tamano: u64,
+    modo: u64,
+    ocupado: u64,
+    etiqueta: Id,
+}
+con_etiqueta!(Heap);
+
+impl Drop for Heap {
+    fn drop(&mut self) {
+        soltar(self.etiqueta);
+    }
+}
+
+/// Un fence (MTLFence): aquí no hay planificador de citas, así que no sincroniza nada; existe para que el cliente
+/// tenga el objeto que espera.
+pub struct Fence {
+    etiqueta: Id,
+}
+con_etiqueta!(Fence);
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        soltar(self.etiqueta);
+    }
+}
+
+/// Un conjunto de residencia (MTLResidencySet): los recursos que se mantienen vivos mientras esté puesto.
+pub struct Residencia {
+    objetos: Vec<Id>,
+    etiqueta: Id,
+}
+con_etiqueta!(Residencia);
+
+impl Drop for Residencia {
+    fn drop(&mut self) {
+        for o in self.objetos.drain(..) {
+            soltar(o);
+        }
+        soltar(self.etiqueta);
+    }
+}
+
+extern "C-unwind" fn heap_tamano(this: Id, _cmd: Sel) -> u64 {
+    estado::<Heap>(this).map(|h| h.tamano).unwrap_or(0)
+}
+extern "C-unwind" fn heap_modo(this: Id, _cmd: Sel) -> u64 {
+    estado::<Heap>(this).map(|h| h.modo).unwrap_or(0)
+}
+extern "C-unwind" fn heap_ocupado(this: Id, _cmd: Sel) -> u64 {
+    estado::<Heap>(this).map(|h| h.ocupado).unwrap_or(0)
+}
+extern "C-unwind" fn heap_nuevo_buffer(this: Id, _cmd: Sel, len: u64, opciones: u64) -> Id {
+    let b = match clases::nuevo_buffer(len as usize, opciones, None) {
+        Ok(b) => b,
+        Err(e) => {
+            registro(&format!("heap: newBufferWithLength:{len}: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    if let Some(h) = estado::<Heap>(this) {
+        h.ocupado += len.next_multiple_of(256);
+    }
+    b
+}
+extern "C-unwind" fn heap_nueva_textura(this: Id, _cmd: Sel, desc: Id) -> Id {
+    let t = textura_de_descriptor(desc);
+    if t.is_null() {
+        return t;
+    }
+    let bytes = estado::<Textura>(t).map(|x| x.ancho * x.alto * x.prof.max(1) * bytes_por_pixel(x.formato)).unwrap_or(0);
+    if let Some(h) = estado::<Heap>(this) {
+        h.ocupado += bytes.next_multiple_of(256);
+    }
+    t
+}
+extern "C-unwind" fn residencia_anadir(this: Id, _cmd: Sel, objetos: Id) {
+    let Some(r) = estado::<Residencia>(this) else { return };
+    if objetos.is_null() {
+        return;
+    }
+    let n = unsafe { objc::m0::<u64>(objetos, "count") };
+    for i in 0..n {
+        let o = unsafe { objc::m1::<u64, Id>(objetos, "objectAtIndexedSubscript:", i) };
+        if !o.is_null() {
+            r.objetos.push(retener(o));
+        }
+    }
+}
+extern "C-unwind" fn residencia_quitar_todo(this: Id, _cmd: Sel) {
+    if let Some(r) = estado::<Residencia>(this) {
+        for o in r.objetos.drain(..) {
+            soltar(o);
+        }
+    }
+}
+
+/// newHeapWithDescriptor: (MTLDevice): QuartzCore lo pide en `update_surface_heap` y MPS en sus cachés.
+extern "C-unwind" fn dev_heap(_this: Id, _cmd: Sel, desc: Id) -> Id {
+    let tamano = campo(desc, "size", 0u64);
+    let modo = campo(desc, "storageMode", 0u64);
+    registro(&format!("heap: {tamano} bytes, modo {modo}"));
+    crear(&clases_render().heap, Heap { tamano, modo, ocupado: 0, etiqueta: std::ptr::null_mut() })
+}
+
+/// newFence (MTLDevice): el objeto en sí; no sincroniza nada.
+extern "C-unwind" fn dev_fence(_this: Id, _cmd: Sel) -> Id {
+    crear(&clases_render().fence, Fence { etiqueta: std::ptr::null_mut() })
+}
+
+/// newResidencySetWithDescriptor:error: (MTLDevice): guarda los recursos que le metan.
+extern "C-unwind" fn dev_residencia(_this: Id, _cmd: Sel, desc: Id, error: *mut Id) -> Id {
+    if !error.is_null() {
+        // SAFETY: parámetro de salida.
+        unsafe { *error = std::ptr::null_mut() };
+    }
+    let _ = desc;
+    crear(&clases_render().residencia, Residencia { objetos: Vec::new(), etiqueta: std::ptr::null_mut() })
+}
+
+/// newBufferWithBytesNoCopy:length:options:deallocator: (MTLDevice): el cliente da memoria ya paginada y espera que
+/// Metal no la copie. Aquí sí se copia al buffer del servidor (el servidor no puede importar memoria del cliente) y
+/// el bloque de liberador no se llama: la memoria sigue siendo del cliente.
+extern "C-unwind" fn dev_buffer_nocopia(_this: Id, _cmd: Sel, p: *const u8, len: u64, opciones: u64, _liberador: Id) -> Id {
+    let datos = if p.is_null() { None } else { Some(unsafe { std::slice::from_raw_parts(p, len as usize) }) };
+    match clases::nuevo_buffer(len as usize, opciones, datos) {
+        Ok(b) => b,
+        Err(e) => {
+            registro(&format!("newBufferWithBytesNoCopy:{len}: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 pub fn registrar(dispositivo: Class) {
     if CLASES.get().is_some() {
         return;
@@ -956,7 +1143,25 @@ pub fn registrar(dispositivo: Class) {
         ("insertDebugSignpost:", ren_nada_o as Imp, "v@:@"),
     ];
     etq(&mut encoder, clases::etiqueta::<Encoder> as Imp, clases::poner_etiqueta::<Encoder> as Imp);
+    let mut heap: Vec<Metodo> = vec![
+        ("size", heap_tamano as Imp, "Q@:"),
+        ("storageMode", heap_modo as Imp, "Q@:"),
+        ("currentAllocatedSize", heap_ocupado as Imp, "Q@:"),
+        ("newBufferWithLength:options:", heap_nuevo_buffer as Imp, "@@:QQ"),
+        ("newTextureWithDescriptor:", heap_nueva_textura as Imp, "@@:@"),
+    ];
+    etq(&mut heap, clases::etiqueta::<Heap> as Imp, clases::poner_etiqueta::<Heap> as Imp);
+    let mut fence: Vec<Metodo> = vec![];
+    etq(&mut fence, clases::etiqueta::<Fence> as Imp, clases::poner_etiqueta::<Fence> as Imp);
+    let mut residencia: Vec<Metodo> = vec![
+        ("addAllObjects:", residencia_anadir as Imp, "v@:@"),
+        ("removeAllObjects", residencia_quitar_todo as Imp, "v@:"),
+    ];
+    etq(&mut residencia, clases::etiqueta::<Residencia> as Imp, clases::poner_etiqueta::<Residencia> as Imp);
     let c = ClasesRender {
+        heap: nueva_clase("TahoeMTLHeap", &["MTLHeap"], &heap),
+        fence: nueva_clase("TahoeMTLFence", &["MTLFence"], &fence),
+        residencia: nueva_clase("TahoeMTLResidencySet", &["MTLResidencySet"], &residencia),
         textura: nueva_clase("TahoeMTLTexture", &["MTLTexture"], &textura),
         sampler: nueva_clase("TahoeMTLSamplerState", &["MTLSamplerState"], &sampler),
         pipeline: nueva_clase("TahoeMTLRenderPipelineState", &["MTLRenderPipelineState"], &pipeline),
@@ -969,9 +1174,22 @@ pub fn registrar(dispositivo: Class) {
         ("newTextureWithDescriptor:", dev_textura as Imp, "@@:@"),
         ("newTextureWithDescriptor:iosurface:plane:", dev_textura_superficie as Imp, "@@:@^vQ"),
         ("newSamplerStateWithDescriptor:", dev_sampler as Imp, "@@:@"),
+        ("heapBufferSizeAndAlignWithLength:options:", tamano_buffer_heap as Imp, "{?=QQ}32@0:8Q16Q24"),
+        ("heapTextureSizeAndAlignWithDescriptor:", tamano_textura_heap as Imp, "{?=QQ}24@0:8@16"),
+        ("newHeapWithDescriptor:", dev_heap as Imp, "@@:@"),
+        ("newFence", dev_fence as Imp, "@16@0:8"),
+        ("newResidencySetWithDescriptor:error:", dev_residencia as Imp, "@@:@^@"),
+        ("newBufferWithBytesNoCopy:length:options:deallocator:", dev_buffer_nocopia as Imp, "@@:^vQQ@"),
         ("newDepthStencilStateWithDescriptor:", dev_profundidad as Imp, "@@:@"),
         ("newRenderPipelineStateWithDescriptor:error:", dev_pipeline_render as Imp, "@@:@^@"),
         ("newRenderPipelineStateWithDescriptor:options:reflection:error:", dev_pipeline_render_opciones as Imp, "@@:@Q^@^@"),
+        ("newRenderPipelineStateWithDescriptor:completionHandler:", crate::pipeline_render_completado as Imp, "v32@0:8@16@?24"),
+        ("newRenderPipelineStateWithDescriptor:options:completionHandler:", crate::pipeline_render_opciones_completado as Imp, "v40@0:8@16Q24@?32"),
+        ("newEvent", crate::dev_evento as Imp, "@16@0:8"),
+        ("newSharedEvent", crate::dev_evento as Imp, "@16@0:8"),
+        ("newSharedEventWithHandle:", crate::dev_evento_manejador as Imp, "@24@0:8@16"),
+        ("functionHandleWithFunction:", crate::dev_manejador_funcion as Imp, "@24@0:8@16"),
+        ("functionHandleWithBinaryFunction:", crate::dev_manejador_funcion as Imp, "@24@0:8@16"),
     ] {
         objc::metodo(dispositivo, n, imp, t);
     }
