@@ -10,6 +10,7 @@
 // llegar un evento se reparte entre todos los knotes activos de ese descriptor.
 #define _GNU_SOURCE
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -588,8 +589,11 @@ static int ts_ms(uint64_t p) {
 	if (safe_read(p, t, 16) != 16) return -3;
 	if (t[0] < 0 || t[0] > INT32_MAX) return -2;        // XNU: tv_sec fuera de rango
 	if (t[1] < 0 || t[1] > 1000000000) return -2;        // XNU: tv_nsec fuera de rango
-	if (t[0] > (INT64_MAX - t[1] / 1000000) / 1000) return -2;   // sin desbordamiento
-	return (int)(t[0] * 1000 + t[1] / 1000000);
+	// El plazo se mide en milisegundos y epoll_wait los toma en un int: un plazo de más de 24,8 días no cabe. Se satura
+	// en INT_MAX en vez de truncar, porque un truncado daría un plazo negativo (epoll_wait lo toma por infinito) o,
+	// peor, el valor -2 o -3, que aquí significan "timespec inválido" y "ilegible".
+	int64_t ms = t[0] * 1000 + t[1] / 1000000;
+	return ms > INT_MAX ? INT_MAX : (int)ms;
 }
 
 static long bsd_kqueue(struct ctx* c) { (void)c; int fd = epoll_create1(0); return fd < 0 ? -darwin_errno(errno) : fd; }
