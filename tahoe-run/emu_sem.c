@@ -11,8 +11,9 @@
 #define KERN_BAD_ARG 4
 #define KERN_TIMED_OUT 49
 #define KERN_ABORTED_ 14
+#define KERN_TERMINATED_ 37        // el semáforo se destruyó mientras el hilo esperaba (XNU: THREAD_RESTART)
 
-struct sem { uint32_t name; int count; pthread_mutex_t m; pthread_cond_t cv; struct sem* next; };
+struct sem { uint32_t name; int count; int destruido; pthread_mutex_t m; pthread_cond_t cv; struct sem* next; };
 static struct sem* sems;
 static pthread_mutex_t table_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -38,6 +39,10 @@ static struct sem* find(uint32_t name) {
 
 // semaphore_destroy: el semáforo deja de existir (los que esperaban despiertan). La memoria se conserva por si un hilo
 // sigue dentro de wait_sem con el puntero; son pocos bytes por hilo terminado.
+// En XNU, semaphore_destroy_internal (osfmk/kern/sync_sema.c:152-196) pone el contador a 0 y despierta a los que
+// esperan con THREAD_RESTART, que en semaphore_block (sync_sema.c:617-618) se traduce en KERN_TERMINATED. Aquí se
+// marca el semáforo como destruido y los que esperan despiertan con ese mismo error: si no, el cliente creería que
+// obtuvo el semáforo y seguiría como si nada.
 int machsem_destroy(uint32_t name) {
 	pthread_mutex_lock(&table_lock);
 	struct sem** pp = &sems;
@@ -46,41 +51,51 @@ int machsem_destroy(uint32_t name) {
 	if (s) *pp = s->next;
 	pthread_mutex_unlock(&table_lock);
 	if (!s) return KERN_BAD_ARG;
-	pthread_mutex_lock(&s->m); s->count += 1 << 20; pthread_cond_broadcast(&s->cv); pthread_mutex_unlock(&s->m);
+	pthread_mutex_lock(&s->m); s->destruido = 1; s->count = 0; pthread_cond_broadcast(&s->cv); pthread_mutex_unlock(&s->m);
 	return KERN_OK;
 }
 
 static void signal_one(struct sem* s) { pthread_mutex_lock(&s->m); s->count++; pthread_cond_signal(&s->cv); pthread_mutex_unlock(&s->m); }
 
-// Espera con plazo opcional (ns relativos; <0 = sin plazo). 0 = obtenido, 1 = plazo vencido.
+// Espera con plazo opcional (ns relativos; <0 = sin plazo). 0 = obtenido, 1 = plazo vencido, 2 = el semáforo se
+// destruyó mientras se esperaba (KERN_TERMINATED, como en XNU).
 static int wait_sem(struct sem* s, long long rel_ns) {
 	struct timespec dl;
 	if (rel_ns >= 0) { clock_gettime(CLOCK_MONOTONIC, &dl); dl.tv_sec += rel_ns / 1000000000LL; dl.tv_nsec += rel_ns % 1000000000LL; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; } }
 	int r = 0;
 	pthread_mutex_lock(&s->m);
-	while (s->count <= 0 && !r) r = rel_ns >= 0 ? pthread_cond_timedwait(&s->cv, &s->m, &dl) : pthread_cond_wait(&s->cv, &s->m);
-	if (s->count > 0) { s->count--; r = 0; }
+	while (s->count <= 0 && !r && !s->destruido) r = rel_ns >= 0 ? pthread_cond_timedwait(&s->cv, &s->m, &dl) : pthread_cond_wait(&s->cv, &s->m);
+	if (s->destruido) r = 2;                              // el semáforo ya no existe: KERN_TERMINATED
+	else if (s->count > 0) { s->count--; r = 0; }
 	pthread_mutex_unlock(&s->m);
-	return r ? 1 : 0;
+	return r;
 }
 
 static long t_signal(struct ctx* c)     { struct sem* s = find((uint32_t)c->a[0]); if (!s) return KERN_BAD_ARG; signal_one(s); return KERN_OK; }
-static long t_signal_all(struct ctx* c) { struct sem* s = find((uint32_t)c->a[0]); if (!s) return KERN_BAD_ARG; pthread_mutex_lock(&s->m); s->count += 1000; pthread_cond_broadcast(&s->cv); pthread_mutex_unlock(&s->m); return KERN_OK; }
-static long t_wait(struct ctx* c)       { struct sem* s = find((uint32_t)c->a[0]); if (!s) return KERN_BAD_ARG; wait_sem(s, -1); return KERN_OK; }
+// semaphore_signal_all: en XNU (osfmk/kern/sync_sema.c:370-380) despierta a todos los que esperan y deja el contador
+// a CERO ("always reset"). Aquí se sumaban 1000 créditos de más: un semaphore_wait posterior no bloqueaba, cuando en
+// macOS sí (y el semáforo de un dispatch se quedaba con créditos de sobra).
+static long t_signal_all(struct ctx* c) { struct sem* s = find((uint32_t)c->a[0]); if (!s) return KERN_BAD_ARG; pthread_mutex_lock(&s->m); s->count = 0; pthread_cond_broadcast(&s->cv); pthread_mutex_unlock(&s->m); return KERN_OK; }
+// El resultado de wait_sem: 0 = obtenido, 1 = plazo vencido, 2 = el semáforo se destruyó (KERN_TERMINATED).
+static long sem_espera(struct sem* s, long long rel_ns) {
+	int r = wait_sem(s, rel_ns);
+	return r == 2 ? KERN_TERMINATED_ : (r ? KERN_TIMED_OUT : KERN_OK);
+}
+static long t_wait(struct ctx* c)       { struct sem* s = find((uint32_t)c->a[0]); if (!s) return KERN_BAD_ARG; return sem_espera(s, -1); }
 static long t_wait_signal(struct ctx* c) {
 	struct sem *w = find((uint32_t)c->a[0]), *g = find((uint32_t)c->a[1]);
 	if (!w || !g) return KERN_BAD_ARG;
-	signal_one(g); wait_sem(w, -1); return KERN_OK;
+	signal_one(g); return sem_espera(w, -1);
 }
 static long t_timedwait(struct ctx* c) {
 	struct sem* s = find((uint32_t)c->a[0]); if (!s) return KERN_BAD_ARG;
-	return wait_sem(s, (long long)(uint32_t)c->a[1] * 1000000000LL + (int32_t)c->a[2]) ? KERN_TIMED_OUT : KERN_OK;
+	return sem_espera(s, (long long)(uint32_t)c->a[1] * 1000000000LL + (int32_t)c->a[2]);
 }
 static long t_timedwait_signal(struct ctx* c) {
 	struct sem *w = find((uint32_t)c->a[0]), *g = find((uint32_t)c->a[1]);
 	if (!w || !g) return KERN_BAD_ARG;
 	signal_one(g);
-	return wait_sem(w, (long long)(uint32_t)c->a[2] * 1000000000LL + (int32_t)c->a[3]) ? KERN_TIMED_OUT : KERN_OK;
+	return sem_espera(w, (long long)(uint32_t)c->a[2] * 1000000000LL + (int32_t)c->a[3]);
 }
 
 // __semwait_signal(cond_sem, mutex_sem, timeout, relative, tv_sec, tv_nsec): usado por pthread_cond/join.
@@ -94,7 +109,10 @@ static long bsd_semwait_signal(struct ctx* c) {
 		if (c->a[3]) ns = sec * 1000000000LL + nsec;      // relativo
 		else { struct timespec now; clock_gettime(CLOCK_REALTIME, &now); ns = (sec - now.tv_sec) * 1000000000LL + (nsec - now.tv_nsec); if (ns < 0) ns = 0; }
 	}
-	return wait_sem(w, ns) ? -60 /* ETIMEDOUT */ : 0;
+	// wait_sem: 0 = obtenido, 1 = plazo vencido, 2 = el semáforo se destruyó. Aquí la API es POSIX (errno), no
+	// kern_return: un semáforo destruido no es un timeout, así que se distingue (ECANCELED).
+	int r = wait_sem(w, ns);
+	return r == 2 ? -89 /* ECANCELED (Darwin) */ : (r ? -60 /* ETIMEDOUT */ : 0);
 }
 
 
