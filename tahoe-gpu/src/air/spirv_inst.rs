@@ -493,7 +493,6 @@ impl Tr<'_> {
             // La capa y el viewport (multiview) no tienen built-in en Vulkan (Layer solo existe en geometría y
             // el índice de capa exige la extensión VK_EXT_shader_viewport_index_layer): salen como un location
             // más, que es lo que hizo el prototipo de AIR.
-            let multiview = matches!(d.clase.as_str(), "air.render_target_array_index" | "air.viewport_array_index");
             let pt = self.ptr_t(StorageClass::Output, st);
             let var = self.var_global(pt, StorageClass::Output, None);
             match d.clase.as_str() {

@@ -9,6 +9,22 @@ mod objc;
 
 use objc::Id;
 
+/// Anota una línea en un fichero: si el proceso aborta, lo que iba por stdout se pierde.
+fn nota(texto: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/private/var/tmp/nota.txt") {
+        let _ = writeln!(f, "{texto}");
+    }
+}
+
+/// Un NSRange (de Foundation): dos enteros de 64 bits.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Rango {
+    loc: u64,
+    len: u64,
+}
+
 extern "C" {
     fn dlopen(p: *const c_char, modo: c_int) -> *mut c_void;
     fn dlsym(h: *mut c_void, s: *const c_char) -> *mut c_void;
@@ -110,7 +126,10 @@ fn cadena(d: Id) -> i32 {
         let por_descriptor = |lib: Id, nombre: &str| -> Id {
             let desc: Id = objc::m0(objc::clase("MTLFunctionDescriptor"), "alloc");
             objc::m1::<Id, ()>(desc, "setName:", objc::nsstring(nombre));
-            objc::m2(lib, "newFunctionWithDescriptor:error:", desc, std::ptr::null_mut::<Id>())
+            nota("creando la función por descriptor");
+            let f: Id = objc::m2(lib, "newFunctionWithDescriptor:error:", desc, std::ptr::null_mut::<Id>());
+            nota(&format!("función: {}", if f.is_null() { "nil" } else { "ok" }));
+            f
         };
         let vf = por_descriptor(lib, &vn);
         let ff = por_descriptor(lib, &fnn);
@@ -203,31 +222,33 @@ fn plano_con(d: Id, constante: bool) -> i32 {
             println!("biblioteca: nil");
             return 3;
         }
-        // Los valores de la constante: un uint4 con el bit 0x80000 en el componente 2.
-        let mut valores: Id = std::ptr::null_mut();
-        if constante {
-            valores = objc::m0(objc::clase("MTLFunctionConstantValues"), "alloc");
-            if valores.is_null() {
-                println!("MTLFunctionConstantValues: nil");
-                return 8;
-            }
-            valores = objc::m0(valores, "init");
-            let mut v = [0u32; 4];
-            v[2] = 0x80000;
-            // MTLDataType: 32 = cuatro enteros de 32 bits (16 bytes).
-            objc::m3::<*const u32, u64, Id, ()>(valores, "setConstantValue:type:withName:", v.as_ptr(), 32, objc::nsstring("_shader_state"));
-        }
-        // La función, por descriptor (como hace el compositor).
-        let por_descriptor = |lib: Id, nombre: &str| -> Id {
-            let desc: Id = objc::m0(objc::clase("MTLFunctionDescriptor"), "alloc");
+        // La función, por descriptor (como hace el compositor). Los valores de la constante se ponen en el
+        // objeto que da el propio descriptor: en macOS 26, MTLFunctionConstantValues es una fachada y el objeto
+        // de verdad es un MTLFunctionConstantValuesInternal, que es el único que acepta los valores.
+        let por_descriptor = |lib: Id, nombre: &str, con_constante: bool| -> Id {
+            let desc: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLFunctionDescriptor"), "alloc"), "init");
             objc::m1::<Id, ()>(desc, "setName:", objc::nsstring(nombre));
-            if !valores.is_null() {
-                objc::m1::<Id, ()>(desc, "setConstantValues:", valores);
+            if con_constante {
+                // Los valores: un uint4 con el bit 0x80000 en el componente 2 (el shader fuerza el alfa a 1).
+                let valores: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLFunctionConstantValues"), "alloc"), "init");
+                nota(&format!("valores: {}", objc::nombre_clase(objc::object_getClass(valores))));
+                let mut v = [0u32; 4];
+                v[2] = 0x80000;
+                // Una constante vectorial se pone con el rango: cuatro escalares (MTLDataType 29 = un entero
+                // de 32 bits) en los índices 0..3.
+                let r = Rango { loc: 0, len: 4 };
+                nota("poniendo la constante por rango");
+                objc::m3::<*const u32, u64, Rango, ()>(valores, "setConstantValues:type:withRange:", v.as_ptr(), 29, r);
+                nota("constante puesta");
+                // Con los valores, la función se pide por nombre (la vía que usa el driver).
+                let f: Id = objc::m3::<Id, Id, *mut Id, Id>(lib, "newFunctionWithName:constantValues:error:", objc::nsstring(nombre), valores, std::ptr::null_mut::<Id>());
+                nota(&format!("función con constantes: {}", if f.is_null() { "nil" } else { "ok" }));
+                return f;
             }
             objc::m2(lib, "newFunctionWithDescriptor:error:", desc, std::ptr::null_mut::<Id>())
         };
-        let vf = por_descriptor(lib, "plane__vertex");
-        let ff = por_descriptor(lib, "plane_color_fragment");
+        let vf = por_descriptor(lib, "plane__vertex", false);
+        let ff = por_descriptor(lib, "plane_color_fragment", constante);
         if vf.is_null() || ff.is_null() {
             println!("shaders: vertex={} fragment={}", if vf.is_null() { "nil" } else { "ok" }, if ff.is_null() { "nil" } else { "ok" });
             return 4;

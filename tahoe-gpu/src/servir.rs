@@ -376,8 +376,7 @@ impl Cliente {
                         // El cliente pone el nombre tal como se escribe en el código («_shader_state»); en el
                         // AIR el nombre viene cualificado («RB::Shader::Constant::_shader_state»): se comparan
                         // los dos, o la constante del cliente no llegaría nunca al shader.
-                        let corto = fc.nombre.rsplit("::").next().unwrap_or(&fc.nombre);
-                        if let Some((_, v)) = por_nombre.iter().find(|(n, _)| *n == fc.nombre || *n == corto) {
+                        if let Some((_, v)) = por_nombre.iter().find(|(n, _)| air::fc::coincide(&fc.nombre, n)) {
                             op2.constantes.insert(fc.indice, v.clone());
                         }
                     }

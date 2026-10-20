@@ -430,10 +430,22 @@ extern "C-unwind" fn nombre(_this: Id, _cmd: Sel) -> Id {
     objc::nsstring(if n.is_empty() { "Tahoe GPU" } else { &n })
 }
 
+/// `respondsToSelector:` sobre el dispositivo: contesta YES para todo lo que la clase tiene, stubs incluidos.
+///
+/// `_MTLDevice` NO implementa `respondsToSelector:` (en el runtime de macOS 26 no aparece
+/// `-[_MTLDevice respondsToSelector…]`, sólo el símbolo indefinido `_objc_opt_respondsToSelector`), así que el
+/// `objc_msgSendSuper` de abajo acaba ejecutando la IMP de NSObject (`-[NSObject respondsToSelector:]`). Esa IMP
+/// reenvía a `objc_msgSend`, que consulta la clase REAL del receptor (`object_getClass` -> TahoeMTLDevice), y
+/// ahí los stubs que añade `stubs::registrar` con `class_addMethod` sí están: por eso la respuesta es YES.
+///
+/// Es intencionado: el driver registra los stubs del protocolo MTLDevice (los que pone `stubs::registrar`, y
+/// cuyo número sale en el registro: «stubs del protocolo MTLDevice: N») precisamente para que el cliente NO
+/// reciba la implementación abstracta de Apple (que lanza una NSException y mata el proceso). Por eso
+/// `respondsToSelector:` contesta YES y, si el cliente pregunta, llama al stub y recibe nil/0.
 extern "C-unwind" fn responde(this: Id, cmd: Sel, s: Sel) -> Bool {
-    // SAFETY: NSObject implementa respondsToSelector:.
+    // SAFETY: la IMP que se ejecuta es la de NSObject (`-[NSObject respondsToSelector:]`), que existe.
     let r: Bool = unsafe { objc::super1(this, madre(), cmd, s) };
-    registro(&format!("respondsToSelector:{} -> {r}", objc::nombre_sel(s)));
+    registro(&format!("respondsToSelector:{} -> {}", objc::nombre_sel(s), if r != 0 { "YES" } else { "NO" }));
     r
 }
 
