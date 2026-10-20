@@ -324,6 +324,15 @@ extern "C-unwind" fn manejador_funcion(this: Id, _cmd: Sel) -> Id {
     estado::<Manejador>(this).map(|m| m.funcion).unwrap_or(std::ptr::null_mut())
 }
 
+/// Copia un bloque de Objective-C para que sobreviva a la llamada (o None si no hay bloque).
+pub fn copiar_bloque(b: Id) -> Option<*mut c_void> {
+    if b.is_null() {
+        return None;
+    }
+    // SAFETY: b es un bloque de Objective-C.
+    Some(unsafe { _Block_copy(b) })
+}
+
 /// Llama a un bloque de Objective-C con dos argumentos. El literal de un bloque tiene la función de invocación en
 /// el desplazamiento 16 (isa, flags, reserved, invoke).
 pub fn llamar_bloque_2(bloque: Id, a: Id, b: Id) {
@@ -365,6 +374,9 @@ pub struct Buffer {
     pub len: usize,
     proyectado: usize,
     opciones: u64,
+    /// El bloque que el cliente da para liberar su memoria cuando el buffer muera
+    /// (newBufferWithBytesNoCopy:length:options:deallocator:). Se copia para que sobreviva a la llamada.
+    liberador: Option<*mut c_void>,
     etiqueta: Id,
 }
 etiqueta_de!(Buffer);
@@ -374,12 +386,29 @@ impl Drop for Buffer {
         liberar_en_servidor(clase::BUFFER, self.id);
         // SAFETY: proyección hecha en nuevo_buffer.
         unsafe { munmap(self.ptr.cast(), self.proyectado) };
+        if let Some(b) = self.liberador {
+            // SAFETY: bloque copiado con _Block_copy; el liberador no toma argumentos.
+            unsafe {
+                llamar_bloque(b, std::ptr::null_mut());
+                _Block_release(b);
+            }
+        }
         soltar(self.etiqueta);
     }
 }
 
 /// MTLBuffer: memoria compartida con el servidor de GPU (archivo en /dev/shm, que se borra en cuanto él lo abre).
 pub fn nuevo_buffer(len: usize, opciones: u64, datos: Option<&[u8]>) -> Result<Id, String> {
+    nuevo_buffer_con_liberador(len, opciones, datos, None)
+}
+
+/// Un buffer con el bloque que libera la memoria del cliente (newBufferWithBytesNoCopy…).
+pub fn nuevo_buffer_con_liberador(
+    len: usize,
+    opciones: u64,
+    datos: Option<&[u8]>,
+    liberador: Option<*mut c_void>,
+) -> Result<Id, String> {
     let id = nuevo_id();
     let proyectado = len.next_multiple_of(4096).max(4096);
     let ruta = format!("/dev/shm/tahoe-mtl-{}-{id}", std::process::id());
@@ -407,7 +436,7 @@ pub fn nuevo_buffer(len: usize, opciones: u64, datos: Option<&[u8]>) -> Result<I
         unsafe { munmap(p, proyectado) };
         return Err(er);
     }
-    Ok(crear(&clases().buffer, Buffer { id, ptr, len, proyectado, opciones, etiqueta: std::ptr::null_mut() }))
+    Ok(crear(&clases().buffer, Buffer { id, ptr, len, proyectado, opciones, liberador, etiqueta: std::ptr::null_mut() }))
 }
 
 extern "C-unwind" fn buffer_contents(this: Id, _cmd: Sel) -> *mut u8 {
@@ -626,6 +655,22 @@ impl Drop for CommandBuffer {
 unsafe fn llamar_bloque(b: *mut c_void, arg: Id) {
     let invoke: extern "C-unwind" fn(*mut c_void, Id) = std::mem::transmute(*(b.cast::<u8>().add(16) as *const *const c_void));
     invoke(b, arg);
+}
+
+/// signalEvent:value: (MTLCommandBuffer): señala el evento compartido con el valor dado.
+extern "C-unwind" fn cb_signal_event(_this: Id, _cmd: Sel, evento: Id, valor: u64) {
+    if let Some(e) = estado::<Evento>(evento) {
+        e.valor = valor;
+    }
+}
+
+/// waitForEvent:value: (MTLCommandBuffer): el commit es síncrono, así que el evento ya está señalado cuando se
+/// llega aquí; si no lo está, se anota.
+extern "C-unwind" fn cb_esperar_evento(_this: Id, _cmd: Sel, evento: Id, valor: u64) {
+    let v = estado::<Evento>(evento).map(|e| e.valor).unwrap_or(0);
+    if v < valor {
+        registro(&format!("waitForEvent: el evento está en {v} y se esperaba {valor}"));
+    }
 }
 
 extern "C-unwind" fn cb_handler_acabar(this: Id, _cmd: Sel, b: *mut c_void) {
@@ -849,6 +894,8 @@ pub fn registrar() {
     comunes(&mut pipeline);
     etiquetas!(pipeline, Pipeline);
     let mut cb: Vec<Metodo> = vec![
+        ("signalEvent:value:", cb_signal_event as Imp, "v@:@Q"),
+        ("waitForEvent:value:", cb_esperar_evento as Imp, "v@:@Q"),
         ("computeCommandEncoder", cb_computo as Imp, "@@:"),
         ("computeCommandEncoderWithDispatchType:", cb_computo_tipo as Imp, "@@:Q"),
         ("blitCommandEncoder", cb_blit as Imp, "@@:"),

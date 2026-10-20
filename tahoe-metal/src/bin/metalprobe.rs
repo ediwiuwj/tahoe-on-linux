@@ -176,10 +176,16 @@ fn cadena(d: Id) -> i32 {
     }
 }
 
-/// Reproduce lo que hace el compositor: la biblioteca de CoreAnimation, sus shaders de plano (plane__vertex y
-/// plane_color_fragment) pedidos por descriptor, el pipeline de render, un pase y el commit.
+/// Reproduce lo que hace el compositor: sus shaders de plano (plane__vertex y plane_color_fragment, que en macOS 26
+/// están en RenderBox) y los datos que les pasa: un buffer de «globals» de 36 bytes en el índice 0 y cuatro vértices.
+///
+/// El vertex shader hace pos = x*g0 + y*g1 + g2 (las esquinas del quad salen del vertex_id) y el fragment shader
+/// escribe el color que viene en los globals (28 bytes del plano + 8 del color) en el primer attachment y la
+/// cobertura en el segundo.
 fn plano(d: Id) -> i32 {
-    const RUTA: &str = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib";
+    const RUTA: &str = "/System/Library/PrivateFrameworks/RenderBox.framework/Versions/A/Resources/default.metallib";
+    const COLOR: u64 = 80;    // MTLPixelFormatBGRA8Unorm
+    const COVERAGE: u64 = 65; // MTLPixelFormatRG16Float (el shader escribe half2 en el segundo attachment)
     unsafe {
         let mut err: Id = std::ptr::null_mut();
         let lib: Id = objc::m2(d, "newLibraryWithFile:error:", objc::nsstring(RUTA), &mut err as *mut Id);
@@ -187,7 +193,7 @@ fn plano(d: Id) -> i32 {
             println!("biblioteca: nil");
             return 3;
         }
-        // La función, por descriptor (como el compositor).
+        // La función, por descriptor (como hace el compositor).
         let por_descriptor = |lib: Id, nombre: &str| -> Id {
             let desc: Id = objc::m0(objc::clase("MTLFunctionDescriptor"), "alloc");
             objc::m1::<Id, ()>(desc, "setName:", objc::nsstring(nombre));
@@ -195,47 +201,82 @@ fn plano(d: Id) -> i32 {
         };
         let vf = por_descriptor(lib, "plane__vertex");
         let ff = por_descriptor(lib, "plane_color_fragment");
-        println!("funciones: vertex={} fragment={}", if vf.is_null() { "nil" } else { "ok" }, if ff.is_null() { "nil" } else { "ok" });
         if vf.is_null() || ff.is_null() {
+            println!("shaders: vertex={} fragment={}", if vf.is_null() { "nil" } else { "ok" }, if ff.is_null() { "nil" } else { "ok" });
             return 4;
         }
-        // El pipeline.
+        // El pipeline: el color y la cobertura, y la topología de tira (el compositor dibuja un quad).
         let pd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLRenderPipelineDescriptor"), "alloc"), "init");
         objc::m1::<Id, ()>(pd, "setVertexFunction:", vf);
         objc::m1::<Id, ()>(pd, "setFragmentFunction:", ff);
-        let ca0: Id = objc::m1(objc::m0::<Id>(pd, "colorAttachments"), "objectAtIndexedSubscript:", 0u64);
-        objc::m1::<u64, ()>(ca0, "setPixelFormat:", 80);
+        let cas: Id = objc::m0(pd, "colorAttachments");
+        let c0: Id = objc::m1(cas, "objectAtIndexedSubscript:", 0u64);
+        objc::m1::<u64, ()>(c0, "setPixelFormat:", COLOR);
+        let c1: Id = objc::m1(cas, "objectAtIndexedSubscript:", 1u64);
+        objc::m1::<u64, ()>(c1, "setPixelFormat:", COVERAGE);
+        // El runtime solo admite 0..3 aquí (Metal compara con 4 y falla); el tipo de primitiva va en el dibujo.
+        objc::m1::<u64, ()>(pd, "setInputPrimitiveTopology:", 3); // MTLPrimitiveTypeTriangle
         let p: Id = objc::m2(d, "newRenderPipelineStateWithDescriptor:error:", pd, &mut err as *mut Id);
         if p.is_null() {
             println!("pipeline: nil ({})", objc::texto(if err.is_null() { err } else { objc::m0(err, "localizedDescription") }));
             return 5;
         }
         println!("pipeline: ok");
-        // Un pase de render sobre una textura BGRA8 de 64x64.
-        let td: Id = {
+        // Los «globals»: 28 bytes del plano (la matriz de 3 float2 y la profundidad) y 8 del color (4 half).
+        let mut g = [0u8; 36];
+        for (o, v) in [(0usize, 2.0f32), (4, 0.0), (8, 0.0), (12, 2.0), (16, -1.0), (20, -1.0), (24, 0.0)] {
+            g[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (o, v) in [(28usize, 0x3c00u16), (30, 0x3800), (32, 0x3400), (34, 0x3c00)] {
+            g[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        }
+        let gb: Id = objc::m3(d, "newBufferWithBytes:length:options:", g.as_ptr(), 36u64, 0u64);
+        // Las texturas: el color (BGRA8) y la cobertura (RG16Float).
+        let textura = |formato: u64| -> Id {
             let f: unsafe extern "C" fn(Id, objc::Sel, u64, u64, u64, i8) -> Id = std::mem::transmute(objc::objc_msgSend as *const ());
-            f(objc::clase("MTLTextureDescriptor"), objc::sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, 64, 64, 0)
+            let td: Id = f(objc::clase("MTLTextureDescriptor"), objc::sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), formato, 64, 64, 0);
+            objc::m1::<u64, ()>(td, "setUsage:", 5);
+            objc::m1(d, "newTextureWithDescriptor:", td)
         };
-        objc::m1::<u64, ()>(td, "setUsage:", 5);
-        let tex: Id = objc::m1(d, "newTextureWithDescriptor:", td);
-        if tex.is_null() {
-            println!("textura: nil");
+        let tex = textura(COLOR);
+        let cob = textura(COVERAGE);
+        if tex.is_null() || cob.is_null() {
+            println!("texturas: nil");
             return 6;
         }
+        // El pase, con los dos attachments.
         let rp: Id = objc::m0(objc::clase("MTLRenderPassDescriptor"), "renderPassDescriptor");
-        let a0: Id = objc::m1(objc::m0::<Id>(rp, "colorAttachments"), "objectAtIndexedSubscript:", 0u64);
-        objc::m1::<Id, ()>(a0, "setTexture:", tex);
-        objc::m1::<u64, ()>(a0, "setLoadAction:", 2);
-        objc::m1::<u64, ()>(a0, "setStoreAction:", 1);
+        let ras: Id = objc::m0(rp, "colorAttachments");
+        for (i, t) in [tex, cob].iter().enumerate() {
+            let a: Id = objc::m1(ras, "objectAtIndexedSubscript:", i as u64);
+            objc::m1::<Id, ()>(a, "setTexture:", *t);
+            objc::m1::<u64, ()>(a, "setLoadAction:", 2);
+            objc::m1::<u64, ()>(a, "setStoreAction:", 1);
+        }
         let q: Id = objc::m0(d, "newCommandQueue");
         let cb: Id = objc::m0(q, "commandBuffer");
         let enc: Id = objc::m1(cb, "renderCommandEncoderWithDescriptor:", rp);
         objc::m1::<Id, ()>(enc, "setRenderPipelineState:", p);
+        objc::m3::<Id, u64, u64, ()>(enc, "setVertexBuffer:offset:atIndex:", gb, 0, 0);
+        objc::m3::<Id, u64, u64, ()>(enc, "setFragmentBuffer:offset:atIndex:", gb, 0, 0);
+        // El quad: cuatro vértices; el shader elige la esquina con el vertex_id.
+        // El tipo de primitiva va en la llamada: 4 = MTLPrimitiveTypeTriangleStrip.
+        objc::m3::<u64, u64, u64, ()>(enc, "drawPrimitives:vertexStart:vertexCount:", 4, 0, 4);
         objc::m0::<()>(enc, "endEncoding");
         objc::m0::<()>(cb, "commit");
         objc::m0::<()>(cb, "waitUntilCompleted");
-        println!("command buffer: estado {}", objc::m0::<u64>(cb, "status"));
-        0
+        let st: u64 = objc::m0(cb, "status");
+        let mut px = vec![0u8; 64 * 64 * 4];
+        {
+            let f: unsafe extern "C" fn(Id, objc::Sel, *mut u8, u64, MTLRegion, u64) = std::mem::transmute(objc::objc_msgSend as *const ());
+            f(tex, objc::sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), px.as_mut_ptr(), 256, MTLRegion { x: 0, y: 0, z: 0, w: 64, h: 64, d: 1 }, 0);
+        }
+        let punto = |x: usize, y: usize| -> [u8; 4] { px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].try_into().unwrap() };
+        println!("command buffer: estado {st}; centro BGRA {:?}; esquina {:?}", punto(32, 32), punto(0, 0));
+        // El color de los globals es (1.0, 0.5, 0.25, 1.0): en BGRA8 son B=64, G=128, R=255, A=255.
+        let bien = punto(32, 32) == [64u8, 128, 255, 255] && punto(0, 0) == [64u8, 128, 255, 255];
+        println!("plano: {}", if bien { "CORRECTO" } else { "MAL" });
+        if bien { 0 } else { 7 }
     }
 }
 

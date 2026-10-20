@@ -80,10 +80,25 @@ extern "C-unwind" fn nueva_cola_max(_this: Id, _cmd: Sel, _n: u64) -> Id {
     clases::nueva_cola()
 }
 
+/// La cola por defecto del dispositivo: la que usa `newCommandBuffer`. Se guarda para no crear una por llamada.
+static COLA_POR_DEFECTO: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+
+fn cola_por_defecto() -> Id {
+    let mut c = COLA_POR_DEFECTO.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(q) = *c {
+        if q != 0 {
+            return q as Id;
+        }
+    }
+    let q = clases::nueva_cola();
+    *c = Some(q as usize);
+    q
+}
+
 /// newCommandBuffer (MTLDevice): un command buffer sin cola propia. En macOS 26 ningún framework del sistema lo
 /// llama, pero está en el protocolo del runtime: como stub devolvía nil.
 extern "C-unwind" fn nuevo_command_buffer(_this: Id, _cmd: Sel) -> Id {
-    let cola = clases::nueva_cola();
+    let cola = cola_por_defecto();
     if cola.is_null() {
         return std::ptr::null_mut();
     }

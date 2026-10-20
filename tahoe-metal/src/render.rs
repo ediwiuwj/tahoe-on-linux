@@ -764,6 +764,10 @@ extern "C-unwind" fn cb_render(this: Id, _cmd: Sel, d: Id) -> Id {
     unsafe { objc::m0(enc, "autorelease") }
 }
 
+/// updateFence: / waitForFence: (MTLCommandEncoder): aquí no hay planificador de citas y el commit es síncrono, así
+/// que el fence no sincroniza nada.
+extern "C-unwind" fn ren_fence(_this: Id, _cmd: Sel, _fence: Id) {}
+
 extern "C-unwind" fn ren_pipeline(this: Id, _cmd: Sel, p: Id) {
     if let (Some(o), Some(pl)) = (ordenes(this), estado::<PipelineRender>(p)) {
         o.u32(orden::PIPELINE_RENDER).u32(pl.id);
@@ -841,6 +845,9 @@ extern "C-unwind" fn ren_sentido(_this: Id, _cmd: Sel, w: u64) {
     }
 }
 fn dibujar(this: Id, prim: u64, primero: u64, cuenta: u64, inst: u64, pinst: u64) {
+    // Se anota el tipo de primitiva: es lo que decide la topología en el servidor, y sirve para ver qué usa
+    // el compositor de verdad.
+    registro(&format!("dibujo: primitiva {prim}, desde {primero}, {cuenta} vértices"));
     if let Some(o) = ordenes(this) {
         o.u32(orden::DIBUJAR).u32(prim as u32).u32(primero as u32).u32(cuenta as u32).u32(inst as u32).u32(pinst as u32);
     }
@@ -910,15 +917,18 @@ extern "C-unwind" fn tamano_textura_heap(_this: Id, _cmd: Sel, d: Id) -> TamanoA
         campo(d, "mipmapLevelCount", 0u64),
         campo(d, "pixelFormat", 0u64),
     );
+    let muestras = campo(d, "sampleCount", 1u64).max(1);
     let bpp = bytes_por_pixel(formato);
     let mut total = 0u64;
     for nivel in 0..niveles.max(1) {
         let w = (ancho >> nivel).max(1);
         let h = (alto >> nivel).max(1);
         let p = (prof >> nivel).max(1);
-        total += w * h * p * bpp;
+        // La fila va alineada, como en el hardware.
+        let fila = (w * bpp).next_multiple_of(ALINEACION_HEAP);
+        total += fila * h * p;
     }
-    total *= capas.max(1);
+    total *= capas.max(1) * muestras;
     TamanoAlineacion { tamano: total.div_ceil(ALINEACION_HEAP) * ALINEACION_HEAP, alineacion: ALINEACION_HEAP }
 }
 
@@ -1002,19 +1012,17 @@ extern "C-unwind" fn heap_nueva_textura(this: Id, _cmd: Sel, desc: Id) -> Id {
     }
     t
 }
-extern "C-unwind" fn residencia_anadir(this: Id, _cmd: Sel, objetos: Id) {
+/// addAllocation: (MTLResidencySet): añade un recurso (buffer o textura) al conjunto.
+extern "C-unwind" fn residencia_anadir(this: Id, _cmd: Sel, recurso: Id) {
     let Some(r) = estado::<Residencia>(this) else { return };
-    if objetos.is_null() {
+    if recurso.is_null() {
         return;
     }
-    let n = unsafe { objc::m0::<u64>(objetos, "count") };
-    for i in 0..n {
-        let o = unsafe { objc::m1::<u64, Id>(objetos, "objectAtIndexedSubscript:", i) };
-        if !o.is_null() {
-            r.objetos.push(retener(o));
-        }
-    }
+    r.objetos.push(retener(recurso));
 }
+
+/// commit (MTLResidencySet): no hay planificador de citas; el conjunto solo retiene los recursos.
+extern "C-unwind" fn residencia_commit(_this: Id, _cmd: Sel) {}
 extern "C-unwind" fn residencia_quitar_todo(this: Id, _cmd: Sel) {
     if let Some(r) = estado::<Residencia>(this) {
         for o in r.objetos.drain(..) {
@@ -1047,11 +1055,12 @@ extern "C-unwind" fn dev_residencia(_this: Id, _cmd: Sel, desc: Id, error: *mut 
 }
 
 /// newBufferWithBytesNoCopy:length:options:deallocator: (MTLDevice): el cliente da memoria ya paginada y espera que
-/// Metal no la copie. Aquí sí se copia al buffer del servidor (el servidor no puede importar memoria del cliente) y
-/// el bloque de liberador no se llama: la memoria sigue siendo del cliente.
-extern "C-unwind" fn dev_buffer_nocopia(_this: Id, _cmd: Sel, p: *const u8, len: u64, opciones: u64, _liberador: Id) -> Id {
+/// Metal no la copie. Aquí sí se copia al buffer del servidor (el servidor no puede importar memoria del cliente),
+/// pero el bloque de liberación se guarda y se llama cuando el buffer muere, como manda el contrato.
+extern "C-unwind" fn dev_buffer_nocopia(_this: Id, _cmd: Sel, p: *const u8, len: u64, opciones: u64, liberador: Id) -> Id {
     let datos = if p.is_null() { None } else { Some(unsafe { std::slice::from_raw_parts(p, len as usize) }) };
-    match clases::nuevo_buffer(len as usize, opciones, datos) {
+    let bloq = clases::copiar_bloque(liberador);
+    match clases::nuevo_buffer_con_liberador(len as usize, opciones, datos, bloq) {
         Ok(b) => b,
         Err(e) => {
             registro(&format!("newBufferWithBytesNoCopy:{len}: {e}"));
@@ -1115,6 +1124,8 @@ pub fn registrar(dispositivo: Class) {
     etq(&mut pipeline, clases::etiqueta::<PipelineRender> as Imp, clases::poner_etiqueta::<PipelineRender> as Imp);
     let mut encoder: Vec<Metodo> = vec![
         ("setRenderPipelineState:", ren_pipeline as Imp, "v@:@"),
+        ("updateFence:", ren_fence as Imp, "v@:@"),
+        ("waitForFence:", ren_fence as Imp, "v@:@"),
         ("setVertexBuffer:offset:atIndex:", ren_vbuffer as Imp, "v@:@QQ"),
         ("setFragmentBuffer:offset:atIndex:", ren_fbuffer as Imp, "v@:@QQ"),
         ("setVertexBytes:length:atIndex:", ren_vbytes as Imp, "v@:^vQQ"),
@@ -1154,8 +1165,9 @@ pub fn registrar(dispositivo: Class) {
     let mut fence: Vec<Metodo> = vec![];
     etq(&mut fence, clases::etiqueta::<Fence> as Imp, clases::poner_etiqueta::<Fence> as Imp);
     let mut residencia: Vec<Metodo> = vec![
-        ("addAllObjects:", residencia_anadir as Imp, "v@:@"),
+        ("addAllocation:", residencia_anadir as Imp, "v@:@"),
         ("removeAllObjects", residencia_quitar_todo as Imp, "v@:"),
+        ("commit", residencia_commit as Imp, "v@:"),
     ];
     etq(&mut residencia, clases::etiqueta::<Residencia> as Imp, clases::poner_etiqueta::<Residencia> as Imp);
     let c = ClasesRender {

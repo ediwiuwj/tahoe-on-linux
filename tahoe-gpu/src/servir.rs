@@ -703,18 +703,46 @@ impl Cliente {
         for d in dibujos {
             let r = &self.renders[&d.est.pipeline.unwrap()];
             let p = &r.por_topologia[&formatos::topologia(d.prim).as_raw()];
-            let rv = self.recursos(&r.v, &d.enl[0], temporales, m)?;
+            // Un recurso que falta no tumba el command buffer entero: se salta ese dibujo y se sigue. Un cliente
+            // real dibuja con lo que tiene ligado, y fallar el pase entero rompe toda la cadena.
+            let rv = match self.recursos(&r.v, &d.enl[0], temporales, m) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("tahoe-gpu: dibujo saltado (vértices): {e}");
+                    continue;
+                }
+            };
             let rf = match &r.f {
-                Some(f) => self.recursos(f, &d.enl[1], temporales, m)?,
+                Some(f) => match self.recursos(f, &d.enl[1], temporales, m) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        eprintln!("tahoe-gpu: dibujo saltado (fragmento): {e}");
+                        continue;
+                    }
+                },
                 None => HashMap::new(),
             };
             let mut vertices = Vec::new();
+            let mut falta = false;
             for ev in &r.enlaces_vertices {
                 match d.enl[0].buffers.get(&ev.buffer) {
-                    Some(Origen::Buffer(b, off)) => vertices.push((ev.buffer, self.buffers.get(b).and_then(|x| x.buf.as_ref()).ok_or("buffer de vértices desconocido")?, *off)),
+                    Some(Origen::Buffer(b, off)) => match self.buffers.get(b).and_then(|x| x.buf.as_ref()) {
+                        Some(buf) => vertices.push((ev.buffer, buf, *off)),
+                        None => {
+                            falta = true;
+                            break;
+                        }
+                    },
                     Some(Origen::Temporal(k)) => vertices.push((ev.buffer, &temporales[*k], 0)),
-                    None => return Err(format!("falta el buffer de vértices {}", ev.buffer)),
+                    None => {
+                        falta = true;
+                        break;
+                    }
                 }
+            }
+            if falta {
+                eprintln!("tahoe-gpu: dibujo saltado: falta el buffer de vértices");
+                continue;
             }
             let indices = match d.indices {
                 Some((b, de32)) => Some((self.buffers.get(&b).and_then(|x| x.buf.as_ref()).ok_or("buffer de índices desconocido")?, 0u64, de32)),
