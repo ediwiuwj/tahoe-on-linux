@@ -276,6 +276,7 @@ impl Cliente {
                 let ordenes = l.bytes()?.to_vec();
                 match self.ejecutar(&ordenes) {
                     Ok(()) => {
+                        eprintln!("tahoe-gpu: command buffer: {} bytes de órdenes", ordenes.len());
                         e.u32(0).texto("");
                     }
                     Err(er) => {

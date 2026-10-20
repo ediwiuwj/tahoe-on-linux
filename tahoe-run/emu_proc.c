@@ -919,6 +919,8 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (getenv("TAHOE_GPU_SOCK")) { snprintf(b13, sizeof b13, "TAHOE_GPU_SOCK=%s", getenv("TAHOE_GPU_SOCK")); nenv[e++] = b13; }
 	if (getenv("TAHOE_FD2LOG")) nenv[e++] = (char*)"TAHOE_FD2LOG=1";
 	if (getenv("TAHOE_DEBUG_NOREBOOT")) nenv[e++] = (char*)"TAHOE_DEBUG_NOREBOOT=1";   // modo depuración (ver emu_iokit.inc)
+	if (getenv("TAHOE_AGDC")) nenv[e++] = (char*)"TAHOE_AGDC=1";                     // el campo AGDC del GPUWrangler lleva el acelerador (ver emu_iokit.inc)
+	if (getenv("TAHOE_FB_INTEL")) nenv[e++] = (char*)"TAHOE_FB_INTEL=1";             // el framebuffer se presenta como el de una Intel (ver emu_iokit.inc)
 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
 	static char b7[300]; cred_env(b7, sizeof b7); nenv[e++] = b7;   // credenciales emuladas (uid/gid) para el hijo
 	for (int i = 0; i < spawn_special_n; i++) nenv[e++] = spawn_special_env[i];

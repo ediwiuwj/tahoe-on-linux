@@ -64,6 +64,12 @@ SMBIOS="${TAHOE_SMBIOS_FILE:-$HOME/.config/tahoe-run/smbios.json}"
 # Argumentos de arranque de macOS (NVRAM boot-args y kern.bootargs), p. ej. TAHOE_BOOTARGS="useIOP=0".
 [ -n "$TAHOE_BOOTARGS" ] && OSK_ENV+=(TAHOE_BOOTARGS="$TAHOE_BOOTARGS")
 [ -n "$TAHOE_GPU" ] && OSK_ENV+=(TAHOE_GPU="$TAHOE_GPU")          # otra identidad PCI para la GPU emulada
+# Camino acelerado de la pantalla (AGDC/IOPresentment): con TAHOE_AGDC=1 el GPUWrangler da el ID del acelerador
+# emulado, con lo que CoreDisplay intenta presentar por la GPU en vez de por software (ver emu_iokit.inc).
+[ -n "$TAHOE_AGDC" ] && OSK_ENV+=(TAHOE_AGDC=1)
+# Con TAHOE_FB_INTEL=1 el framebuffer emulado se presenta como el de una Intel, con lo que CoreDisplay usa el camino
+# AGDC/IOPresentment en vez del clásico por software (ver emu_iokit.inc).
+[ -n "$TAHOE_FB_INTEL" ] && OSK_ENV+=(TAHOE_FB_INTEL=1)
 # Driver Metal (tahoe-metal): carpeta del anfitrión con TahoeMetal.bundle; con ella macOS ve un IOAccelerator con ese driver.
 # Con él arranca también el servidor de GPU de Linux (tahoe-gpu servir, Vulkan), al que el driver manda los comandos por
 # el socket TAHOE_GPU_SOCK (por omisión /dev/shm/tahoe-gpu-<uid>.sock).
