@@ -344,6 +344,18 @@ impl Tr<'_> {
                     let i = d.int_tras("air.location_index").unwrap_or(0) as u32;
                     if d.int_tras("air.address_space") == Some(3) { TV::Ptr(Base::WgArg(i), Off::C(0)) } else { TV::Ptr(Base::Buf(i), Off::C(0)) }
                 }
+                // Un argumento de kernel pasado por valor: el cliente lo pone con setBytes, así que llega como un
+                // buffer temporal en ese índice y su valor se lee de ahí.
+                "air.stage_in" => {
+                    let i = d.int_tras("air.location_index").unwrap_or(0) as u32;
+                    TV::Id(self.cargar(Base::Buf(i), Off::C(0), t_arg)?)
+                }
+                // El identificador de amplificación y los índices de capa y de viewport no tienen equivalente en
+                // Vulkan (no hay amplify ni multiview): se dejan a cero.
+                "air.amplification_id" | "air.render_target_array_index" | "air.viewport_array_index" => {
+                    let st = self.ty(t_arg)?;
+                    TV::Id(self.b.constant_null(st))
+                }
                 "air.texture" => {
                     let i = d.int_tras("air.location_index").unwrap_or(0) as u32;
                     let nombre = d.txt_tras("air.arg_type_name").unwrap_or("");
@@ -478,6 +490,10 @@ impl Tr<'_> {
                 continue;
             }
             let st = self.ty(tc)?;
+            // La capa y el viewport (multiview) no tienen built-in en Vulkan (Layer solo existe en geometría y
+            // el índice de capa exige la extensión VK_EXT_shader_viewport_index_layer): salen como un location
+            // más, que es lo que hizo el prototipo de AIR.
+            let multiview = matches!(d.clase.as_str(), "air.render_target_array_index" | "air.viewport_array_index");
             let pt = self.ptr_t(StorageClass::Output, st);
             let var = self.var_global(pt, StorageClass::Output, None);
             match d.clase.as_str() {
@@ -500,6 +516,12 @@ impl Tr<'_> {
                     let rt = d.propios().first().and_then(|x| match x { super::super::Dato::Int(i) => Some(*i as u32), _ => None }).unwrap_or(0);
                     self.b.decorate(var, Decoration::Location, [Operand::LiteralBit32(rt)]);
                     self.colores.push(rt);
+                }
+                // El índice de capa (array) y el de viewport: un location más (ver arriba).
+                "air.render_target_array_index" | "air.viewport_array_index" => {
+                    let loc = self.varyings_out.len() as u32;
+                    self.b.decorate(var, Decoration::Location, [Operand::LiteralBit32(loc)]);
+                    self.varyings_out.push((String::new(), loc));
                 }
                 otra => return Err(format!("salida {otra} sin soporte aún")),
             }

@@ -223,21 +223,24 @@ fn bytes_por_pixel(formato: u64) -> u64 {
         1 => 1,      // A8Unorm
         10 => 1,     // R8Unorm
         12 => 1,     // R8Snorm
-        14 => 1,     // R8Uint
-        16 => 1,     // R8Sint
+        13 => 1,     // R8Uint
+        14 => 1,     // R8Sint
         20 => 2,     // R16Unorm
-        28 => 2,     // R16Float
+        25 => 2,     // R16Float
         30 => 2,     // RG8Unorm
-        40 => 4,     // R32Uint
-        44 => 4,     // R32Float
-        50 => 4,     // RG16Unorm
+        40 => 2,     // B5G6R5Unorm
+        44 => 2,     // BGRA4Unorm
+        53 => 4,     // R32Uint
+        55 => 4,     // R32Float
+        60 => 4,     // RG16Unorm
         70 => 4,     // RGBA8Unorm
         71 => 4,     // RGBA8Unorm_sRGB
         72 => 4,     // RGBA8Snorm
         80 => 4,     // BGRA8Unorm
         81 => 4,     // BGRA8Unorm_sRGB
-        90 => 8,     // RGBA16Unorm
-        100 => 8,    // RGBA32Float
+        90 => 4,     // RGB10A2Unorm
+        110 => 8,    // RGBA16Unorm
+        125 => 16,   // RGBA32Float
         _ => 4,
     }
 }
@@ -526,9 +529,13 @@ extern "C-unwind" fn fc_nombre(this: Id, cmd: Sel, p: *const u8, t: u64, n: Id) 
 /// setConstantValues: (MTLFunctionDescriptor): Metal copia los valores a un objeto interno; los nuestros se copian
 /// al objeto copiado, que es el que luego lee el driver al crear la función.
 extern "C-unwind" fn fd_constantes(this: Id, cmd: Sel, valores: Id) {
+    let orig = ORIGINALES.get().map(|o| o[3]).unwrap_or(0);
+    if orig == 0 {
+        return;
+    }
     // SAFETY: el método original de Metal con la misma firma.
     unsafe {
-        let f: extern "C-unwind" fn(Id, Sel, Id) = std::mem::transmute(ORIGINALES.get().unwrap()[3]);
+        let f: extern "C-unwind" fn(Id, Sel, Id) = std::mem::transmute(orig);
         f(this, cmd, valores);
     }
     // SAFETY: el descriptor es un MTLFunctionDescriptor.
@@ -573,29 +580,22 @@ fn interceptar_constantes() {
             registro("MTLFunctionConstantValuesInternal sin los métodos esperados");
             return;
         }
+        // También el descriptor: al poner los valores, Metal los copia a un objeto interno suyo, y esa copia no
+        // pasa por los métodos interceptados. Se copia lo nuestro al objeto copiado.
+        let d = objc::clase("MTLFunctionDescriptor");
+        let md = if d.is_null() { std::ptr::null_mut() } else { objc::class_getInstanceMethod(d, objc::sel("setConstantValues:")) };
+        // El OnceLock solo se puede fijar una vez: las cuatro implementaciones originales seGuardan juntas.
         let _ = ORIGINALES.set([
             objc::method_getImplementation(a) as usize,
             objc::method_getImplementation(b) as usize,
             objc::method_getImplementation(c) as usize,
-            0,
+            if md.is_null() { 0 } else { objc::method_getImplementation(md) as usize },
         ]);
         objc::method_setImplementation(a, fc_indice as Imp);
         objc::method_setImplementation(b, fc_nombre as Imp);
         objc::method_setImplementation(c, fc_rango as Imp);
-        // También el descriptor: al poner los valores, Metal los copia a un objeto interno suyo, y esa copia no
-        // pasa por los métodos interceptados. Se copia lo nuestro al objeto copiado.
-        let d = objc::clase("MTLFunctionDescriptor");
-        if !d.is_null() {
-            let m = objc::class_getInstanceMethod(d, objc::sel("setConstantValues:"));
-            if !m.is_null() {
-                let _ = ORIGINALES.set([
-                    objc::method_getImplementation(a) as usize,
-                    objc::method_getImplementation(b) as usize,
-                    objc::method_getImplementation(c) as usize,
-                    objc::method_getImplementation(m) as usize,
-                ]);
-                objc::method_setImplementation(m, fd_constantes as Imp);
-            }
+        if !md.is_null() {
+            objc::method_setImplementation(md, fd_constantes as Imp);
         }
     }
 }
@@ -999,7 +999,9 @@ extern "C-unwind" fn tamano_textura_heap(_this: Id, _cmd: Sel, d: Id) -> TamanoA
 /// ocupado: cada recurso se crea en el servidor de GPU como los del dispositivo.
 pub struct Heap {
     tamano: u64,
-    modo: u64,
+    /// Las opciones del heap (MTLResourceOptions): la caché en los bits 0-3, el modo de almacenamiento en los 4-7 y el
+    /// modo de hazard en los 8-9. Se guardan empaquetadas para poder contestar resourceOptions tal cual.
+    opciones: u64,
     ocupado: u64,
     etiqueta: Id,
 }
@@ -1043,14 +1045,49 @@ impl Drop for Residencia {
 extern "C-unwind" fn heap_tamano(this: Id, _cmd: Sel) -> u64 {
     estado::<Heap>(this).map(|h| h.tamano).unwrap_or(0)
 }
+/// storageMode (MTLHeap): el modo de almacenamiento son los bits 4-7 de las opciones.
 extern "C-unwind" fn heap_modo(this: Id, _cmd: Sel) -> u64 {
-    estado::<Heap>(this).map(|h| h.modo).unwrap_or(0)
+    estado::<Heap>(this).map(|h| (h.opciones >> 4) & 0xf).unwrap_or(0)
 }
+/// cpuCacheMode (MTLHeap): la caché son los bits 0-3 de las opciones.
+extern "C-unwind" fn heap_cache(this: Id, _cmd: Sel) -> u64 {
+    estado::<Heap>(this).map(|h| h.opciones & 0xf).unwrap_or(0)
+}
+/// hazardTrackingMode (MTLHeap): el modo de hazard son los bits 8-9 de las opciones.
+extern "C-unwind" fn heap_hazard(this: Id, _cmd: Sel) -> u64 {
+    estado::<Heap>(this).map(|h| (h.opciones >> 8) & 0x3).unwrap_or(0)
+}
+/// resourceOptions (MTLHeap): las opciones tal cual (modo de almacenamiento, caché y hazard empaquetados). Antes se
+/// contestaba 0 y el cliente deducía de ahí un almacenamiento *Shared* que no era el del heap.
+extern "C-unwind" fn heap_opciones(this: Id, _cmd: Sel) -> u64 {
+    estado::<Heap>(this).map(|h| h.opciones).unwrap_or(0)
+}
+/// unfilteredResourceOptions (MTLHeap): las opciones sin el modo de hazard tracking.
+extern "C-unwind" fn heap_opciones_sin_hazard(this: Id, _cmd: Sel) -> u64 {
+    estado::<Heap>(this).map(|h| h.opciones & !(3u64 << 8)).unwrap_or(0)
+}
+/// usedSize y currentAllocatedSize (MTLHeap): los bytes que ocupa lo que se ha sacado del heap.
 extern "C-unwind" fn heap_ocupado(this: Id, _cmd: Sel) -> u64 {
     estado::<Heap>(this).map(|h| h.ocupado).unwrap_or(0)
 }
-/// cpuCacheMode, hazardTrackingMode, resourceOptions, type y gpuAddress (MTLHeap): el heap no tiene memoria propia
-/// (los recursos viven en el servidor de GPU), así que se contestan los valores neutros.
+/// maxAvailableSizeWithAlignment: (MTLHeap): lo que queda libre del heap, redondeado hacia abajo a la alineación
+/// pedida (si no se pide ninguna, se devuelve tal cual).
+extern "C-unwind" fn heap_max_disponible(this: Id, _cmd: Sel, alineacion: u64) -> u64 {
+    let Some(h) = estado::<Heap>(this) else { return 0 };
+    let libre = h.tamano.saturating_sub(h.ocupado);
+    if alineacion > 1 {
+        libre - libre % alineacion
+    } else {
+        libre
+    }
+}
+/// setPurgeableState: (MTLHeap): la memoria la tiene el servidor de GPU y no se puede purgar; se acepta el cambio de
+/// estado y se dice que la memoria sigue ahí (como en el buffer).
+extern "C-unwind" fn heap_purgeable(_this: Id, _cmd: Sel, _estado: u64) -> Bool {
+    1
+}
+/// type y gpuAddress (MTLHeap): el heap no tiene memoria propia (los recursos viven en el servidor de GPU), así que se
+/// contesta el tipo automático y la dirección 0.
 extern "C-unwind" fn heap_cero(_this: Id, _cmd: Sel) -> u64 {
     0
 }
@@ -1077,6 +1114,22 @@ extern "C-unwind" fn heap_nuevo_buffer_offset(this: Id, cmd: Sel, len: u64, opci
     registro(&format!("heap: newBufferWithLength:options:offset: {len} bytes en {offset}: el desplazamiento se ignora"));
     heap_nuevo_buffer(this, cmd, len, opciones)
 }
+/// newBufferWithLength:options:atOffset: (MTLHeap): la otra forma de pedir lo mismo que con offset:.
+extern "C-unwind" fn heap_nuevo_buffer_at_offset(this: Id, cmd: Sel, len: u64, opciones: u64, offset: u64) -> Id {
+    registro(&format!("heap: newBufferWithLength:options:atOffset: {len} bytes en {offset}: el desplazamiento se ignora"));
+    heap_nuevo_buffer(this, cmd, len, opciones)
+}
+/// newBufferWithDescriptor: (MTLHeap): el buffer sale del descriptor (MTLBufferDescriptor: «length» y «options»).
+extern "C-unwind" fn heap_nuevo_buffer_desc(this: Id, cmd: Sel, desc: Id) -> Id {
+    let len = campo(desc, "length", 0u64);
+    let opciones = campo(desc, "options", 0u64);
+    heap_nuevo_buffer(this, cmd, len, opciones)
+}
+/// newBufferWithDescriptor:offset: (MTLHeap): como el otro, el desplazamiento dentro del heap se ignora.
+extern "C-unwind" fn heap_nuevo_buffer_desc_offset(this: Id, cmd: Sel, desc: Id, offset: u64) -> Id {
+    registro(&format!("heap: newBufferWithDescriptor:offset: en {offset}: el desplazamiento se ignora"));
+    heap_nuevo_buffer_desc(this, cmd, desc)
+}
 extern "C-unwind" fn heap_nueva_textura(this: Id, _cmd: Sel, desc: Id) -> Id {
     let t = textura_de_descriptor(desc);
     if t.is_null() {
@@ -1092,6 +1145,31 @@ extern "C-unwind" fn heap_nueva_textura(this: Id, _cmd: Sel, desc: Id) -> Id {
 extern "C-unwind" fn heap_nueva_textura_offset(this: Id, cmd: Sel, desc: Id, offset: u64) -> Id {
     registro(&format!("heap: newTextureWithDescriptor:offset: en {offset}: el desplazamiento se ignora"));
     heap_nueva_textura(this, cmd, desc)
+}
+/// newTextureWithDescriptor:atOffset: (MTLHeap): la otra forma de pedir lo mismo que con offset:.
+extern "C-unwind" fn heap_nueva_textura_at_offset(this: Id, cmd: Sel, desc: Id, offset: u64) -> Id {
+    registro(&format!("heap: newTextureWithDescriptor:atOffset: en {offset}: el desplazamiento se ignora"));
+    heap_nueva_textura(this, cmd, desc)
+}
+/// Las estructuras de aceleración no existen en este driver: se devuelve nil (como hacen los stubs del protocolo del
+/// dispositivo) para que el cliente no se deadly con un selector desconocido.
+extern "C-unwind" fn heap_acel_tamano(_this: Id, _cmd: Sel, _tamano: u64) -> Id {
+    std::ptr::null_mut()
+}
+extern "C-unwind" fn heap_acel_desc(_this: Id, _cmd: Sel, _desc: Id) -> Id {
+    std::ptr::null_mut()
+}
+extern "C-unwind" fn heap_acel_tamano_offset(_this: Id, _cmd: Sel, _tamano: u64, _offset: u64) -> Id {
+    std::ptr::null_mut()
+}
+extern "C-unwind" fn heap_acel_desc_offset(_this: Id, _cmd: Sel, _desc: Id, _offset: u64) -> Id {
+    std::ptr::null_mut()
+}
+extern "C-unwind" fn heap_acel_tamano_indice(_this: Id, _cmd: Sel, _tamano: u64, _indice: u64) -> Id {
+    std::ptr::null_mut()
+}
+extern "C-unwind" fn heap_acel_tamano_offset_indice(_this: Id, _cmd: Sel, _tamano: u64, _offset: u64, _indice: u64) -> Id {
+    std::ptr::null_mut()
 }
 /// addAllocation: (MTLResidencySet): añade un recurso (buffer o textura) al conjunto.
 extern "C-unwind" fn residencia_anadir(this: Id, _cmd: Sel, recurso: Id) {
@@ -1159,8 +1237,12 @@ extern "C-unwind" fn residencia_quitar_todo(this: Id, _cmd: Sel) {
 extern "C-unwind" fn dev_heap(_this: Id, _cmd: Sel, desc: Id) -> Id {
     let tamano = campo(desc, "size", 0u64);
     let modo = campo(desc, "storageMode", 0u64);
-    registro(&format!("heap: {tamano} bytes, modo {modo}"));
-    crear(&clases_render().heap, Heap { tamano, modo, ocupado: 0, etiqueta: std::ptr::null_mut() })
+    let cache = campo(desc, "cpuCacheMode", 0u64);
+    let hazard = campo(desc, "hazardTrackingMode", 0u64);
+    // MTLResourceOptions: la caché en los bits 0-3, el modo de almacenamiento en los 4-7 y el hazard en los 8-9.
+    let opciones = (cache & 0xf) | ((modo & 0xf) << 4) | ((hazard & 0x3) << 8);
+    registro(&format!("heap: {tamano} bytes, modo {modo}, opciones {opciones}"));
+    crear(&clases_render().heap, Heap { tamano, opciones, ocupado: 0, etiqueta: std::ptr::null_mut() })
 }
 
 /// newFence (MTLDevice): el objeto en sí; no sincroniza nada.
@@ -1182,10 +1264,15 @@ extern "C-unwind" fn dev_residencia(_this: Id, _cmd: Sel, desc: Id, error: *mut 
 /// Metal no la copie. Aquí sí se copia al buffer del servidor (el servidor no puede importar memoria del cliente),
 /// pero el bloque de liberación se guarda y se llama cuando el buffer muere con el puntero que dio el cliente, como
 /// manda el contrato (`void (^)(const void *)`).
+///
+/// Si el cliente no da memoria (`bytes == NULL`) pero sí da liberador, en Metal se crearía un buffer vacío y el bloque
+/// se llamaría una vez con NULL: aquí el bloque se copia igualmente y se llama con NULL al morir el buffer (el puntero
+/// que se le pasa es `origen`, que es NULL cuando el cliente no dio memoria).
 extern "C-unwind" fn dev_buffer_nocopia(_this: Id, _cmd: Sel, p: *const u8, len: u64, opciones: u64, liberador: Id) -> Id {
+    // SAFETY: el cliente garantiza que hay len bytes en p (si no hay memoria, p es nulo y no se lee nada).
     let datos = if p.is_null() { None } else { Some(unsafe { std::slice::from_raw_parts(p, len as usize) }) };
-    // Sin memoria del cliente no hay nada que liberar: el bloque ni se copia (quedaría sin llamar).
-    let bloq = if p.is_null() { None } else { clases::copiar_bloque(liberador) };
+    // El bloque se copia siempre que no sea nulo: si no hay memoria del cliente, se llamará con NULL al morir el buffer.
+    let bloq = clases::copiar_bloque(liberador);
     match clases::nuevo_buffer_con_liberador(len as usize, opciones, datos, bloq, p) {
         Ok(b) => b,
         Err(e) => {
@@ -1283,17 +1370,32 @@ pub fn registrar(dispositivo: Class) {
     let mut heap: Vec<Metodo> = vec![
         ("size", heap_tamano as Imp, "Q@:"),
         ("allocatedSize", heap_ocupado as Imp, "Q@:"),
+        ("usedSize", heap_ocupado as Imp, "Q@:"),
+        ("currentAllocatedSize", heap_ocupado as Imp, "Q@:"),
+        ("maxAvailableSizeWithAlignment:", heap_max_disponible as Imp, "Q@:Q"),
+        ("setPurgeableState:", heap_purgeable as Imp, "c@:Q"),
         ("storageMode", heap_modo as Imp, "Q@:"),
-        ("cpuCacheMode", heap_cero as Imp, "Q@:"),
-        ("hazardTrackingMode", heap_cero as Imp, "Q@:"),
-        ("resourceOptions", heap_cero as Imp, "Q@:"),
+        ("cpuCacheMode", heap_cache as Imp, "Q@:"),
+        ("hazardTrackingMode", heap_hazard as Imp, "Q@:"),
+        ("resourceOptions", heap_opciones as Imp, "Q@:"),
+        ("unfilteredResourceOptions", heap_opciones_sin_hazard as Imp, "Q@:"),
         ("type", heap_cero as Imp, "Q@:"),
         ("gpuAddress", heap_cero as Imp, "Q@:"),
         ("memoryPoolId", heap_nil as Imp, "@@:"),
         ("newBufferWithLength:options:", heap_nuevo_buffer as Imp, "@@:QQ"),
         ("newBufferWithLength:options:offset:", heap_nuevo_buffer_offset as Imp, "@@:QQQ"),
+        ("newBufferWithLength:options:atOffset:", heap_nuevo_buffer_at_offset as Imp, "@@:QQQ"),
+        ("newBufferWithDescriptor:", heap_nuevo_buffer_desc as Imp, "@@:@"),
+        ("newBufferWithDescriptor:offset:", heap_nuevo_buffer_desc_offset as Imp, "@@:@Q"),
         ("newTextureWithDescriptor:", heap_nueva_textura as Imp, "@@:@"),
         ("newTextureWithDescriptor:offset:", heap_nueva_textura_offset as Imp, "@@:@Q"),
+        ("newTextureWithDescriptor:atOffset:", heap_nueva_textura_at_offset as Imp, "@@:@Q"),
+        ("newAccelerationStructureWithSize:", heap_acel_tamano as Imp, "@@:Q"),
+        ("newAccelerationStructureWithDescriptor:", heap_acel_desc as Imp, "@@:@"),
+        ("newAccelerationStructureWithSize:offset:", heap_acel_tamano_offset as Imp, "@@:QQ"),
+        ("newAccelerationStructureWithDescriptor:offset:", heap_acel_desc_offset as Imp, "@@:@Q"),
+        ("newAccelerationStructureWithSize:resourceIndex:", heap_acel_tamano_indice as Imp, "@@:QQ"),
+        ("newAccelerationStructureWithSize:offset:resourceIndex:", heap_acel_tamano_offset_indice as Imp, "@@:QQQ"),
     ];
     etq(&mut heap, clases::etiqueta::<Heap> as Imp, clases::poner_etiqueta::<Heap> as Imp);
     let mut fence: Vec<Metodo> = vec![];
@@ -1332,7 +1434,7 @@ pub fn registrar(dispositivo: Class) {
         ("newHeapWithDescriptor:", dev_heap as Imp, "@@:@"),
         ("newFence", dev_fence as Imp, "@16@0:8"),
         ("newResidencySetWithDescriptor:error:", dev_residencia as Imp, "@@:@^@"),
-        ("newBufferWithBytesNoCopy:length:options:deallocator:", dev_buffer_nocopia as Imp, "@@:^vQQ@"),
+        ("newBufferWithBytesNoCopy:length:options:deallocator:", dev_buffer_nocopia as Imp, "@48@0:8^v16Q24Q32@?40"),
         ("newDepthStencilStateWithDescriptor:", dev_profundidad as Imp, "@@:@"),
         ("newRenderPipelineStateWithDescriptor:error:", dev_pipeline_render as Imp, "@@:@^@"),
         ("newRenderPipelineStateWithDescriptor:options:reflection:error:", dev_pipeline_render_opciones as Imp, "@@:@Q^@^@"),

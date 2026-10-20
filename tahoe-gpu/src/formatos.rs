@@ -181,13 +181,15 @@ pub fn mascara(m: u32) -> vk::ColorComponentFlags {
     r
 }
 
-/// MTLPrimitiveType → topología de Vulkan (punto 0, línea 1, tira de líneas 2, triángulo 3, tira de triángulos 4).
+/// MTLPrimitiveType → topología de Vulkan (punto 0, línea 1, tira de líneas 2, triángulo 3, tira de triángulos 4, abanico de triángulos 5).
 pub fn topologia(p: u32) -> vk::PrimitiveTopology {
     match p {
         0 => vk::PrimitiveTopology::POINT_LIST,
         1 => vk::PrimitiveTopology::LINE_LIST,
         2 => vk::PrimitiveTopology::LINE_STRIP,
+        3 => vk::PrimitiveTopology::TRIANGLE_LIST,
         4 => vk::PrimitiveTopology::TRIANGLE_STRIP,
+        5 => vk::PrimitiveTopology::TRIANGLE_FAN,
         _ => vk::PrimitiveTopology::TRIANGLE_LIST,
     }
 }

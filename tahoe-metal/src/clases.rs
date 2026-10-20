@@ -320,8 +320,53 @@ extern "C-unwind" fn evento_valor_poner(this: Id, _cmd: Sel, v: u64) {
     }
 }
 
+/// newSharedEventHandle (MTLSharedEvent): el «mango» (MTLSharedEventHandle) es en macOS 26 un puerto Mach, y
+/// compartirlo entre procesos es trabajo de otra ruta (la ruta B). Aquí no hay mango que dar, así que se devuelve nil,
+/// que es la respuesta honesta (y el cliente, como QuartzCore, tiene ruta de error para el nil).
+extern "C-unwind" fn evento_mango(_this: Id, _cmd: Sel) -> Id {
+    registro("newSharedEventHandle: este driver no comparte eventos entre procesos; se devuelve nil");
+    std::ptr::null_mut()
+}
+
+/// waitUntilSignaledValue:timeoutMS: (MTLSharedEvent): aquí no hay espera posible (no hay sincronización entre
+/// procesos y el commit es síncrono), así que solo se mira el valor actual: YES si ya llegó al valor pedido, NO si
+/// no. Nunca bloquea, así que el timeout no se usa.
+extern "C-unwind" fn evento_esperar(this: Id, _cmd: Sel, valor: u64, _timeout_ms: u64) -> Bool {
+    let v = estado::<Evento>(this).map(|e| e.valor).unwrap_or(0);
+    if v >= valor {
+        1
+    } else {
+        registro(&format!("waitUntilSignaledValue: el evento está en {v} y se esperaba {valor}"));
+        0
+    }
+}
+
+/// notifyListener:atValue:block: (MTLSharedEvent): no hay oyentes entre procesos, así que no se avisa a nadie y el
+/// bloque no se llama. Solo traza.
+extern "C-unwind" fn evento_notificar(_this: Id, _cmd: Sel, _oyente: Id, valor: u64, _bloque: *mut c_void) {
+    registro(&format!("notifyListener:atValue: sin oyentes entre procesos; no se avisa del valor {valor}"));
+}
+
 extern "C-unwind" fn manejador_funcion(this: Id, _cmd: Sel) -> Id {
     estado::<Manejador>(this).map(|m| m.funcion).unwrap_or(std::ptr::null_mut())
+}
+
+/// name (MTLFunctionHandle): el nombre de la función que retiene.
+extern "C-unwind" fn manejador_nombre(this: Id, _cmd: Sel) -> Id {
+    let Some(m) = estado::<Manejador>(this) else { return std::ptr::null_mut() };
+    let Some(f) = estado::<Funcion>(m.funcion) else { return std::ptr::null_mut() };
+    objc::nsstring(&f.nombre)
+}
+
+/// functionType (MTLFunctionHandle): el tipo (MTLFunctionType) de la función que retiene.
+extern "C-unwind" fn manejador_tipo(this: Id, _cmd: Sel) -> u64 {
+    let Some(m) = estado::<Manejador>(this) else { return TIPO_FUNCION_KERNEL };
+    estado::<Funcion>(m.funcion).map(|f| f.tipo).unwrap_or(TIPO_FUNCION_KERNEL)
+}
+
+/// gpuResourceID (MTLFunctionHandle): aquí no hay identificador de recurso de GPU (MTLResourceID); se devuelve 0.
+extern "C-unwind" fn manejador_recurso(_this: Id, _cmd: Sel) -> u64 {
+    0
 }
 
 /// Copia un bloque de Objective-C para que sobreviva a la llamada (o None si no hay bloque).
@@ -342,7 +387,7 @@ pub fn llamar_bloque_2(bloque: Id, a: Id, b: Id) {
     // SAFETY: bloque de Objective-C.
     unsafe {
         let p = bloque.cast::<*const c_void>();
-        let invocar: extern "C" fn(Id, Id, Id) = std::mem::transmute(p.offset(2).read());
+        let invocar: extern "C-unwind" fn(Id, Id, Id) = std::mem::transmute(p.offset(2).read());
         invocar(bloque, a, b);
     }
 }
@@ -416,8 +461,26 @@ pub fn nuevo_buffer_con_liberador(
     let id = nuevo_id();
     let proyectado = len.next_multiple_of(4096).max(4096);
     let ruta = format!("/dev/shm/tahoe-mtl-{}-{id}", std::process::id());
-    let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&ruta).map_err(|e| format!("{ruta}: {e}"))?;
-    f.set_len(proyectado as u64).map_err(|e| e.to_string())?;
+    // Si el buffer no llega a existir, la memoria sigue siendo del cliente: el bloque liberador no se llama, pero su
+    // copia (la de _Block_copy) sí se suelta, y el fichero que se hubiera creado se borra.
+    let f = match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&ruta) {
+        Ok(f) => f,
+        Err(e) => {
+            if let Some(b) = liberador {
+                // SAFETY: bloque copiado con _Block_copy.
+                unsafe { _Block_release(b) };
+            }
+            return Err(format!("{ruta}: {e}"));
+        }
+    };
+    if let Err(e) = f.set_len(proyectado as u64) {
+        let _ = std::fs::remove_file(&ruta);
+        if let Some(b) = liberador {
+            // SAFETY: bloque copiado con _Block_copy.
+            unsafe { _Block_release(b) };
+        }
+        return Err(e.to_string());
+    }
     use std::os::fd::AsRawFd;
     // SAFETY: proyección compartida de un archivo propio (macOS: PROT_READ|PROT_WRITE = 3, MAP_SHARED = 1).
     let p = unsafe { mmap(std::ptr::null_mut(), proyectado, 3, 1, f.as_raw_fd(), 0) };
@@ -544,6 +607,8 @@ pub unsafe fn bytes_de_dispatch_data(d: Id) -> Vec<u8> {
 pub struct Funcion {
     pub(crate) biblioteca: Id,
     pub(crate) nombre: String,
+    /// MTLFunctionType de la función: aquí solo hay funciones de cómputo (MTLFunctionTypeKernel).
+    pub(crate) tipo: u64,
     /// function constants dadas (newFunctionWithName:constantValues:error:): ya serializadas para el servidor
     pub(crate) constantes: Vec<u8>,
     etiqueta: Id,
@@ -568,7 +633,7 @@ extern "C-unwind" fn biblioteca_funcion(this: Id, _cmd: Sel, nombre: Id) -> Id {
         registro(&format!("newFunctionWithName:{n}: no está en la biblioteca ({}) [{}]", b.nombres.len(), lista));
         return std::ptr::null_mut();
     }
-    crear(&clases().funcion, Funcion { biblioteca: retener(this), nombre: n, constantes: Vec::new(), etiqueta: std::ptr::null_mut() })
+    crear(&clases().funcion, Funcion { biblioteca: retener(this), nombre: n, tipo: TIPO_FUNCION_KERNEL, constantes: Vec::new(), etiqueta: std::ptr::null_mut() })
 }
 
 extern "C-unwind" fn biblioteca_nombres(this: Id, _cmd: Sel) -> Id {
@@ -582,9 +647,12 @@ extern "C-unwind" fn funcion_nombre(this: Id, _cmd: Sel) -> Id {
     estado::<Funcion>(this).map(|f| objc::nsstring(&f.nombre)).unwrap_or(std::ptr::null_mut())
 }
 
+/// MTLFunctionTypeKernel: aquí solo hay funciones de cómputo.
+const TIPO_FUNCION_KERNEL: u64 = 3;
+
 /// MTLFunctionTypeKernel (por ahora solo cómputo)
-extern "C-unwind" fn funcion_tipo(_this: Id, _cmd: Sel) -> u64 {
-    3
+extern "C-unwind" fn funcion_tipo(this: Id, _cmd: Sel) -> u64 {
+    estado::<Funcion>(this).map(|f| f.tipo).unwrap_or(TIPO_FUNCION_KERNEL)
 }
 
 // ------------------------------------------------------------------ pipeline de cómputo
@@ -821,6 +889,14 @@ extern "C-unwind" fn enc_fin(this: Id, _cmd: Sel) {
     }
 }
 
+/// updateFence: / waitForFence: (MTLCommandEncoder): aquí no hay planificador de citas y el commit es síncrono, así que
+/// el fence no sincroniza nada: se anota y se sigue (como en el encoder de render). MPS, en cambio, sí usa fences con
+/// los kernels de cómputo, así que el método tiene que existir aunque no haga nada.
+extern "C-unwind" fn enc_fence(_this: Id, cmd: Sel, _fence: Id) {
+    let nombre = objc::nombre_sel(cmd);
+    registro(&format!("{}: el fence no sincroniza nada (el commit es síncrono)", nombre.trim_end_matches(':')));
+}
+
 extern "C-unwind" fn comp_pipeline(this: Id, _cmd: Sel, p: Id) {
     if let (Some(o), Some(pl)) = (ordenes(this), estado::<Pipeline>(p)) {
         o.u32(orden::PIPELINE).u32(pl.id);
@@ -881,10 +957,21 @@ pub fn registrar() {
     let mut evento: Vec<Metodo> = vec![
         ("signaledValue", evento_valor as Imp, "Q@:"),
         ("setSignaledValue:", evento_valor_poner as Imp, "v@:Q"),
+        // Los tres métodos que pide el protocolo MTLSharedEvent (si faltan, el cliente recibe «unrecognized selector»
+        // y el proceso muere, porque la clase madre es NSObject).
+        ("newSharedEventHandle", evento_mango as Imp, "@@:"),
+        ("notifyListener:atValue:block:", evento_notificar as Imp, "v@:@Q@?"),
+        ("waitUntilSignaledValue:timeoutMS:", evento_esperar as Imp, "c@:QQ"),
     ];
     comunes(&mut evento);
     etiquetas!(evento, Evento);
-    let mut manejador: Vec<Metodo> = vec![("function", manejador_funcion as Imp, "@@:")];
+    let mut manejador: Vec<Metodo> = vec![
+        ("function", manejador_funcion as Imp, "@@:"),
+        // Los tres que pide el protocolo MTLFunctionHandle (CoreImage los lee al crear el manejador).
+        ("name", manejador_nombre as Imp, "@@:"),
+        ("functionType", manejador_tipo as Imp, "Q@:"),
+        ("gpuResourceID", manejador_recurso as Imp, "Q@:"),
+    ];
     comunes(&mut manejador);
     etiquetas!(manejador, Manejador);
     let mut cola: Vec<Metodo> = vec![
@@ -957,6 +1044,8 @@ pub fn registrar() {
         ("setThreadgroupMemoryLength:atIndex:", comp_memoria as Imp, "v@:QQ"),
         ("dispatchThreadgroups:threadsPerThreadgroup:", comp_grupos as Imp, "v@:{MTLSize=QQQ}{MTLSize=QQQ}"),
         ("dispatchThreads:threadsPerThreadgroup:", comp_hilos as Imp, "v@:{MTLSize=QQQ}{MTLSize=QQQ}"),
+        ("updateFence:", enc_fence as Imp, "v@:@"),
+        ("waitForFence:", enc_fence as Imp, "v@:@"),
         ("endEncoding", enc_fin as Imp, "v@:"),
         ("pushDebugGroup:", nada1 as Imp, "v@:@"),
         ("popDebugGroup", nada as Imp, "v@:"),
@@ -967,6 +1056,8 @@ pub fn registrar() {
     let mut blit: Vec<Metodo> = vec![
         ("copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:", blit_copiar as Imp, "v@:@Q@QQ"),
         ("synchronizeResource:", nada1 as Imp, "v@:@"),
+        ("updateFence:", enc_fence as Imp, "v@:@"),
+        ("waitForFence:", enc_fence as Imp, "v@:@"),
         ("endEncoding", enc_fin as Imp, "v@:"),
         ("pushDebugGroup:", nada1 as Imp, "v@:@"),
         ("popDebugGroup", nada as Imp, "v@:"),
