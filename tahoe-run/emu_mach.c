@@ -38,8 +38,15 @@ struct hdr { uint32_t bits, size, remote, local, voucher; int32_t id; };
 static void hexdump(const uint8_t* b, size_t len) {
 	for (size_t i = 0; i < len; i += 16) {
 		char line[100];
+		// snprintf devuelve la longitud que habría escrito: si trunca, n queda mayor que el búfer y el siguiente
+		// "sizeof line - n" da un tamaño enorme (n es int, el resto size_t), con lo que se escribiría fuera.
 		int n = snprintf(line, sizeof line, "      %04zx ", i);
-		for (size_t j = i; j < i + 16 && j < len; j++) n += snprintf(line + n, sizeof line - n, " %02x", b[j]);
+		if (n < 0 || (size_t)n >= sizeof line) { logf_("%s\n", line); continue; }
+		for (size_t j = i; j < i + 16 && j < len; j++) {
+			int m = snprintf(line + n, sizeof line - (size_t)n, " %02x", b[j]);
+			if (m < 0 || (size_t)m >= sizeof line - (size_t)n) break;   // no cabe: se deja lo escrito
+			n += m;
+		}
 		logf_("%s\n", line);
 	}
 }
@@ -746,7 +753,16 @@ static long user_receive(struct ctx* c, uint64_t options, uint64_t buf, uint32_t
 	if (access("/dev/shm/tahoe-mach-trace", F_OK) == 0) {
 		uint32_t hh[6] = { 0 }; if (r == 0) safe_read(buf, hh, 24);
 		logf_("    MT pid=%d.%ld recv port=0x%x r=0x%lx id=%d size=%u\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, r, (int32_t)hh[5], hh[1]);
-		if (r == 0 && hh[1] <= 192 && hh[1] >= 24) { uint32_t w[48] = { 0 }; safe_read(buf, w, hh[1]); char line[480]; int k = 0; for (uint32_t q = 0; q < hh[1] / 4; q++) k += snprintf(line + k, sizeof line - (size_t)k, " %08x", w[q]); logf_("      MT bytes <%d>:%s\n", (int)getpid(), line); }
+		if (r == 0 && hh[1] <= 192 && hh[1] >= 24) {
+			uint32_t w[48] = { 0 }; safe_read(buf, w, hh[1]); char line[480]; int k = 0;
+			// como en hexdump: si el snprintf trunca, k queda mayor que el búfer y se escribiría fuera
+			for (uint32_t q = 0; q < hh[1] / 4; q++) {
+				int m = snprintf(line + k, sizeof line - (size_t)k, " %08x", w[q]);
+				if (m < 0 || (size_t)m >= sizeof line - (size_t)k) break;
+				k += m;
+			}
+			logf_("      MT bytes <%d>:%s\n", (int)getpid(), line);
+		}
 		if (r == 0x10004003 && access("/dev/shm/tahoe-stacks", F_OK) == 0) diag_stack(c->uc, "espera");
 	}
 	return r;
