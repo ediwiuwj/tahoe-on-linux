@@ -179,7 +179,7 @@ static void lock(void) {
 }
 static void unlock(void) { nucleo_candado_soltar(&shm->lk); }
 
-enum { KERN_OK = 0, KERN_INVALID_NAME_ = 15, KERN_INVALID_RIGHT_ = 17, KERN_INVALID_VALUE_ = 18 };
+enum { KERN_OK = 0, KERN_INVALID_NAME_ = 15, KERN_INVALID_RIGHT_ = 17, KERN_INVALID_VALUE_ = 18, KERN_RESOURCE_SHORTAGE_ = 6 };
 #define MACH_RCV_TIMED_OUT 0x10004003
 #define MACH_RCV_TOO_LARGE_ 0x10004004
 
@@ -1297,8 +1297,21 @@ static long t_activity_id(struct ctx* c) {
 // ---------------------------------------------------------------- mk_timer: puertos que reciben un mensaje al vencer
 // mach_absolute_time de este entorno son nanosegundos de CLOCK_MONOTONIC, así que el plazo se usa tal cual.
 struct mktimer { uint32_t name; int tfd; pthread_t th; int live; };
-static struct mktimer timers[64];
+// La tabla crece según haga falta: en XNU no hay un tope por tarea (mk_timer reserva el objeto con zalloc_flags y
+// Z_NOFAIL, osfmk/kern/mk_timer.c:79), así que un tope fijo de 64 haría que el 65.º temporizador devolviera un
+// puerto inválido sin explicación. Las ranuras se liberan en t_mk_destroy.
+static struct mktimer* timers;
+static int timers_n, timers_cap;
 static pthread_mutex_t timers_lock = PTHREAD_MUTEX_INITIALIZER;
+// Amplía la tabla (con el candado tomado). Devuelve 0 si no hay memoria.
+static int timers_grow(void) {
+	int nc = timers_cap ? timers_cap * 2 : 16;
+	struct mktimer* t = realloc(timers, (size_t)nc * sizeof *t);
+	if (!t) return 0;
+	memset(t + timers_cap, 0, (size_t)(nc - timers_cap) * sizeof *t);
+	timers = t; timers_cap = nc;
+	return 1;
+}
 static void* mk_timer_thread(void* p) {
 	struct mktimer* t = p;
 	for (;;) {
@@ -1312,13 +1325,17 @@ static void* mk_timer_thread(void* p) {
 	}
 	return NULL;
 }
-static struct mktimer* timer_find(uint32_t name) { for (int i = 0; i < 64; i++) if (timers[i].live && timers[i].name == name) return &timers[i]; return NULL; }
+static struct mktimer* timer_find(uint32_t name) { for (int i = 0; i < timers_n; i++) if (timers[i].live && timers[i].name == name) return &timers[i]; return NULL; }
 static long t_mk_create(struct ctx* c) {
 	(void)c;
 	pthread_mutex_lock(&timers_lock);
 	struct mktimer* t = NULL;
-	for (int i = 0; i < 64; i++) if (!timers[i].live) { t = &timers[i]; break; }
-	if (!t) { pthread_mutex_unlock(&timers_lock); return 0; }
+	for (int i = 0; i < timers_n; i++) if (!timers[i].live) { t = &timers[i]; break; }
+	if (!t) {
+		// No queda ninguna ranura libre: se amplía la tabla (como en XNU, donde no hay tope).
+		if (!timers_grow()) { pthread_mutex_unlock(&timers_lock); return KERN_RESOURCE_SHORTAGE_; }
+		t = &timers[timers_n++];
+	}
 	t->name = port_create(0);
 	t->tfd = fd_hi(timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC));
 	t->live = 1;
