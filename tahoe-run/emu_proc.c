@@ -657,11 +657,14 @@ static int linux_to_darwin_sig(int s) {
 	for (int d = 1; d < 32; d++) if (darwin_to_linux_sig(d) == s) return d;
 	return s;
 }
-// Estado de wait4: salida normal = código << 8; terminado por señal = nº de señal de Darwin (+0x80 si volcó core).
+// Estado de wait4: salida normal = código << 8; terminado por señal = nº de señal de Darwin (+0x80 si volcó core);
+// parado = 0x7f | (señal << 8); continuado = W_STOPCODE(SIGCONT) = 0x137f (como en XNU, kern_exit.c:3209).
 static int darwin_wait_status(int st) {
 	if (WIFEXITED(st)) return WEXITSTATUS(st) << 8;
 	if (WIFSIGNALED(st)) return linux_to_darwin_sig(WTERMSIG(st)) | (WCOREDUMP(st) ? 0x80 : 0);
 	if (WIFSTOPPED(st)) return 0x7f | (linux_to_darwin_sig(WSTOPSIG(st)) << 8);
+	if (st == 0xFFFF) return 0x137f;                // Linux: __WCONTINUED (el hijo se paró y siguió). En Darwin, WIFSIGNALED
+	                                                // de 0xffff sería "muerto por la señal 255", así que hay que traducirlo.
 	return st;
 }
 
