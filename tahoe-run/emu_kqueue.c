@@ -357,7 +357,15 @@ static int apply(int kq, const struct kev* c) {
 		}
 		case EVFILT_MACHPORT: {
 			int pfd = port_eventfd((uint32_t)c->ident);
-			if (pfd < 0) { logf_("    kevent: EVFILT_MACHPORT 0x%lx: puerto desconocido o de otro proceso\n", c->ident); break; }
+			if (pfd < 0) {
+				// XNU (osfmk/ipc/ipc_pset.c:765-790, filt_machportattach): si el nombre no está en el espacio de IPs del
+				// proceso, el knote queda con error ENOENT y el kevent lo devuelve como EV_ERROR (un nombre que existe pero
+				// sin derecho de recepción daría ENOTSUP). Aquí el knote se destruye: si no, quedaba colgado (registrado
+				// con éxito, pero sin evento nunca) y su fd nulo no disparaba jamás.
+				logf_("    kevent: EVFILT_MACHPORT 0x%lx: puerto desconocido o de otro proceso\n", c->ident);
+				drop(n);
+				return port_exists((uint32_t)c->ident) ? D_ENOMEM : D_ENOENT;
+			}
 			n->fd = pfd;
 			if (trace_all || mach_trace()) logf_("    kevent: EVFILT_MACHPORT puerto=0x%lx flags=0x%x fflags=0x%x udata=0x%lx kq=%d\n", c->ident, c->flags, c->fflags, c->udata, kq);
 			break;
