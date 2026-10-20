@@ -443,7 +443,11 @@ static long net_getsockopt(struct ctx* c) {
 			int on = sock_nosigpipe_get(fd);
 			memcpy(v, &on, 4); l = 4;
 		} else if (lo < 0 || getsockopt(fd, SOL_SOCKET, lo, v, &l) < 0) { if (lo >= 0) return err(); memset(v, 0, 4); l = 4; }
-	} else { memset(v, 0, 4); l = 4; }
+	} else {
+		// Un nivel que no sea SOL_SOCKET: en XNU, sogetoptlock devuelve ENOPROTOOPT (uipc_socket.c:5879) en vez de
+		// dejar el búfer a cero sin avisar. El nivel de SOL_SOCKET en Darwin es 0xffff.
+		return -D_ENOPROTOOPT;
+	}
 	uint32_t n = l < cap ? l : cap;
 	if (n && safe_write(c->a[3], v, n) < 0) return -D_EFAULT;
 	safe_write(c->a[4], &n, 4);
