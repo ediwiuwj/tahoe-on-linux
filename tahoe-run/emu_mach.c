@@ -220,23 +220,36 @@ static size_t mig_mach_vm_remap(const struct hdr* req, const uint8_t* m, uint8_t
 		p = want ? mremap((void*)s0, 0, len, MREMAP_MAYMOVE | MREMAP_FIXED, (void*)want) : mremap((void*)s0, 0, len, MREMAP_MAYMOVE);
 	}
 	if (p == MAP_FAILED) {
-		uint64_t align = mask + 1 > PAGE ? mask + 1 : PAGE;
-		if (want) p = mmap((void*)want, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | ((flags & 0x4000) ? MAP_FIXED : MAP_FIXED_NOREPLACE), -1, 0);
+		// El respaldo copia la página de origen en una nueva. Con copy = 0 (compartir) eso NO es lo que pidió el
+		// cliente: en XNU, copy = 0 mapea las mismas páginas (vm_map_remap con copy = FALSE, osfmk/vm/vm_user.c:981-995),
+		// así que una copia silenciosa haría que el cliente escribiera en su copia y no viera el efecto en el original.
+		// Aquí, si no se puede compartir, se dice que no hay espacio en vez de copiar.
+		if (!copy) kr = KERN_NO_SPACE_;
 		else {
-			uint8_t* q = mmap(NULL, len + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-			if (q != MAP_FAILED) {
-				uint64_t a = ((uint64_t)q + align - 1) & ~(align - 1);
-				if (a > (uint64_t)q) munmap(q, a - (uint64_t)q);
-				if ((uint64_t)q + len + align > a + len) munmap((void*)(a + len), (uint64_t)q + len + align - (a + len));
-				p = (void*)a;
+			uint64_t align = mask + 1 > PAGE ? mask + 1 : PAGE;
+			if (want) p = mmap((void*)want, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | ((flags & 0x4000) ? MAP_FIXED : MAP_FIXED_NOREPLACE), -1, 0);
+			else {
+				uint8_t* q = mmap(NULL, len + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+				if (q != MAP_FAILED) {
+					uint64_t a = ((uint64_t)q + align - 1) & ~(align - 1);
+					if (a > (uint64_t)q) munmap(q, a - (uint64_t)q);
+					if ((uint64_t)q + len + align > a + len) munmap((void*)(a + len), (uint64_t)q + len + align - (a + len));
+					p = (void*)a;
+				}
 			}
-		}
-		if (p == MAP_FAILED) kr = KERN_NO_SPACE_;
-		else {
-			if (!(prot & 1)) mprotect((void*)s0, len, prot | PROT_READ);      // origen ilegible: leerlo para copiarlo
-			memcpy(p, (void*)s0, len);
-			if (!(prot & 1)) mprotect((void*)s0, len, prot);
-			mprotect(p, len, prot);
+			if (p == MAP_FAILED) kr = KERN_NO_SPACE_;
+			else {
+				// El origen es del invitado: se lee con safe_read, que falla sin tocar memoria no mapeada en vez de
+				// provocar un SIGSEGV en el proceso emulado (como ya se hace en mach_vm_copy).
+				uint8_t* tmp = malloc(len);
+				if (!tmp) kr = KERN_NO_SPACE_;
+				else if (safe_read(s0, tmp, (size_t)len) != (ssize_t)len) kr = KERN_INVALID_ADDR;
+				else {
+					memcpy(p, tmp, len);
+					mprotect(p, len, prot);
+				}
+				free(tmp);
+			}
 		}
 	}
 	uint64_t out = p == MAP_FAILED ? 0 : (uint64_t)p + (src - s0);
