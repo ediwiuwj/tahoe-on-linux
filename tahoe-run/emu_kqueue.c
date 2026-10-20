@@ -436,9 +436,13 @@ static void kev_out(int layout, uint8_t* b, const struct kev* k) {
 	else { memcpy(b + 12, &k->qos, 4); memcpy(b + 16, &k->udata, 8); memcpy(b + 24, &k->fflags, 4); memcpy(b + 32, &k->data, 8); memcpy(b + 40, k->ext, 32); }
 }
 
-// Núcleo común. timeout_ms: -1 = esperar, 0 = no esperar.
+// Núcleo común. timeout_ms: -1 = esperar, 0 = no esperar, -2 = EINVAL y -3 = EFAULT (plazo inválido o ilegible).
 static __thread int g_no_poll;   // KEVENT_FLAG_ERROR_EVENTS: solo se devuelven errores de los cambios, no eventos
 static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_t evp, long nev, int timeout_ms) {
+	// XNU valida el plazo antes de tocar la cola (kevent_legacy_get_deadline va antes de kevent_internal), así que un
+	// timespec inválido se devuelve sin haber aplicado los cambios.
+	if (timeout_ms == -2) return -D_EINVAL;
+	if (timeout_ms == -3) return -D_EFAULT;
 	int kq = kq_for(guest_kq);
 	uint8_t raw[72];
 	long nout = 0;
@@ -575,10 +579,16 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 	return nout;
 }
 
+// El plazo de kevent es un struct timespec (16 bytes: dos int64). Devuelve los milisegundos, -1 si no hay plazo
+// (espera infinita), -2 si el timespec no vale (EINVAL, como en XNU: timespec_is_valid() exige tv_sec >= 0 y
+// tv_nsec en [0, 1e9]; ver kern_time.c) o -3 si el plazo no se puede leer (EFAULT, como el copyin de XNU).
 static int ts_ms(uint64_t p) {
 	if (!p) return -1;
 	int64_t t[2];
-	if (safe_read(p, t, 16) != 16) return -1;
+	if (safe_read(p, t, 16) != 16) return -3;
+	if (t[0] < 0 || t[0] > INT32_MAX) return -2;        // XNU: tv_sec fuera de rango
+	if (t[1] < 0 || t[1] > 1000000000) return -2;        // XNU: tv_nsec fuera de rango
+	if (t[0] > (INT64_MAX - t[1] / 1000000) / 1000) return -2;   // sin desbordamiento
 	return (int)(t[0] * 1000 + t[1] / 1000000);
 }
 
