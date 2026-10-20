@@ -76,7 +76,8 @@ static int msg_flags(int f) {                         // MSG_* de Darwin -> Linu
 	if (f & 0x2) l |= MSG_PEEK;
 	if (f & 0x4) l |= MSG_DONTROUTE;
 	if (f & 0x8) l |= MSG_EOR;
-	if (f & 0x20) l |= MSG_TRUNC;
+	if (f & 0x10) l |= MSG_TRUNC;                      // Darwin TRUNC 0x10 -> Linux 0x20
+	if (f & 0x20) l |= MSG_CTRUNC;                     // Darwin CTRUNC 0x20 -> Linux 0x8
 	if (f & 0x40) l |= MSG_WAITALL;
 	if (f & 0x80) l |= MSG_DONTWAIT;
 	return l;
