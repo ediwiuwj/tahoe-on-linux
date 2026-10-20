@@ -131,9 +131,12 @@ int tahoe_metal_guest(const char* host, char* out, size_t cap) {
 	const char* dir = getenv("TAHOE_METAL");
 	char pre[4200];
 	if (!dir || !*dir) return 0;
-	size_t n = (size_t)snprintf(pre, sizeof pre, "%s/TahoeMetal.bundle", dir);
+	// snprintf devuelve la longitud que habría escrito, mayor que el búfer si trunca: el puntero quedaría fuera de él.
+	int n = snprintf(pre, sizeof pre, "%s/TahoeMetal.bundle", dir);
+	if (n < 0 || (size_t)n >= sizeof pre) return 0;                  // truncado: no es una ruta de Metal
 	if (strncmp(host, pre, n) || (host[n] && host[n] != '/')) return 0;
-	snprintf(out, cap, "%s%s", METAL_GUEST, host + n);
+	int m = snprintf(out, cap, "%s%s", METAL_GUEST, host + n);
+	if (m < 0 || (size_t)m >= cap) return 0;                          // la ruta no cabe: no es de Metal
 	return 1;
 }
 // st_dev de la carpeta de TAHOE_METAL: para macOS es el volumen del sistema, como el resto de /System.
@@ -478,13 +481,17 @@ static int xname(uint64_t a, char* out, size_t cap) {
 }
 static long xerr(void) { return errno == ENODATA ? -93 /* ENOATTR */ : errno == ENOTSUP ? -45 : err(); }
 // getxattr(ruta, nombre, valor, tamaño, posición, opciones) / fgetxattr(fd, ...)
+#define XATTR_VAL_MAX 65536                                            // el valor de un xattr no pasa de 64 KiB (XATTR_SIZE_MAX de Linux)
 static long xget(struct ctx* c, int byfd) {
 	char p[4096], b[4200], nm[300]; long e;
 	if ((e = xname(c->a[1], nm, sizeof nm))) return e;
-	size_t sz = c->a[3]; uint8_t* v = sz ? malloc(sz) : NULL;
+	size_t sz = c->a[3];
+	size_t cap = sz > XATTR_VAL_MAX ? XATTR_VAL_MAX : sz;             // el valor no puede pasar de 64 KiB
+	uint8_t* v = sz ? malloc(cap) : NULL;
+	if (sz && !v) return -D_ENOMEM;
 	ssize_t r;
-	if (byfd) r = fgetxattr((int)c->a[0], nm, v, sz);
-	else { if (safe_string(c->a[0], p, sizeof p) != 0) { free(v); return -D_EFAULT; } const char* hp = resolve(p, b, sizeof b); r = (c->a[5] & 1) ? lgetxattr(hp, nm, v, sz) : getxattr(hp, nm, v, sz); }
+	if (byfd) r = fgetxattr((int)c->a[0], nm, v, cap);
+	else { if (safe_string(c->a[0], p, sizeof p) != 0) { free(v); return -D_EFAULT; } const char* hp = resolve(p, b, sizeof b); r = (c->a[5] & 1) ? lgetxattr(hp, nm, v, cap) : getxattr(hp, nm, v, cap); }
 	if (r < 0) { e = errno == ERANGE ? -34 : xerr(); free(v); return e; }
 	if (sz && r > 0 && safe_write(c->a[2], v, (size_t)r) != r) r = -D_EFAULT;
 	free(v); return r;
@@ -492,7 +499,10 @@ static long xget(struct ctx* c, int byfd) {
 static long xset(struct ctx* c, int byfd) {
 	char p[4096], b[4200], nm[300]; long e;
 	if ((e = xname(c->a[1], nm, sizeof nm))) return e;
-	size_t sz = c->a[3]; uint8_t* v = malloc(sz ? sz : 1);
+	size_t sz = c->a[3];
+	if (sz > XATTR_VAL_MAX) return -7;                                // E2BIG: ni el sistema de ficheros del anfitrión lo guarda
+	uint8_t* v = malloc(sz ? sz : 1);
+	if (!v) return -D_ENOMEM;
 	if (sz && safe_read(c->a[2], v, sz) != (ssize_t)sz) { free(v); return -D_EFAULT; }
 	int fl = (c->a[5] & 2) ? XATTR_CREATE : (c->a[5] & 4) ? XATTR_REPLACE : 0;
 	int r;
@@ -1064,6 +1074,7 @@ static long bsd_fchdir(struct ctx* c) { RET(fchdir((int)c->a[0])); }
 static long bsd_getdirentries64(struct ctx* c) {
 	int fd = (int)c->a[0];
 	uint64_t gbuf = c->a[1], gsize = c->a[2];
+	if (gsize > (1ull << 30)) return -D_EINVAL;                       // un búfer de más de 1 GiB no lo pide nadie
 	uint8_t lin[16384];
 	off_t start = lseek(fd, 0, SEEK_CUR);
 	size_t want = gsize * 2 / 3 < sizeof lin ? gsize * 2 / 3 : sizeof lin;
@@ -1101,7 +1112,8 @@ static long bsd_getdirentries64(struct ctx* c) {
 		}
 		n = k;
 	}
-	uint8_t* out = malloc(gsize);
+	uint8_t* out = malloc(gsize ? gsize : 1);
+	if (!out) return -D_ENOMEM;
 	size_t used = 0;
 	off_t prev = start;
 	for (long pos = 0; pos < n;) {
@@ -1362,6 +1374,7 @@ static long bsd_getattrlistbulk(struct ctx* c) {
 	}
 	dir_attrs_g = dir; cmnext_g = cmnext;
 	uint64_t gbuf = c->a[2], gsize = c->a[3];
+	if (gsize > (1ull << 30)) return -D_EINVAL;                       // un búfer de más de 1 GiB no lo pide nadie
 	uint8_t lin[16384];
 	uint8_t* out = malloc(gsize);
 	if (!out) return -D_ENOMEM;
@@ -1577,6 +1590,7 @@ static long bsd_map_with_linking(struct ctx* c) {
 	struct mwl_region_ r[5];
 	if (safe_read(c->a[0], r, nreg * sizeof r[0]) != (ssize_t)(nreg * sizeof r[0])) return -D_EFAULT;
 	uint8_t* blob = malloc(bsz);
+	if (!blob) return -D_ENOMEM;
 	if (safe_read(c->a[2], blob, bsz) != (ssize_t)bsz) { free(blob); return -D_EFAULT; }
 	struct mwl_hdr_ h; memcpy(&h, blob, sizeof h);
 	if (diag_target()) { logf_("    MWL <%d> v=%u pág=0x%x fmt=%u binds=%u@0x%x cadenas=0x%x@0x%x slide=0x%lx imagen=0x%lx regiones=%u\n", (int)getpid(), h.version, h.page_size, h.ptr_format, h.binds_count, h.binds_off, h.chains_size, h.chains_off, h.slide, h.image_address, nreg);
