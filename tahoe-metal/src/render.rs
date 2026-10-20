@@ -242,9 +242,8 @@ fn bytes_por_pixel(formato: u64) -> u64 {
     }
 }
 
-/// allocatedSize: los bytes que ocupa la textura, con todos sus niveles.
-fn tex_allocado(this: Id, _cmd: Sel) -> u64 {
-    let Some(t) = estado::<Textura>(this) else { return 0 };
+/// Los bytes que ocupa una textura, con todos sus niveles.
+fn tamano_de_textura(t: &Textura) -> u64 {
     let bpp = bytes_por_pixel(t.formato);
     let mut total = 0u64;
     for nivel in 0..t.niveles.max(1) {
@@ -254,6 +253,23 @@ fn tex_allocado(this: Id, _cmd: Sel) -> u64 {
         total += w * h * d * bpp;
     }
     total * t.capas.max(1)
+}
+
+/// allocatedSize: los bytes que ocupa la textura, con todos sus niveles.
+fn tex_allocado(this: Id, _cmd: Sel) -> u64 {
+    let Some(t) = estado::<Textura>(this) else { return 0 };
+    tamano_de_textura(t)
+}
+
+/// Los bytes que ocupa un recurso (buffer o textura) de un conjunto de residencia.
+fn tamano_de_recurso(o: Id) -> u64 {
+    if let Some(b) = estado::<clases::Buffer>(o) {
+        return b.len as u64;
+    }
+    if let Some(t) = estado::<Textura>(o) {
+        return tamano_de_textura(t);
+    }
+    0
 }
 
 /// setPurgeableState: (MTLPurgeableState): la memoria la tiene el servidor de GPU; se acepta y sigue ahí.
@@ -465,7 +481,7 @@ extern "C-unwind" fn dev_sampler(_this: Id, _cmd: Sel, d: Id) -> Id {
 /// MTLDataType y bytes.
 type Constantes = Vec<(u32, String, u32, Vec<u8>)>;
 static CONSTANTES: Mutex<Option<HashMap<usize, Constantes>>> = Mutex::new(None);
-static ORIGINALES: OnceLock<[usize; 3]> = OnceLock::new();
+static ORIGINALES: OnceLock<[usize; 4]> = OnceLock::new();
 
 /// Bytes de un valor de MTLDataType.
 fn tam_tipo(t: u64) -> usize {
@@ -483,6 +499,7 @@ fn tam_tipo(t: u64) -> usize {
 fn apuntar(obj: Id, indice: u32, nombre: String, tipo_d: u64, p: *const u8) {
     // SAFETY: Metal pasa un valor de ese tipo en p.
     let b = unsafe { std::slice::from_raw_parts(p, tam_tipo(tipo_d)) }.to_vec();
+    registro(&format!("constante: índice {indice} nombre «{nombre}» tipo {tipo_d} bytes {}", b.len()));
     if let Ok(mut g) = CONSTANTES.lock() {
         let v = g.get_or_insert_with(HashMap::new).entry(obj as usize).or_default();
         v.retain(|x| !(x.0 == indice && x.1 == nombre));
@@ -506,6 +523,29 @@ extern "C-unwind" fn fc_nombre(this: Id, cmd: Sel, p: *const u8, t: u64, n: Id) 
         f(this, cmd, p, t, n)
     }
 }
+/// setConstantValues: (MTLFunctionDescriptor): Metal copia los valores a un objeto interno; los nuestros se copian
+/// al objeto copiado, que es el que luego lee el driver al crear la función.
+extern "C-unwind" fn fd_constantes(this: Id, cmd: Sel, valores: Id) {
+    // SAFETY: el método original de Metal con la misma firma.
+    unsafe {
+        let f: extern "C-unwind" fn(Id, Sel, Id) = std::mem::transmute(ORIGINALES.get().unwrap()[3]);
+        f(this, cmd, valores);
+    }
+    // SAFETY: el descriptor es un MTLFunctionDescriptor.
+    let destino: Id = unsafe { objc::m0(this, "constantValues") };
+    if destino.is_null() || valores.is_null() {
+        return;
+    }
+    let v = CONSTANTES.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&(valores as usize)).cloned()));
+    if let Some(v) = v {
+        let n = v.len();
+        if let Ok(mut g) = CONSTANTES.lock() {
+            g.get_or_insert_with(HashMap::new).insert(destino as usize, v);
+        }
+        registro(&format!("constantes: {n} valores copiados al objeto del descriptor"));
+    }
+}
+
 extern "C-unwind" fn fc_rango(this: Id, cmd: Sel, p: *const u8, t: u64, r: clases::NSRange) {
     let paso = tam_tipo(t);
     for k in 0..r.len {
@@ -533,16 +573,37 @@ fn interceptar_constantes() {
             registro("MTLFunctionConstantValuesInternal sin los métodos esperados");
             return;
         }
-        let _ = ORIGINALES.set([objc::method_getImplementation(a) as usize, objc::method_getImplementation(b) as usize, objc::method_getImplementation(c) as usize]);
+        let _ = ORIGINALES.set([
+            objc::method_getImplementation(a) as usize,
+            objc::method_getImplementation(b) as usize,
+            objc::method_getImplementation(c) as usize,
+            0,
+        ]);
         objc::method_setImplementation(a, fc_indice as Imp);
         objc::method_setImplementation(b, fc_nombre as Imp);
         objc::method_setImplementation(c, fc_rango as Imp);
+        // También el descriptor: al poner los valores, Metal los copia a un objeto interno suyo, y esa copia no
+        // pasa por los métodos interceptados. Se copia lo nuestro al objeto copiado.
+        let d = objc::clase("MTLFunctionDescriptor");
+        if !d.is_null() {
+            let m = objc::class_getInstanceMethod(d, objc::sel("setConstantValues:"));
+            if !m.is_null() {
+                let _ = ORIGINALES.set([
+                    objc::method_getImplementation(a) as usize,
+                    objc::method_getImplementation(b) as usize,
+                    objc::method_getImplementation(c) as usize,
+                    objc::method_getImplementation(m) as usize,
+                ]);
+                objc::method_setImplementation(m, fd_constantes as Imp);
+            }
+        }
     }
 }
 
 /// Las constantes de un MTLFunctionConstantValues, serializadas como las pide el protocolo.
 fn serializar_constantes(valores: Id) -> Vec<u8> {
     let v = CONSTANTES.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&(valores as usize)).cloned())).unwrap_or_default();
+    registro(&format!("constantes: {} valores para {:p}", v.len(), valores));
     let mut e = Escritor::default();
     e.u32(v.len() as u32);
     for (i, n, t, b) in v {
@@ -988,6 +1049,15 @@ extern "C-unwind" fn heap_modo(this: Id, _cmd: Sel) -> u64 {
 extern "C-unwind" fn heap_ocupado(this: Id, _cmd: Sel) -> u64 {
     estado::<Heap>(this).map(|h| h.ocupado).unwrap_or(0)
 }
+/// cpuCacheMode, hazardTrackingMode, resourceOptions, type y gpuAddress (MTLHeap): el heap no tiene memoria propia
+/// (los recursos viven en el servidor de GPU), así que se contestan los valores neutros.
+extern "C-unwind" fn heap_cero(_this: Id, _cmd: Sel) -> u64 {
+    0
+}
+/// memoryPoolId (MTLHeap): este heap no sale de ningún conjunto de memoria.
+extern "C-unwind" fn heap_nil(_this: Id, _cmd: Sel) -> Id {
+    std::ptr::null_mut()
+}
 extern "C-unwind" fn heap_nuevo_buffer(this: Id, _cmd: Sel, len: u64, opciones: u64) -> Id {
     let b = match clases::nuevo_buffer(len as usize, opciones, None) {
         Ok(b) => b,
@@ -1001,6 +1071,12 @@ extern "C-unwind" fn heap_nuevo_buffer(this: Id, _cmd: Sel, len: u64, opciones: 
     }
     b
 }
+/// newBufferWithLength:options:offset: (MTLHeap): el desplazamiento dentro del heap no se puede honorar (aquí los
+/// recursos no se colocan en el heap, sino en el servidor de GPU), así que se crea el buffer como el otro y se anota.
+extern "C-unwind" fn heap_nuevo_buffer_offset(this: Id, cmd: Sel, len: u64, opciones: u64, offset: u64) -> Id {
+    registro(&format!("heap: newBufferWithLength:options:offset: {len} bytes en {offset}: el desplazamiento se ignora"));
+    heap_nuevo_buffer(this, cmd, len, opciones)
+}
 extern "C-unwind" fn heap_nueva_textura(this: Id, _cmd: Sel, desc: Id) -> Id {
     let t = textura_de_descriptor(desc);
     if t.is_null() {
@@ -1012,6 +1088,11 @@ extern "C-unwind" fn heap_nueva_textura(this: Id, _cmd: Sel, desc: Id) -> Id {
     }
     t
 }
+/// newTextureWithDescriptor:offset: (MTLHeap): como el otro, el desplazamiento dentro del heap se ignora.
+extern "C-unwind" fn heap_nueva_textura_offset(this: Id, cmd: Sel, desc: Id, offset: u64) -> Id {
+    registro(&format!("heap: newTextureWithDescriptor:offset: en {offset}: el desplazamiento se ignora"));
+    heap_nueva_textura(this, cmd, desc)
+}
 /// addAllocation: (MTLResidencySet): añade un recurso (buffer o textura) al conjunto.
 extern "C-unwind" fn residencia_anadir(this: Id, _cmd: Sel, recurso: Id) {
     let Some(r) = estado::<Residencia>(this) else { return };
@@ -1020,9 +1101,52 @@ extern "C-unwind" fn residencia_anadir(this: Id, _cmd: Sel, recurso: Id) {
     }
     r.objetos.push(retener(recurso));
 }
+/// removeAllocation: (MTLResidencySet): quita un recurso del conjunto.
+extern "C-unwind" fn residencia_quitar(this: Id, _cmd: Sel, recurso: Id) {
+    let Some(r) = estado::<Residencia>(this) else { return };
+    if let Some(p) = r.objetos.iter().position(|o| *o == recurso) {
+        let o = r.objetos.remove(p);
+        soltar(o);
+    }
+}
+/// allAllocations (MTLResidencySet): los recursos que tiene el conjunto ahora mismo.
+extern "C-unwind" fn residencia_todos(this: Id, _cmd: Sel) -> Id {
+    let v: Vec<Id> = estado::<Residencia>(this).map(|r| r.objetos.clone()).unwrap_or_default();
+    // SAFETY: NSArray de Foundation.
+    unsafe { objc::m2(objc::clase("NSArray"), "arrayWithObjects:count:", v.as_ptr(), v.len() as u64) }
+}
+/// allocatedSize (MTLResidencySet): los bytes que ocupan los recursos del conjunto.
+extern "C-unwind" fn residencia_tamano(this: Id, _cmd: Sel) -> u64 {
+    let Some(r) = estado::<Residencia>(this) else { return 0 };
+    r.objetos.iter().map(|o| tamano_de_recurso(*o)).sum()
+}
+/// allocationCount (MTLResidencySet): cuántos recursos tiene el conjunto.
+extern "C-unwind" fn residencia_cuenta(this: Id, _cmd: Sel) -> u64 {
+    estado::<Residencia>(this).map(|r| r.objetos.len() as u64).unwrap_or(0)
+}
+/// addAllObjects: (no es del protocolo MTLResidencySet, pero algunos clientes lo usan): añade todos los objetos de
+/// un NSArray al conjunto.
+extern "C-unwind" fn residencia_anadir_todos(this: Id, _cmd: Sel, objetos: Id) {
+    if objetos.is_null() {
+        return;
+    }
+    // SAFETY: objetos es un NSArray.
+    let n = unsafe { objc::m0::<u64>(objetos, "count") };
+    for i in 0..n {
+        // SAFETY: el NSArray tiene n objetos.
+        let o = unsafe { objc::m1::<u64, Id>(objetos, "objectAtIndexedSubscript:", i) };
+        if !o.is_null() {
+            residencia_anadir(this, _cmd, o);
+        }
+    }
+}
 
 /// commit (MTLResidencySet): no hay planificador de citas; el conjunto solo retiene los recursos.
 extern "C-unwind" fn residencia_commit(_this: Id, _cmd: Sel) {}
+/// requestResidency (MTLResidencySet): no hay planificador de citas; el conjunto ya retiene los recursos.
+extern "C-unwind" fn residencia_pedir(_this: Id, _cmd: Sel) {}
+/// endResidency (MTLResidencySet): lo mismo que pedir residencia; aquí no hace nada.
+extern "C-unwind" fn residencia_terminar(_this: Id, _cmd: Sel) {}
 extern "C-unwind" fn residencia_quitar_todo(this: Id, _cmd: Sel) {
     if let Some(r) = estado::<Residencia>(this) {
         for o in r.objetos.drain(..) {
@@ -1056,11 +1180,13 @@ extern "C-unwind" fn dev_residencia(_this: Id, _cmd: Sel, desc: Id, error: *mut 
 
 /// newBufferWithBytesNoCopy:length:options:deallocator: (MTLDevice): el cliente da memoria ya paginada y espera que
 /// Metal no la copie. Aquí sí se copia al buffer del servidor (el servidor no puede importar memoria del cliente),
-/// pero el bloque de liberación se guarda y se llama cuando el buffer muere, como manda el contrato.
+/// pero el bloque de liberación se guarda y se llama cuando el buffer muere con el puntero que dio el cliente, como
+/// manda el contrato (`void (^)(const void *)`).
 extern "C-unwind" fn dev_buffer_nocopia(_this: Id, _cmd: Sel, p: *const u8, len: u64, opciones: u64, liberador: Id) -> Id {
     let datos = if p.is_null() { None } else { Some(unsafe { std::slice::from_raw_parts(p, len as usize) }) };
-    let bloq = clases::copiar_bloque(liberador);
-    match clases::nuevo_buffer_con_liberador(len as usize, opciones, datos, bloq) {
+    // Sin memoria del cliente no hay nada que liberar: el bloque ni se copia (quedaría sin llamar).
+    let bloq = if p.is_null() { None } else { clases::copiar_bloque(liberador) };
+    match clases::nuevo_buffer_con_liberador(len as usize, opciones, datos, bloq, p) {
         Ok(b) => b,
         Err(e) => {
             registro(&format!("newBufferWithBytesNoCopy:{len}: {e}"));
@@ -1156,18 +1282,33 @@ pub fn registrar(dispositivo: Class) {
     etq(&mut encoder, clases::etiqueta::<Encoder> as Imp, clases::poner_etiqueta::<Encoder> as Imp);
     let mut heap: Vec<Metodo> = vec![
         ("size", heap_tamano as Imp, "Q@:"),
+        ("allocatedSize", heap_ocupado as Imp, "Q@:"),
         ("storageMode", heap_modo as Imp, "Q@:"),
-        ("currentAllocatedSize", heap_ocupado as Imp, "Q@:"),
+        ("cpuCacheMode", heap_cero as Imp, "Q@:"),
+        ("hazardTrackingMode", heap_cero as Imp, "Q@:"),
+        ("resourceOptions", heap_cero as Imp, "Q@:"),
+        ("type", heap_cero as Imp, "Q@:"),
+        ("gpuAddress", heap_cero as Imp, "Q@:"),
+        ("memoryPoolId", heap_nil as Imp, "@@:"),
         ("newBufferWithLength:options:", heap_nuevo_buffer as Imp, "@@:QQ"),
+        ("newBufferWithLength:options:offset:", heap_nuevo_buffer_offset as Imp, "@@:QQQ"),
         ("newTextureWithDescriptor:", heap_nueva_textura as Imp, "@@:@"),
+        ("newTextureWithDescriptor:offset:", heap_nueva_textura_offset as Imp, "@@:@Q"),
     ];
     etq(&mut heap, clases::etiqueta::<Heap> as Imp, clases::poner_etiqueta::<Heap> as Imp);
     let mut fence: Vec<Metodo> = vec![];
     etq(&mut fence, clases::etiqueta::<Fence> as Imp, clases::poner_etiqueta::<Fence> as Imp);
     let mut residencia: Vec<Metodo> = vec![
         ("addAllocation:", residencia_anadir as Imp, "v@:@"),
-        ("removeAllObjects", residencia_quitar_todo as Imp, "v@:"),
+        ("removeAllocation:", residencia_quitar as Imp, "v@:@"),
+        ("allAllocations", residencia_todos as Imp, "@@:"),
+        ("allocatedSize", residencia_tamano as Imp, "Q@:"),
+        ("allocationCount", residencia_cuenta as Imp, "Q@:"),
         ("commit", residencia_commit as Imp, "v@:"),
+        ("requestResidency", residencia_pedir as Imp, "v@:"),
+        ("endResidency", residencia_terminar as Imp, "v@:"),
+        ("addAllObjects:", residencia_anadir_todos as Imp, "v@:@"),
+        ("removeAllObjects", residencia_quitar_todo as Imp, "v@:"),
     ];
     etq(&mut residencia, clases::etiqueta::<Residencia> as Imp, clases::poner_etiqueta::<Residencia> as Imp);
     let c = ClasesRender {

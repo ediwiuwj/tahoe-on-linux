@@ -83,6 +83,75 @@ fn bloque_falso() -> Id {
     b as Id
 }
 
+/// Cuántas veces se ha llamado al bloque liberador de un buffer «no copia» y con qué puntero.
+static LIBERADOR_LLAMADAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIBERADOR_PUNTERO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// El liberador `void (^)(const void *)` de un buffer «no copia»: apunta el puntero que recibe y que se ha llamado.
+extern "C" fn bloque_liberador(_bloque: *mut c_void, p: *const u8) {
+    LIBERADOR_PUNTERO.store(p as usize, std::sync::atomic::Ordering::SeqCst);
+    LIBERADOR_LLAMADAS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// La firma del bloque liberador (`void (^)(const void *)`).
+static FIRMA_LIBERADOR: &[u8] = b"v@^v\0";
+
+/// El descriptor de un literal de bloque: el runtime de bloques (libclosure) lo lee para saber el tamaño del bloque
+/// (el segundo campo) y su firma (el tercero).
+#[repr(C)]
+struct DescriptorBloque {
+    reservado: u64,
+    tamano: u64,
+    firma: *const c_char,
+}
+
+/// Un literal de bloque de Objective-C: `isa`, `flags`, `reserved`, la función de invocación (en el desplazamiento 16)
+/// y el descriptor.
+#[repr(C)]
+struct LiteralBloque {
+    isa: *const c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: extern "C" fn(*mut c_void, *const u8),
+    descriptor: *const DescriptorBloque,
+}
+
+/// Un bloque liberador de verdad (`void (^)(const void *)`), para el buffer «no copia».
+///
+/// A diferencia del bloque de mentira de arriba, este lo copia el driver con `_Block_copy`, así que tiene que ser un
+/// bloque de verdad: la clase de los bloques de pila (`_NSConcreteStackBlock`, que exporta libSystem), la función de
+/// invocación en el desplazamiento 16 y un descriptor con el tamaño del literal y su firma. `None` si el proceso no
+/// trae ese símbolo (entonces no se puede comprobar el contrato).
+fn nuevo_bloque_liberador() -> Option<Id> {
+    // RTLD_DEFAULT: el ámbito global de símbolos (así se busca uno sin saber en qué biblioteca está).
+    let mut isa = unsafe { dlsym((-2isize) as *mut c_void, c"_NSConcreteStackBlock".as_ptr()) };
+    if isa.is_null() {
+        // Por si el ámbito global no llega al símbolo: se busca en libSystem, que es quien lo exporta.
+        let h = unsafe { dlopen(c"/usr/lib/libSystem.B.dylib".as_ptr(), 2) };
+        if !h.is_null() {
+            isa = unsafe { dlsym(h, c"_NSConcreteStackBlock".as_ptr()) };
+        }
+    }
+    if isa.is_null() {
+        return None;
+    }
+    // El literal y su descriptor se quedan vivos a propósito (el runtime los lee al copiar el bloque, y el descriptor
+    // lo consulta al soltarlo).
+    let descriptor = Box::into_raw(Box::new(DescriptorBloque {
+        reservado: 0,
+        tamano: std::mem::size_of::<LiteralBloque>() as u64,
+        firma: FIRMA_LIBERADOR.as_ptr().cast(),
+    }));
+    let b = Box::into_raw(Box::new(LiteralBloque {
+        isa: isa.cast(),
+        flags: 1 << 30, // BLOCK_HAS_SIGNATURE
+        reserved: 0,
+        invoke: bloque_liberador,
+        descriptor: descriptor.cast(),
+    }));
+    Some(b.cast())
+}
+
 /// La función de cómputo de la biblioteca de CoreRE3D (la misma que usa metalprobe).
 fn funcion_de_computo(d: Id) -> Option<Id> {
     unsafe {
@@ -116,6 +185,18 @@ fn chequear_si(inf: &mut Informe, nombre: &str, aplica: bool, f: impl FnOnce() -
         return;
     }
     chequear(inf, nombre, f)
+}
+
+/// Una comprobación que puede no aplicar por el entorno (no por el driver): si no, se cuenta como saltada y se dice
+/// por qué.
+fn chequear_si_falta(inf: &mut Informe, nombre: &str, falta: Option<&str>, f: impl FnOnce() -> Result<(), String>) {
+    match falta {
+        Some(motivo) => {
+            inf.saltados += 1;
+            println!("  (n/d)   {nombre}: {motivo}");
+        }
+        None => chequear(inf, nombre, f),
+    }
 }
 
 /// Una comprobación que depende de que exista un selector en el marco de Apple: si no existe, no es un fallo del
@@ -427,10 +508,16 @@ fn main() {
                 return Err("nil".into());
             }
             let buf: Id = objc::m2::<u64, u64, Id>(d, "newBufferWithLength:options:", 256, 0);
-            // NSMutableArray: +array devuelve un NSArray inmutable y addObject: sobre él lanza excepción.
-            let arr: Id = objc::m0(objc::clase("NSMutableArray"), "array");
+            // El array tiene que ser mutable: addObject: sobre un NSArray inmutable lanza excepción, así que se
+            // reserva con alloc/init en vez de con +array.
+            let arr: Id = objc::m0(objc::m0::<Id>(objc::clase("NSMutableArray"), "alloc"), "init");
             objc::m1::<Id, ()>(arr, "addObject:", buf);
             objc::m1::<Id, ()>(r, "addAllObjects:", arr);
+            // Y el conjunto tiene que haberse quedado con el recurso.
+            let n = objc::m0::<u64>(r, "allocationCount");
+            if n != 1 {
+                return Err(format!("el conjunto tiene {n} recursos en vez de 1"));
+            }
             Ok(())
         });
         chequear(&mut inf, "buffer sin copia", || {
@@ -444,6 +531,50 @@ fn main() {
             let len = objc::m0::<u64>(b, "length");
             if len != 4 {
                 return Err(format!("longitud {len} en vez de 4"));
+            }
+            Ok(())
+        });
+        // El liberador es `void (^)(const void *)`: el driver lo guarda y lo llama cuando el buffer muere, y tiene que
+        // recibir el mismo puntero que dio el cliente (no el del buffer del servidor).
+        let liberador = nuevo_bloque_liberador();
+        let falta = if liberador.is_none() {
+            Some("el proceso no exporta _NSConcreteStackBlock (libclosure)")
+        } else {
+            None
+        };
+        chequear_si_falta(&mut inf, "bloque liberador del buffer sin copia", falta, || {
+            let bloque = liberador.ok_or("no se pudo construir el bloque")?;
+            let datos: [u8; 4] = [9, 8, 7, 6];
+            let p_datos = datos.as_ptr();
+            LIBERADOR_LLAMADAS.store(0, std::sync::atomic::Ordering::SeqCst);
+            LIBERADOR_PUNTERO.store(0, std::sync::atomic::Ordering::SeqCst);
+            let enviar4: unsafe extern "C" fn(Id, objc::Sel, *const u8, u64, u64, Id) -> Id =
+                std::mem::transmute(objc::objc_msgSend as *const ());
+            let b: Id = enviar4(d, objc::sel("newBufferWithBytesNoCopy:length:options:deallocator:"), p_datos, 4, 0, bloque);
+            if b.is_null() {
+                return Err("nil".into());
+            }
+            // El contenido es el que dio el cliente.
+            let p = objc::m0::<*const u8>(b, "contents");
+            if p.is_null() {
+                return Err("contents nil".into());
+            }
+            if std::slice::from_raw_parts(p, 4) != datos {
+                return Err("el contenido no es el esperado".into());
+            }
+            // Al soltar el buffer tiene que morir el bloque liberador, una sola vez y con el puntero del cliente.
+            if objc::responde_instancia(b, "release") {
+                objc::m0::<()>(b, "release");
+            } else {
+                objc::m0::<()>(b, "dealloc");
+            }
+            let n = LIBERADOR_LLAMADAS.load(std::sync::atomic::Ordering::SeqCst);
+            if n != 1 {
+                return Err(format!("el bloque se llamó {n} veces, se esperaba 1 (el buffer se soltó con release)"));
+            }
+            let ptr = LIBERADOR_PUNTERO.load(std::sync::atomic::Ordering::SeqCst);
+            if ptr != p_datos as usize {
+                return Err(format!("el bloque recibió {ptr:#x} en vez de {:#x}", p_datos as usize));
             }
             Ok(())
         });
@@ -461,10 +592,47 @@ fn main() {
             Ok(())
         });
         chequear(&mut inf, "evento con mango", || {
+            // El «mango» (MTLSharedEventHandle) es en macOS 26 un puerto Mach, y compartirlo entre procesos es otra
+            // ruta (la ruta B). Así que el driver devuelve nil a propósito: un nil honesto es mejor que un objeto
+            // mentiroso, porque QuartzCore (CA::shared_event_submit) tiene ruta de error para el nil, mientras que con
+            // un evento de mentira esperaría una señal que nadie va a dar. (El mango de verdad es un objeto con un
+            // puerto Mach detrás; aquí se le pasa otro objeto cualquiera, que el driver no usa.)
             let e: Id = objc::m1(d, "newSharedEventWithHandle:", objc::nsstring("mango-de-prueba"));
+            if !e.is_null() {
+                return Err(format!("el driver devolvió un evento ({e:?}) en vez de nil"));
+            }
+            // Y la llamada no rompe nada: el dispositivo sigue dando eventos.
+            let otro: Id = objc::m0(d, "newSharedEvent");
+            if otro.is_null() {
+                return Err("el dispositivo dejó de dar eventos".into());
+            }
+            Ok(())
+        });
+        chequear(&mut inf, "señalización del evento compartido", || {
+            let e: Id = objc::m0(d, "newSharedEvent");
             if e.is_null() {
                 return Err("nil".into());
             }
+            // Un evento nuevo empieza sin señalizar.
+            let v0 = objc::m0::<u64>(e, "signaledValue");
+            if v0 != 0 {
+                return Err(format!("el valor inicial es {v0} en vez de 0"));
+            }
+            let cb: Id = objc::m0(d, "newCommandBuffer");
+            if cb.is_null() {
+                return Err("command buffer nil".into());
+            }
+            // La señal se da desde el command buffer.
+            objc::m2::<Id, u64, ()>(cb, "signalEvent:value:", e, 5);
+            let v = objc::m0::<u64>(e, "signaledValue");
+            if v != 5 {
+                return Err(format!("el valor es {v} en vez de 5"));
+            }
+            // Esperar por ese valor no rompe nada: el commit es síncrono, así que el evento ya está señalado (si no
+            // lo estuviera, el driver solo dejaría traza).
+            objc::m2::<Id, u64, ()>(cb, "waitForEvent:value:", e, 5);
+            objc::m0::<()>(cb, "commit");
+            objc::m0::<()>(cb, "waitUntilCompleted");
             Ok(())
         });
         chequear(&mut inf, "manejador de función", || {

@@ -170,6 +170,8 @@ struct Tr<'a> {
     grid: Option<Word>,
     usa_demote: bool,
     usa_subgrupos: bool,
+    /// El shader escribe la profundidad (air.depth): necesita el modo de ejecución DepthReplacing.
+    escribe_profundidad: bool,
     /// Capacidades que piden los recursos usados (Sampled1D, SampledCubeArray...).
     capacidades: Vec<Capability>,
     /// descriptor set de los recursos (Opciones::set)

@@ -377,6 +377,9 @@ pub struct Buffer {
     /// El bloque que el cliente da para liberar su memoria cuando el buffer muera
     /// (newBufferWithBytesNoCopy:length:options:deallocator:). Se copia para que sobreviva a la llamada.
     liberador: Option<*mut c_void>,
+    /// La memoria que dio el cliente (newBufferWithBytesNoCopy…): es el puntero que recibe el bloque liberador
+    /// (`void (^)(const void *)`). Nulo si el buffer no es del cliente.
+    origen: *const u8,
     etiqueta: Id,
 }
 etiqueta_de!(Buffer);
@@ -387,11 +390,8 @@ impl Drop for Buffer {
         // SAFETY: proyección hecha en nuevo_buffer.
         unsafe { munmap(self.ptr.cast(), self.proyectado) };
         if let Some(b) = self.liberador {
-            // SAFETY: bloque copiado con _Block_copy; el liberador no toma argumentos.
-            unsafe {
-                llamar_bloque(b, std::ptr::null_mut());
-                _Block_release(b);
-            }
+            // SAFETY: bloque copiado con _Block_copy; el liberador toma la memoria del cliente.
+            unsafe { liberar_con_bloque(b, self.origen) };
         }
         soltar(self.etiqueta);
     }
@@ -399,15 +399,19 @@ impl Drop for Buffer {
 
 /// MTLBuffer: memoria compartida con el servidor de GPU (archivo en /dev/shm, que se borra en cuanto él lo abre).
 pub fn nuevo_buffer(len: usize, opciones: u64, datos: Option<&[u8]>) -> Result<Id, String> {
-    nuevo_buffer_con_liberador(len, opciones, datos, None)
+    nuevo_buffer_con_liberador(len, opciones, datos, None, std::ptr::null())
 }
 
 /// Un buffer con el bloque que libera la memoria del cliente (newBufferWithBytesNoCopy…).
+///
+/// `origen` es la memoria que dio el cliente: es el puntero que recibe el bloque liberador, que es de tipo
+/// `void (^)(const void *)`. Nulo si el buffer no es del cliente.
 pub fn nuevo_buffer_con_liberador(
     len: usize,
     opciones: u64,
     datos: Option<&[u8]>,
     liberador: Option<*mut c_void>,
+    origen: *const u8,
 ) -> Result<Id, String> {
     let id = nuevo_id();
     let proyectado = len.next_multiple_of(4096).max(4096);
@@ -420,6 +424,11 @@ pub fn nuevo_buffer_con_liberador(
     drop(f);
     if p.is_null() || p as isize == -1 {
         let _ = std::fs::remove_file(&ruta);
+        if let Some(b) = liberador {
+            // El buffer no llegó a existir: la memoria sigue siendo del cliente, así que el bloque no se llama.
+            // SAFETY: bloque copiado con _Block_copy.
+            unsafe { _Block_release(b) };
+        }
         return Err("mmap del buffer".into());
     }
     let ptr = p.cast::<u8>();
@@ -434,9 +443,15 @@ pub fn nuevo_buffer_con_liberador(
     if let Err(er) = r {
         // SAFETY: proyección de arriba.
         unsafe { munmap(p, proyectado) };
+        if let Some(b) = liberador {
+            // El buffer no llegó a existir: la memoria sigue siendo del cliente (que la suelta él), así que el
+            // bloque no se llama, solo se suelta la copia.
+            // SAFETY: bloque copiado con _Block_copy.
+            unsafe { _Block_release(b) };
+        }
         return Err(er);
     }
-    Ok(crear(&clases().buffer, Buffer { id, ptr, len, proyectado, opciones, liberador, etiqueta: std::ptr::null_mut() }))
+    Ok(crear(&clases().buffer, Buffer { id, ptr, len, proyectado, opciones, liberador, origen, etiqueta: std::ptr::null_mut() }))
 }
 
 extern "C-unwind" fn buffer_contents(this: Id, _cmd: Sel) -> *mut u8 {
@@ -655,6 +670,24 @@ impl Drop for CommandBuffer {
 unsafe fn llamar_bloque(b: *mut c_void, arg: Id) {
     let invoke: extern "C-unwind" fn(*mut c_void, Id) = std::mem::transmute(*(b.cast::<u8>().add(16) as *const *const c_void));
     invoke(b, arg);
+}
+
+/// Llama a un bloque liberador `void (^)(const void *)` con el puntero a la memoria del cliente.
+///
+/// # Safety
+/// `b` debe ser un bloque con esa firma.
+unsafe fn llamar_bloque_con_puntero(b: *mut c_void, p: *const u8) {
+    let invoke: extern "C-unwind" fn(*mut c_void, *const u8) = std::mem::transmute(*(b.cast::<u8>().add(16) as *const *const c_void));
+    invoke(b, p);
+}
+
+/// Llama al bloque liberador con la memoria del cliente y suelta la copia del bloque: el bloque se llama una sola vez.
+///
+/// # Safety
+/// `b` debe ser un bloque `void (^)(const void *)` copiado con `_Block_copy`.
+unsafe fn liberar_con_bloque(b: *mut c_void, origen: *const u8) {
+    llamar_bloque_con_puntero(b, origen);
+    _Block_release(b);
 }
 
 /// signalEvent:value: (MTLCommandBuffer): señala el evento compartido con el valor dado.

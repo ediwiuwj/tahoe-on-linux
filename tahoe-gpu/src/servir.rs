@@ -373,7 +373,11 @@ impl Cliente {
                     // las constantes por nombre, a su índice en esta función
                     let mut op2 = spirv::Opciones { constantes: op.constantes.clone(), varyings: op.varyings.clone(), set: op.set };
                     for fc in air::fc::constantes(&m) {
-                        if let Some((_, v)) = por_nombre.iter().find(|(n, _)| *n == fc.nombre) {
+                        // El cliente pone el nombre tal como se escribe en el código («_shader_state»); en el
+                        // AIR el nombre viene cualificado («RB::Shader::Constant::_shader_state»): se comparan
+                        // los dos, o la constante del cliente no llegaría nunca al shader.
+                        let corto = fc.nombre.rsplit("::").next().unwrap_or(&fc.nombre);
+                        if let Some((_, v)) = por_nombre.iter().find(|(n, _)| *n == fc.nombre || *n == corto) {
                             op2.constantes.insert(fc.indice, v.clone());
                         }
                     }

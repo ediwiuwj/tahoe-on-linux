@@ -81,6 +81,7 @@ fn traducir_modo(m: &Module, e: &Entrada, op: &Opciones, estructurado: bool) -> 
         grid: None,
         usa_demote: false,
         usa_subgrupos: false,
+        escribe_profundidad: false,
         capacidades: Vec::new(),
         set: op.set,
         bases: HashMap::new(),
@@ -212,7 +213,13 @@ impl Tr<'_> {
         self.b.entry_point(modelo, fun, nombre, interfaz);
         match self.ent.etapa {
             Etapa::Kernel => {}
-            Etapa::Fragment => self.b.execution_mode(fun, ExecutionMode::OriginUpperLeft, []),
+            Etapa::Fragment => {
+                self.b.execution_mode(fun, ExecutionMode::OriginUpperLeft, []);
+                if self.escribe_profundidad {
+                    // Sin este modo, el SPIR-V con OpStore %gl_FragDepth no valida (VUID-FragDepth-04216).
+                    self.b.execution_mode(fun, ExecutionMode::DepthReplacing, []);
+                }
+            }
             Etapa::Vertex => {}
         }
         Ok(())
@@ -478,7 +485,10 @@ impl Tr<'_> {
                     self.b.decorate(var, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::Position)]);
                 }
                 "air.point_size" => self.b.decorate(var, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::PointSize)]),
-                "air.depth" => self.b.decorate(var, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::FragDepth)]),
+                "air.depth" => {
+                    self.b.decorate(var, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::FragDepth)]);
+                    self.escribe_profundidad = true;
+                }
                 "air.vertex_output" => {
                     let nombre = d.propios().first().and_then(|x| match x { super::super::Dato::Txt(s) => Some(s.clone()), _ => None }).unwrap_or_default();
                     let loc = self.varyings_out.len() as u32;
@@ -915,9 +925,13 @@ impl Tr<'_> {
                 continue;
             }
             let (tc, val) = if struct_ret {
-                let tc = match &self.m.types[t] { Type::Struct { elems, .. } => elems[k], _ => unreachable!() };
+                let tc = match &self.m.types[t] {
+                    Type::Struct { elems, .. } if k < elems.len() => elems[k],
+                    _ => return Err(format!("salida {k} sin campo en la struct de retorno")),
+                };
                 let id = match &x {
-                    TV::C(V::Agg(es)) => self.constante(tc, &es[k])?,
+                    TV::C(V::Agg(es)) if k < es.len() => self.constante(tc, &es[k])?,
+                    TV::C(V::Agg(_)) => return Err(format!("salida {k} sin valor en la constante")),
                     TV::C(V::Undef) => {
                         let st = self.ty(tc)?;
                         self.b.constant_null(st)

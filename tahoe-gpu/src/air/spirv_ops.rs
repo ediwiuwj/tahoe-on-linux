@@ -247,7 +247,15 @@ impl Tr<'_> {
                 match self.tv(*i)? {
                     TV::C(V::Int(_, k)) => TV::Id(self.b.composite_extract(st, None, x, [k as u32]).unwrap()),
                     _ => {
-                        let k = self.id(*i)?;
+                        let mut k = self.id(*i)?;
+                        // El índice debe ser un entero escalar: si es un i1 (como en uber_fragment) se
+                        // convierte a u32, o el SPIR-V no valida («Expected Index to be int scalar»).
+                        let tidx = self.f.values[*i].ty;
+                        if bits(self.m, tidx) == 1 {
+                            // Un booleano de SPIR-V vale 0 o 1: se convierte con un select (no hay OpZeroExtend).
+                            let (uno, cero) = (self.cu(1), self.cu(0));
+                            k = self.b.select(self.t_u32, None, k, uno, cero).unwrap();
+                        }
                         TV::Id(self.b.vector_extract_dynamic(st, None, x, k).unwrap())
                     }
                 }
@@ -745,6 +753,30 @@ impl Tr<'_> {
                     o => return Err(format!("pack {o:?}")),
                 };
                 self.ext(st, op, &[x])
+            }
+            // extract_bits.u.i32(valor, desplazamiento, cuenta): saca «cuenta» bits a partir de
+            // «desplazamiento» (la cuenta es el número de bits, no un valor de máscara).
+            "extract_bits" => {
+                let val = self.id(a[0])?;
+                let off = self.id(a[1])?;
+                let cnt = self.id(a[2])?;
+                let uno = self.cu(1);
+                let der = self.b.shift_right_logical(self.t_u32, None, val, off).unwrap();
+                let r = if cnt == 32 {
+                    der
+                } else {
+                    // máscara de «cuenta» bits: (1 << cuenta) - 1
+                    let shl = self.b.shift_left_logical(self.t_u32, None, uno, cnt).unwrap();
+                    let masca = self.b.i_sub(self.t_u32, None, shl, uno).unwrap();
+                    self.b.bitwise_and(self.t_u32, None, der, masca).unwrap()
+                };
+                return Ok(Some(TV::Id(r)));
+            }
+            // popcount.i32(x): OpBitCount (no existe en GLSL.std.450).
+            "popcount" => {
+                let x = self.id(a[0])?;
+                let r = self.b.bit_count(self.t_u32, None, x).unwrap();
+                return Ok(Some(TV::Id(r)));
             }
             "get_null_texture_2d" | "get_null_texture_3d" | "get_null_texture_cube" => return Ok(Some(TV::Ptr(Base::Nula, Off::C(0)))),
             "get_read_sampler" => return Ok(Some(TV::Smp(Smp::Lectura))),

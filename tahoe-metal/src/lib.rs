@@ -258,9 +258,14 @@ fn crear_evento() -> Id {
     clases::nuevo_evento()
 }
 
-/// newSharedEventWithHandle: el mango no se comparte con nadie: se crea un evento nuevo.
-pub(crate) extern "C-unwind" fn dev_evento_manejador(_this: Id, _cmd: Sel, _mango: Id) -> Id {
-    crear_evento()
+/// newSharedEventWithHandle: el «mango» (MTLSharedEventHandle) es en macOS 26 un puerto Mach, y compartirlo entre
+/// procesos es trabajo de otra ruta (la ruta B). Mientras el mango no se pueda compartir no se puede honrar lo que el
+/// cliente pide, así que se devuelve nil: el cliente (QuartzCore, en CA::shared_event_submit) tiene una ruta de error
+/// para el nil, mientras que un evento nuevo (falso) lo llevaría por la ruta «con evento», esperando una señal de un
+/// evento que nadie va a señalar.
+pub(crate) extern "C-unwind" fn dev_evento_manejador(_this: Id, _cmd: Sel, mango: Id) -> Id {
+    registro(&format!("newSharedEventWithHandle: mango {mango:?} no compartido; se devuelve nil"));
+    std::ptr::null_mut()
 }
 
 /// functionHandleWithFunction: y functionHandleWithBinaryFunction:: el manejador de una función.

@@ -62,6 +62,9 @@ fn main() {
         if std::env::args().nth(1).as_deref() == Some("plano") {
             std::process::exit(plano(d));
         }
+        if std::env::args().nth(1).as_deref() == Some("constante") {
+            std::process::exit(plano_con(d, true));
+        }
         if std::env::args().nth(1).as_deref() == Some("cadena") {
             std::process::exit(cadena(d));
         }
@@ -182,7 +185,14 @@ fn cadena(d: Id) -> i32 {
 /// El vertex shader hace pos = x*g0 + y*g1 + g2 (las esquinas del quad salen del vertex_id) y el fragment shader
 /// escribe el color que viene en los globals (28 bytes del plano + 8 del color) en el primer attachment y la
 /// cobertura en el segundo.
+///
+/// Con `constante` se pone además la function constant `_shader_state` (un uint4) como pone el compositor: con el
+/// bit 0x80000 del componente 2, el shader fuerza el alfa a 1 en vez de usar el del buffer.
 fn plano(d: Id) -> i32 {
+    plano_con(d, false)
+}
+
+fn plano_con(d: Id, constante: bool) -> i32 {
     const RUTA: &str = "/System/Library/PrivateFrameworks/RenderBox.framework/Versions/A/Resources/default.metallib";
     const COLOR: u64 = 80;    // MTLPixelFormatBGRA8Unorm
     const COVERAGE: u64 = 65; // MTLPixelFormatRG16Float (el shader escribe half2 en el segundo attachment)
@@ -193,10 +203,27 @@ fn plano(d: Id) -> i32 {
             println!("biblioteca: nil");
             return 3;
         }
+        // Los valores de la constante: un uint4 con el bit 0x80000 en el componente 2.
+        let mut valores: Id = std::ptr::null_mut();
+        if constante {
+            valores = objc::m0(objc::clase("MTLFunctionConstantValues"), "alloc");
+            if valores.is_null() {
+                println!("MTLFunctionConstantValues: nil");
+                return 8;
+            }
+            valores = objc::m0(valores, "init");
+            let mut v = [0u32; 4];
+            v[2] = 0x80000;
+            // MTLDataType: 32 = cuatro enteros de 32 bits (16 bytes).
+            objc::m3::<*const u32, u64, Id, ()>(valores, "setConstantValue:type:withName:", v.as_ptr(), 32, objc::nsstring("_shader_state"));
+        }
         // La función, por descriptor (como hace el compositor).
         let por_descriptor = |lib: Id, nombre: &str| -> Id {
             let desc: Id = objc::m0(objc::clase("MTLFunctionDescriptor"), "alloc");
             objc::m1::<Id, ()>(desc, "setName:", objc::nsstring(nombre));
+            if !valores.is_null() {
+                objc::m1::<Id, ()>(desc, "setConstantValues:", valores);
+            }
             objc::m2(lib, "newFunctionWithDescriptor:error:", desc, std::ptr::null_mut::<Id>())
         };
         let vf = por_descriptor(lib, "plane__vertex");
@@ -227,7 +254,8 @@ fn plano(d: Id) -> i32 {
         for (o, v) in [(0usize, 2.0f32), (4, 0.0), (8, 0.0), (12, 2.0), (16, -1.0), (20, -1.0), (24, 0.0)] {
             g[o..o + 4].copy_from_slice(&v.to_le_bytes());
         }
-        for (o, v) in [(28usize, 0x3c00u16), (30, 0x3800), (32, 0x3400), (34, 0x3c00)] {
+        // El color: (1.0, 0.5, 0.25) con alfa 0.5 (así se ve el efecto de la constante).
+        for (o, v) in [(28usize, 0x3c00u16), (30, 0x3800), (32, 0x3400), (34, 0x3800)] {
             g[o..o + 2].copy_from_slice(&v.to_le_bytes());
         }
         let gb: Id = objc::m3(d, "newBufferWithBytes:length:options:", g.as_ptr(), 36u64, 0u64);
@@ -273,9 +301,11 @@ fn plano(d: Id) -> i32 {
         }
         let punto = |x: usize, y: usize| -> [u8; 4] { px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].try_into().unwrap() };
         println!("command buffer: estado {st}; centro BGRA {:?}; esquina {:?}", punto(32, 32), punto(0, 0));
-        // El color de los globals es (1.0, 0.5, 0.25, 1.0): en BGRA8 son B=64, G=128, R=255, A=255.
-        let bien = punto(32, 32) == [64u8, 128, 255, 255] && punto(0, 0) == [64u8, 128, 255, 255];
-        println!("plano: {}", if bien { "CORRECTO" } else { "MAL" });
+        // El color de los globals es (1.0, 0.5, 0.25, 0.5): en BGRA8 son B=64, G=128, R=255, A=128.
+        // Con la constante puesta, el shader fuerza el alfa a 1 (A=255).
+        let esperado: [u8; 4] = if constante { [64, 128, 255, 255] } else { [64, 128, 255, 128] };
+        let bien = punto(32, 32) == esperado && punto(0, 0) == esperado;
+        println!("plano{}: {}", if constante { " con constante" } else { "" }, if bien { "CORRECTO" } else { "MAL" });
         if bien { 0 } else { 7 }
     }
 }

@@ -66,6 +66,16 @@ pub struct Especializacion {
 
 /// Especializa con `valores` (índice de la function constant → valor). Las que no se den quedan sin definir
 /// (air.is_function_constant_defined da falso).
+/// Cuántos componentes tiene una constante de tipo vectorial («uint4» → 4, «float3» → 3).
+fn componentes(tipo: &str) -> Option<usize> {
+    let n = tipo.chars().last()?.to_digit(10)? as usize;
+    if (1..=4).contains(&n) && tipo.len() > 1 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
 pub fn especializar(m: &Module, valores: &HashMap<u32, V>) -> Res<Especializacion> {
     let mut mem = Memoria::nueva(m);
     let mut definidas = Vec::new();
@@ -73,10 +83,26 @@ pub fn especializar(m: &Module, valores: &HashMap<u32, V>) -> Res<Especializacio
         if let Some(v) = valores.get(&fc.indice) {
             let ty = m.globals[fc.global].ty;
             // un bool de Metal es un i8 en memoria
-            let v = match (&m.types[ty], v) {
+            let mut v = match (&m.types[ty], v) {
                 (Type::Int(8), V::Int(1, x)) => V::Int(8, *x),
                 (_, v) => v.clone(),
             };
+            // Una constante vectorial (uint4, float4...) llega del cliente como varios escalares consecutivos:
+            // el cliente los pone con setConstantValues:type:withRange:, y aquí se reunen.
+            if !matches!(v, V::Vec(_)) {
+                if let Some(n) = componentes(&fc.tipo) {
+                    if n > 1 {
+                        let mut vs = Vec::with_capacity(n);
+                        for k in 0..n {
+                            match valores.get(&(fc.indice + k as u32)) {
+                                Some(x) => vs.push(x.clone()),
+                                None => return Err(format!("constante {}: faltan componentes", fc.nombre)),
+                            }
+                        }
+                        v = V::Vec(vs);
+                    }
+                }
+            }
             mem.guardar(m, &V::Ptr(Mem::Global(fc.global), 0), ty, &v).map_err(|e| format!("constante {}: {e}", fc.nombre))?;
             definidas.push(fc.global);
         }
