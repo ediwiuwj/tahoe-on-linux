@@ -35,6 +35,10 @@ extern void wq_arm_workloop(uint64_t);
 enum { EVFILT_READ = -1, EVFILT_WRITE = -2, EVFILT_SIGNAL = -6, EVFILT_TIMER = -7, EVFILT_MACHPORT = -8, EVFILT_USER = -10, EVFILT_WORKLOOP = -17, EVFILT_PROC = -5, EVFILT_FS = -9 };
 static __thread uint64_t g_dout, g_davail;   // búfer de datos del kevent_qos en curso (mensajes Mach recibidos directamente)
 enum { EV_ADD = 1, EV_DELETE = 2, EV_ENABLE = 4, EV_DISABLE = 8, EV_ONESHOT = 0x10, EV_CLEAR = 0x20, EV_RECEIPT = 0x40, EV_ERROR = 0x4000 };
+// Banderas de la llamada al sistema (bsd/sys/event.h:139-141): el plazo se ignora y no se espera (IMMEDIATE), o solo se
+// devuelven los errores de la lista de cambios, sin eventos (ERROR_EVENTS).
+#define KEVENT_FLAG_IMMEDIATE 0x1
+#define KEVENT_FLAG_ERROR_EVENTS 0x2
 #define NOTE_TRIGGER 0x01000000u
 #define NOTE_FFCTRLMASK 0xc0000000u
 #define NOTE_FFAND 0x40000000u
@@ -189,10 +193,10 @@ static void kq_drop_notes(int kq) {
 	pthread_mutex_unlock(&kq_lock);
 }
 
-// Registra una kqueue del invitado (la crea bsd_kqueue).
-static void kq_reg(int fd) {
+// Registra una kqueue del invitado (la crea bsd_kqueue). Devuelve 0 si se registró, -1 si no hubo memoria.
+static int kq_reg(int fd) {
 	struct kqrec* r = calloc(1, sizeof *r);
-	if (!r) return;
+	if (!r) return -1;
 	r->fd = fd;
 	r->sent = fd_hi(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
 	if (r->sent >= 0) {
@@ -202,6 +206,7 @@ static void kq_reg(int fd) {
 	pthread_mutex_lock(&kqr_lock);
 	r->next = kqrecs; kqrecs = r;
 	pthread_mutex_unlock(&kqr_lock);
+	return 0;
 }
 
 // Suelta el registro de una kqueue (cuando ya no la usa nadie: ni el que espera ni el que la cerró).
@@ -394,6 +399,9 @@ static int apply(int kq, const struct kev* c) {
 	if (!n) {
 		if (!(c->flags & EV_ADD)) return D_ENOENT;
 		n = calloc(1, sizeof *n);
+		// Sin knote no hay nada que registrar: XNU reserva el knote con Z_NOFAIL (kern_event.c:7300-7305) y no falla, pero
+		// aquí no se puede bloquear esperando memoria: se avisa al invitado con ENOMEM en vez de escribir sobre NULL.
+		if (!n) return D_ENOMEM;
 		n->kq = kq; n->fd = -1; n->enabled = 1; n->k = *c;
 		n->next = notes; notes = n;
 		switch (c->filter) {
@@ -455,7 +463,10 @@ static int apply(int kq, const struct kev* c) {
 			// Señales de Darwin como eventos: un manejador del anfitrión suma al eventfd de esa señal, y el knote lo lee.
 			int ls = darwin_to_linux_sig_k((int)c->ident);
 			if (ls <= 0 || ls >= 65) { drop(n); return D_EINVAL; }
-			n->fd = signal_source(ls); n->owns_fd = n->fd >= 0;
+			n->fd = signal_source(ls);
+			// signal_source puede fallar (no hay manejador para esa señal): sin fd el knote nunca dispararía, sin error.
+			if (n->fd < 0) { drop(n); return D_ENOMEM; }
+			n->owns_fd = 1;
 			break;
 		}
 		case EVFILT_MACHPORT: {
@@ -720,20 +731,40 @@ static int ts_ms(uint64_t p) {
 
 static long bsd_kqueue(struct ctx* c) {
 	(void)c;
+	// Sin EPOLL_CLOEXEC, como en macOS: el fd de kqueue() no lleva close-on-exec (en XNU solo se activa con
+	// F_DUPFD_CLOEXEC, kern_descrip.c:2919), y un proceso que cree una kqueue y luego haga exec debe conservarla.
 	int fd = epoll_create1(0);
 	if (fd < 0) return -darwin_errno(errno);
-	kq_reg(fd);                                              // el programa puede cerrarla: hay que soltar sus knotes
+	// Sin memoria para el registro, la kqueue no se puede usar bien (al cerrarla no se soltarían sus knotes): se devuelve
+	// ENOMEM y no hay descriptor. En XNU, kqueue_alloc espera la memoria en vez de fallar (kern_event.c:3024-3039,
+	// zalloc_flags con Z_WAITOK); aquí no se puede bloquear esperando memoria.
+	if (kq_reg(fd) < 0) { close(fd); return -D_ENOMEM; }   // el programa puede cerrarla: hay que soltar sus knotes
 	return fd;
 }
 // kevent(kq, changelist, nchanges, eventlist, nevents, timeout)
 static long bsd_kevent(struct ctx* c) { g_dout = 0; g_no_poll = 0; return do_kevent((int)c->a[0], 0, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], ts_ms(c->a[5])); }
 // kevent64(kq, changelist, nchanges, eventlist, nevents, flags, timeout)
-static long bsd_kevent64(struct ctx* c) { g_dout = 0; g_no_poll = 0; return do_kevent((int)c->a[0], 1, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], ts_ms(ctx_arg(c, 6))); }
+// El 6.º argumento son las banderas y el 7.º el plazo (bsd/man/man2/kqueue.2:71 y bsd/kern/syscalls.master:550).
+// ctx_arg(c, 6) es el 7.º argumento: los argumentos 7 y 8 de una syscall van en la pila (tahoe_run.c:1000), así que el
+// plazo ya se leía del sitio correcto.
+static long bsd_kevent64(struct ctx* c) {
+	uint64_t flags = c->a[5];
+	g_dout = 0;
+	// KEVENT_FLAG_ERROR_EVENTS: XNU no recorre la cola en busca de eventos, solo devuelve los errores (y los recibos) de
+	// la lista de cambios (bsd/kern/kern_event.c:8207: el escaneo solo se hace si no está la bandera).
+	g_no_poll = (flags & KEVENT_FLAG_ERROR_EVENTS) != 0;
+	// KEVENT_FLAG_IMMEDIATE: XNU no valida el plazo (kern_event.c:8520: el plazo solo se mira si NO está la bandera, así
+	// que un timespec inválido no da EINVAL) y no espera a los eventos (kern_event.c:8030: con la bandera, kqueue_scan
+	// vuelve sin bloquear). Aquí, el plazo no se lee en absoluto y la espera es de 0 ms.
+	if (flags & KEVENT_FLAG_IMMEDIATE)
+		return do_kevent((int)c->a[0], 1, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], 0);
+	return do_kevent((int)c->a[0], 1, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], ts_ms(ctx_arg(c, 6)));
+}
 // kevent_qos(kq, changelist, nchanges, eventlist, nevents, data_out, data_available, flags)
 static long bsd_kevent_qos(struct ctx* c) {
 	uint64_t flags = ctx_arg(c, 7);
-	g_dout = c->a[5]; g_davail = ctx_arg(c, 6); g_no_poll = (flags & 2) != 0;
-	long r = do_kevent((int)c->a[0], 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & 1) ? 0 : -1);
+	g_dout = c->a[5]; g_davail = ctx_arg(c, 6); g_no_poll = (flags & KEVENT_FLAG_ERROR_EVENTS) != 0;
+	long r = do_kevent((int)c->a[0], 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & KEVENT_FLAG_IMMEDIATE) ? 0 : -1);
 	if ((int)c->a[0] == -1) wq_arm_workloop(WQ_KQID_WORKQ);   // los eventos de la cola de trabajo piden un hilo cuando haya alguno listo
 	return r;
 }
@@ -814,8 +845,8 @@ static long bsd_kevent_id(struct ctx* c) {
 	int kq = wl_take(c->a[0]);
 	if (kq < 0) return -D_ENOMEM;
 	wq_note_workloop(c->a[0]);
-	g_dout = c->a[5]; g_davail = ctx_arg(c, 6); g_no_poll = (flags & 2) != 0;
-	long r = do_kevent(kq, 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & 1) ? 0 : -1);
+	g_dout = c->a[5]; g_davail = ctx_arg(c, 6); g_no_poll = (flags & KEVENT_FLAG_ERROR_EVENTS) != 0;
+	long r = do_kevent(kq, 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & KEVENT_FLAG_IMMEDIATE) ? 0 : -1);
 	wl_put(c->a[0]);
 	wq_arm_workloop(c->a[0]);
 	return r;
