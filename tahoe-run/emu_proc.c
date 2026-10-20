@@ -864,6 +864,61 @@ static void psfa_apply_here(void) {
 // execve: se relanza tahoe-run con el programa nuevo. Soporta "#!" (hasta 4 niveles).
 static char spawn_special_env[8][32];   // TAHOE_SP<n>=<puerto>: puertos especiales para el hijo (acciones de puerto de posix_spawn)
 static int spawn_special_n;
+
+// ---- POSIX_SPAWN_START_SUSPENDED ------------------------------------------------------------------------------------
+// En XNU, si el atributo de spawn lleva POSIX_SPAWN_START_SUSPENDED (bsd/sys/spawn.h:60), el proceso hijo se queda en
+// SSTOP y con la tarea suspendida antes de ejecutar una sola instrucción del programa nuevo (bsd/kern/kern_exec.c:
+// 2808-2821: p_stat = SSTOP y task_suspend_internal). Quien lo lanzó lo ve parado (waitpid con WUNTRACED) y lo reanuda
+// con un SIGCONT (tests/suspended_spawn_26184412.c de XNU).
+// Aquí el hijo es otro proceso de tahoe-run (el que carga el programa de macOS y lo ejecuta), así que el que se para es
+// él mismo al arrancar: el constructor de este fichero se para con SIGSTOP si encuentra TAHOE_SPAWN_SUSPENDED en el
+// entorno, antes de que cargue nada del programa. El padre no devuelve el control hasta que el hijo está de verdad
+// parado: un SIGCONT enviado a un proceso que todavía no se ha parado se pierde (su acción por defecto no hace nada) y
+// el hijo quedaría colgado para siempre.
+static int spawn_suspended;                                  // POSIX_SPAWN_START_SUSPENDED en el atributo de spawn
+
+__attribute__((constructor)) static void spawn_suspended_child(void) {
+	const char* s = getenv("TAHOE_SPAWN_SUSPENDED");
+	if (!s || !*s) return;
+	unsetenv("TAHOE_SPAWN_SUSPENDED");                       // los nietos no heredan la suspensión
+	raise(SIGSTOP);                                          // parado: un SIGCONT lo reanuda
+}
+// Estado de un proceso según /proc: 'T' o 't' parado, 'Z' zombi, 'X' muerto, 'R'/'S' vivo; 0 si no se puede leer.
+static char proc_state(pid_t pid) {
+	char p[64], buf[512];
+	snprintf(p, sizeof p, "/proc/%d/stat", (int)pid);
+	int fd = open(p, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return 0;
+	ssize_t n = read(fd, buf, sizeof buf - 1);
+	close(fd);
+	if (n <= 0) return 0;
+	buf[n] = 0;
+	char* c = strrchr(buf, ')');                              // tras el nombre del proceso (entre paréntesis) va el estado
+	if (!c) return 0;
+	c++;
+	while (*c == ' ') c++;
+	return *c;
+}
+// Espera a que el hijo de un spawn suspendido esté de verdad parado (lo para su constructor con SIGSTOP). Si no se para
+// en un plazo razonable, se le sigue mandando SIGCONT y se vuelve: un SIGCONT a un proceso que no está parado no hace
+// nada, así que si el hijo se para más tarde no debe quedar colgado. Mejor un hijo que corre que un hijo colgado.
+static void wait_child_stopped(pid_t pid) {
+	int i;
+	for (i = 0; i < 5000; i++) {                             // hasta ~5 s
+		char st = proc_state(pid);
+		if (st == 'T' || st == 't') return;                  // parado: ya se le puede mandar el SIGCONT
+		if (!st || st == 'Z' || st == 'X' || st == 'x') return;   // murió antes de pararse
+		usleep(1000);
+	}
+	logf_("    posix_spawn: el hijo %d no se ha parado; se le continúa\n", (int)pid);
+	for (i = 0; i < 20; i++) {                               // ~2 s más, por si se para tarde
+		syscall(SYS_kill, (int)pid, SIGCONT);
+		usleep(100000);
+		char st = proc_state(pid);
+		if (!st || st == 'Z' || st == 'X' || st == 'x') return;
+	}
+}
+
 static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn, pid_t* pidout) {
 	char gpath[4096], hpath[4200];
 	if (safe_string(pathp, gpath, sizeof gpath) != 0) return -D_EFAULT;
@@ -928,7 +983,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 			if (l == gl && !strncmp(p, gpath, l)) {
 				logf_("    exec \"%s\" sustituido por un proceso que sale con 0\n", gpath);
 				char* targv[] = { (char*)"true", NULL };
-				if (spawn) { int pe = posix_spawnp(pidout, "true", NULL, NULL, targv, environ); return pe ? -darwin_errno(pe) : 0; }
+				if (spawn) { int pe = posix_spawnp(pidout, "true", NULL, NULL, targv, environ); spawn_suspended = 0; return pe ? -darwin_errno(pe) : 0; }
 				_exit(0);
 			}
 			p += l + (q ? 1 : 0);
@@ -942,8 +997,8 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	nargv[k++] = (char*)g_dyld_path;
 	nargv[k++] = hpath;
 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
-	// 17 de entorno + 1 de credenciales + 8 de puertos especiales + 9 heredados + terminador NULL
-	char** nenv = calloc((size_t)ec + 17 + 1 + 8 + 9 + 1, sizeof(char*));
+	// 18 de entorno + 1 de credenciales + 8 de puertos especiales + 9 heredados + terminador NULL
+	char** nenv = calloc((size_t)ec + 18 + 1 + 8 + 9 + 1, sizeof(char*));
 	int e = 0;
 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
 	char b1[4300], b2[4300];
@@ -975,6 +1030,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (getenv("TAHOE_FB_INTEL")) nenv[e++] = (char*)"TAHOE_FB_INTEL=1";             // el framebuffer se presenta como el de una Intel (ver emu_iokit.inc)
 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
 	static char b7[300]; cred_env(b7, sizeof b7); nenv[e++] = b7;   // credenciales emuladas (uid/gid) para el hijo
+	if (spawn && spawn_suspended) nenv[e++] = (char*)"TAHOE_SPAWN_SUSPENDED=1";   // el hijo se para al arrancar (ver arriba)
 	for (int i = 0; i < spawn_special_n; i++) nenv[e++] = spawn_special_env[i];
 	static char inh[9][40];                                          // lo que hereda el hijo (ver ports_inherit_env)
 	int ni = ports_inherit_env(inh, 9);
@@ -990,6 +1046,9 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 		posix_spawnattr_destroy(&at);
 		posix_spawn_file_actions_destroy(&fa);
 		spawn_fa_n = 0; spawn_cloexec_default = 0; spawn_setpgroup = 0;
+		// El hijo suspendido no corre hasta que quien lo lanzó le mande un SIGCONT: se espera a que esté de verdad parado.
+		if (!pe && spawn_suspended && pidout) wait_child_stopped(*pidout);
+		spawn_suspended = 0;
 		return pe ? -darwin_errno(pe) : 0;
 	}
 	if (spawn_fa_n || spawn_cloexec_default) { psfa_apply_here(); spawn_fa_n = 0; spawn_cloexec_default = 0; }   // POSIX_SPAWN_SETEXEC
@@ -1031,11 +1090,20 @@ static long bsd_posix_spawn(struct ctx* c) {
 	logf_("    posix_spawn <%d>(\"%s\") attr_flags=0x%x ad=%lx,%lx,%lx,%lx,%lx,%lx\n", (int)getpid(), gp, psa_flags, ad[0], ad[1], ad[2], ad[3], ad[4], ad[5]);
 	read_file_actions(ad[3], ad[2]);
 	spawn_cloexec_default = (psa_flags & 0x4000) != 0;              // POSIX_SPAWN_CLOEXEC_DEFAULT
+	// POSIX_SPAWN_START_SUSPENDED (0x80): el hijo nace parado (SSTOP) y espera un SIGCONT de quien lo lanzó
+	// (en XNU: bsd/kern/kern_exec.c:2808-2821; ver el constructor de este fichero).
+	spawn_suspended = (psa_flags & 0x80) != 0;
 	// POSIX_SPAWN_SETPGROUP (0x2): el hijo en el grupo psa_pgroup, o en uno nuevo con su pid si es 0. Quien lo lanza puede
 	// luego matar al grupo entero (system_profiler: kill(-pid, SIGTERM) a un informe que no acaba); sin esto fallaba y
 	// system_profiler se quedaba esperando para siempre.
 	spawn_setpgroup = (psa_flags & 0x2) != 0; spawn_pgroup = psa_pgroup;
-	if (psa_flags & 0x40) { long r0 = exec_common(c->a[1], c->a[3], c->a[4], 0, NULL); cred_spawn_session(0); return r0; }
+	if (psa_flags & 0x40) {                                          // POSIX_SPAWN_SETEXEC: la imagen se carga en este proceso
+		if (spawn_suspended) logf_("    posix_spawn: POSIX_SPAWN_START_SUSPENDED con POSIX_SPAWN_SETEXEC: se ignora (el proceso se suspendería a sí mismo)\n");
+		long r0 = exec_common(c->a[1], c->a[3], c->a[4], 0, NULL);
+		cred_spawn_session(0);
+		spawn_suspended = 0;
+		return r0;
+	}
 	pid_t pid = 0;
 	long r = exec_common(c->a[1], c->a[3], c->a[4], 1, &pid);
 	cred_spawn_session(0);
