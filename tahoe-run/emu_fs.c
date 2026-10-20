@@ -1376,7 +1376,7 @@ static long bsd_getattrlistbulk(struct ctx* c) {
 	uint64_t gbuf = c->a[2], gsize = c->a[3];
 	if (gsize > (1ull << 30)) return -D_EINVAL;                       // un búfer de más de 1 GiB no lo pide nadie
 	uint8_t lin[16384];
-	uint8_t* out = malloc(gsize);
+	uint8_t* out = malloc(gsize ? gsize : 1);                          // malloc(0) puede devolver NULL: no es un fallo
 	if (!out) return -D_ENOMEM;
 	size_t used = 0;
 	long count = 0, rc = 0;
