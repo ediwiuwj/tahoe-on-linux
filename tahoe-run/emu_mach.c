@@ -10,6 +10,7 @@
 #include <sys/syscall.h>
 #include <pthread.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,7 @@
 #define KERN_INVALID_ADDR    1
 #define KERN_NO_SPACE_       3
 #define KERN_INVALID_ARG     4
+#define KERN_RES_SHORTAGE_   6      // KERN_RESOURCE_SHORTAGE (osfmk/mach/kern_return.h:98)
 
 struct hdr { uint32_t bits, size, remote, local, voucher; int32_t id; };
 
@@ -104,9 +106,12 @@ static size_t mig_make_memory_entry(const struct hdr* req, const uint8_t* m, uin
 	int named_create = (perm & 0x20000) != 0;                // MAP_MEM_NAMED_CREATE: memoria nueva (a cero), sin rango de origen
 	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
 	int ok = fd >= 0 && len && ftruncate(fd, (off_t)len) == 0 && (off != 0 || named_create);
+	int32_t kr = KERN_INVALID_ARG;                            // error con el que se responde si la llamada falla
 	if (ok && !named_create) {
 		uint8_t* tmp = malloc(len);
-		if (!tmp) ok = 0;                                       // sin memoria: se informa del fallo, sin copiar nada
+		if (!tmp) { ok = 0; kr = KERN_RES_SHORTAGE_; }            // sin memoria: como en XNU, que responde
+			// KERN_RESOURCE_SHORTAGE (osfmk/mach/kern_return.h:98; el mismo error que devuelve
+			// vm_map_copyin_kernel_buffer cuando su kalloc_data() no tiene memoria, osfmk/vm/vm_map.c:10431)
 		else {
 			// La dirección es del invitado: se lee con safe_read, que falla si el rango no es válido (XNU
 			// devuelve KERN_INVALID_ARGUMENT) en vez de matar el proceso emulado con un SIGSEGV.
@@ -117,9 +122,17 @@ static size_t mig_make_memory_entry(const struct hdr* req, const uint8_t* m, uin
 		}
 	}
 	if (fd >= 0) close(fd);
-	if (ok) port_me_created(port); else unlink(path);
+	if (ok) port_me_created(port);
+	else {
+		unlink(path);
+		// El puerto se creó antes de saber si la llamada iba a funcionar. Si la llamada falla, en XNU el puerto
+		// nunca llega a entregarse (mach_make_memory_entry_cleanup pone el handle a IPC_PORT_NULL,
+		// osfmk/vm/vm_memory_entry.c:115), así que aquí se destruye en vez de dejarlo vivo para siempre.
+		// execwatch_del() es la vía pública de emu_port.c para hacer ipc_port_destroy (destroy_locked).
+		execwatch_del(port);
+	}
 	if (mach_trace()) { logf_("    MT pid=%d make_memory_entry tamaño=0x%lx dir=0x%lx permiso=0x%x -> puerto 0x%x %s\n", (int)getpid(), size, off, perm, port, ok ? "ok" : "FALLO"); }
-	if (!ok) return reply_begin(r, req, KERN_INVALID_ARG);
+	if (!ok) return reply_begin(r, req, kr);
 	size_t n = reply_port(r, req, port, 17);
 	memcpy(r + n, NDR_LE, 8); memcpy(r + n + 8, &len, 8);
 	n += 16;
@@ -698,8 +711,14 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 		size_t rk = 0;
 		for (int i = 0; i < nd && i < 64; i++) {
 			uint8_t cl = d[i].clase;
-			if ((cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTO_GUARDA) && rk < sizeof rxports - 24)
-				rk += (size_t)snprintf(rxports + rk, sizeof rxports - rk, "%s0x%x%s", rk ? "," : " puertos=", d[i].nombre, port_exists(d[i].nombre) ? "" : "(muerto)");
+			if ((cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTO_GUARDA) && rk + 32 <= sizeof rxports) {
+				// snprintf devuelve la longitud que habría escrito: si no cabe, se deja lo escrito y no se
+				// sigue (rk no puede pasar de sizeof rxports, o el siguiente "sizeof rxports - rk" sería un
+				// tamaño enorme y se escribiría fuera del búfer).
+				int w = snprintf(rxports + rk, sizeof rxports - rk, "%s0x%x%s", rk ? "," : " puertos=", d[i].nombre, port_exists(d[i].nombre) ? "" : "(muerto)");
+				if (w < 0 || (size_t)w >= sizeof rxports - rk) rk = sizeof rxports - 1;   // truncado
+				else rk += (size_t)w;
+			}
 			if ((trace_all || mach_trace()) && (cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTO_GUARDA)) logf_("    mach_msg: <%d> descriptor de puerto%s 0x%x disposición %u\n", (int)getpid(), cl == NUCLEO_PUERTO_GUARDA ? " con guarda" : "", d[i].nombre, d[i].disp);
 			// MOVE_RECEIVE: el receptor pasa a ser dueño (también en un puerto con guarda, que es como launchd entrega los
 			// puertos de servicio)
