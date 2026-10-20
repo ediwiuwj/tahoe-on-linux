@@ -99,10 +99,13 @@ static size_t mig_make_memory_entry(const struct hdr* req, const uint8_t* m, uin
 	int ok = fd >= 0 && len && ftruncate(fd, (off_t)len) == 0 && (off != 0 || named_create);
 	if (ok && !named_create) {
 		uint8_t* tmp = malloc(len);
-		memcpy(tmp, (void*)off, len);                           // lo que ya hubiera escrito el creador
-		if (pwrite(fd, tmp, len, 0) != (ssize_t)len) ok = 0;
-		free(tmp);
-		if (ok && mmap((void*)off, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) ok = 0;
+		if (!tmp) ok = 0;                                       // sin memoria: se informa del fallo, sin copiar nada
+		else {
+			memcpy(tmp, (void*)off, len);                       // lo que ya hubiera escrito el creador
+			if (pwrite(fd, tmp, len, 0) != (ssize_t)len) ok = 0;
+			free(tmp);
+			if (ok && mmap((void*)off, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) ok = 0;
+		}
 	}
 	if (fd >= 0) close(fd);
 	if (ok) port_me_created(port); else unlink(path);
