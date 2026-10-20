@@ -435,8 +435,8 @@ impl Drop for Buffer {
         // SAFETY: proyección hecha en nuevo_buffer.
         unsafe { munmap(self.ptr.cast(), self.proyectado) };
         if let Some(b) = self.liberador {
-            // SAFETY: bloque copiado con _Block_copy; el liberador toma la memoria del cliente.
-            unsafe { liberar_con_bloque(b, self.origen) };
+            // SAFETY: bloque copiado con _Block_copy; el liberador toma la memoria del cliente y su longitud.
+            unsafe { liberar_con_bloque(b, self.origen, self.len as u64) };
         }
         soltar(self.etiqueta);
     }
@@ -740,21 +740,45 @@ unsafe fn llamar_bloque(b: *mut c_void, arg: Id) {
     invoke(b, arg);
 }
 
-/// Llama a un bloque liberador `void (^)(const void *)` con el puntero a la memoria del cliente.
+/// Llama a un bloque liberador con el puntero a la memoria del cliente y su longitud.
+///
+/// En macOS 26 la firma del bloque es `void (^)(const void *bytes, NSUInteger length)` (cadena `v24@?0^v8Q16` en el
+/// descriptor del literal de bloque de la caché de macOS 26), no `void (^)(const void *)`: el bloque de CoreImage y
+/// el de MetalKit son de ese tipo, así que hay que pasar los dos argumentos.
 ///
 /// # Safety
 /// `b` debe ser un bloque con esa firma.
-unsafe fn llamar_bloque_con_puntero(b: *mut c_void, p: *const u8) {
-    let invoke: extern "C-unwind" fn(*mut c_void, *const u8) = std::mem::transmute(*(b.cast::<u8>().add(16) as *const *const c_void));
-    invoke(b, p);
+unsafe fn llamar_bloque_con_puntero(b: *mut c_void, p: *const u8, len: u64) {
+    let invoke: extern "C-unwind" fn(*mut c_void, *const u8, u64) =
+        std::mem::transmute(*(b.cast::<u8>().add(16) as *const *const c_void));
+    invoke(b, p, len);
 }
 
 /// Llama al bloque liberador con la memoria del cliente y suelta la copia del bloque: el bloque se llama una sola vez.
 ///
 /// # Safety
-/// `b` debe ser un bloque `void (^)(const void *)` copiado con `_Block_copy`.
-unsafe fn liberar_con_bloque(b: *mut c_void, origen: *const u8) {
-    llamar_bloque_con_puntero(b, origen);
+/// `b` debe ser un bloque `void (^)(const void *, NSUInteger)` copiado con `_Block_copy`.
+unsafe fn liberar_con_bloque(b: *mut c_void, origen: *const u8, len: u64) {
+    llamar_bloque_con_puntero(b, origen, len);
+    _Block_release(b);
+}
+
+/// Llama al bloque liberador del cliente (con su puntero y su longitud) y suelta la copia: se llama **una sola vez**.
+///
+/// Es `pub` porque el llamador puede querer avisar en el momento en que los bytes ya están copiados, sin esperar a
+/// que el buffer muera.
+///
+/// # Safety
+/// `b` debe ser un bloque `void (^)(const void *, NSUInteger)` copiado con `_Block_copy`.
+pub unsafe fn liberar_bloque_del_cliente(b: *mut c_void, origen: *const u8, len: u64) {
+    liberar_con_bloque(b, origen, len);
+}
+
+/// Suelta la copia de un bloque sin llamarlo (el buffer no llegó a existir: la memoria sigue siendo del cliente).
+///
+/// # Safety
+/// `b` debe ser un bloque copiado con `_Block_copy`.
+pub unsafe fn soltar_bloque(b: *mut c_void) {
     _Block_release(b);
 }
 

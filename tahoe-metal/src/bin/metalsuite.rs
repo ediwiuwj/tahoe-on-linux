@@ -199,38 +199,6 @@ fn chequear_si_falta(inf: &mut Informe, nombre: &str, falta: Option<&str>, f: im
     }
 }
 
-/// Una comprobación que depende de que exista un selector en el marco de Apple: si no existe, no es un fallo del
-/// driver, se cuenta como saltada.
-fn comprobar(inf: &mut Informe, nombre: &str, selector: Option<&str>, f: impl FnOnce() -> Result<(), String>) {
-    match selector {
-        Some(s) if !existe(s) => {
-            inf.saltados += 1;
-            println!("  (n/d)   {nombre}: Apple no tiene «{s}»");
-        }
-        _ => chequear(inf, nombre, f),
-    }
-}
-
-/// Si el marco de Apple (Metal) tiene ese selector de clase.
-fn existe(selector: &str) -> bool {
-    unsafe {
-        // Se busca en cualquier clase de Metal registrada: el runtime lo resuelve por nombre de selector.
-        let h = dlopen(c"/System/Library/Frameworks/Metal.framework/Metal".as_ptr(), 2);
-        if h.is_null() {
-            return false;
-        }
-        // metal: usa el runtime de Objective-C: se mira si alguna clase Metal implementa el selector.
-        let clases = [
-            "MTLTextureDescriptor", "MTLSamplerStateDescriptor", "MTLRenderPipelineDescriptor", "MTLHeapDescriptor",
-            "MTLArgumentBufferDescriptor", "MTLIndirectCommandBufferDescriptor", "MTLResidencySetDescriptor",
-        ];
-        clases.iter().any(|c| {
-            let clase = objc::clase(c);
-            !clase.is_null() && objc::responde_clase(clase, selector)
-        })
-    }
-}
-
 /// Métodos del protocolo que el driver no implementa: se comparan las implementaciones de la clase del driver con las
 /// de la clase madre de Apple (_MTLDevice). Si son la misma, es que el driver no lo implementa.
 fn sin_implementar(d: Id) -> Vec<(String, String)> {

@@ -1271,11 +1271,28 @@ extern "C-unwind" fn dev_residencia(_this: Id, _cmd: Sel, desc: Id, error: *mut 
 extern "C-unwind" fn dev_buffer_nocopia(_this: Id, _cmd: Sel, p: *const u8, len: u64, opciones: u64, liberador: Id) -> Id {
     // SAFETY: el cliente garantiza que hay len bytes en p (si no hay memoria, p es nulo y no se lee nada).
     let datos = if p.is_null() { None } else { Some(unsafe { std::slice::from_raw_parts(p, len as usize) }) };
-    // El bloque se copia siempre que no sea nulo: si no hay memoria del cliente, se llamará con NULL al morir el buffer.
+    // El bloque se copia siempre que no sea nulo: si no hay memoria del cliente, se llamará con NULL.
     let bloq = clases::copiar_bloque(liberador);
-    match clases::nuevo_buffer_con_liberador(len as usize, opciones, datos, bloq, p) {
-        Ok(b) => b,
+    match clases::nuevo_buffer_con_liberador(len as usize, opciones, datos, None, p) {
+        Ok(b) => {
+            // Los bytes ya están copiados al fichero del servidor: la memoria del cliente ya no la necesita Metal
+            // para nada, así que se avisa AHORA, exactamente una vez y con su puntero y su longitud. Si se esperase
+            // a que el buffer muera, el bloque no se llamaría nunca en un cliente que no suelta el objeto (Metal
+            // devuelve los objetos autoreleados) y ese cliente se quedaría esperando su aviso: es el caso de
+            // CoreImage, cuyo bloque recupera el contexto de la conversión.
+            if let Some(bloque) = bloq {
+                // SAFETY: bloque copiado con _Block_copy, con la firma void (^)(const void *, NSUInteger).
+                unsafe { clases::liberar_bloque_del_cliente(bloque, p, len) };
+            }
+            b
+        }
         Err(e) => {
+            // El buffer no llegó a existir: la memoria sigue siendo del cliente, así que el bloque NO se llama;
+            // solo se suelta la copia.
+            if let Some(bloque) = bloq {
+                // SAFETY: bloque copiado con _Block_copy.
+                unsafe { clases::soltar_bloque(bloque) };
+            }
             registro(&format!("newBufferWithBytesNoCopy:{len}: {e}"));
             std::ptr::null_mut()
         }
