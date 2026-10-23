@@ -1,0 +1,193 @@
+From 9204aa070a4012a0240f8b698885994a7dd1f035 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:34:34 -0600
+Subject: [PATCH 50/57] =?UTF-8?q?Emulador:=20las=20reservas=20de=20las=20f?=
+ =?UTF-8?q?irmas=20de=20c=C3=B3digo=20se=20comprueban=20y=20sus=20desplaza?=
+ =?UTF-8?q?mientos=20no=20dan=20la=20vuelta?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_cs.c: las cinco reservas de cs_blob/cs_blob_fd no se comprobaban.
+  En la del token de una firma, el búfer se rellenaba con memset
+  después de reservar: si la reserva fallaba, se escribía sobre el
+  puntero nulo y moría el proceso tahoe-run entero. Ahora la llamada
+  distingue "el archivo no tiene esa firma" de "no hay memoria"
+  (con un parámetro de error) y avisa con ENOMEM.
+- emu_cs.c: los desplazamientos y los tamaños del índice del SuperBlob
+  salen del archivo, así que se comparan en 64 bits: con 32 bits, un
+  valor enorme daba la vuelta (bo + 8 se volvía 7) y dejaba pasar un
+  acceso fuera del búfer.
+- emu_cs.c: el offset del índice se sigue leyendo en big-endian, como
+  el resto del SuperBlob (XNU: ntohl(blobIndex->offset),
+  bsd/kern/ubc_subr.c:556).
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_cs.c | 72 ++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 50 insertions(+), 22 deletions(-)
+
+diff --git a/tahoe-run/emu_cs.c b/tahoe-run/emu_cs.c
+index 4109fbb..824d93e 100644
+--- a/tahoe-run/emu_cs.c
++++ b/tahoe-run/emu_cs.c
+@@ -77,9 +77,13 @@ static int64_t slice_offset(int fd) {
+ }
+ #define CS_WHOLE 0xffffffffu                                    // «ranura» especial: la firma completa
+ // Busca en la firma del ejecutable el blob de la ranura indicada. Devuelve malloc() con el blob (cabecera incluida).
+-static uint8_t* cs_blob_fd(int fd, uint32_t slot, uint32_t* len) {
++// Si una reserva de memoria falla, *err = D_ENOMEM y se devuelve NULL: así el que llama distingue «el archivo no
++// tiene esa firma» de «no hay memoria» (los tamaños salen de la cabecera del archivo, que puede ser enorme).
++// Si err es NULL, el error se ignora.
++static uint8_t* cs_blob_fd(int fd, uint32_t slot, uint32_t* len, int* err) {
+ 	uint8_t h[4096];
+ 	uint64_t base = 0;
++	if (err) *err = 0;
+ 	if (pread(fd, h, sizeof h, 0) < 32) return NULL;
+ 	if (be32(h) == 0xcafebabe) {                              // binario universal: rebanada x86_64
+ 		uint32_t nf = be32(h + 4);
+@@ -90,29 +94,40 @@ static uint8_t* cs_blob_fd(int fd, uint32_t slot, uint32_t* len) {
+ 	uint8_t* out = NULL;
+ 	if (rd32(h) == 0xfeedfacf) {
+ 		uint32_t ncmds = rd32(h + 16), sizeofcmds = rd32(h + 20);
+-		uint8_t* lc = malloc(sizeofcmds);
+-		if (lc && pread(fd, lc, sizeofcmds, (off_t)base + 32) == (ssize_t)sizeofcmds) {
+-			uint32_t off = 0;
++		uint8_t* lc = malloc(sizeofcmds ? sizeofcmds : 1);     // malloc(0) puede devolver NULL: no es un fallo
++		if (!lc) { if (err) *err = D_ENOMEM; return NULL; }
++		if (pread(fd, lc, sizeofcmds, (off_t)base + 32) == (ssize_t)sizeofcmds) {
++			uint64_t off = 0;
+ 			for (uint32_t i = 0; i < ncmds && off + 8 <= sizeofcmds; i++) {
+ 				uint32_t cmd = rd32(lc + off), cs = rd32(lc + off + 4);
+ 				if (cs < 8) break;
+ 				if (cmd == 0x1d && off + 16 <= sizeofcmds) {          // LC_CODE_SIGNATURE: dataoff, datasize
+-					uint32_t doff = rd32(lc + off + 8), dsz = rd32(lc + off + 12);
+-					uint8_t* sb = malloc(dsz);
+-					if (sb && dsz >= 12 && pread(fd, sb, dsz, (off_t)(base + doff)) == (ssize_t)dsz && be32(sb) == 0xfade0cc0) {
++					uint64_t doff = rd32(lc + off + 8), dsz = rd32(lc + off + 12);
++					uint8_t* sb = malloc(dsz ? dsz : 1);
++					if (!sb) { if (err) *err = D_ENOMEM; free(lc); return NULL; }
++					if (dsz >= 12 && pread(fd, sb, dsz, (off_t)(base + doff)) == (ssize_t)dsz && be32(sb) == 0xfade0cc0) {
+ 						uint32_t count = be32(sb + 8);
+ 						if (slot == CS_WHOLE) {                          // la firma entera (SuperBlob), para CS_OPS_BLOB
+ 							uint32_t tl = be32(sb + 4);
+-							if (tl >= 12 && tl <= dsz && (out = malloc(tl))) { memcpy(out, sb, tl); *len = tl; }
++							if (tl >= 12 && tl <= dsz) {
++								out = malloc(tl);
++								if (!out) { if (err) *err = D_ENOMEM; free(sb); free(lc); return NULL; }
++								memcpy(out, sb, tl); *len = tl;
++							}
+ 							count = 0;
+ 						}
+-						for (uint32_t k = 0; k < count && 12 + (k + 1) * 8 <= dsz; k++) {
+-							uint32_t type = be32(sb + 12 + k * 8), bo = be32(sb + 12 + k * 8 + 4);
++						// Los desplazamientos y los tamaños salen del archivo (del invitado): se comparan en 64 bits
++						// para que un valor enorme no dé la vuelta y deje pasar un acceso fuera del búfer.
++						// El offset del índice va en big-endian, como el resto del SuperBlob (XNU: ubc_subr.c:556,
++						// ntohl(blobIndex->offset)).
++						for (uint64_t k = 0; k < count && 12 + (k + 1) * 8 <= dsz; k++) {
++							uint64_t type = be32(sb + 12 + k * 8), bo = be32(sb + 12 + k * 8 + 4);
+ 							if (type != slot || bo + 8 > dsz) continue;
+-							uint32_t bl = be32(sb + bo + 4);
++							uint64_t bl = be32(sb + bo + 4);
+ 							if (bl < 8 || bo + bl > dsz) break;
+ 							out = malloc(bl);
+-							if (out) { memcpy(out, sb + bo, bl); *len = bl; }
++							if (!out) { if (err) *err = D_ENOMEM; free(sb); free(lc); return NULL; }
++							memcpy(out, sb + bo, bl); *len = bl;
+ 							break;
+ 						}
+ 					}
+@@ -126,12 +141,13 @@ static uint8_t* cs_blob_fd(int fd, uint32_t slot, uint32_t* len) {
+ 	}
+ 	return out;
+ }
+-static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
++static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len, int* err) {
+ 	char path[4096];
++	if (err) *err = 0;
+ 	if (exe_host_path(pid, path, sizeof path) != 0) return NULL;
+ 	int fd = open(path, O_RDONLY | O_CLOEXEC);
+ 	if (fd < 0) return NULL;
+-	uint8_t* out = cs_blob_fd(fd, slot, len);
++	uint8_t* out = cs_blob_fd(fd, slot, len, err);
+ 	close(fd);
+ 	return out;
+ }
+@@ -139,7 +155,7 @@ static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
+ // -1 sin firma. Para fcntl F_GETSIGSINFO (emu_fs.c).
+ int cs_file_platform(int fd) {
+ 	uint32_t len = 0;
+-	uint8_t* cd = cs_blob_fd(fd, 0, &len);
++	uint8_t* cd = cs_blob_fd(fd, 0, &len, NULL);
+ 	if (!cd || len < 44 || be32(cd) != 0xfade0c02) { free(cd); return -1; }
+ 	uint32_t team = len >= 52 && be32(cd + 8) >= 0x20200 ? be32(cd + 48) : 0;
+ 	int r = !team && !(be32(cd + 12) & 0x2u);
+@@ -268,13 +284,16 @@ static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
+ 		// invalid» y el llavero del sistema no se desbloquea) y shortcuts exige ser binario de plataforma.
+ 		uint32_t st = 0, len = 0;
+ 		if (usize < 4) return -D_EINVAL;
+-		uint8_t* cd = cs_blob(pid, 0, &len);
++		int err = 0;
++		uint8_t* cd = cs_blob(pid, 0, &len, &err);
++		if (err) return -D_ENOMEM;                                 // sin memoria al leer la firma
+ 		if (cd && len >= 44 && be32(cd) == 0xfade0c02) {
+ 			st = 0x00000001u | 0x20000000u;                          // CS_VALID | CS_SIGNED
+ 			st |= be32(cd + 12) & (0x2u | 0x100u | 0x200u | 0x800u | 0x1000u | 0x2000u | 0x10000u | 0x20000u);
+ 			uint32_t team = len >= 52 && be32(cd + 8) >= 0x20200 ? be32(cd + 48) : 0;
+ 			if (!team && !(st & 0x2u)) st |= 0x04000000u | 0x02000000u;   // CS_PLATFORM_BINARY | CS_DYLD_PLATFORM
+-			uint32_t el = 0; uint8_t* ent = cs_blob(pid, 5, &el);
++			uint32_t el = 0; uint8_t* ent = cs_blob(pid, 5, &el, &err);
++			if (err) { free(cd); return -D_ENOMEM; }
+ 			if (ent) st |= 0x4000u;                                  // CS_ENTITLEMENTS_VALIDATED
+ 			free(ent);
+ 		}
+@@ -283,14 +302,18 @@ static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
+ 	}
+ 	case 7: case 16: {                                           // ENTITLEMENTS_BLOB (XML, ranura 5) / DER_ENTITLEMENTS_BLOB (ranura 7)
+ 		uint32_t len = 0;
+-		uint8_t* b = cs_blob(pid, op == 7 ? 5 : 7, &len);
++		int err = 0;
++		uint8_t* b = cs_blob(pid, op == 7 ? 5 : 7, &len, &err);
++		if (err) return -D_ENOMEM;
+ 		long r = copy_token(b, len, uaddr, usize);
+ 		free(b);
+ 		return r;
+ 	}
+ 	case 10: {                                                   // BLOB: la firma entera (SuperBlob embebido), como cs_blob_get
+ 		uint32_t len = 0;
+-		uint8_t* b = cs_blob(pid, CS_WHOLE, &len);
++		int err = 0;
++		uint8_t* b = cs_blob(pid, CS_WHOLE, &len, &err);
++		if (err) return -D_ENOMEM;
+ 		if (!b) return -D_EINVAL;                                 // sin firma
+ 		long r = copy_token(b, len, uaddr, usize);
+ 		free(b);
+@@ -298,7 +321,9 @@ static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
+ 	}
+ 	case 11: case 14: {                                          // IDENTITY / TEAMID: cadenas del CodeDirectory (ranura 0)
+ 		uint32_t len = 0;
+-		uint8_t* cd = cs_blob(pid, 0, &len);
++		int err = 0;
++		uint8_t* cd = cs_blob(pid, 0, &len, &err);
++		if (err) return -D_ENOMEM;
+ 		const char* s = NULL;
+ 		if (cd && len >= 52 && be32(cd) == 0xfade0c02) {
+ 			uint32_t off = op == 11 ? be32(cd + 20) : (be32(cd + 8) >= 0x20200 ? be32(cd + 48) : 0);
+@@ -320,9 +345,12 @@ static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
+ 	case 5: {                                                    // CDHASH: del CodeDirectory de mejor hash (SHA-256 si lo hay)
+ 		if (usize < 20) return -D_EINVAL;
+ 		uint32_t len = 0, best_len = 0;
+-		uint8_t* best = cs_blob(pid, 0, &best_len);              // el principal (ranura 0) y los alternativos (0x1000...)
++		int err = 0;
++		uint8_t* best = cs_blob(pid, 0, &best_len, &err);         // el principal (ranura 0) y los alternativos (0x1000...)
++		if (err) return -D_ENOMEM;
+ 		for (uint32_t slot = 0x1000; slot < 0x1005; slot++) {
+-			uint8_t* alt = cs_blob(pid, slot, &len);
++			uint8_t* alt = cs_blob(pid, slot, &len, &err);
++			if (err) { free(best); return -D_ENOMEM; }
+ 			if (!alt) continue;
+ 			int rank_alt = len > 37 ? (alt[37] == 1 ? 1 : alt[37] == 3 ? 2 : alt[37] == 2 ? 3 : alt[37] == 4 ? 4 : 0) : 0;
+ 			int rank_best = best && best_len > 37 ? (best[37] == 1 ? 1 : best[37] == 3 ? 2 : best[37] == 2 ? 3 : best[37] == 4 ? 4 : 0) : 0;

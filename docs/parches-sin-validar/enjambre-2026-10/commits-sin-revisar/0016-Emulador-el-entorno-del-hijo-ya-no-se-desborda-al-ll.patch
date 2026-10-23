@@ -1,0 +1,47 @@
+From 5bd5289cbc3eaa71b9b26e2ac0f24bbdd373d6d0 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 21:47:56 -0600
+Subject: [PATCH 16/57] Emulador: el entorno del hijo ya no se desborda al
+ llenarlo
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_proc.c: la lista de variables de entorno que se pasa al hijo se
+  reserva con el tamaño que de verdad hace falta. Antes se pedían 34
+  punteros y se escribían hasta 35 (17 fijas + 1 de credenciales + 8 de
+  puertos especiales + 9 heredadas), así que el último puntero caía
+  fuera del bloque y la lista no quedaba terminada en NULL como exige
+  execve.
+- emu_proc.c: se termina la lista con NULL explícitamente, antes de
+  posix_spawn y de execve.
+
+Verificado: tahoe-run compila (build.sh, sin avisos nuevos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_proc.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tahoe-run/emu_proc.c b/tahoe-run/emu_proc.c
+index bf40e2a..df521de 100644
+--- a/tahoe-run/emu_proc.c
++++ b/tahoe-run/emu_proc.c
+@@ -891,7 +891,8 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
+ 	nargv[k++] = (char*)g_dyld_path;
+ 	nargv[k++] = hpath;
+ 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
+-	char** nenv = calloc(ec + 17 + 8 + 9, sizeof(char*));
++	// 17 de entorno + 1 de credenciales + 8 de puertos especiales + 9 heredados + terminador NULL
++	char** nenv = calloc((size_t)ec + 17 + 1 + 8 + 9 + 1, sizeof(char*));
+ 	int e = 0;
+ 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
+ 	char b1[4300], b2[4300];
+@@ -927,6 +928,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
+ 	static char inh[9][40];                                          // lo que hereda el hijo (ver ports_inherit_env)
+ 	int ni = ports_inherit_env(inh, 9);
+ 	for (int i = 0; i < ni; i++) nenv[e++] = inh[i];
++	nenv[e] = NULL;                 // antes de posix_spawn/execve: execve exige lista terminada en NULL
+ 	if (trace_all) logf_("    execve(\"%s\") -> relanzando tahoe-run\n", gpath);
+ 	if (spawn) {
+ 		posix_spawn_file_actions_t fa;

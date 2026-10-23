@@ -1,0 +1,162 @@
+From cce8517ae7321947277f93bb1382a07b808fc3a2 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:58:08 -0600
+Subject: [PATCH 36/57] Emulador: las banderas de mensaje de Darwin se nombran
+ y se ignoran las que colisionan
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_net.c: los valores de MSG_* de Darwin pasan a constantes con
+  nombre (bsd/sys/socket.h:613-643), para que la traducción se lea sin
+  tener que consultar la cabecera.
+- emu_net.c: se documenta por qué las banderas sin equivalente en Linux
+  se ignoran, y es un motivo fuerte: sus valores coinciden con los de
+  otras banderas de Linux con otro significado, así que traducirlas
+  cambiaría el comportamiento del socket. MSG_EOF 0x100 es el
+  MSG_WAITALL de Linux (esperaría a llenar el búfer), MSG_HAVEMORE 0x2000
+  el MSG_ERRQUEUE (vaciaría la cola de errores), MSG_RCVMORE 0x4000 el
+  MSG_NOSIGNAL y MSG_NEEDSA 0x10000 el MSG_WAITFORONE.
+- emu_net.c: SO_NOSIGPIPE (0x1022) se guarda por socket y getsockopt
+  devuelve el valor puesto, como en XNU (uipc_socket.c:6007-6009);
+  antes devolvía siempre 0. Un socket nuevo o aceptado no lo hereda.
+- emu_net.c: el SIGPIPE se sigue suprimiendo siempre, porque las
+  señales del emulador son virtuales y una señal real mataría al
+  proceso emulador en vez de al hilo que escribió. Queda anotado en el
+  código cómo traducribirlo cuando se pueda entregar la señal.
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_net.c | 73 ++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 63 insertions(+), 10 deletions(-)
+
+diff --git a/tahoe-run/emu_net.c b/tahoe-run/emu_net.c
+index 7e54067..6d458cd 100644
+--- a/tahoe-run/emu_net.c
++++ b/tahoe-run/emu_net.c
+@@ -70,19 +70,61 @@ static uint32_t sa_out(const uint8_t* l, socklen_t llen, uint8_t* d) {
+ 	return 0;
+ }
+ 
++// Banderas de mensaje de Darwin (bsd/sys/socket.h:613-643) y su equivalente en Linux.
++#define DMSG_OOB        0x1
++#define DMSG_PEEK       0x2
++#define DMSG_DONTROUTE  0x4
++#define DMSG_EOR        0x8
++#define DMSG_TRUNC      0x10
++#define DMSG_CTRUNC     0x20
++#define DMSG_WAITALL    0x40
++#define DMSG_DONTWAIT   0x80
++#define DMSG_EOF        0x100                          // "data completes connection" (bsd/kern/uipc_socket.c:2405-2412)
++#define DMSG_WAITSTREAM 0x200                          // obsoleto (APPLE_API_OBSOLETE): esperar hasta el final, puede devolver parcial
++#define DMSG_HAVEMORE   0x2000                         // bit de salida: queda más datos (bsd/kern/uipc_socket.c:3876-3881)
++#define DMSG_RCVMORE    0x4000                         // bit de salida: el resto del paquete sigue en el socket (bsd/kern/uipc_socket.c:3863)
++#define DMSG_NEEDSA     0x10000                        // fallar la recepción si no se puede reservar la dirección (bsd/kern/uipc_socket.c:2912)
++#define DMSG_NOSIGNAL   0x80000                        // no generar SIGPIPE (bsd/sys/socket.h:637)
++#define DMSG_USEUPCALL  0x80000000                     // solo para el núcleo: heredar el upcall en sock_accept (bsd/sys/socket.h:642)
++
+ static int msg_flags(int f) {                         // MSG_* de Darwin -> Linux
+-	int l = MSG_NOSIGNAL;
+-	if (f & 0x1) l |= MSG_OOB;
+-	if (f & 0x2) l |= MSG_PEEK;
+-	if (f & 0x4) l |= MSG_DONTROUTE;
+-	if (f & 0x8) l |= MSG_EOR;
+-	if (f & 0x10) l |= MSG_TRUNC;                      // Darwin TRUNC 0x10 -> Linux 0x20
+-	if (f & 0x20) l |= MSG_CTRUNC;                     // Darwin CTRUNC 0x20 -> Linux 0x8
+-	if (f & 0x40) l |= MSG_WAITALL;
+-	if (f & 0x80) l |= MSG_DONTWAIT;
++	int l = 0;
++	if (f & DMSG_OOB) l |= MSG_OOB;
++	if (f & DMSG_PEEK) l |= MSG_PEEK;
++	if (f & DMSG_DONTROUTE) l |= MSG_DONTROUTE;
++	if (f & DMSG_EOR) l |= MSG_EOR;
++	if (f & DMSG_TRUNC) l |= MSG_TRUNC;               // Darwin TRUNC 0x10 -> Linux 0x20
++	if (f & DMSG_CTRUNC) l |= MSG_CTRUNC;             // Darwin CTRUNC 0x20 -> Linux 0x8
++	if (f & DMSG_WAITALL) l |= MSG_WAITALL;           // Darwin WAITALL 0x40 -> Linux 0x100
++	if (f & DMSG_DONTWAIT) l |= MSG_DONTWAIT;         // Darwin DONTWAIT 0x80 -> Linux 0x40
++	// El resto de banderas de Darwin no tiene equivalente en Linux y ADEMÁS su valor coincide con el de otra bandera
++	// de Linux, así que traducirlas cambiaría el comportamiento del socket:
++	//   MSG_EOF 0x100 = Linux MSG_WAITALL (esperaría a llenar el búfer), MSG_HAVEMORE 0x2000 = Linux MSG_ERRQUEUE
++	//   (vaciaría la cola de errores), MSG_RCVMORE 0x4000 = Linux MSG_NOSIGNAL, MSG_NEEDSA 0x10000 = Linux
++	//   MSG_WAITFORONE. MSG_WAITSTREAM 0x200 (bsd/kern/uipc_socket.c:3788) espera el primer fragmento y devuelve lo
++	//   que haya, que es justo lo que hace Linux sin MSG_WAITALL. MSG_USEUPCALL 0x80000000 es solo del núcleo
++	//   (bsd/sys/socket.h:642) y aquí no hay upcalls. Se ignoran todas.
++	//
++	// MSG_NOSIGNAL (0x80000): en XNU el SIGPIPE se lanza al escribir en un socket cerrado si NO viene el bit y el
++	// socket no tiene SO_NOSIGPIPE (bsd/kern/uipc_syscalls.c:1388-1392 en send y 1962-1966 en sendmsg; el estado
++	// por socket está en so->so_flags & SOF_NOSIGPIPE, bsd/kern/uipc_socket.c:4986-4995). El emulador no puede
++	// entregar esa señal al invitado (las señales son virtuales: no se construyen marcos de señal, emu_proc.c:234)
++	// y una señal real en el anfitrión mataría al emulador, no al hilo que escribió. Así que se suprime siempre
++	// (MSG_NOSIGNAL de Linux). PENDIENTE: falta poder entregar SIGPIPE al invitado (ver el informe); cuando exista,
++	// aquí irá  if ((f & DMSG_NOSIGNAL) || sock_nosigpipe_get(fd)) l |= MSG_NOSIGNAL; else l &= ~MSG_NOSIGNAL;
++	l |= MSG_NOSIGNAL;
+ 	return l;
+ }
+ 
++// ---- Estado por socket (descriptor del invitado): SO_NOSIGPIPE (Darwin 0x1022, bsd/sys/socket.h:174) no existe en
++// Linux, que solo tiene MSG_NOSIGNAL por llamada. Se guarda aquí para que getsockopt devuelva el valor puesto (XNU:
++// bsd/kern/uipc_socket.c:6007-6009, que devuelve so->so_flags & SOF_NOSIGPIPE) y para poder respetarlo en el envío
++// cuando se pueda entregar la señal al invitado. En XNU el socket aceptado no lo hereda (nace con so_flags = 0), igual
++// que aquí: al crear un socket se borra el estado del descriptor.
++static uint8_t sock_nosigpipe[FD_INTERNAL_LIMIT];
++static void sock_state_new(int fd) { if (fd >= 0 && fd < FD_INTERNAL_LIMIT) sock_nosigpipe[fd] = 0; }
++static int sock_nosigpipe_get(int fd) { return fd >= 0 && fd < FD_INTERNAL_LIMIT ? sock_nosigpipe[fd] : 0; }
++
+ // ---- PF_SYSTEM / SYSPROTO_EVENT: socket de eventos del núcleo (kern_event_msg: red, energía, sistema de archivos...).
+ // configd, mDNSResponder y otros lo abren al arrancar y filtran con SIOCSKEVFILT. Es un extremo de un par de sockets de
+ // datagramas: la otra punta queda abierta para publicar eventos (hoy ninguno), así que leer espera como en macOS cuando
+@@ -106,6 +148,7 @@ static long kev_socket(void) {
+ 	struct stat st; fstat(sv[0], &st);
+ 	if (kev_ino[sv[0]] && kev_peer[sv[0]] > 0) close(kev_peer[sv[0]]);   // un socket de eventos anterior ya cerrado
+ 	kev_ino[sv[0]] = st.st_ino; kev_peer[sv[0]] = sv[1];
++	sock_state_new(sv[0]);
+ 	return sv[0];
+ }
+ // Códigos de fabricante (SIOCGKEVVENDOR): "com.apple" es KEV_VENDOR_APPLE (1); los demás se numeran desde 1000.
+@@ -294,11 +337,13 @@ static long net_socket(struct ctx* c) {
+ 		r = syscall(SYS_socket, AF_INET, SOCK_DGRAM, IPPROTO_ICMP);   // ping sin privilegios
+ 		if (r >= 0 && r < ICMP_MAX_FD) { icmp_emul[r] = 1; icmp_id[r] = 0; }
+ 	} else if (r >= 0 && r < ICMP_MAX_FD) icmp_emul[r] = 0;
++	if (r >= 0) sock_state_new((int)r);                              // socket nuevo: sin SO_NOSIGPIPE heredado
+ 	return r < 0 ? err() : r;
+ }
+ static long net_socketpair(struct ctx* c) {
+ 	int fds[2];
+ 	if (socketpair(dom_to_linux((int)c->a[0]), (int)c->a[1], (int)c->a[2], fds) < 0) return err();
++	sock_state_new(fds[0]); sock_state_new(fds[1]);
+ 	return safe_write(c->a[3], fds, 8) == 8 ? 0 : -D_EFAULT;
+ }
+ static long net_bind(struct ctx* c) {
+@@ -334,6 +379,7 @@ static long net_accept(struct ctx* c) {
+ 	uint8_t l[128]; socklen_t ll = sizeof l;
+ 	long r = accept((int)c->a[0], (struct sockaddr*)l, &ll);
+ 	if (r < 0) return err();
++	sock_state_new((int)r);                                         // el socket aceptado no hereda SO_NOSIGPIPE (como en XNU)
+ 	write_name(c->a[1], c->a[2], l, ll);
+ 	return r;
+ }
+@@ -364,7 +410,11 @@ static long net_setsockopt(struct ctx* c) {
+ 	uint8_t v[64]; uint32_t len = (uint32_t)c->a[4];
+ 	if (len > sizeof v || (len && safe_read(c->a[3], v, len) != (ssize_t)len)) return -D_EFAULT;
+ 	if (level == 0xffff) {
+-		if (opt == 0x1022) return 0;                                  // SO_NOSIGPIPE: ya se usa MSG_NOSIGNAL
++		if (opt == 0x1022) {                                          // SO_NOSIGPIPE: no hay equivalente en Linux, se guarda por socket
++			int on = 0; if (len >= 4) memcpy(&on, v, 4);
++			if (fd >= 0 && fd < FD_INTERNAL_LIMIT) sock_nosigpipe[fd] = on != 0;
++			return 0;
++		}
+ 		int lo = opt_to_linux(opt);
+ 		if (lo < 0) return 0;                                         // opción sin equivalente: se acepta
+ 		if ((opt == 0x1005 || opt == 0x1006) && len >= 16) {          // timeval de Darwin {i64, i32, pad}
+@@ -389,6 +439,9 @@ static long net_getsockopt(struct ctx* c) {
+ 			if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &e, &el) < 0) return err();
+ 			e = e ? darwin_errno(e) : 0;
+ 			memcpy(v, &e, 4); l = 4;
++		} else if (opt == 0x1022) {                                   // SO_NOSIGPIPE: valor guardado por socket (como en XNU)
++			int on = sock_nosigpipe_get(fd);
++			memcpy(v, &on, 4); l = 4;
+ 		} else if (lo < 0 || getsockopt(fd, SOL_SOCKET, lo, v, &l) < 0) { if (lo >= 0) return err(); memset(v, 0, 4); l = 4; }
+ 	} else { memset(v, 0, 4); l = 4; }
+ 	uint32_t n = l < cap ? l : cap;

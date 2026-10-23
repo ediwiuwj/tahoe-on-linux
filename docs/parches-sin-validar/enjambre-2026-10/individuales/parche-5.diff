@@ -1,0 +1,494 @@
+diff --git i/Pendientes.md w/Pendientes.md
+index 2c36a0b..f49f227 100644
+--- i/Pendientes.md
++++ w/Pendientes.md
+@@ -13,6 +13,12 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
+ 
+ 
+ ## Hecho recientemente
++- **Tamaño de los volúmenes APFS.** `diskutil list` ya no pone el tamaño del contenedor (63,1 GB) en todos los volúmenes, y
++  `diskutil apfs list` dice lo que ocupa cada uno (antes 0 B en datos y Preboot). El contenedor es el disco de Linux donde
++  vive el macOS; sus volúmenes (sistema, datos, Preboot) se reparten la capacidad en cuotas proporcionales a lo que ocupa
++  cada uno, y el usado de cada uno se mide con `tools/volsize.sh` (du sobre el árbol de cada volumen: del orden de diez
++  minutos) y se deja en `~/.config/tahoe-run/volsize`. Lo mismo se ve en `statfs` y en los atributos de volumen de
++  `getattrlist`. Con `TAHOE_VOL_QUOTA=0` se vuelve al reparto de antes (todos los volúmenes con la capacidad del contenedor).
+ - **Teclado y ratón.** En macOS el sistema de eventos HID vive en WindowServer, que busca en IOKit los servicios con
+   `HIDServiceSupport`. tahoe-run publica un teclado y un puntero (IOHIDEventDriver) con su IOHIDEventServiceUserClient:
+   la cola de eventos es un IODataQueue compartido y cada evento un IOHIDSystemQueueElement (formatos de IOHIDFamily,
+@@ -166,6 +172,7 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
+     relacionado con kexts.
+ 11. **PR #9** (orden de la pausa y lo que venga después): fusionar en `main` cuando se quiera.
+ 12. **Para lo último** (funciona, son detalles):
+-    - `diskutil apfs list`: los volúmenes Data y Preboot dicen 0 B consumidos (comparten el disco de Linux).
+-    - `diskutil list`: cada volumen sale con el tamaño del contenedor (63,1 GB).
++    - `diskutil apfs list` y `diskutil list`: los volúmenes ya tienen su propio tamaño y lo que ocupan (medidos con
++      `tools/volsize.sh`, que deja el archivo que lee el emulador). Sin ese archivo, los volúmenes de datos y Preboot siguen
++      con 0 B consumidos y con el tamaño del contenedor (63,1 GB), como antes.
+     - `diskutil list` y `system_profiler` tardan la primera vez tras arrancar (~1 min) mientras lsd limpia su base de datos.
+diff --git i/README.md w/README.md
+index b0093d6..69e223c 100644
+--- i/README.md
++++ w/README.md
+@@ -124,10 +124,12 @@ seguir parcheándola; lo de muy bajo nivel (señales, cambios de pila) se queda
+ | `tahoe-run/` | La capa de compatibilidad (C): syscalls BSD, trampas Mach, puertos entre procesos, kqueue/workloops, IOKit, XPC... |
+ | `tahoe-run/nucleo/` | Las partes del núcleo reescritas en Rust (biblioteca estática): descriptores de mensajes Mach, desbordamiento de mensajes grandes, `pthread_rwlock` (traducción de `kern_synch.c`) y el candado de la región de puertos entre procesos; con pruebas (`cargo test --lib`) |
+ | `tools/inventario_total.sh` | Ejecuta todos los programas de la shell del macOS completo y los clasifica con `tools/diag/inventario.py` |
++| `tools/volsize.sh` | Mide lo que ocupa cada volumen APFS emulado (`du` sobre su árbol) y lo deja en el archivo que lee el emulador (`~/.config/tahoe-run/volsize`), para que `diskutil list` y `diskutil apfs list` enseñen el tamaño y el uso de cada volumen |
+ | `patches/` | Parche para [`darlinghq/indium`](https://github.com/darlinghq/indium) (`git am`) |
+ | `tools/extract_air.py` | Saca los módulos AIR de un `.metallib` |
+ | `tools/map_dyld_cache.py` | Mapea la `dyld_shared_cache` en sus direcciones fijas y lo verifica |
+ | `test/sud_syscall_dispatch.c` | Prueba de interceptación de syscalls de macOS con syscall user dispatch |
++| `test/vol_quotas.c` | Prueba del reparto de la capacidad del contenedor APFS entre sus volúmenes (los invariantes de las cifras que ve macOS) |
+ | `tools/used_syscalls.py` | Lista las syscalls BSD y trampas Mach que invoca un Mach-O x86_64 |
+ | `tools/historico_darling/` | Herramientas antiguas de cuando se probó Darling (no se usan; ver su `NOTA.md`) |
+ | `tools/narrow_int64.py` | Quita `Int64` de un SPIR-V cuando solo se usa para indexar (conservador) |
+@@ -591,6 +593,14 @@ Herramientas usadas para encontrar estos fallos: `tools/diag/` (ver «Probarlo»
+   de las notificaciones IOKit (el lector de cadenas devolvía siempre el mismo búfer y la notificación de terminación retiraba
+   todos los discos nada más crearlos) y que arranque `fskitd`, que busca el servicio `com_apple_filesystems_lifs` (LiveFS).
+   Con la jerarquía, las fases `mount -P` del arranque se ejecutan de verdad.
++- **Espacio de los volúmenes**: el contenedor APFS que ve macOS es el disco de Linux donde vive la raíz de macOS, y sus
++  volúmenes (el del sistema, el de datos y el Preboot) son carpetas de ese disco. En APFS los volúmenes comparten el espacio
++  del contenedor: cada uno tiene su cuota y lo que ocupa. Aquí la capacidad del contenedor se reparte entre los volúmenes
++  en proporción a lo que ocupa cada uno (`tahoe_vol_quotas`, `tahoe-run/tahoe.h`): así la suma de las cuotas es la capacidad
++  del contenedor, ningún volumen se queda sin espacio y `diskutil list` deja de poner el tamaño del contenedor (63,1 GB) en
++  todos ellos. Lo que ocupa cada volumen lo mide `tools/volsize.sh` (`du` sobre su árbol, que tarda minutos) y lo deja en
++  `~/.config/tahoe-run/volsize`; sin ese archivo se usa lo que ocupa el disco entero, como antes. Las mismas cifras salen en
++  `statfs` (`df`) y en los atributos de volumen de `getattrlist` (`ATTR_VOL_SIZE`, `ATTR_VOL_SPACEUSED`, `ATTR_VOL_QUOTA_SIZE`).
+ 
+ 
+ ### macOS 26 completo (11 de octubre de 2026, tarde)
+diff --git i/tahoe-run/emu_fs.c w/tahoe-run/emu_fs.c
+index 6512f85..7a3d560 100644
+--- i/tahoe-run/emu_fs.c
++++ w/tahoe-run/emu_fs.c
+@@ -113,6 +113,96 @@ static uint64_t sysvol_mnt(size_t i) {                                  // id de
+ 	return id[i];
+ }
+ int sys_volume_present(int k) { return k >= 0 && (size_t)k < NSYSVOL && sysvol_mnt((size_t)k) != 0; }
++
++// ---- Espacio de los volúmenes APFS emulados
++// El contenedor APFS que ve macOS es el sistema de archivos del anfitrión donde vive TAHOE_ROOT (un disco virtual ext4 con
++// el macOS instalado). Los volúmenes del contenedor son carpetas de ese mismo sistema de archivos: el del sistema
++// (TAHOE_ROOT), el de datos (TAHOE_ROOT/System/Volumes/Data) y el Preboot (TAHOE_ROOT/System/Volumes/Preboot), que en un
++// macOS completo son volúmenes APFS aparte. En APFS los volúmenes comparten el espacio del contenedor: la capacidad de
++// cada uno es la del contenedor (salvo que tenga cuota) y el «usado» de cada uno es el de sus archivos.
++// Aquí el contenedor se reparte entre los volúmenes en cuotas proporcionales a lo que ocupa cada uno: así cada volumen
++// tiene su propio tamaño (y no el del contenedor, que es lo que se veía) y las cifras cuadran: lo que usan todos los
++// volúmenes es lo que usa el contenedor. El usado de cada volumen lo mide tools/volsize.sh (du sobre su árbol: tarda
++// minutos) y lo deja en un archivo; sin ese archivo, todo el usado del disco se atribuye al volumen del sistema (como
++// antes) y los volúmenes de datos y Preboot salen con 0 B.
++#define VOLFILE_SUFFIX "/.config/tahoe-run/volsize"
++static const char* volfile_path(void) {
++	const char* p = getenv("TAHOE_VOLFILE");
++	if (p && *p) return p;
++	static char path[1024]; static int known;
++	if (!known) {
++		known = 1;
++		const char* h = getenv("HOME");
++		snprintf(path, sizeof path, "%s%s", h && *h ? h : "/root", VOLFILE_SUFFIX);
++	}
++	return path;
++}
++// «data <bytes>» y «preboot <bytes>»: lo que ocupa cada volumen (lo escribe tools/volsize.sh). Los demás volúmenes de
++// System/Volumes (BaseSystem, Recovery, Update...) no se emulan: su espacio está dentro del árbol del sistema y va con él.
++static int vol_used_file(uint64_t* data, uint64_t* pre, uint64_t* other) {
++	FILE* f = fopen(volfile_path(), "r");
++	if (!f) return 0;
++	char line[256]; int got = 0;
++	while (fgets(line, sizeof line, f)) {
++		char key[32]; unsigned long long v;
++		if (sscanf(line, "%31s %llu", key, &v) != 2) continue;
++		if (!strcmp(key, "data")) { *data = v; got |= 1; }
++		else if (!strcmp(key, "preboot")) { *pre = v; got |= 2; }
++		else if (!strcmp(key, "other")) { *other = v; got |= 4; }
++	}
++	fclose(f);
++	return (got & 3) == 3;
++}
++void tahoe_vol_space(struct tahoe_volspace* vs) {
++	static struct tahoe_volspace cache; static int done; static int cached_full;
++	memset(vs, 0, sizeof *vs);
++	struct statfs sf;
++	uint64_t size = 0, used = 0;
++	if (tahoe_root && statfs(tahoe_root, &sf) == 0) {
++		uint64_t bs = sf.f_bsize ? (uint64_t)sf.f_bsize : 4096;
++		size = (uint64_t)sf.f_blocks * bs;
++		used = (uint64_t)(sf.f_blocks - sf.f_bfree) * bs;
++	}
++	if (!size) size = 64ULL << 30;
++	size &= ~4095ULL;
++	// Los volúmenes de datos y Preboot solo existen en un macOS completo (en la Recovery, /System/Volumes/Data es un tmpfs).
++	int full = sys_volume_present(0) && sys_volume_present(1);
++	if (done && cached_full == full) { *vs = cache; return; }   // ya está calculado (y los volúmenes no han cambiado)
++	uint64_t ud = 0, up = 0, uo = 0;
++	int medido = full && vol_used_file(&ud, &up, &uo);
++	// Si la medida no cabe en el disco (está vieja: el disco se limpió después de medir) no se usa: se queda lo de antes,
++	// con todo el disco en el volumen del sistema. Si cabe, el sistema se queda con lo que sobra.
++	if (medido && ud + up > used) medido = 0;
++	if (!medido) { ud = 0; up = 0; }
++	// El volumen del sistema es el árbol de la raíz de macOS: lo que queda del disco después de los volúmenes de datos y
++	// de preboot (que son carpetas dentro de él). Los demás volúmenes de System/Volumes (BaseSystem, Recovery, Update...)
++	// también están dentro del árbol del sistema, así que su espacio va con él («other»).
++	(void)uo;
++	uint64_t us = used > ud + up ? used - ud - up : 0;
++	vs->size = size; vs->used = used; vs->free = size > used ? size - used : 0;
++	vs->nvol = full ? 3 : 1;
++	vs->medido = medido;
++	const char* nq = getenv("TAHOE_VOL_QUOTA");
++	int quota = !(nq && !strcmp(nq, "0"));
++	uint64_t q[TAHOE_VOL_N] = { 0, 0, 0 };
++	// Sin medidas no hay cuotas: cada volumen se queda con la capacidad del contenedor (como en un Mac donde no se pone
++	// ninguna, y como se veía antes de repartirlas).
++	if (!quota || !medido) for (int i = 0; i < TAHOE_VOL_N; i++) q[i] = size;
++	else {
++		// El reparto puede ajustar la medida (si no cuadra con el disco): las cifras que se enseñan son las ajustadas.
++		uint64_t vused[TAHOE_VOL_N] = { us, ud, up };
++		tahoe_vol_quotas(size, used, vused, q);
++		us = vused[TAHOE_VOL_SYS]; ud = vused[TAHOE_VOL_DATA]; up = vused[TAHOE_VOL_PRE];
++	}
++	vs->vol[TAHOE_VOL_SYS].used = us;
++	vs->vol[TAHOE_VOL_DATA].used = ud;
++	vs->vol[TAHOE_VOL_PRE].used = up;
++	for (int i = 0; i < TAHOE_VOL_N; i++) {
++		vs->vol[i].quota = q[i];
++		vs->vol[i].free = q[i] > vs->vol[i].used ? q[i] - vs->vol[i].used : 0;
++	}
++	cache = *vs; done = 1; cached_full = full;
++}
+ // Driver Metal de tahoe-run (tahoe-metal): con TAHOE_METAL=<carpeta del anfitrión con TahoeMetal.bundle>, las rutas de
+ // macOS /System/Library/Extensions/TahoeMetal.bundle[/...] llevan a esa carpeta (sin distinguir mayúsculas, como APFS).
+ // macOS ve el bundle donde Metal busca los drivers (MetalPluginName del IOAccelerator) y su copia no se toca. (Un overlayfs
+@@ -703,15 +793,36 @@ static void fsid_of(const struct statfs* s, const struct gmount* m, uint32_t id[
+ 	if (dm >= 0) { id[0] = darwin_dev(EMU_DISK_MAJOR, dm); id[1] = m->ftype; }
+ 	else { id[0] = (uint32_t)s->f_fsid.__val[0]; id[1] = (uint32_t)s->f_fsid.__val[1]; }
+ }
++// Volumen APFS emulado al que pertenece un montaje (0 el del sistema, 1 el de datos, 2 el Preboot), o -1 si el montaje no
++// es uno de ellos (un tmpfs, como el /System/Volumes/Data de la Recovery, o devfs).
++static int vol_of_mount(const struct gmount* m) {
++	if (!strcmp(m->type, "tmpfs")) return -1;
++	if (!strcmp(m->on, "/")) return TAHOE_VOL_SYS;
++	for (size_t k = 0; k < NSYSVOL; k++) if (!strcmp(m->on, sys_volumes[k].on)) return TAHOE_VOL_SYS + 1 + (int)k;
++	return -1;
++}
+ static void put_statfs(uint64_t out, const struct statfs* s, const struct gmount* m) {
+ 	uint8_t d[2168];
+ 	memset(d, 0, sizeof d);
++	// Cada volumen APFS tiene su capacidad (su cuota del contenedor) y su espacio libre; el contenedor reparte el suyo
++	// entre ellos. Los tmpfs y devfs siguen con los del anfitrión, y los volúmenes sin medidas (sin el archivo que
++	// tools/volsize.sh escribe) siguen con los del sistema de archivos, como antes.
++	uint64_t f_blocks = s->f_blocks, f_bfree = s->f_bfree, f_bavail = s->f_bavail;
++	int v = vol_of_mount(m);
++	if (v >= 0) {
++		struct tahoe_volspace vs; tahoe_vol_space(&vs);
++		if (vs.medido && vs.vol[v].quota) {
++			uint64_t bs = s->f_bsize ? (uint64_t)s->f_bsize : 4096;
++			f_blocks = vs.vol[v].quota / bs;
++			f_bfree = f_bavail = vs.vol[v].free / bs;
++		}
++	}
+ #define W(type, off, v) do { type t_ = (type)(v); memcpy(d + (off), &t_, sizeof t_); } while (0)
+ 	W(uint32_t, 0, s->f_bsize);
+ 	W(int32_t, 4, m->iosize);
+-	W(uint64_t, 8, s->f_blocks);
+-	W(uint64_t, 16, s->f_bfree);
+-	W(uint64_t, 24, s->f_bavail);
++	W(uint64_t, 8, f_blocks);
++	W(uint64_t, 16, f_bfree);
++	W(uint64_t, 24, f_bavail);
+ 	W(uint64_t, 32, s->f_files);
+ 	W(uint64_t, 40, s->f_ffree);
+ 	{ uint32_t id[2]; fsid_of(s, m, id); W(uint32_t, 48, id[0]); W(uint32_t, 52, id[1]); }
+@@ -998,11 +1109,24 @@ static long bsd_getattrlist(struct ctx* c) {
+ 		PUTREF(gpath);
+ 	}
+ 	uint64_t bs = sf.f_bsize ? (uint64_t)sf.f_bsize : 4096;
++	// Los atributos de volumen son los del volumen al que pertenece la ruta: su capacidad (su cuota del contenedor), su
++	// libre y lo que ocupa. Los tmpfs (el /System/Volumes/Data de la Recovery) y los volúmenes sin medidas siguen con los
++	// del anfitrión.
++	uint64_t vsize = sf.f_blocks * bs, vfree = sf.f_bfree * bs, vavail = sf.f_bavail * bs;
++	uint64_t vused = (sf.f_blocks - sf.f_bfree) * bs, vquota = 0;
++	int vvol = vol_of_mount(vm);
++	if (vvol >= 0) {
++		struct tahoe_volspace vs; tahoe_vol_space(&vs);
++		if (vs.medido && vs.vol[vvol].quota) {
++			vsize = vs.vol[vvol].quota; vfree = vavail = vs.vol[vvol].free;
++			vused = vs.vol[vvol].used; vquota = vs.vol[vvol].quota;
++		}
++	}
+ 	if (vol & 0x1) PUTU32(0x1c);                           // FSTYPE (número de vfs; apfs)
+ 	if (vol & 0x2) PUTU32(0x4244);                         // SIGNATURE
+-	if (vol & 0x4) PUTU64(sf.f_blocks * bs);               // SIZE
+-	if (vol & 0x8) PUTU64(sf.f_bfree * bs);                // SPACEFREE
+-	if (vol & 0x10) PUTU64(sf.f_bavail * bs);              // SPACEAVAIL
++	if (vol & 0x4) PUTU64(vsize);                          // SIZE
++	if (vol & 0x8) PUTU64(vfree);                          // SPACEFREE
++	if (vol & 0x10) PUTU64(vavail);                        // SPACEAVAIL
+ 	if (vol & 0x20) PUTU64(bs);                            // MINALLOCATION
+ 	if (vol & 0x40) PUTU64(bs);                            // ALLOCATIONCLUMP
+ 	if (vol & 0x80) PUTU32(bs);                            // IOBLOCKSIZE
+@@ -1037,8 +1161,8 @@ static long bsd_getattrlist(struct ctx* c) {
+ 	if (vol & 0x100000) PUTREF(vm->type);                 // FSTYPENAME
+ 	if (vol & 0x200000) PUTU32(0);                         // FSSUBTYPE
+ 	if (vol & 0x400000) PUTU32(0);                         // OWNER (root)
+-	if (vol & 0x800000) PUTU64((sf.f_blocks - sf.f_bfree) * bs);   // SPACEUSED
+-	if (vol & 0x10000000) PUTU64(0);                       // QUOTA_SIZE
++	if (vol & 0x800000) PUTU64(vused);                     // SPACEUSED
++	if (vol & 0x10000000) PUTU64(vquota);                  // QUOTA_SIZE
+ 	if (vol & 0x20000000) PUTU64(0);                       // RESERVED_SIZE
+ 	if (vol & 0x40000000) {                                // ATTRIBUTES: vol_attributes_attr_t (válidos y nativos)
+ 		uint32_t va[10] = { 0xffffffff, 0xF0FFFFFF, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xF0FFFFFF, 0xffffffff, 0xffffffff, 0xffffffff };
+diff --git i/tahoe-run/emu_iokit.inc w/tahoe-run/emu_iokit.inc
+index 02f83b0..1d8fb34 100644
+--- i/tahoe-run/emu_iokit.inc
++++ w/tahoe-run/emu_iokit.inc
+@@ -336,11 +336,11 @@ static void disk_media(int e, const char* bsd, int unit, int minor, uint64_t siz
+ }
+ static uint64_t io_disk_size;                                  // bytes del disco virtual (io_disks), para la ruta EFI de arranque
+ static void io_disks(int bus) {
+-	struct statfs sf;
+-	uint64_t size = 0, used = 0;
+-	if (tahoe_root && statfs(tahoe_root, &sf) == 0) { size = (uint64_t)sf.f_blocks * sf.f_bsize; used = (uint64_t)(sf.f_blocks - sf.f_bfree) * sf.f_bsize; }
+-	if (!size) size = 64ULL << 30;
+-	size &= ~4095ULL;
++	// El contenedor es el disco de Linux donde vive el macOS; cada volumen tiene su capacidad (su cuota del contenedor) y
++	// lo que ocupa, así que diskutil no ve el tamaño del contenedor en todos los volúmenes (tahoe_vol_space, emu_fs.c).
++	struct tahoe_volspace vs;
++	tahoe_vol_space(&vs);
++	uint64_t size = vs.size, used = vs.used;
+ 	io_disk_size = size;
+ 	int dev = ent_add(bus, "Tahoe Virtual Disk", "IOBlockStorageDevice", "IORegistryEntry IOService", "1f,2", PL_SERVICE, 0);
+ 	// "Virtual Interface": en una Recovery real el sistema base (BaseSystem.dmg) es una imagen de disco y diskutil la presenta
+@@ -375,7 +375,7 @@ static void io_disks(int bus) {
+ 	int full = sys_volume_present(0) && sys_volume_present(1);
+ 	const char* sysname = full ? "Macintosh HD" : "macOS Base System";
+ 	int vol = ent_add(cont, sysname, "AppleAPFSVolume", "IORegistryEntry IOService IOStorage IOMedia", "1", PL_SERVICE, 0);
+-	disk_media(vol, "disk1s1", 1, 3, size, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
++	disk_media(vol, "disk1s1", 1, 3, vs.vol[TAHOE_VOL_SYS].quota, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
+ 	p_str(vol, "UUID", BOOT_VOLUME_UUID); p_str(vol, "VolGroupUUID", BOOT_VOLUME_UUID);
+ 	p_num(vol, "Partition ID", 1, 32); p_str(vol, "FullName", sysname);
+ 	if (!full) return;
+@@ -387,7 +387,7 @@ static void io_disks(int bus) {
+ 	struct val* r = v_new(V_ARRAY); v_add(r, NULL, v_str("System")); v_set(io_e[vol].props, "Role", r); p_num(vol, "RoleValue", 1, 16);
+ 	for (size_t i = 0; i < sizeof more / sizeof more[0]; i++) {
+ 		int v = ent_add(cont, more[i].name, "AppleAPFSVolume", "IORegistryEntry IOService IOStorage IOMedia", more[i].bsd + 6, PL_SERVICE, 0);
+-		disk_media(v, more[i].bsd, 1, more[i].minor, size, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
++		disk_media(v, more[i].bsd, 1, more[i].minor, vs.vol[TAHOE_VOL_DATA + i].quota, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
+ 		p_str(v, "UUID", more[i].uuid); p_str(v, "VolGroupUUID", more[i].group ? BOOT_VOLUME_UUID : more[i].uuid);
+ 		p_num(v, "Partition ID", (uint64_t)more[i].id, 32); p_str(v, "FullName", more[i].name);
+ 		struct val* ro = v_new(V_ARRAY); v_add(ro, NULL, v_str(more[i].role)); v_set(io_e[v].props, "Role", ro);
+@@ -1373,19 +1373,21 @@ static int32_t uc_apfs_container(struct uc_call* c) {
+ 	if (c->selector == 8) {
+ 		// Diccionario por nombre BSD: el contenedor (disk1: size, used, reserve, «Max volume count») y cada volumen (disk1sN:
+ 		// fs_used, fs_reserve, fs_quota). storagekitd lo recorre (_addToExtendedDiskInfoCacheWithDictionary:) y cada valor
+-		// tiene que ser otro diccionario. Los volúmenes comparten el sistema de archivos de Linux: lo usado va al del sistema.
++		// tiene que ser otro diccionario. Los volúmenes comparten el sistema de archivos de Linux: lo usado de cada uno es el
++		// de sus archivos (tools/volsize.sh lo mide) y su cuota, su parte del contenedor (tahoe_vol_space, emu_fs.c).
+ 		if (!c->ool_out || !c->ool_out_size) return kIOReturnBadArgument;
+-		struct statfs sf; uint64_t size = io_disk_size, used = 0;
+-		if (tahoe_root && statfs(tahoe_root, &sf) == 0) used = (uint64_t)(sf.f_blocks - sf.f_bfree) * sf.f_bsize;
+-		int nvol = (sys_volume_present(0) && sys_volume_present(1)) ? 3 : 1;
++		struct tahoe_volspace vs;
++		tahoe_vol_space(&vs);
++		uint64_t size = vs.size, used = vs.used;
++		int nvol = vs.nvol;
+ 		char d[2048];
+ 		int n = snprintf(d, sizeof d, "<dict><key>disk1</key><dict><key>size</key><integer size=\"64\">%llu</integer><key>used</key>"
+ 		                 "<integer size=\"64\">%llu</integer><key>reserve</key><integer size=\"64\">0</integer>"
+ 		                 "<key>Max volume count</key><integer size=\"32\">100</integer></dict>", (unsigned long long)size, (unsigned long long)used);
+ 		for (int v = 1; v <= nvol && n > 0 && (size_t)n < sizeof d; v++)
+ 			n += snprintf(d + n, sizeof d - n, "<key>disk1s%d</key><dict><key>fs_used</key><integer size=\"64\">%llu</integer>"
+-			              "<key>fs_reserve</key><integer size=\"64\">0</integer><key>fs_quota</key><integer size=\"64\">0</integer></dict>",
+-			              v, (unsigned long long)(v == 1 ? used : 0));
++			              "<key>fs_reserve</key><integer size=\"64\">0</integer><key>fs_quota</key><integer size=\"64\">%llu</integer></dict>",
++			              v, (unsigned long long)vs.vol[v - 1].used, (unsigned long long)vs.vol[v - 1].quota);
+ 		if (n > 0 && (size_t)n < sizeof d) n += snprintf(d + n, sizeof d - n, "</dict>");
+ 		if (n < 0 || (size_t)n + 1 > sizeof d || (size_t)n + 1 > c->ool_out_size) return kIOReturnNoMemory;
+ 		memcpy((void*)c->ool_out, d, (size_t)n + 1); *c->ool_out_len = (uint64_t)n + 1; *c->noutband = 0; *c->nsout = 0;
+diff --git i/tahoe-run/tahoe.h w/tahoe-run/tahoe.h
+index d30b47b..a4411a2 100644
+--- i/tahoe-run/tahoe.h
++++ w/tahoe-run/tahoe.h
+@@ -41,6 +41,49 @@ extern char cache_guest_path[1024];   // ruta de la caché vista desde macOS (si
+ extern uint64_t cache_ino;
+ void dsmos_unprotect(uint8_t* seg, uint64_t fileoff, uint64_t filesize, const char* path);   // emu_dsmos.c
+ int sys_volume_present(int k);   // emu_fs.c: 1 si el volumen k (0 Data, 1 Preboot) del macOS completo está montado
++// Espacio de los volúmenes APFS emulados (emu_fs.c). El contenedor es el sistema de archivos del anfitrión donde vive
++// TAHOE_ROOT; cada volumen es una carpeta de ese sistema (el del sistema, el de datos y el Preboot). En APFS los volúmenes
++// comparten el espacio del contenedor: la capacidad de cada uno es la del contenedor (o su cuota, si tiene una) y el
++// «usado» de cada uno es el de sus archivos. Aquí el contenedor se reparte entre los volúmenes en cuotas proporcionales a
++// lo que ocupa cada uno (así cada volumen tiene su tamaño y las cifras cuadran); el usado lo mide tools/volsize.sh.
++enum { TAHOE_VOL_SYS = 0, TAHOE_VOL_DATA, TAHOE_VOL_PRE, TAHOE_VOL_N };
++struct tahoe_vol { uint64_t quota;      // capacidad del volumen (su parte del contenedor)
++                    uint64_t used;       // bytes que ocupa
++                    uint64_t free; };    // quota - used
++struct tahoe_volspace { uint64_t size, used, free;    // el contenedor
++                         int nvol; int medido;         // medido: hay medidas de lo que ocupa cada volumen
++                         struct tahoe_vol vol[TAHOE_VOL_N]; };
++void tahoe_vol_space(struct tahoe_volspace* vs);
++// Reparte la capacidad del contenedor entre los volúmenes, en proporción a lo que ocupa cada uno (emu_fs.c).
++//   size: la capacidad del contenedor; used: lo que usa el contenedor.
++//   vused[i]: lo que ocupa el volumen i; se ajusta a la baja si la medición no cuadra con el disco (una medición vieja:
++//     el disco se limpió después de medir), para que lo que ocupan los volúmenes sea lo que usa el contenedor.
++//   quota[i]: la parte de la capacidad del contenedor que le toca a cada volumen.
++// Invariantes: la suma de las cuotas es la capacidad del contenedor; ningún volumen tiene una cuota menor que lo que
++// ocupa (su libre nunca es negativo); si no hay nada usado, cada volumen se queda con el contenedor entero (que es lo que
++// se veía antes de repartir).
++static inline void tahoe_vol_quotas(uint64_t size, uint64_t used, uint64_t* vused, uint64_t* quota) {
++	uint64_t tot = 0;
++	for (int i = 0; i < TAHOE_VOL_N; i++) tot += vused[i];
++	if (tot > used) {                                   // la medición no cuadra con el disco: se ajusta a la baja
++		uint64_t acc = 0;
++		for (int i = 0; i < TAHOE_VOL_N; i++) {
++			vused[i] = (uint64_t)((__uint128_t)vused[i] * used / tot);
++			acc += vused[i];
++		}
++		vused[TAHOE_VOL_SYS] += used - acc;            // el resto va al volumen del sistema (la suma ha de ser exacta)
++		tot = used;
++	}
++	if (!used || !tot) { for (int i = 0; i < TAHOE_VOL_N; i++) quota[i] = size; return; }
++	uint64_t sum = 0;
++	for (int i = 0; i < TAHOE_VOL_N; i++) {
++		uint64_t q = (uint64_t)((__uint128_t)size * vused[i] / used);
++		q &= ~((1ULL << 20) - 1);                       // a megas enteras
++		if (q < vused[i]) q = vused[i];                 // nunca menos de lo que ocupa (su libre no puede ser negativo)
++		quota[i] = q; sum += q;
++	}
++	if (sum < size) quota[TAHOE_VOL_SYS] += size - sum; // lo que sobra (del redondeo) va al volumen del sistema
++}
+ int cs_file_platform(int fd);     // emu_cs.c: 1 si el archivo lleva firma de plataforma de Apple, 0 si no, -1 sin firma
+ void sys_volumes_mount(void);       // emu_fs.c: volúmenes Data y Preboot de un macOS completo (en el PID 1)
+ extern const char *g_cache_path, *g_dyld_path, *g_self_exe;   // para relanzar tahoe-run en execve   // raíz del sistema de archivos de macOS 26 (TAHOE_ROOT)
+diff --git i/test/vol_quotas.c w/test/vol_quotas.c
+new file mode 100644
+index 0000000..a24af91
+--- /dev/null
++++ w/test/vol_quotas.c
+@@ -0,0 +1,77 @@
++// Prueba del reparto de la capacidad del contenedor entre los volúmenes APFS emulados (tahoe_vol_quotas, tahoe.h).
++//
++//   clang -O1 -Wall -Wextra -o /tmp/vol_quotas test/vol_quotas.c -I tahoe-run
++//   /tmp/vol_quotas
++//
++// Lo que se comprueba (los invariantes que debe cumplir el reparto, para que las cifras que ve macOS cuadren):
++//   - la suma de las cuotas de los volúmenes es la capacidad del contenedor;
++//   - ningún volumen tiene una cuota menor que lo que ocupa (su espacio libre nunca es negativo);
++//   - lo que ocupan los volúmenes es lo que usa el contenedor;
++//   - si no hay medición (o no hay nada usado), cada volumen se queda con el contenedor entero (el comportamiento de
++//     antes de repartir);
++//   - si la medición no cuadra con el disco (está vieja), lo ocupado se ajusta a la baja y las cuotas siguen cabiendo en
++//     el contenedor.
++#include <stdint.h>
++#include <stdio.h>
++
++#include "tahoe.h"
++
++#define GIB (1ULL << 30)
++
++static int fallos;
++
++static void check(int ok, const char* what) {
++	if (!ok) { fprintf(stderr, "FALLO: %s\n", what); fallos++; }
++}
++
++// Reparte y comprueba los invariantes con una medida dada.
++static void caso(const char* nombre, uint64_t size, uint64_t used, uint64_t* vused) {
++	uint64_t q[TAHOE_VOL_N] = { 0, 0, 0 };
++	uint64_t tot = 0;
++	for (int i = 0; i < TAHOE_VOL_N; i++) tot += vused[i];
++	tahoe_vol_quotas(size, used, vused, q);
++	uint64_t suma = 0;
++	for (int i = 0; i < TAHOE_VOL_N; i++) suma += q[i];
++	check(suma == size, nombre);                                 // las cuotas caben en el contenedor
++	uint64_t suma_used = 0;
++	for (int i = 0; i < TAHOE_VOL_N; i++) {
++		check(q[i] >= vused[i], nombre);                        // el libre no puede ser negativo
++		suma_used += vused[i];
++	}
++	if (tot <= used) check(suma_used == used, nombre);           // lo que ocupan los volúmenes es lo que usa el contenedor
++	printf("  %-28s capacidad %6llu GiB  cuotas: %llu / %llu / %llu GiB   ocupado: %llu / %llu / %llu GiB\n", nombre,
++	       (unsigned long long)(size / GIB), (unsigned long long)(q[0] / GIB), (unsigned long long)(q[1] / GIB),
++	       (unsigned long long)(q[2] / GIB), (unsigned long long)(vused[0] / GIB), (unsigned long long)(vused[1] / GIB),
++	       (unsigned long long)(vused[2] / GIB));
++}
++
++int main(void) {
++	printf("reparto de la capacidad del contenedor entre los volúmenes:\n");
++	// Un macOS completo en un disco de 63,1 GB: el sistema ocupa 29 GB, los datos 10 GB y el preboot 200 MB.
++	{
++		uint64_t v[TAHOE_VOL_N] = { 29ULL * GIB, 10ULL * GIB, 200ULL << 20 };
++		caso("medida normal", 63100ULL << 20, 29ULL * GIB + 10ULL * GIB + (200ULL << 20), v);
++	}
++	// Un volumen que no ocupa nada (el preboot vacío): su cuota es 0 y la del sistema se queda con el resto.
++	{
++		uint64_t v[TAHOE_VOL_N] = { 40ULL * GIB, 0, 0 };
++		caso("volúmenes vacíos", 63100ULL << 20, 40ULL * GIB, v);
++	}
++	// Medición vieja: los volúmenes ocupan más que el disco (el disco se limpió después de medir). Lo ocupado se ajusta
++	// a la baja y las cuotas siguen cabiendo en el contenedor.
++	{
++		uint64_t v[TAHOE_VOL_N] = { 50ULL * GIB, 30ULL * GIB, 1ULL * GIB };
++		caso("medida mayor que el disco", 63100ULL << 20, 20ULL * GIB, v);
++	}
++	// Sin nada usado: cada volumen se queda con el contenedor entero (como antes de repartir).
++	{
++		uint64_t v[TAHOE_VOL_N] = { 0, 0, 0 };
++		uint64_t q[TAHOE_VOL_N] = { 0, 0, 0 };
++		tahoe_vol_quotas(63100ULL << 20, 0, v, q);
++		for (int i = 0; i < TAHOE_VOL_N; i++) check(q[i] == 63100ULL << 20, "sin uso: cada volumen, el disco entero");
++		printf("  %-28s los tres volúmenes con el disco entero\n", "sin uso");
++	}
++	if (fallos) { fprintf(stderr, "%d comprobaciones fallidas\n", fallos); return 1; }
++	printf("todas las comprobaciones bien\n");
++	return 0;
++}
+diff --git i/tools/volsize.sh w/tools/volsize.sh
+new file mode 100755
+index 0000000..43953f9
+--- /dev/null
++++ w/tools/volsize.sh
+@@ -0,0 +1,45 @@
++#!/bin/bash
++# volsize.sh [raíz de macOS]: mide lo que ocupa cada volumen APFS emulado y lo deja en el archivo que lee el emulador
++# (~/.config/tahoe-run/volsize; con TAHOE_VOLFILE se cambia el sitio). El emulador (tahoe_vol_space, emu_fs.c) reparte la
++# capacidad del contenedor entre los volúmenes en proporción a lo que ocupa cada uno; sin estas medidas, todo el espacio
++# usado del disco se atribuye al volumen del sistema y los volúmenes de datos y Preboot salen con 0 B (como antes).
++#
++# Medir es lento (du sobre el árbol de cada volumen: del orden de minutos con un disco mecánico), así que se hace una vez,
++# con el macOS parado. Para volver a medir: volsize.sh otra vez (los números se quedan oldeados conforme crece el disco).
++#
++#   raíz de macOS:  por omisión $TAHOE_ROOT, o ~/macos26/completo/macOS.
++set -euo pipefail
++RAIZ="${1:-${TAHOE_ROOT:-$HOME/macos26/completo/macOS}}"
++SALIDA="${TAHOE_VOLFILE:-$HOME/.config/tahoe-run/volsize}"
++[ -d "$RAIZ" ] || { echo "no existe el directorio $RAIZ"; exit 1; }
++V="$RAIZ/System/Volumes"
++[ -d "$V" ] || { echo "$RAIZ no tiene System/Volumes: no es un macOS completo (no hay volúmenes que medir)"; exit 1; }
++# Bytes ocupados por un árbol (los bloques que tiene asignados, como los que cuenta el disco: du sin --apparent-size).
++# Los enlaces duros se cuentan una vez (du los recuerda) y los montajes de dentro no se siguen (du no cruza de sistema de
++# archivos), que es lo que quiere: el volumen de datos es la carpeta que monta sobre sí misma.
++du_bytes() { du -s --block-size=1 "$1" 2>/dev/null | cut -f1; }
++data=0; preboot=0
++for d in "$V"/*; do
++	[ -d "$d" ] || continue
++	case "$(basename "$d")" in
++		Data)    data=$(du_bytes "$d");;
++		Preboot) preboot=$(du_bytes "$d");;
++	esac
++done
++[ "$data" -gt 0 ] || { echo "no se ha podido medir $V/Data"; exit 1; }
++[ "$preboot" -gt 0 ] || { echo "no se ha podido medir $V/Preboot"; exit 1; }
++mkdir -p "$(dirname "$SALIDA")"
++tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
++{
++	echo "# Tamaño de los volúmenes APFS emulados (bytes), medido el $(date -Is)."
++	echo "# Lo lee tahoe_vol_space (emu_fs.c). El volumen del sistema ocupa lo que queda del disco."
++	echo "data $data"
++	echo "preboot $preboot"
++} > "$tmp"
++mv "$tmp" "$SALIDA"
++trap - EXIT
++echo "escrito $SALIDA"
++awk -v d="$data" -v p="$preboot" 'BEGIN {
++	printf "  datos   %13d bytes (%.2f GB)\n", d, d/1e9
++	printf "  preboot %13d bytes (%.2f GB)\n", p, p/1e9
++}'

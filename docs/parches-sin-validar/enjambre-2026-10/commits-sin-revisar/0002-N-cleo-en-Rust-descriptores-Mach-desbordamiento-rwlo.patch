@@ -1,0 +1,2038 @@
+From 28f77bafa9ff4ea83fe59e440ffb2f4d7514f654 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:36:17 -0600
+Subject: [PATCH 02/57] =?UTF-8?q?N=C3=BAcleo=20en=20Rust:=20descriptores?=
+ =?UTF-8?q?=20Mach,=20desbordamiento,=20rwlock=20y=20candado=20de=20puerto?=
+ =?UTF-8?q?s?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Biblioteca estática sin la biblioteca estándar (no_std), enlazada en el
+mismo binario de tahoe-run. Cuatro módulos:
+
+- mensaje.rs: recorrido de los descriptores de un mensaje Mach (los cinco
+  tipos de XNU, con el byte de tipo en +11 y los tamaños reales de usuario).
+- desborde.rs: los datos fuera de línea que no caben en la ranura de la
+  cola van a un archivo en /dev/shm; se borran al leer.
+- rwlock.rs: traducción de los pthread_rwlock de libpthread (la cola por
+  dirección, el reparto por secuencia, el prepost y el solapamiento de
+  lectores de kern_synch.c).
+- candado.rs: sustituye al mutex robusto de glibc para la región de puertos
+  entre procesos. El de glibc identifica al dueño por su TID, que el fork
+  directo de tahoe-run no actualiza en el hijo: la exclusión se rompía y
+  se perdían despertares. Aquí el dueño es el TID real, con futex
+  compartido y recuperación de dueño muerto.
+
+Sin panic: la lógica está en Rust seguro y el unsafe se confina a los
+envoltorios FFI. Hay pruebas unitarias (cargo test --lib).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/nucleo.h               |  51 ++
+ tahoe-run/nucleo/.gitignore      |   1 +
+ tahoe-run/nucleo/Cargo.lock      |   7 +
+ tahoe-run/nucleo/Cargo.toml      |  17 +
+ tahoe-run/nucleo/src/candado.rs  | 381 ++++++++++++
+ tahoe-run/nucleo/src/desborde.rs | 203 +++++++
+ tahoe-run/nucleo/src/lib.rs      |  30 +
+ tahoe-run/nucleo/src/mensaje.rs  | 251 ++++++++
+ tahoe-run/nucleo/src/rwlock.rs   | 992 +++++++++++++++++++++++++++++++
+ 9 files changed, 1933 insertions(+)
+ create mode 100644 tahoe-run/nucleo.h
+ create mode 100644 tahoe-run/nucleo/.gitignore
+ create mode 100644 tahoe-run/nucleo/Cargo.lock
+ create mode 100644 tahoe-run/nucleo/Cargo.toml
+ create mode 100644 tahoe-run/nucleo/src/candado.rs
+ create mode 100644 tahoe-run/nucleo/src/desborde.rs
+ create mode 100644 tahoe-run/nucleo/src/lib.rs
+ create mode 100644 tahoe-run/nucleo/src/mensaje.rs
+ create mode 100644 tahoe-run/nucleo/src/rwlock.rs
+
+diff --git a/tahoe-run/nucleo.h b/tahoe-run/nucleo.h
+new file mode 100644
+index 0000000..8c3758d
+--- /dev/null
++++ b/tahoe-run/nucleo.h
+@@ -0,0 +1,51 @@
++// Interfaz con el núcleo en Rust (nucleo/, biblioteca estática). Los tipos son espejo de los de Rust (#[repr(C)]).
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++
++// Un descriptor de mensaje Mach ya leído (nucleo/src/mensaje.rs, struct Desc).
++struct nucleo_desc {
++	uint32_t off;      // desplazamiento en el mensaje
++	uint8_t clase;     // 0 puerto, 1 memoria, 2 puertos, 3 memoria volátil, 4 puerto con guarda
++	uint8_t disp;      // disposición del derecho
++	uint16_t r;
++	uint32_t nombre;   // puerto (clases 0 y 4)
++	uint32_t bytes;    // datos fuera de línea (clases 1-3; puertos: número × 4)
++	uint64_t dir;      // dirección de los datos fuera de línea, o la guarda (clase 4)
++};
++_Static_assert(sizeof(struct nucleo_desc) == 24 && offsetof(struct nucleo_desc, nombre) == 8 && offsetof(struct nucleo_desc, dir) == 16, "nucleo_desc");
++enum { NUCLEO_PUERTO = 0, NUCLEO_MEMORIA = 1, NUCLEO_PUERTOS = 2, NUCLEO_MEMORIA_VOLATIL = 3, NUCLEO_PUERTO_GUARDA = 4 };
++static inline int nucleo_fuera_de_linea(uint8_t clase) { return clase >= NUCLEO_MEMORIA && clase <= NUCLEO_MEMORIA_VOLATIL; }
++
++// Descriptores del mensaje m (tam bytes): rellena out (hasta max) y devuelve cuántos hay en total, o -1 si el mensaje está
++// mal formado (descriptor fuera del mensaje o de tipo desconocido).
++int nucleo_descriptores(const uint8_t* m, uint32_t tam, struct nucleo_desc* out, uint32_t max);
++
++// Desbordamiento de mensajes grandes (nucleo/src/desborde.rs): los datos fuera de línea que no caben en una ranura van a
++// /dev/shm/tahoe.<etiqueta>.ool.<id>. guardar/leer devuelven 0 si todo bien; leer borra el archivo.
++int nucleo_desborde_guardar(const char* etiqueta, uint64_t id, const uint8_t* datos, uint64_t len);
++int nucleo_desborde_leer(const char* etiqueta, uint64_t id, uint8_t* dst, uint64_t len);
++void nucleo_desborde_borrar(const char* etiqueta, uint64_t id);
++
++// pthread_rwlock en el núcleo (nucleo/src/rwlock.rs, traducción de kern_synch.c). Se llama con el candado de
++// emu_psynch.c tomado. despertar(ctx, espera, valor) despierta a un hilo dormido (devuelve 1 si esperaba).
++enum { NUCLEO_RW_LECTURA = 0x01, NUCLEO_RW_ESCRITURA = 0x04 };
++typedef int (*nucleo_rw_despertar)(void* ctx, uint64_t espera, uint32_t valor);
++// 0: concedido (*valor); 1: a dormir hasta que despertar llame con «espera», y luego nucleo_rw_fin_espera(*ranura);
++// otro: errno.
++int nucleo_rw_lock(uint32_t tipo, uint64_t addr, uint32_t l, uint32_t u, uint32_t s, uint32_t flags, uint64_t espera,
++	uint64_t ahora, nucleo_rw_despertar despertar, void* ctx, uint32_t* valor, uint32_t* ranura);
++void nucleo_rw_fin_espera(uint32_t ranura, uint64_t ahora);
++// 0 y *valor, o errno.
++int nucleo_rw_unlock(uint64_t addr, uint32_t l, uint32_t u, uint32_t s, uint32_t flags, uint64_t ahora,
++	nucleo_rw_despertar despertar, void* ctx, uint32_t* valor);
++
++// Candado y esperas de la región de puertos, entre procesos (nucleo/src/candado.rs). El candado es una palabra a cero
++// (libre); tomar devuelve 0 o EOWNERDEAD (el dueño murió con él tomado). esperar: con el candado tomado, lo suelta,
++// duerme hasta un aviso en *e (o el plazo absoluto hasta, CLOCK_MONOTONIC; NULL = sin plazo) y lo vuelve a tomar;
++// devuelve 0 (también en despertares espurios: hay que volver a mirar), ETIMEDOUT o EOWNERDEAD.
++struct timespec;
++int nucleo_candado_tomar(uint32_t* c);
++void nucleo_candado_soltar(uint32_t* c);
++int nucleo_esperar(uint32_t* e, uint32_t* c, const struct timespec* hasta);
++void nucleo_avisar(uint32_t* e);
+diff --git a/tahoe-run/nucleo/.gitignore b/tahoe-run/nucleo/.gitignore
+new file mode 100644
+index 0000000..2f7896d
+--- /dev/null
++++ b/tahoe-run/nucleo/.gitignore
+@@ -0,0 +1 @@
++target/
+diff --git a/tahoe-run/nucleo/Cargo.lock b/tahoe-run/nucleo/Cargo.lock
+new file mode 100644
+index 0000000..f118489
+--- /dev/null
++++ b/tahoe-run/nucleo/Cargo.lock
+@@ -0,0 +1,7 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "nucleo"
++version = "0.1.0"
+diff --git a/tahoe-run/nucleo/Cargo.toml b/tahoe-run/nucleo/Cargo.toml
+new file mode 100644
+index 0000000..a4793fb
+--- /dev/null
++++ b/tahoe-run/nucleo/Cargo.toml
+@@ -0,0 +1,17 @@
++[package]
++name = "nucleo"
++version = "0.1.0"
++edition = "2021"
++description = "Partes del núcleo emulado de tahoe-run escritas en Rust (enlazadas como biblioteca estática)"
++license = "MIT"
++
++[lib]
++crate-type = ["staticlib", "rlib"]
++
++# Pruebas: cargo test --lib (el perfil de pruebas no admite panic = "abort" en la biblioteca estática).
++# Se ejecuta dentro del manejador de SIGSYS de tahoe-run: sin desenrollado de pila (un pánico aborta el proceso, como un
++# fallo de C, pero con mensaje) y sin la biblioteca estándar en la biblioteca enlazada (las pruebas sí la usan).
++[profile.release]
++panic = "abort"
++opt-level = 2
++debug = true
+diff --git a/tahoe-run/nucleo/src/candado.rs b/tahoe-run/nucleo/src/candado.rs
+new file mode 100644
+index 0000000..6713e53
+--- /dev/null
++++ b/tahoe-run/nucleo/src/candado.rs
+@@ -0,0 +1,381 @@
++//! Candado y esperas de la región compartida de puertos Mach (`emu_port.c`), entre procesos.
++//!
++//! Antes era un `pthread_mutex_t` robusto y compartido de glibc con `pthread_cond_t` compartidos. glibc identifica al
++//! dueño por el TID que guarda en su descriptor de hilo, y tahoe-run hace `fork` con la llamada al sistema directa (sin
++//! pasar por glibc): en el hijo, glibc sigue creyendo que su TID es el del hilo del padre. Un hijo que pedía el candado
++//! mientras el padre lo tenía se creía ya su dueño, entraba sin esperar y al soltarlo liberaba el del padre. Así se
++//! rompía la exclusión y se perdían despertares: un `bash` se quedó 30 minutos dormido con el candado libre.
++//!
++//! Aquí el dueño es el TID real (`gettid` en cada toma, que no depende de glibc), los futex son compartidos (sin
++//! `FUTEX_PRIVATE_FLAG`: la palabra está en memoria compartida entre procesos) y toda espera tiene plazo, así que un
++//! despertar perdido cuesta como mucho un plazo y nunca un cuelgue:
++//! - candado (`u32`): 0 libre; si no, TID del dueño, con el bit 31 si alguien espera. Si la espera vence y el dueño ya
++//!   no existe (murió con el candado tomado), se toma igualmente y se devuelve `EOWNERDEAD`, como el robusto de glibc;
++//! - espera (`u32`): un número de secuencia. Quien espera lo lee con el candado tomado, suelta el candado y duerme
++//!   mientras no cambie; quien avisa lo incrementa (con el candado tomado) y despierta a todos. Los despertares pueden
++//!   ser espurios: quien espera vuelve a comprobar su condición, como con `pthread_cond_wait`.
++
++use core::ffi::{c_int, c_long};
++use core::sync::atomic::{AtomicU32, Ordering};
++
++const ESPERAS: u32 = 1 << 31;
++const TID: u32 = !ESPERAS;
++
++pub const ETIMEDOUT: i32 = 110;
++pub const EOWNERDEAD: i32 = 130;
++const ESRCH: c_int = 3;
++
++// x86_64
++const SYS_FUTEX: c_long = 202;
++const SYS_GETTID: c_long = 186;
++const SYS_KILL: c_long = 62;
++const FUTEX_WAKE: c_int = 1;
++const FUTEX_WAIT_BITSET: c_int = 9;
++const FUTEX_BITSET_MATCH_ANY: u32 = 0xffff_ffff;
++const CLOCK_MONOTONIC: c_int = 1;
++
++/// Cuánto se duerme como mucho de una vez: tras el plazo se mira si el dueño del candado sigue vivo (y una espera sin
++/// plazo vuelve para que quien espera compruebe su condición).
++const PLAZO_CANDADO_NS: i64 = 200_000_000;
++const PLAZO_ESPERA_NS: i64 = 1_000_000_000;
++
++#[repr(C)]
++#[derive(Clone, Copy)]
++pub struct Timespec {
++    pub tv_sec: i64,
++    pub tv_nsec: i64,
++}
++
++extern "C" {
++    fn syscall(n: c_long, ...) -> c_long;
++    fn __errno_location() -> *mut c_int;
++    fn clock_gettime(clk: c_int, ts: *mut Timespec) -> c_int;
++}
++
++fn errno() -> c_int {
++    // SAFETY: __errno_location devuelve la dirección del errno del hilo.
++    unsafe { *__errno_location() }
++}
++fn gettid() -> u32 {
++    // SAFETY: gettid no tiene argumentos y no falla.
++    unsafe { syscall(SYS_GETTID) as u32 }
++}
++fn ahora() -> Timespec {
++    let mut t = Timespec { tv_sec: 0, tv_nsec: 0 };
++    // SAFETY: t es un Timespec válido.
++    unsafe { clock_gettime(CLOCK_MONOTONIC, &mut t) };
++    t
++}
++fn sumar(t: Timespec, ns: i64) -> Timespec {
++    let n = t.tv_nsec + ns;
++    Timespec { tv_sec: t.tv_sec + n / 1_000_000_000, tv_nsec: n % 1_000_000_000 }
++}
++fn antes(a: &Timespec, b: &Timespec) -> bool {
++    (a.tv_sec, a.tv_nsec) < (b.tv_sec, b.tv_nsec)
++}
++/// Duerme mientras `*p == val`, hasta el instante `hasta` (CLOCK_MONOTONIC). 0, ETIMEDOUT o el errno (EAGAIN si ya no
++/// valía `val`, EINTR).
++fn futex_esperar(p: &AtomicU32, val: u32, hasta: &Timespec) -> c_int {
++    // SAFETY: p es una palabra válida; FUTEX_WAIT_BITSET toma un plazo absoluto de CLOCK_MONOTONIC.
++    let r = unsafe {
++        syscall(SYS_FUTEX, p.as_ptr(), FUTEX_WAIT_BITSET, val, hasta as *const Timespec, 0usize, FUTEX_BITSET_MATCH_ANY)
++    };
++    if r == 0 {
++        0
++    } else {
++        errno()
++    }
++}
++fn futex_despertar(p: &AtomicU32, n: c_int) {
++    // SAFETY: p es una palabra válida.
++    unsafe { syscall(SYS_FUTEX, p.as_ptr(), FUTEX_WAKE, n) };
++}
++/// ¿Existe aún el hilo `tid`? (kill con señal 0: ESRCH si no; cualquier otra respuesta cuenta como vivo).
++fn vivo(tid: u32) -> bool {
++    // SAFETY: la señal 0 no envía nada.
++    let r = unsafe { syscall(SYS_KILL, tid as c_int, 0) };
++    if r != 0 && errno() == ESRCH {
++        return false;
++    }
++    // Un proceso muerto que su padre aún no ha recogido (zombi) sigue respondiendo a kill(…, 0): se mira su estado en
++    // /proc/<tid>/stat («pid (nombre) Z …»). Sin esto, un dueño que murió con el candado tomado no se recuperaba nunca y
++    // todo el arranque se quedaba esperando.
++    !zombi(tid)
++}
++extern "C" {
++    fn open(path: *const core::ffi::c_char, flags: c_int, ...) -> c_int;
++    fn read(fd: c_int, buf: *mut u8, n: usize) -> isize;
++    fn close(fd: c_int) -> c_int;
++}
++fn zombi(tid: u32) -> bool {
++    let mut ruta = *b"/proc/0000000000/stat\0";
++    // dígitos del tid en su sitio, y el resto de la ruta detrás
++    let mut dig = [0u8; 10];
++    let (mut v, mut k) = (tid, dig.len());
++    loop {
++        k -= 1;
++        dig[k] = b'0' + (v % 10) as u8;
++        v /= 10;
++        if v == 0 {
++            break;
++        }
++    }
++    let d = &dig[k..];
++    let mut n = 6;
++    ruta[n..n + d.len()].copy_from_slice(d);
++    n += d.len();
++    ruta[n..n + 6].copy_from_slice(b"/stat\0");
++    let mut buf = [0u8; 256];
++    // SAFETY: ruta termina en NUL; buf es nuestro.
++    let fd = unsafe { open(ruta.as_ptr().cast(), 0) };
++    if fd < 0 {
++        return true; // ya no existe
++    }
++    let got = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
++    unsafe { close(fd) };
++    if got <= 0 {
++        return true;
++    }
++    let s = &buf[..got as usize];
++    match s.iter().rposition(|&c| c == b')') {
++        Some(i) if i + 2 < s.len() => matches!(s[i + 2], b'Z' | b'X' | b'x'),
++        _ => false,
++    }
++}
++/// Toma el candado. 0, o EOWNERDEAD si el dueño anterior había muerto con él tomado (el estado que protege puede estar a
++/// medias).
++pub fn tomar(c: &AtomicU32) -> i32 {
++    let yo = gettid();
++    if c.compare_exchange(0, yo, Ordering::Acquire, Ordering::Relaxed).is_ok() {
++        return 0;
++    }
++    loop {
++        let v = c.load(Ordering::Relaxed);
++        if v == 0 {
++            // tras haber esperado se toma con el bit de esperas: puede quedar alguien dormido detrás
++            if c.compare_exchange(0, yo | ESPERAS, Ordering::Acquire, Ordering::Relaxed).is_ok() {
++                return 0;
++            }
++            continue;
++        }
++        if v & TID == yo {
++            // imposible si todo va bien (nadie toma dos veces): mejor seguir que quedarse colgado para siempre
++            if c.compare_exchange(v, yo | ESPERAS, Ordering::Acquire, Ordering::Relaxed).is_ok() {
++                return EOWNERDEAD;
++            }
++            continue;
++        }
++        if v & ESPERAS == 0 && c.compare_exchange(v, v | ESPERAS, Ordering::Relaxed, Ordering::Relaxed).is_err() {
++            continue;
++        }
++        let hasta = sumar(ahora(), PLAZO_CANDADO_NS);
++        if futex_esperar(c, v | ESPERAS, &hasta) == ETIMEDOUT {
++            let cur = c.load(Ordering::Relaxed);
++            let dueno = cur & TID;
++            if dueno != 0
++                && !vivo(dueno)
++                && c.compare_exchange(cur, yo | ESPERAS, Ordering::Acquire, Ordering::Relaxed).is_ok()
++            {
++                return EOWNERDEAD;
++            }
++        }
++    }
++}
++
++/// Suelta el candado y, si alguien esperaba, despierta a uno.
++pub fn soltar(c: &AtomicU32) {
++    if c.swap(0, Ordering::Release) & ESPERAS != 0 {
++        futex_despertar(c, 1);
++    }
++}
++
++/// Con el candado tomado: lo suelta, duerme hasta un aviso en `e` (o el plazo absoluto `hasta`, CLOCK_MONOTONIC) y lo
++/// vuelve a tomar. 0 (aviso o despertar espurio), ETIMEDOUT (venció el plazo) o EOWNERDEAD (al volver a tomarlo).
++pub fn esperar(e: &AtomicU32, c: &AtomicU32, hasta: Option<&Timespec>) -> i32 {
++    let s = e.load(Ordering::Relaxed);
++    soltar(c);
++    let tope = sumar(ahora(), PLAZO_ESPERA_NS);
++    let limite = match hasta {
++        Some(h) if antes(h, &tope) => *h,
++        _ => tope,
++    };
++    let r = futex_esperar(e, s, &limite);
++    let vencido = r == ETIMEDOUT && hasta.is_some_and(|h| !antes(&ahora(), h));
++    let t = tomar(c);
++    if vencido {
++        ETIMEDOUT
++    } else if t != 0 {
++        t
++    } else {
++        0
++    }
++}
++
++/// Con el candado tomado: avisa a todos los que esperan en `e`.
++pub fn avisar(e: &AtomicU32) {
++    e.fetch_add(1, Ordering::Release);
++    futex_despertar(e, c_int::MAX);
++}
++
++// ---- interfaz con C (emu_port.c) ----
++
++/// # Safety
++/// `c` apunta a una palabra de 4 bytes alineada (en la región compartida).
++#[no_mangle]
++pub unsafe extern "C" fn nucleo_candado_tomar(c: *mut u32) -> i32 {
++    tomar(unsafe { AtomicU32::from_ptr(c) })
++}
++/// # Safety
++/// Como `nucleo_candado_tomar`, y el candado lo tiene este hilo.
++#[no_mangle]
++pub unsafe extern "C" fn nucleo_candado_soltar(c: *mut u32) {
++    soltar(unsafe { AtomicU32::from_ptr(c) })
++}
++/// # Safety
++/// `e` y `c` palabras válidas; el candado lo tiene este hilo; `hasta` nulo (sin plazo) o un Timespec válido.
++#[no_mangle]
++pub unsafe extern "C" fn nucleo_esperar(e: *mut u32, c: *mut u32, hasta: *const Timespec) -> i32 {
++    let h = if hasta.is_null() { None } else { Some(unsafe { &*hasta }) };
++    esperar(unsafe { AtomicU32::from_ptr(e) }, unsafe { AtomicU32::from_ptr(c) }, h)
++}
++/// # Safety
++/// `e` es una palabra válida.
++#[no_mangle]
++pub unsafe extern "C" fn nucleo_avisar(e: *mut u32) {
++    avisar(unsafe { AtomicU32::from_ptr(e) })
++}
++
++#[cfg(test)]
++mod pruebas {
++    use super::*;
++    extern crate std;
++    use std::sync::Arc;
++    use std::thread;
++    use std::time::{Duration, Instant};
++
++    #[test]
++    fn exclusion_entre_hilos() {
++        struct Comp {
++            c: AtomicU32,
++            n: core::cell::UnsafeCell<u64>,
++        }
++        unsafe impl Sync for Comp {}
++        let s = Arc::new(Comp { c: AtomicU32::new(0), n: core::cell::UnsafeCell::new(0) });
++        let hs: std::vec::Vec<_> = (0..8)
++            .map(|_| {
++                let s = s.clone();
++                thread::spawn(move || {
++                    for _ in 0..20000 {
++                        assert_eq!(tomar(&s.c), 0);
++                        unsafe { *s.n.get() += 1 };
++                        soltar(&s.c);
++                    }
++                })
++            })
++            .collect();
++        for h in hs {
++            h.join().unwrap();
++        }
++        assert_eq!(unsafe { *s.n.get() }, 160000);
++        assert_eq!(s.c.load(Ordering::Relaxed), 0);
++    }
++
++    #[test]
++    fn dueno_muerto_se_recupera() {
++        let c = Arc::new(AtomicU32::new(0));
++        let c2 = c.clone();
++        // un hilo toma el candado y termina sin soltarlo
++        thread::spawn(move || assert_eq!(tomar(&c2), 0)).join().unwrap();
++        assert_ne!(c.load(Ordering::Relaxed), 0);
++        let t0 = Instant::now();
++        assert_eq!(tomar(&c), EOWNERDEAD);
++        assert!(t0.elapsed() < Duration::from_secs(2));
++        assert_eq!(c.load(Ordering::Relaxed) & TID, gettid());
++        soltar(&c);
++    }
++
++    #[test]
++    fn dueno_zombi_se_recupera() {
++        extern "C" {
++            fn fork() -> c_int;
++            fn _exit(c: c_int) -> !;
++            fn waitpid(p: c_int, st: *mut c_int, o: c_int) -> c_int;
++        }
++        // un hijo que termina y que no se recoge todavía (zombi) es el dueño del candado
++        let hijo = unsafe { fork() };
++        if hijo == 0 {
++            unsafe { _exit(0) };
++        }
++        thread::sleep(Duration::from_millis(100));
++        let c = AtomicU32::new(hijo as u32);
++        assert!(!vivo(hijo as u32));
++        let t0 = Instant::now();
++        assert_eq!(tomar(&c), EOWNERDEAD);
++        assert!(t0.elapsed() < Duration::from_secs(2));
++        soltar(&c);
++        let mut st = 0;
++        unsafe { waitpid(hijo, &mut st, 0) };
++    }
++
++    #[test]
++    fn espera_con_aviso_y_con_plazo() {
++        let c = Arc::new(AtomicU32::new(0));
++        let e = Arc::new(AtomicU32::new(0));
++        let listo = Arc::new(AtomicU32::new(0));
++        let (c2, e2, l2) = (c.clone(), e.clone(), listo.clone());
++        let h = thread::spawn(move || {
++            tomar(&c2);
++            while l2.load(Ordering::Relaxed) == 0 {
++                esperar(&e2, &c2, None);
++            }
++            soltar(&c2);
++        });
++        thread::sleep(Duration::from_millis(50));
++        tomar(&c);
++        listo.store(1, Ordering::Relaxed);
++        avisar(&e);
++        soltar(&c);
++        h.join().unwrap();
++        // con plazo y sin aviso: ETIMEDOUT, y vuelve con el candado tomado
++        tomar(&c);
++        let hasta = sumar(ahora(), 100_000_000);
++        let t0 = Instant::now();
++        let mut r = 0;
++        while r == 0 {
++            r = esperar(&e, &c, Some(&hasta));
++        }
++        assert_eq!(r, ETIMEDOUT);
++        assert!(t0.elapsed() >= Duration::from_millis(90));
++        assert_eq!(c.load(Ordering::Relaxed) & TID, gettid());
++        soltar(&c);
++    }
++
++    #[test]
++    fn exclusion_entre_procesos() {
++        extern "C" {
++            fn mmap(a: *mut u8, l: usize, p: c_int, f: c_int, fd: c_int, o: i64) -> *mut u8;
++            fn fork() -> c_int;
++            fn waitpid(p: c_int, st: *mut c_int, o: c_int) -> c_int;
++            fn _exit(c: c_int) -> !;
++        }
++        // memoria compartida: candado + contador
++        let m = unsafe { mmap(core::ptr::null_mut(), 4096, 3, 0x01 | 0x20, -1, 0) };
++        assert!(!m.is_null());
++        let c = unsafe { AtomicU32::from_ptr(m as *mut u32) };
++        let n = unsafe { &mut *(m.add(8) as *mut u64) };
++        let hijo = unsafe { fork() };
++        let vueltas = 50000;
++        for _ in 0..vueltas {
++            tomar(c);
++            let v = unsafe { core::ptr::read_volatile(n) };
++            unsafe { core::ptr::write_volatile(n, v + 1) };
++            soltar(c);
++        }
++        if hijo == 0 {
++            unsafe { _exit(0) };
++        }
++        let mut st = 0;
++        unsafe { waitpid(hijo, &mut st, 0) };
++        assert_eq!(*n, 2 * vueltas);
++    }
++}
+diff --git a/tahoe-run/nucleo/src/desborde.rs b/tahoe-run/nucleo/src/desborde.rs
+new file mode 100644
+index 0000000..3b61c4e
+--- /dev/null
++++ b/tahoe-run/nucleo/src/desborde.rs
+@@ -0,0 +1,203 @@
++//! Desbordamiento de mensajes grandes. Las ranuras de la cola de mensajes (región compartida de `emu_port.c`) tienen un
++//! tamaño fijo; los datos fuera de línea de un mensaje pueden ser mucho mayores (en XNU, megas). Cuando un mensaje no cabe,
++//! esos datos van a un archivo de `/dev/shm` (`tahoe.<arranque>.ool.<id>`), la ranura guarda solo el mensaje y el
++//! receptor lee el archivo y lo borra. Si el mensaje se descarta sin recibirse, se borra igual. La limpieza del arranque
++//! (`ports_cleanup`, que borra `/dev/shm/tahoe.<arranque>.*`) se lleva los que queden.
++//!
++//! Sin biblioteca estándar: las llamadas al sistema van por las funciones de la libc con la que se enlaza tahoe-run.
++
++use core::ffi::{c_char, c_int};
++
++extern "C" {
++    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
++    fn read(fd: c_int, buf: *mut u8, n: usize) -> isize;
++    fn write(fd: c_int, buf: *const u8, n: usize) -> isize;
++    fn close(fd: c_int) -> c_int;
++    fn unlink(path: *const c_char) -> c_int;
++}
++const O_RDONLY: c_int = 0;
++const O_WRONLY: c_int = 1;
++const O_CREAT: c_int = 0o100;
++const O_EXCL: c_int = 0o200;
++const O_CLOEXEC: c_int = 0o2000000;
++
++/// Ruta `/dev/shm/tahoe.<etiqueta>.ool.<id>` terminada en NUL, en un búfer fijo.
++struct Ruta([u8; 128]);
++
++impl Ruta {
++    fn nueva(etiqueta: &[u8], id: u64) -> Option<Ruta> {
++        let mut b = [0u8; 128];
++        let mut n = 0;
++        let mut poner = |s: &[u8]| -> Option<()> {
++            let fin = n + s.len();
++            b.get_mut(n..fin)?.copy_from_slice(s);
++            n = fin;
++            Some(())
++        };
++        poner(b"/dev/shm/tahoe.")?;
++        // la etiqueta del arranque es hexadecimal; cualquier otro carácter (como '/') se rechaza
++        if etiqueta.is_empty() || !etiqueta.iter().all(u8::is_ascii_alphanumeric) {
++            return None;
++        }
++        poner(etiqueta)?;
++        poner(b".ool.")?;
++        let mut dig = [0u8; 20];
++        let mut v = id;
++        let mut k = dig.len();
++        loop {
++            k -= 1;
++            dig[k] = b'0' + (v % 10) as u8;
++            v /= 10;
++            if v == 0 {
++                break;
++            }
++        }
++        poner(&dig[k..])?;
++        // queda al menos un byte a cero detrás (b empezó a cero y n < 128 si cupo todo)
++        (n < b.len()).then_some(Ruta(b))
++    }
++    fn ptr(&self) -> *const c_char {
++        self.0.as_ptr().cast()
++    }
++}
++
++/// Lee la etiqueta (cadena C) como bytes, como mucho 64.
++///
++/// # Safety
++/// `etiqueta` debe ser nula o una cadena C válida.
++unsafe fn etiqueta_de<'a>(etiqueta: *const c_char) -> &'a [u8] {
++    if etiqueta.is_null() {
++        return &[];
++    }
++    // SAFETY: cadena C terminada en NUL, según el llamante; se para en 64 bytes.
++    let p = etiqueta.cast::<u8>();
++    let mut n = 0;
++    while n < 64 && unsafe { *p.add(n) } != 0 {
++        n += 1;
++    }
++    // SAFETY: los n primeros bytes son legibles (recorridos arriba).
++    unsafe { core::slice::from_raw_parts(p, n) }
++}
++
++/// Guarda `len` bytes de `datos` en el archivo de desbordamiento `id`. 0 si todo se escribió; -1 si no.
++///
++/// # Safety
++/// `etiqueta` es una cadena C válida y `datos` apunta a `len` bytes legibles.
++#[no_mangle]
++pub unsafe extern "C" fn nucleo_desborde_guardar(etiqueta: *const c_char, id: u64, datos: *const u8, len: u64) -> c_int {
++    // SAFETY: según el contrato de esta función.
++    let Some(ruta) = Ruta::nueva(unsafe { etiqueta_de(etiqueta) }, id) else { return -1 };
++    if datos.is_null() && len > 0 {
++        return -1;
++    }
++    // SAFETY: ruta terminada en NUL; open con modo como tercer argumento.
++    let fd = unsafe { open(ruta.ptr(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600 as c_int) };
++    if fd < 0 {
++        return -1;
++    }
++    let mut hecho: u64 = 0;
++    while hecho < len {
++        let trozo = core::cmp::min(len - hecho, 1 << 30) as usize;
++        // SAFETY: datos + hecho .. + trozo está dentro de los len bytes legibles.
++        let n = unsafe { write(fd, datos.add(hecho as usize), trozo) };
++        if n <= 0 {
++            break;
++        }
++        hecho += n as u64;
++    }
++    // SAFETY: fd abierto arriba.
++    unsafe { close(fd) };
++    if hecho == len {
++        0
++    } else {
++        // SAFETY: ruta válida.
++        unsafe { unlink(ruta.ptr()) };
++        -1
++    }
++}
++
++/// Lee el archivo de desbordamiento `id` en `dst` (`len` bytes) y lo borra. 0 si se leyó entero; -1 si no (lo que no se
++/// pudo leer queda a cero).
++///
++/// # Safety
++/// `etiqueta` es una cadena C válida y `dst` apunta a `len` bytes escribibles.
++#[no_mangle]
++pub unsafe extern "C" fn nucleo_desborde_leer(etiqueta: *const c_char, id: u64, dst: *mut u8, len: u64) -> c_int {
++    // SAFETY: según el contrato de esta función.
++    let Some(ruta) = Ruta::nueva(unsafe { etiqueta_de(etiqueta) }, id) else { return -1 };
++    if dst.is_null() && len > 0 {
++        return -1;
++    }
++    // SAFETY: ruta terminada en NUL.
++    let fd = unsafe { open(ruta.ptr(), O_RDONLY | O_CLOEXEC) };
++    let mut hecho: u64 = 0;
++    if fd >= 0 {
++        while hecho < len {
++            let trozo = core::cmp::min(len - hecho, 1 << 30) as usize;
++            // SAFETY: dst + hecho .. + trozo está dentro de los len bytes escribibles.
++            let n = unsafe { read(fd, dst.add(hecho as usize), trozo) };
++            if n <= 0 {
++                break;
++            }
++            hecho += n as u64;
++        }
++        // SAFETY: fd abierto arriba.
++        unsafe { close(fd) };
++    }
++    if hecho < len {
++        // SAFETY: el resto de dst sigue dentro de los len bytes escribibles.
++        unsafe { core::ptr::write_bytes(dst.add(hecho as usize), 0, (len - hecho) as usize) };
++    }
++    // SAFETY: ruta válida.
++    unsafe { unlink(ruta.ptr()) };
++    if hecho == len { 0 } else { -1 }
++}
++
++/// Borra el archivo de desbordamiento `id` (mensaje descartado sin recibir).
++///
++/// # Safety
++/// `etiqueta` es una cadena C válida.
++#[no_mangle]
++pub unsafe extern "C" fn nucleo_desborde_borrar(etiqueta: *const c_char, id: u64) {
++    // SAFETY: según el contrato de esta función.
++    if let Some(ruta) = Ruta::nueva(unsafe { etiqueta_de(etiqueta) }, id) {
++        // SAFETY: ruta válida.
++        unsafe { unlink(ruta.ptr()) };
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::ffi::CString;
++
++    #[test]
++    fn ruta() {
++        let r = Ruta::nueva(b"6acc5f38", 1234).unwrap();
++        let s = std::ffi::CStr::from_bytes_until_nul(&r.0).unwrap();
++        assert_eq!(s.to_str().unwrap(), "/dev/shm/tahoe.6acc5f38.ool.1234");
++        assert!(Ruta::nueva(b"../x", 1).is_none()); // nada de rutas raras
++        assert!(Ruta::nueva(b"", 1).is_none());
++        assert!(Ruta::nueva(&[b'a'; 120], 1).is_none()); // no cabe
++    }
++
++    #[test]
++    fn guardar_leer_y_borrar() {
++        let tag = CString::new(format!("prueba{}", std::process::id())).unwrap();
++        let datos: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect(); // mayor que una ranura
++        // SAFETY: búferes válidos del tamaño indicado.
++        unsafe {
++            assert_eq!(nucleo_desborde_guardar(tag.as_ptr(), 7, datos.as_ptr(), datos.len() as u64), 0);
++            // el mismo id no se pisa (O_EXCL)
++            assert_eq!(nucleo_desborde_guardar(tag.as_ptr(), 7, datos.as_ptr(), 1), -1);
++            let mut fuera = vec![0xffu8; datos.len()];
++            assert_eq!(nucleo_desborde_leer(tag.as_ptr(), 7, fuera.as_mut_ptr(), fuera.len() as u64), 0);
++            assert_eq!(fuera, datos);
++            // ya se borró: leerlo otra vez falla y deja ceros
++            let mut otra = vec![0xffu8; 16];
++            assert_eq!(nucleo_desborde_leer(tag.as_ptr(), 7, otra.as_mut_ptr(), 16), -1);
++            assert_eq!(otra, vec![0u8; 16]);
++            nucleo_desborde_borrar(tag.as_ptr(), 7); // no existe: sin efecto
++        }
++    }
++}
+diff --git a/tahoe-run/nucleo/src/lib.rs b/tahoe-run/nucleo/src/lib.rs
+new file mode 100644
+index 0000000..4eb73b7
+--- /dev/null
++++ b/tahoe-run/nucleo/src/lib.rs
+@@ -0,0 +1,30 @@
++//! Núcleo de tahoe-run en Rust: las partes del «kernel» emulado que más fallaban en C se reescriben aquí, una a una
++//! (ver README, «criterio de lenguaje»). Se enlaza en tahoe-run como biblioteca estática y se llama desde C con
++//! funciones `extern "C"` cuyo prototipo está en `nucleo.h`.
++//!
++//! Todo esto se ejecuta dentro del manejador de SIGSYS (y en procesos de macOS), así que la biblioteca no usa la
++//! biblioteca estándar ni memoria dinámica: trabaja sobre los búferes que le pasa el C y comprueba siempre los límites.
++#![cfg_attr(not(test), no_std)]
++
++pub mod candado;
++pub mod desborde;
++pub mod mensaje;
++pub mod rwlock;
++
++/// Un pánico en el núcleo es un error de programación: se anota y se aborta el proceso, como haría un fallo en C, pero
++/// sin corromper memoria antes.
++#[cfg(not(test))]
++#[panic_handler]
++fn panic(_: &core::panic::PanicInfo) -> ! {
++    extern "C" {
++        fn abort() -> !;
++    }
++    // SAFETY: abort de la libc no vuelve y no necesita nada.
++    unsafe { abort() }
++}
++
++/// La biblioteca `core` precompilada hace referencia a la rutina de desenrollado de pila aunque aquí un pánico aborta
++/// (panic = "abort"): nunca se llama, pero el enlazador necesita el símbolo.
++#[cfg(not(test))]
++#[no_mangle]
++pub extern "C" fn rust_eh_personality() {}
+diff --git a/tahoe-run/nucleo/src/mensaje.rs b/tahoe-run/nucleo/src/mensaje.rs
+new file mode 100644
+index 0000000..c498722
+--- /dev/null
++++ b/tahoe-run/nucleo/src/mensaje.rs
+@@ -0,0 +1,251 @@
++//! Formato de los mensajes Mach (cabecera y descriptores), como `mach/message.h` de XNU para x86_64.
++//!
++//! Un mensaje empieza con `mach_msg_header_t` (24 bytes). Si el bit «complejo» (0x80000000 en `msgh_bits`) está
++//! puesto, sigue un `mach_msg_body_t` con el número de descriptores y luego los descriptores, de 12 o 16 bytes:
++//!
++//! | tipo | descriptor                 | tamaño | campos (desplazamiento)                                         |
++//! |------|----------------------------|--------|-----------------------------------------------------------------|
++//! | 0    | puerto                     | 12     | nombre (+0), disposición (+10), tipo (+11)                       |
++//! | 1    | memoria fuera de línea     | 16     | dirección (+0), dealloc/copia (+8, +9), tipo (+11), tamaño (+12) |
++//! | 2    | puertos fuera de línea     | 16     | dirección (+0), disposición (+10), tipo (+11), número (+12)      |
++//! | 3    | memoria volátil            | 16     | como el 1                                                       |
++//! | 4    | puerto con guarda          | 16     | contexto (+0), flags (+8), disposición (+10), tipo (+11), nombre (+12) |
++//!
++//! El tipo está siempre en el byte +11, así que se puede recorrer la lista sin conocer los demás campos.
++
++/// Tamaño de `mach_msg_header_t`.
++pub const CABECERA: usize = 24;
++const COMPLEJO: u32 = 0x8000_0000;
++
++/// Clase de descriptor (byte +11).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[repr(u8)]
++pub enum Clase {
++    Puerto = 0,
++    Memoria = 1,
++    Puertos = 2,
++    MemoriaVolatil = 3,
++    PuertoConGuarda = 4,
++}
++
++impl Clase {
++    fn de(b: u8) -> Option<Clase> {
++        Some(match b {
++            0 => Clase::Puerto,
++            1 => Clase::Memoria,
++            2 => Clase::Puertos,
++            3 => Clase::MemoriaVolatil,
++            4 => Clase::PuertoConGuarda,
++            _ => return None,
++        })
++    }
++    /// Bytes que ocupa el descriptor en el mensaje.
++    pub fn tamano(self) -> usize {
++        if self == Clase::Puerto { 12 } else { 16 }
++    }
++    /// ¿Lleva datos fuera de línea (memoria o una lista de nombres de puerto) que el núcleo copia?
++    pub fn fuera_de_linea(self) -> bool {
++        matches!(self, Clase::Memoria | Clase::Puertos | Clase::MemoriaVolatil)
++    }
++}
++
++/// Un descriptor ya leído. Interfaz C: `struct nucleo_desc` en `nucleo.h` (mismo orden y tamaños).
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
++#[repr(C)]
++pub struct Desc {
++    /// Desplazamiento del descriptor en el mensaje.
++    pub off: u32,
++    /// Clase (0-4, ver `Clase`).
++    pub clase: u8,
++    /// Disposición del derecho (puertos y puertos fuera de línea).
++    pub disp: u8,
++    pub _r: u16,
++    /// Nombre del puerto (descriptores de puerto y de puerto con guarda); 0 en los demás.
++    pub nombre: u32,
++    /// Bytes de datos fuera de línea (para los de puertos, número × 4); 0 en los demás.
++    pub bytes: u32,
++    /// Dirección de los datos fuera de línea (en el emisor), o el contexto de un puerto con guarda.
++    pub dir: u64,
++}
++
++fn u32_en(m: &[u8], off: usize) -> Option<u32> {
++    Some(u32::from_le_bytes(m.get(off..off + 4)?.try_into().ok()?))
++}
++fn u64_en(m: &[u8], off: usize) -> Option<u64> {
++    Some(u64::from_le_bytes(m.get(off..off + 8)?.try_into().ok()?))
++}
++
++/// Error al leer un mensaje.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Error {
++    /// Más corto que la cabecera.
++    Corto,
++    /// Un descriptor se sale del mensaje o tiene un tipo desconocido.
++    Descriptor,
++}
++
++/// Recorre los descriptores de un mensaje. `f` recibe cada uno; devuelve cuántos hay (0 si el mensaje no es complejo).
++/// Un mensaje mal formado (descriptor fuera de límites o de tipo desconocido) da error y no se mira más allá.
++pub fn descriptores(m: &[u8], mut f: impl FnMut(Desc)) -> Result<usize, Error> {
++    let bits = u32_en(m, 0).ok_or(Error::Corto)?;
++    if m.len() < CABECERA {
++        return Err(Error::Corto);
++    }
++    if bits & COMPLEJO == 0 {
++        return Ok(0);
++    }
++    let cuenta = u32_en(m, CABECERA).ok_or(Error::Descriptor)? as usize;
++    let mut off = CABECERA + 4;
++    for _ in 0..cuenta {
++        let clase = Clase::de(*m.get(off + 11).ok_or(Error::Descriptor)?).ok_or(Error::Descriptor)?;
++        if off + clase.tamano() > m.len() {
++            return Err(Error::Descriptor);
++        }
++        let disp = m[off + 10];
++        let d = match clase {
++            Clase::Puerto => Desc { nombre: u32_en(m, off).unwrap_or(0), ..Default::default() },
++            Clase::PuertoConGuarda => {
++                Desc { nombre: u32_en(m, off + 12).unwrap_or(0), dir: u64_en(m, off).unwrap_or(0), ..Default::default() }
++            }
++            Clase::Memoria | Clase::MemoriaVolatil => {
++                Desc { bytes: u32_en(m, off + 12).unwrap_or(0), dir: u64_en(m, off).unwrap_or(0), ..Default::default() }
++            }
++            Clase::Puertos => {
++                // número de puertos × 4 bytes por nombre; un número absurdo no puede desbordar
++                let n = u32_en(m, off + 12).unwrap_or(0);
++                Desc { bytes: n.checked_mul(4).ok_or(Error::Descriptor)?, dir: u64_en(m, off).unwrap_or(0), ..Default::default() }
++            }
++        };
++        f(Desc { off: off as u32, clase: clase as u8, disp, ..d });
++        off += clase.tamano();
++    }
++    Ok(cuenta)
++}
++
++/// Interfaz C: rellena `out` (hasta `max`) con los descriptores del mensaje `m` (`tam` bytes) y devuelve cuántos hay en
++/// total, o -1 si el mensaje está mal formado (en ese caso los de `out` son los leídos hasta el error).
++///
++/// # Safety
++/// `m` debe apuntar a `tam` bytes legibles y `out` a `max` elementos escribibles (o ser nulo con `max` = 0).
++#[no_mangle]
++pub unsafe extern "C" fn nucleo_descriptores(m: *const u8, tam: u32, out: *mut Desc, max: u32) -> i32 {
++    if m.is_null() {
++        return -1;
++    }
++    // SAFETY: el llamante garantiza que m apunta a tam bytes.
++    let msg = unsafe { core::slice::from_raw_parts(m, tam as usize) };
++    let salida: &mut [Desc] = if out.is_null() || max == 0 {
++        &mut []
++    } else {
++        // SAFETY: el llamante garantiza max elementos escribibles en out.
++        unsafe { core::slice::from_raw_parts_mut(out, max as usize) }
++    };
++    let mut n = 0usize;
++    let r = descriptores(msg, |d| {
++        if let Some(s) = salida.get_mut(n) {
++            *s = d;
++        }
++        n += 1;
++    });
++    match r {
++        Ok(total) => i32::try_from(total).unwrap_or(i32::MAX),
++        Err(_) => -1,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::vec::Vec;
++
++    fn cabecera(complejo: bool, tam: u32) -> Vec<u8> {
++        let mut m = Vec::new();
++        let bits: u32 = 0x1513 | if complejo { COMPLEJO } else { 0 };
++        m.extend_from_slice(&bits.to_le_bytes());
++        m.extend_from_slice(&tam.to_le_bytes());
++        m.extend_from_slice(&[0u8; 16]); // remoto, local, vale, id
++        m
++    }
++    fn puerto(nombre: u32, disp: u8) -> [u8; 12] {
++        let mut d = [0u8; 12];
++        d[0..4].copy_from_slice(&nombre.to_le_bytes());
++        d[10] = disp;
++        d[11] = 0;
++        d
++    }
++    fn de16(clase: u8, a: u64, disp: u8, ultimo: u32) -> [u8; 16] {
++        let mut d = [0u8; 16];
++        d[0..8].copy_from_slice(&a.to_le_bytes());
++        d[10] = disp;
++        d[11] = clase;
++        d[12..16].copy_from_slice(&ultimo.to_le_bytes());
++        d
++    }
++    fn mensaje(descs: &[&[u8]]) -> Vec<u8> {
++        let mut m = cabecera(true, 0);
++        m.extend_from_slice(&(descs.len() as u32).to_le_bytes());
++        for d in descs {
++            m.extend_from_slice(d);
++        }
++        let t = m.len() as u32;
++        m[4..8].copy_from_slice(&t.to_le_bytes());
++        m
++    }
++    fn todos(m: &[u8]) -> Result<Vec<Desc>, Error> {
++        let mut v = Vec::new();
++        descriptores(m, |d| v.push(d)).map(|_| v)
++    }
++
++    #[test]
++    fn mensaje_simple_sin_descriptores() {
++        assert_eq!(todos(&cabecera(false, 24)), Ok(vec![]));
++        assert_eq!(todos(&[0u8; 10]), Err(Error::Corto));
++    }
++
++    #[test]
++    fn puerto_memoria_y_puertos() {
++        let m = mensaje(&[&puerto(0x2e03, 17), &de16(1, 0x7000, 0, 300), &de16(2, 0x8000, 19, 5)]);
++        let v = todos(&m).unwrap();
++        assert_eq!(v.len(), 3);
++        assert_eq!((v[0].clase, v[0].nombre, v[0].disp, v[0].off), (0, 0x2e03, 17, 28));
++        assert_eq!((v[1].clase, v[1].bytes, v[1].dir, v[1].off), (1, 300, 0x7000, 40));
++        assert_eq!((v[2].clase, v[2].bytes, v[2].disp), (2, 20, 19)); // 5 puertos × 4 bytes
++    }
++
++    #[test]
++    fn puerto_con_guarda_no_es_memoria() {
++        // el fallo de la versión en C: el tipo 4 se trataba como datos fuera de línea (dirección = guarda, tamaño =
++        // nombre del puerto); aquí es un puerto con su nombre en +12 y su guarda en +0
++        let m = mensaje(&[&de16(4, 0xdead_beef, 16, 0x1e103)]);
++        let v = todos(&m).unwrap();
++        assert_eq!((v[0].clase, v[0].nombre, v[0].dir, v[0].bytes, v[0].disp), (4, 0x1e103, 0xdead_beef, 0, 16));
++        assert!(!Clase::PuertoConGuarda.fuera_de_linea());
++    }
++
++    #[test]
++    fn mensajes_mal_formados() {
++        let mut m = mensaje(&[&puerto(1, 17)]);
++        m.truncate(m.len() - 1); // descriptor cortado
++        assert_eq!(todos(&m), Err(Error::Descriptor));
++        let mut m = mensaje(&[&puerto(1, 17)]);
++        m[28 + 11] = 9; // tipo desconocido
++        assert_eq!(todos(&m), Err(Error::Descriptor));
++        let mut m = mensaje(&[]);
++        m[24..28].copy_from_slice(&u32::MAX.to_le_bytes()); // dice tener 4 000 millones de descriptores
++        assert_eq!(todos(&m), Err(Error::Descriptor));
++        let m = mensaje(&[&de16(2, 0, 0, u32::MAX)]); // número de puertos que desbordaría ×4
++        assert_eq!(todos(&m), Err(Error::Descriptor));
++    }
++
++    #[test]
++    fn interfaz_c() {
++        let m = mensaje(&[&puerto(7, 18), &de16(1, 1, 0, 8)]);
++        let mut out = [Desc::default(); 1];
++        // SAFETY: búferes válidos del tamaño indicado.
++        let n = unsafe { nucleo_descriptores(m.as_ptr(), m.len() as u32, out.as_mut_ptr(), 1) };
++        assert_eq!(n, 2); // hay 2, aunque solo cabía 1
++        assert_eq!(out[0].nombre, 7);
++        // SAFETY: puntero nulo con tamaño 0.
++        assert_eq!(unsafe { nucleo_descriptores(core::ptr::null(), 0, core::ptr::null_mut(), 0) }, -1);
++    }
++}
+diff --git a/tahoe-run/nucleo/src/rwlock.rs b/tahoe-run/nucleo/src/rwlock.rs
+new file mode 100644
+index 0000000..e1a50c9
+--- /dev/null
++++ b/tahoe-run/nucleo/src/rwlock.rs
+@@ -0,0 +1,992 @@
++//! psynch_rw_*: la parte del núcleo de los `pthread_rwlock` de libpthread (llamadas 306-308).
++//!
++//! libpthread lleva en memoria del proceso tres palabras de secuencia (L: intentos de bloqueo, U: desbloqueos, S: la
++//! secuencia del núcleo) y solo entra en el núcleo cuando hay contención: `psynch_rw_rdlock`/`psynch_rw_wrlock` para
++//! dormir y `psynch_rw_unlock` para repartir el cerrojo entre los que esperan. El valor que devuelve el núcleo (los bits
++//! de L y cuántos lectores entran) lo aplica libpthread tal cual: si no cuadra con su protocolo, aborta con `ud1`.
++//! Por eso esto es una traducción fiel, paso a paso, de `kern_synch.c` (libpthread de Apple, APSL): la cola por
++//! dirección (`ksyn_wait_queue`), las colas de lectores y escritores ordenadas por secuencia, los desbloqueos que llegan
++//! antes que los que esperan («prepost»), el solapamiento de lectores y la reinicialización del cerrojo. Los nombres de
++//! las funciones de Apple van en el comentario de cada una para poder compararlas.
++//!
++//! Lo que no se traduce porque aquí no existe: los turnstiles y la QoS (prioridades del dueño), los cerrojos compartidos
++//! entre procesos (`PTHREAD_PROCESS_SHARED`: tahoe-run guarda la tabla en cada proceso; el C lo anota) y los tipos de
++//! cola de mutex y variables de condición (los lleva `emu_psynch.c` a su manera).
++//!
++//! Dormir y despertar los hilos es cosa del C (`emu_psynch.c`), que llama a todo esto con su candado tomado: aquí solo
++//! se decide quién espera y con qué valor se despierta a cada uno (la función `despertar` que pasa el C).
++
++/// Cerrojo para lectura o escritura (PTH_RW_TYPE_READ / PTH_RW_TYPE_WRITE de kern_synch.c).
++pub const TIPO_LECTURA: u32 = 0x01;
++pub const TIPO_ESCRITURA: u32 = 0x04;
++const PTH_RW_TYPE_MASK: u32 = 0xff;
++const PTH_RWSHFT_TYPE_READ: u32 = 0x0100;
++const PTH_RWSHFT_TYPE_WRITE: u32 = 0x0400;
++const PTH_RWSHFT_TYPE_MASK: u32 = 0xff00;
++
++// synch_internal.h
++const PTHRW_COUNT_SHIFT: u32 = 8;
++pub const PTHRW_INC: u32 = 1 << PTHRW_COUNT_SHIFT;
++const PTHRW_BIT_MASK: u32 = (1 << PTHRW_COUNT_SHIFT) - 1;
++pub const PTHRW_COUNT_MASK: u32 = !PTHRW_BIT_MASK;
++const PTHRW_MAX_READERS: u32 = PTHRW_COUNT_MASK;
++// palabra L
++pub const PTH_RWL_KBIT: u32 = 0x01;
++pub const PTH_RWL_EBIT: u32 = 0x02;
++pub const PTH_RWL_WBIT: u32 = 0x04;
++pub const PTH_RWL_MBIT: u32 = 0x40;
++pub const PTH_RWL_IBIT: u32 = 0x80;
++const PTHRW_RWL_INIT: u32 = PTH_RWL_IBIT;
++// palabra S
++const PTH_RWS_SBIT: u32 = 0x01;
++const PTH_RWS_WSVBIT: u32 = 0x04;
++const PTHRW_RWS_SAVEMASK: u32 = PTH_RWS_WSVBIT;
++const PTHRW_RWS_INIT: u32 = PTH_RWS_SBIT;
++/// rw_flags: cerrojo compartido entre procesos
++pub const PTHREAD_PROCESS_SHARED: u32 = 0x10;
++const PTHREAD_PSHARED_FLAGS_MASK: u32 = 0x30;
++
++// kern_synch.c
++const KSYN_KWF_INITCLEARED: u16 = 0x1;
++const KSYN_KWF_OVERLAP_GUARD: u16 = 0x8;
++const KSYN_CLEANUP_DEADLINE: u64 = 10;
++const KW_UNLOCK_PREPOST: u32 = 0x01;
++const KW_UNLOCK_PREPOST_READLOCK: u32 = 0x08;
++const KW_UNLOCK_PREPOST_WRLOCK: u32 = 0x20;
++const KSYN_QUEUE_READ: usize = 0;
++const KSYN_QUEUE_WRITE: usize = 1;
++const KWQ_INTR_NONE: u32 = 0;
++const KWQ_INTR_READ: u32 = 0x1;
++const KWQ_INTR_WRITE: u32 = 0x2;
++
++// errno de Darwin (los mismos números que en Linux para estos)
++pub const ESRCH: i32 = 3;
++pub const ENOMEM: i32 = 12;
++pub const EBUSY: i32 = 16;
++pub const EINVAL: i32 = 22;
++
++/// Colas por proceso y hilos que caben en cada cola. En XNU son dinámicas; aquí, sin memoria dinámica, fijas: una cola
++/// solo existe mientras hay contención (o un prepost pendiente) y cada hilo espera en una sola a la vez.
++const KWQS: usize = 256;
++const COLA: usize = 64;
++
++// ---- comparación de secuencias (synch_internal.h): circulares, módulo 2^32, solo la parte de contador ----
++
++pub fn is_seqlower(x: u32, y: u32) -> bool {
++    let (x, y) = (x & PTHRW_COUNT_MASK, y & PTHRW_COUNT_MASK);
++    if x < y {
++        (y - x) < (PTHRW_MAX_READERS / 2)
++    } else {
++        (x - y) > (PTHRW_MAX_READERS / 2)
++    }
++}
++pub fn is_seqlower_eq(x: u32, y: u32) -> bool {
++    (x & PTHRW_COUNT_MASK) == (y & PTHRW_COUNT_MASK) || is_seqlower(x, y)
++}
++pub fn is_seqhigher(x: u32, y: u32) -> bool {
++    let (x, y) = (x & PTHRW_COUNT_MASK, y & PTHRW_COUNT_MASK);
++    if x > y {
++        (x - y) < (PTHRW_MAX_READERS / 2)
++    } else {
++        (y - x) > (PTHRW_MAX_READERS / 2)
++    }
++}
++pub fn is_seqhigher_eq(x: u32, y: u32) -> bool {
++    (x & PTHRW_COUNT_MASK) == (y & PTHRW_COUNT_MASK) || is_seqhigher(x, y)
++}
++fn diff_genseq(x: u32, y: u32) -> u32 {
++    let (x, y) = (x & PTHRW_COUNT_MASK, y & PTHRW_COUNT_MASK);
++    if x == y {
++        0
++    } else if x > y {
++        x - y
++    } else {
++        (PTHRW_MAX_READERS - y).wrapping_add(x).wrapping_add(PTHRW_INC)
++    }
++}
++/// Cuántos incrementos hay entre las dos secuencias (L - U: cuántos esperan o tienen el cerrojo).
++pub fn find_diff(upto: u32, lowest: u32) -> u32 {
++    if upto == lowest {
++        return 0;
++    }
++    let diff = if is_seqlower(upto, lowest) { diff_genseq(lowest, upto) } else { diff_genseq(upto, lowest) };
++    diff >> PTHRW_COUNT_SHIFT
++}
++fn is_rwl_wbit_set(x: u32) -> bool {
++    x & PTH_RWL_WBIT != 0
++}
++fn is_rws_sbit_set(x: u32) -> bool {
++    x & PTH_RWS_SBIT != 0
++}
++fn is_rws_savemask_set(x: u32) -> bool {
++    x & PTHRW_RWS_SAVEMASK != 0
++}
++
++/// Un hilo que espera (ksyn_waitq_element): su secuencia y el identificador que le da el C para despertarlo.
++#[derive(Clone, Copy)]
++struct Elem {
++    seq: u32,
++    espera: u64,
++}
++const ELEM0: Elem = Elem { seq: 0, espera: 0 };
++
++/// ksyn_queue: los que esperan, ordenados por secuencia (SEQFIT), y la primera y la última.
++#[derive(Clone, Copy)]
++struct Cola {
++    el: [Elem; COLA],
++    count: u32,
++    firstnum: u32,
++    lastnum: u32,
++}
++const COLA0: Cola = Cola { el: [ELEM0; COLA], count: 0, firstnum: 0, lastnum: 0 };
++
++impl Cola {
++    fn items(&self) -> &[Elem] {
++        &self.el[..self.count as usize]
++    }
++    fn meter(&mut self, i: usize, e: Elem) {
++        let n = self.count as usize;
++        self.el.copy_within(i..n, i + 1);
++        self.el[i] = e;
++    }
++}
++
++/// ksyn_wait_queue de un rwlock.
++#[derive(Clone, Copy)]
++struct Kwq {
++    addr: u64,
++    en_hash: bool,  // KSYN_WQ_INHASH: la ranura está en uso para addr
++    en_libre: bool, // KSYN_WQ_FLIST: sin usuarios, pendiente de liberar
++    sello: u64,     // kw_stamp: cuándo entró en la lista de libres (s)
++    iocount: u32,
++    tipo: u16, // kw_type: 0 = por inicializar
++    kflags: u16,
++    inqueue: u32,
++    highseq: u32,
++    lowseq: u32,
++    lword: u32,
++    uword: u32,
++    sword: u32,
++    lastunlockseq: u32,
++    lastseqword: u32,
++    nextseqword: u32,
++    pp_count: u32, // kw_prepost
++    pp_lseq: u32,
++    pp_sseq: u32,
++    in_type: u32, // kw_intr
++    in_count: u32,
++    in_seq: u32,
++    in_returnbits: u32,
++    colas: [Cola; 2],
++}
++const KWQ0: Kwq = Kwq {
++    addr: 0,
++    en_hash: false,
++    en_libre: false,
++    sello: 0,
++    iocount: 0,
++    tipo: 0,
++    kflags: 0,
++    inqueue: 0,
++    highseq: 0,
++    lowseq: 0,
++    lword: 0,
++    uword: 0,
++    sword: 0,
++    lastunlockseq: 0,
++    lastseqword: 0,
++    nextseqword: 0,
++    pp_count: 0,
++    pp_lseq: 0,
++    pp_sseq: 0,
++    in_type: 0,
++    in_count: 0,
++    in_seq: 0,
++    in_returnbits: 0,
++    colas: [COLA0; 2],
++};
++const KSYN_WQTYPE_RWLOCK: u16 = 0x04;
++
++/// Despertar a un hilo que espera: (identificador, valor que devuelve su llamada). false = ya no esperaba
++/// (KERN_NOT_WAITING: en XNU, un hilo interrumpido por una señal).
++pub type Despertar<'a> = &'a mut dyn FnMut(u64, u32) -> bool;
++
++/// Resultado de un bloqueo: concedido con este valor, o el hilo debe esperar (en la ranura dada) hasta que lo despierten.
++#[derive(Debug, PartialEq, Eq)]
++pub enum Bloqueo {
++    Concedido(u32),
++    Espera(usize),
++}
++
++impl Kwq {
++    // _kwq_clear_preposted_wakeup / _kwq_mark_preposted_wakeup
++    fn clear_preposted_wakeup(&mut self) {
++        self.pp_lseq = 0;
++        self.pp_sseq = PTHRW_RWS_INIT;
++        self.pp_count = 0;
++    }
++    fn mark_preposted_wakeup(&mut self, count: u32, lseq: u32, sseq: u32) {
++        self.pp_count = count;
++        self.pp_lseq = lseq;
++        self.pp_sseq = sseq;
++    }
++    // _kwq_clear_interrupted_wakeup / _kwq_mark_interruped_wakeup
++    fn clear_interrupted_wakeup(&mut self) {
++        self.in_type = KWQ_INTR_NONE;
++        self.in_count = 0;
++        self.in_seq = 0;
++        self.in_returnbits = 0;
++    }
++    fn mark_interrupted_wakeup(&mut self, tipo: u32, count: u32, lseq: u32, returnbits: u32) {
++        self.in_count = count;
++        self.in_seq = lseq;
++        self.in_returnbits = returnbits;
++        self.in_type = tipo;
++    }
++    // _kwq_is_used
++    fn is_used(&self) -> bool {
++        self.inqueue != 0 || self.pp_count != 0 || self.in_count != 0
++    }
++    // CLEAR_REINIT_BITS (rama de rwlock)
++    fn clear_reinit_bits(&mut self) {
++        if self.tipo == KSYN_WQTYPE_RWLOCK {
++            self.nextseqword = PTHRW_RWS_INIT;
++            self.kflags &= !KSYN_KWF_OVERLAP_GUARD;
++        }
++        self.clear_preposted_wakeup();
++        self.lastunlockseq = PTHRW_RWL_INIT;
++        self.lastseqword = PTHRW_RWS_INIT;
++        self.clear_interrupted_wakeup();
++        self.lword = 0;
++        self.uword = 0;
++        self.sword = PTHRW_RWS_INIT;
++    }
++    // _ksyn_check_init
++    fn check_init(&mut self, lgenval: u32) -> bool {
++        let res = lgenval & PTHRW_RWL_INIT != 0;
++        if res && self.kflags & KSYN_KWF_INITCLEARED == 0 {
++            // el primero que ve el cerrojo reiniciado borra los preposts
++            self.clear_reinit_bits();
++            self.kflags |= KSYN_KWF_INITCLEARED;
++        }
++        res
++    }
++    // _kwq_handle_interrupted_wakeup. Como en XNU, se compara el tipo de cerrojo (1 lectura, 4 escritura) con el tipo
++    // de interrupción (1 lectura, 2 escritura): para escritores nunca coincide.
++    fn handle_interrupted_wakeup(&mut self, tipo: u32, lseq: u32) -> Option<u32> {
++        if self.in_count != 0 && self.in_type == tipo && (self.in_seq == 0 || is_seqlower_eq(lseq, self.in_seq)) {
++            self.in_count -= 1;
++            let r = self.in_returnbits;
++            if self.in_returnbits == 0 {
++                self.clear_interrupted_wakeup();
++            }
++            return Some(r);
++        }
++        None
++    }
++    // _kwq_handle_overlap: un lector que llega mientras otros lectores tienen el cerrojo y no hay escritores entra ya.
++    fn handle_overlap(&mut self, tipo: u32, lgenval: u32, rw_wc: u32) -> Option<u32> {
++        if tipo != TIPO_LECTURA {
++            return None;
++        }
++        if self.kflags & KSYN_KWF_OVERLAP_GUARD != 0 && !is_rws_savemask_set(rw_wc) && !is_rwl_wbit_set(lgenval) {
++            if is_seqlower_eq(rw_wc, self.nextseqword) || is_seqhigher_eq(self.lastseqword, rw_wc) {
++                self.nextseqword = self.nextseqword.wrapping_add(PTHRW_INC);
++                return Some(PTHRW_INC | (self.nextseqword & PTHRW_BIT_MASK) | PTH_RWL_MBIT);
++            }
++        }
++        None
++    }
++    // _kwq_handle_preposted_wakeup: el desbloqueo llegó antes que este hilo; si es el último que faltaba, se reparte.
++    fn handle_preposted_wakeup(&mut self, tipo_pp: u32, lseq: u32, despertar: Despertar) -> Option<u32> {
++        if self.pp_count == 0 || !is_seqlower_eq(lseq, self.pp_lseq) {
++            return None;
++        }
++        self.pp_count -= 1;
++        if self.pp_count > 0 {
++            return None;
++        }
++        let (pp_lseq, pp_sseq) = (self.pp_lseq, self.pp_sseq);
++        self.clear_preposted_wakeup();
++        self.kflags &= !KSYN_KWF_INITCLEARED;
++        let (updatebits, block) = self.handle_unlock(pp_lseq, pp_sseq, tipo_pp | KW_UNLOCK_PREPOST, lseq, despertar);
++        if block {
++            return None;
++        }
++        Some(updatebits)
++    }
++
++    // update_low_high / find_nextlowseq / find_nexthighseq
++    fn update_low_high(&mut self, lockseq: u32) {
++        if self.inqueue == 1 {
++            self.lowseq = lockseq;
++            self.highseq = lockseq;
++        } else {
++            if is_seqlower(lockseq, self.lowseq) {
++                self.lowseq = lockseq;
++            }
++            if is_seqhigher(lockseq, self.highseq) {
++                self.highseq = lockseq;
++            }
++        }
++    }
++    fn find_nextlowseq(&self) -> u32 {
++        let mut lowest = 0;
++        let mut first = true;
++        for q in &self.colas {
++            if q.count > 0 && (first || is_seqlower(q.firstnum, lowest)) {
++                lowest = q.firstnum;
++                first = false;
++            }
++        }
++        lowest
++    }
++    fn find_nexthighseq(&self) -> u32 {
++        let mut highest = 0;
++        let mut first = true;
++        for q in &self.colas {
++            if q.count > 0 && (first || is_seqhigher(q.lastnum, highest)) {
++                highest = q.lastnum;
++                first = false;
++            }
++        }
++        highest
++    }
++
++    // ksyn_queue_insert con SEQFIT (los rwlocks siempre insertan por secuencia)
++    fn queue_insert(&mut self, kqi: usize, e: Elem) -> Result<(), i32> {
++        let lockseq = e.seq;
++        let kq = &mut self.colas[kqi];
++        if kq.count as usize >= COLA {
++            return Err(ENOMEM);
++        }
++        if kq.count == 0 {
++            kq.meter(0, e);
++            kq.firstnum = lockseq;
++            kq.lastnum = lockseq;
++        } else if lockseq == kq.firstnum || lockseq == kq.lastnum {
++            // dos con la misma secuencia: en XNU solo se admite para un prepost de un hilo cancelado, que aquí no hay
++            return Err(EBUSY);
++        } else if is_seqlower(kq.lastnum, lockseq) {
++            kq.meter(kq.count as usize, e);
++            kq.lastnum = lockseq;
++        } else if is_seqlower(lockseq, kq.firstnum) {
++            kq.meter(0, e);
++            kq.firstnum = lockseq;
++        } else {
++            match kq.items().iter().position(|q| is_seqhigher(q.seq, lockseq)) {
++                Some(i) => kq.meter(i, e),
++                None => return Err(ESRCH),
++            }
++        }
++        kq.count += 1;
++        self.inqueue += 1;
++        self.update_low_high(lockseq);
++        Ok(())
++    }
++    // ksyn_queue_remove_item (del elemento i de la cola kqi)
++    fn queue_remove_item(&mut self, kqi: usize, i: usize) -> Elem {
++        let kq = &mut self.colas[kqi];
++        let n = kq.count as usize;
++        let e = kq.el[i];
++        kq.el.copy_within(i + 1..n, i);
++        kq.count -= 1;
++        if kq.count > 0 {
++            kq.firstnum = kq.el[0].seq;
++            kq.lastnum = kq.el[kq.count as usize - 1].seq;
++        } else {
++            kq.firstnum = 0;
++            kq.lastnum = 0;
++        }
++        self.inqueue -= 1;
++        if self.inqueue > 0 {
++            if self.lowseq == e.seq {
++                self.lowseq = self.find_nextlowseq();
++            }
++            if self.highseq == e.seq {
++                self.highseq = self.find_nexthighseq();
++            }
++        } else {
++            self.lowseq = 0;
++            self.highseq = 0;
++        }
++        e
++    }
++    // ksyn_queue_count_tolowest: cuántos esperan en la cola con secuencia hasta upto (incluida)
++    fn queue_count_tolowest(&self, kqi: usize, upto: u32) -> u32 {
++        let kq = &self.colas[kqi];
++        if kq.count == 0 || is_seqhigher(kq.firstnum, upto) {
++            return 0;
++        }
++        if upto == kq.firstnum {
++            return 1;
++        }
++        let mut i = 0;
++        for e in kq.items() {
++            if is_seqhigher(e.seq, upto) {
++                break;
++            }
++            i += 1;
++            if upto == e.seq {
++                break;
++            }
++        }
++        i
++    }
++    // find_seq_till: ¿están ya en las colas los nwaiters hilos hasta upto? (y cuántos hay)
++    fn find_seq_till(&self, upto: u32, nwaiters: u32) -> (bool, u32) {
++        let mut count = 0;
++        for kqi in 0..2 {
++            count += self.queue_count_tolowest(kqi, upto);
++            if count >= nwaiters {
++                break;
++            }
++        }
++        (count != 0 && count >= nwaiters, count)
++    }
++    // ksyn_signal con kwe = NULL: despierta al primero de la cola
++    fn signal_first(&mut self, kqi: usize, updateval: u32, despertar: Despertar) -> bool {
++        // XNU entra en pánico si la cola está vacía; aquí no se llega con ella vacía (los llamantes miran count)
++        let e = self.queue_remove_item(kqi, 0);
++        despertar(e.espera, updateval)
++    }
++
++    // kwq_find_rw_lowest: de qué tipo es la secuencia más baja que espera (contando la del hilo del prepost, premgen)
++    fn find_rw_lowest(&self, flags: u32, premgen: u32) -> (u32, [u32; 2]) {
++        let mut tipo = 0;
++        let mut lowest = [0u32; 2];
++        let mut numbers = [0u32; 2];
++        let mut typenum = [0u32; 2];
++        let mut count = 0;
++        let r = &self.colas[KSYN_QUEUE_READ];
++        if r.count != 0 || flags & KW_UNLOCK_PREPOST_READLOCK != 0 {
++            tipo |= PTH_RWSHFT_TYPE_READ;
++            let mut kw_fr = premgen;
++            if r.count != 0 {
++                kw_fr = r.firstnum;
++                if flags & KW_UNLOCK_PREPOST_READLOCK != 0 && is_seqlower(premgen, kw_fr) {
++                    kw_fr = premgen;
++                }
++            }
++            lowest[KSYN_QUEUE_READ] = kw_fr;
++            numbers[count] = kw_fr;
++            typenum[count] = TIPO_LECTURA;
++            count += 1;
++        }
++        let w = &self.colas[KSYN_QUEUE_WRITE];
++        if w.count != 0 || flags & KW_UNLOCK_PREPOST_WRLOCK != 0 {
++            tipo |= PTH_RWSHFT_TYPE_WRITE;
++            let mut kw_fwr = premgen;
++            if w.count != 0 {
++                kw_fwr = w.firstnum;
++                if flags & KW_UNLOCK_PREPOST_WRLOCK != 0 && is_seqlower(premgen, kw_fwr) {
++                    kw_fwr = premgen;
++                }
++            }
++            lowest[KSYN_QUEUE_WRITE] = kw_fwr;
++            numbers[count] = kw_fwr;
++            typenum[count] = TIPO_ESCRITURA;
++            count += 1;
++        }
++        let mut low = numbers[0];
++        let mut lowtype = typenum[0];
++        for i in 1..count {
++            if is_seqlower(numbers[i], low) {
++                low = numbers[i];
++                lowtype = typenum[i];
++            }
++        }
++        (tipo | lowtype, lowest)
++    }
++
++    // ksyn_wakeupreaders: despierta lectores hasta el primer escritor (o todos). Devuelve (fallidos, despertados).
++    fn wakeupreaders(&mut self, limitread: u32, allreaders: bool, updatebits: u32, despertar: Despertar) -> u32 {
++        let mut failed = 0;
++        while self.colas[KSYN_QUEUE_READ].count != 0
++            && (allreaders || is_seqlower(self.colas[KSYN_QUEUE_READ].firstnum, limitread))
++        {
++            if !self.signal_first(KSYN_QUEUE_READ, updatebits, despertar) {
++                failed += 1;
++            }
++        }
++        failed
++    }
++
++    // kwq_handle_unlock: reparte el cerrojo al siguiente grupo. Devuelve (updatebits, block): block = false si el hilo
++    // del prepost (premgen) se lo queda y no tiene que dormir.
++    fn handle_unlock(&mut self, _mgen: u32, rw_wc: u32, flags: u32, premgen: u32, despertar: Despertar) -> (u32, bool) {
++        let mut block = true;
++        self.lastseqword = rw_wc;
++        self.lastunlockseq = rw_wc & PTHRW_COUNT_MASK;
++        self.kflags &= !KSYN_KWF_OVERLAP_GUARD;
++
++        let (rwtype, lowest) = self.find_rw_lowest(flags, premgen);
++        let low_writer = lowest[KSYN_QUEUE_WRITE];
++        let mut updatebits: u32 = 0;
++
++        match rwtype & PTH_RW_TYPE_MASK {
++            TIPO_LECTURA => {
++                if rwtype & PTH_RWSHFT_TYPE_MASK != 0 && rwtype & PTH_RWSHFT_TYPE_WRITE != 0 {
++                    updatebits |= PTH_RWL_WBIT | PTH_RWL_KBIT;
++                }
++                let mut limitrdnum = 0;
++                let mut allreaders = false;
++                let mut numneeded: u32 = 0;
++                let mut curthreturns = false;
++                if rwtype & PTH_RWSHFT_TYPE_WRITE != 0 {
++                    limitrdnum = low_writer;
++                    numneeded = self.queue_count_tolowest(KSYN_QUEUE_READ, limitrdnum);
++                    if flags & KW_UNLOCK_PREPOST_READLOCK != 0 && is_seqlower(premgen, limitrdnum) {
++                        curthreturns = true;
++                        numneeded += 1;
++                    }
++                } else {
++                    // sin escritores: solo lectores, entran todos y los que lleguen después se solapan
++                    allreaders = true;
++                    self.kflags |= KSYN_KWF_OVERLAP_GUARD;
++                    numneeded += self.colas[KSYN_QUEUE_READ].count;
++                    if flags & KW_UNLOCK_PREPOST_READLOCK != 0 {
++                        curthreturns = true;
++                        numneeded += 1;
++                    }
++                }
++                updatebits = updatebits.wrapping_add(numneeded << PTHRW_COUNT_SHIFT);
++                self.nextseqword = (rw_wc & PTHRW_COUNT_MASK).wrapping_add(updatebits);
++                if curthreturns {
++                    block = false;
++                }
++                let nfailed = self.wakeupreaders(limitrdnum, allreaders, updatebits, despertar);
++                if nfailed != 0 {
++                    self.mark_interrupted_wakeup(KWQ_INTR_READ, nfailed, limitrdnum, updatebits);
++                }
++                // XNU: panic("writer pending but no writebit set") si quedan escritores sin W; no puede pasar
++                debug_assert!(self.colas[KSYN_QUEUE_WRITE].count == 0 || updatebits & PTH_RWL_WBIT != 0);
++            }
++            TIPO_ESCRITURA => {
++                // solo entra un hilo
++                updatebits |= PTHRW_INC | PTH_RWL_KBIT | PTH_RWL_EBIT;
++                if flags & KW_UNLOCK_PREPOST_WRLOCK != 0 && low_writer == premgen {
++                    block = false;
++                    if self.colas[KSYN_QUEUE_WRITE].count != 0 {
++                        updatebits |= PTH_RWL_WBIT;
++                    }
++                } else {
++                    // no se le da al hilo del prepost: si quedan escritores (o él mismo espera), bit W
++                    if self.colas[KSYN_QUEUE_WRITE].count > 1 || flags & KW_UNLOCK_PREPOST_WRLOCK != 0 {
++                        updatebits |= PTH_RWL_WBIT;
++                    }
++                    if !self.signal_first(KSYN_QUEUE_WRITE, updatebits, despertar) {
++                        self.mark_interrupted_wakeup(KWQ_INTR_WRITE, 1, low_writer, updatebits);
++                    }
++                }
++                self.nextseqword = (rw_wc & PTHRW_COUNT_MASK).wrapping_add(updatebits);
++            }
++            // XNU: panic("rwunlock: invalid type for lock grants"); find_rw_lowest siempre da un tipo cuando se llama
++            _ => {}
++        }
++        (updatebits, block)
++    }
++}
++
++/// La tabla de colas de un proceso (en XNU, la tabla hash del proceso más la lista de libres).
++pub struct Tabla {
++    kwqs: [Kwq; KWQS],
++}
++
++impl Tabla {
++    pub const fn nueva() -> Tabla {
++        Tabla { kwqs: [KWQ0; KWQS] }
++    }
++
++    // psynch_wq_cleanup: libera las colas sin usuarios que llevan KSYN_CLEANUP_DEADLINE s en la lista de libres.
++    fn limpiar(&mut self, ahora: u64) {
++        for k in self.kwqs.iter_mut() {
++            if k.en_libre && !k.is_used() && k.iocount == 0 && ahora.abs_diff(k.sello) >= KSYN_CLEANUP_DEADLINE {
++                *k = KWQ0;
++            }
++        }
++    }
++
++    // ksyn_wqfind: la cola de la dirección (creándola si no existe) con una referencia más (iocount).
++    fn wqfind(&mut self, addr: u64, mgen: u32, ugen: u32, sgen: u32, flags: u32, ahora: u64) -> Result<usize, i32> {
++        if flags & PTHREAD_PSHARED_FLAGS_MASK == PTHREAD_PROCESS_SHARED {
++            // compartido entre procesos: XNU lo busca por objeto de memoria; aquí la tabla es del proceso (ver arriba)
++        }
++        self.limpiar(ahora);
++        let i = match self.kwqs.iter().position(|k| k.en_hash && k.addr == addr) {
++            Some(i) => {
++                self.kwqs[i].en_libre = false;
++                i
++            }
++            None => {
++                let i = self.kwqs.iter().position(|k| !k.en_hash).ok_or(ENOMEM)?;
++                self.kwqs[i] = KWQ0; // zalloc(Z_ZERO)
++                self.kwqs[i].en_hash = true;
++                self.kwqs[i].addr = addr;
++                i
++            }
++        };
++        let k = &mut self.kwqs[i];
++        if k.tipo == 0 {
++            k.tipo = KSYN_WQTYPE_RWLOCK;
++            k.clear_reinit_bits();
++            k.lword = mgen;
++            k.uword = ugen;
++            k.sword = sgen;
++            k.kflags = 0;
++        }
++        k.iocount += 1;
++        Ok(i)
++    }
++
++    /// ksyn_wqrelease (qfreenow = 0): suelta la referencia; sin usuarios, la cola pasa a la lista de libres.
++    pub fn wqrelease(&mut self, i: usize, ahora: u64) {
++        let k = &mut self.kwqs[i];
++        k.iocount -= 1;
++        if k.iocount == 0 && !k.is_used() {
++            k.sello = ahora;
++            k.en_libre = true;
++        }
++    }
++
++    /// __psynch_rw_lock: Concedido(valor) si el hilo vuelve ya; Espera(ranura) si debe dormir hasta que `despertar` lo
++    /// llame con su identificador `espera` (después, el C llama a `wqrelease(ranura)`, como psynch_rw_*continue).
++    pub fn lock(
++        &mut self,
++        tipo: u32,
++        addr: u64,
++        lgenval: u32,
++        ugenval: u32,
++        rw_wc: u32,
++        flags: u32,
++        espera: u64,
++        ahora: u64,
++        despertar: Despertar,
++    ) -> Result<Bloqueo, i32> {
++        let lockseq = lgenval & PTHRW_COUNT_MASK;
++        let (prepost_type, kqi) = if tipo == TIPO_LECTURA {
++            (KW_UNLOCK_PREPOST_READLOCK, KSYN_QUEUE_READ)
++        } else {
++            (KW_UNLOCK_PREPOST_WRLOCK, KSYN_QUEUE_WRITE)
++        };
++        let i = self.wqfind(addr, lgenval, ugenval, rw_wc, flags, ahora)?;
++        let k = &mut self.kwqs[i];
++        k.check_init(lgenval);
++        let pronto = k
++            .handle_interrupted_wakeup(tipo, lockseq)
++            // los solapes van antes porque no cuentan para los preposts; usan los bits de lgenval
++            .or_else(|| k.handle_overlap(tipo, lgenval, rw_wc))
++            .or_else(|| k.handle_preposted_wakeup(prepost_type, lockseq, despertar));
++        if let Some(v) = pronto {
++            self.wqrelease(i, ahora);
++            return Ok(Bloqueo::Concedido(v));
++        }
++        // ksyn_wait
++        match k.queue_insert(kqi, Elem { seq: lockseq, espera }) {
++            Ok(()) => Ok(Bloqueo::Espera(i)),
++            Err(e) => {
++                self.wqrelease(i, ahora);
++                Err(e)
++            }
++        }
++    }
++
++    /// _psynch_rw_unlock: el valor que devuelve la llamada (los hilos a los que les toca se despiertan con `despertar`).
++    pub fn unlock(
++        &mut self,
++        addr: u64,
++        lgenval: u32,
++        ugenval: u32,
++        rw_wc: u32,
++        flags: u32,
++        ahora: u64,
++        despertar: Despertar,
++    ) -> Result<u32, i32> {
++        let curgen = lgenval & PTHRW_COUNT_MASK;
++        let i = self.wqfind(addr, lgenval, ugenval, rw_wc, flags, ahora)?;
++        let k = &mut self.kwqs[i];
++        let mut updatebits = 0;
++        let mut clearedkflags = false;
++        let isinit = k.check_init(lgenval);
++
++        // un desbloqueo con secuencia más baja que el último es espurio
++        if !(k.lastunlockseq != PTHRW_RWL_INIT && is_seqlower(ugenval, k.lastunlockseq)) {
++            // si L - U no es el número de los que esperan, falta gente por llegar: prepost
++            let diff = find_diff(lgenval, ugenval);
++            let (todos, count) = k.find_seq_till(curgen, diff);
++            if !todos && (count == 0 || count < diff) {
++                // prepost: se guarda si la secuencia es más alta que la del anterior, o si es el primero
++                if is_rws_sbit_set(k.pp_sseq) || is_seqhigher_eq(rw_wc, k.pp_sseq) {
++                    k.mark_preposted_wakeup(diff - count, curgen, rw_wc);
++                    updatebits = lgenval; // que libpthread no haga nada con esto
++                }
++            } else {
++                // están todos: se quita el bit de reinicio y se reparte ya
++                if isinit && k.kflags & KSYN_KWF_INITCLEARED != 0 {
++                    k.kflags &= !KSYN_KWF_INITCLEARED;
++                    clearedkflags = true;
++                }
++                k.clear_preposted_wakeup();
++                updatebits = k.handle_unlock(lgenval, rw_wc, 0, 0, despertar).0;
++            }
++        }
++        // rdar://22244050: si algún despertar falló (el hilo ya volvió por una señal), el reinicio no se borra todavía
++        if clearedkflags && k.in_count > 0 {
++            k.kflags |= KSYN_KWF_INITCLEARED;
++        }
++        self.wqrelease(i, ahora);
++        Ok(updatebits)
++    }
++}
++
++// ---- interfaz con C (emu_psynch.c), que llama siempre con su candado tomado ----
++
++static mut TABLA: Tabla = Tabla::nueva();
++
++/// Despertar del C: (contexto, identificador del que espera, valor) -> 1 si esperaba.
++pub type DespertarC = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, espera: u64, valor: u32) -> i32;
++
++/// psynch_rw_rdlock / psynch_rw_wrlock. Devuelve 0 y *valor si se concede ya; 1 y *ranura si hay que esperar a que
++/// `despertar` llame con `espera` (y luego `nucleo_rw_fin_espera(ranura)`); o un errno.
++///
++/// # Safety
++/// Llamar con el candado de emu_psynch.c tomado; `valor` y `ranura` válidos.
++#[no_mangle]
++pub unsafe extern "C" fn nucleo_rw_lock(
++    tipo: u32,
++    addr: u64,
++    l: u32,
++    u: u32,
++    s: u32,
++    flags: u32,
++    espera: u64,
++    ahora: u64,
++    despertar: DespertarC,
++    ctx: *mut core::ffi::c_void,
++    valor: *mut u32,
++    ranura: *mut u32,
++) -> i32 {
++    // SAFETY: el candado del C serializa todo acceso a TABLA.
++    let t = unsafe { &mut *core::ptr::addr_of_mut!(TABLA) };
++    let mut d = |e: u64, v: u32| unsafe { despertar(ctx, e, v) != 0 };
++    match t.lock(tipo, addr, l, u, s, flags, espera, ahora, &mut d) {
++        Ok(Bloqueo::Concedido(v)) => {
++            unsafe { *valor = v };
++            0
++        }
++        Ok(Bloqueo::Espera(i)) => {
++            unsafe { *ranura = i as u32 };
++            1
++        }
++        Err(e) => e,
++    }
++}
++
++/// El hilo que esperaba ya fue despertado: suelta su referencia (psynch_rw_rdcontinue / wrcontinue).
++///
++/// # Safety
++/// Llamar con el candado de emu_psynch.c tomado y una ranura devuelta por nucleo_rw_lock.
++#[no_mangle]
++pub unsafe extern "C" fn nucleo_rw_fin_espera(ranura: u32, ahora: u64) {
++    let t = unsafe { &mut *core::ptr::addr_of_mut!(TABLA) };
++    if (ranura as usize) < KWQS {
++        t.wqrelease(ranura as usize, ahora);
++    }
++}
++
++/// psynch_rw_unlock: 0 y *valor, o un errno.
++///
++/// # Safety
++/// Llamar con el candado de emu_psynch.c tomado; `valor` válido.
++#[no_mangle]
++pub unsafe extern "C" fn nucleo_rw_unlock(
++    addr: u64,
++    l: u32,
++    u: u32,
++    s: u32,
++    flags: u32,
++    ahora: u64,
++    despertar: DespertarC,
++    ctx: *mut core::ffi::c_void,
++    valor: *mut u32,
++) -> i32 {
++    let t = unsafe { &mut *core::ptr::addr_of_mut!(TABLA) };
++    let mut d = |e: u64, v: u32| unsafe { despertar(ctx, e, v) != 0 };
++    match t.unlock(addr, l, u, s, flags, ahora, &mut d) {
++        Ok(v) => {
++            unsafe { *valor = v };
++            0
++        }
++        Err(e) => e,
++    }
++}
++
++#[cfg(test)]
++mod pruebas {
++    use super::*;
++    extern crate std;
++    use std::boxed::Box;
++    use std::vec::Vec;
++
++    const A: u64 = 0x7000_1000;
++    const KE: u32 = PTH_RWL_KBIT | PTH_RWL_EBIT;
++    // Como en libpthread, el desbloqueo entra en el núcleo cuando U == S, y S lleva el bit I (0x2) en ese momento.
++
++    fn tabla() -> Box<Tabla> {
++        Box::new(Tabla::nueva())
++    }
++    /// Ejecuta con un despertar que apunta a quién se despierta y con qué valor.
++    fn con<R>(f: impl FnOnce(Despertar) -> R) -> (R, Vec<(u64, u32)>) {
++        let mut v = Vec::new();
++        let mut d = |e: u64, x: u32| {
++            v.push((e, x));
++            true
++        };
++        let r = f(&mut d);
++        (r, v)
++    }
++
++    #[test]
++    fn secuencias_circulares() {
++        assert!(is_seqlower(0x100, 0x200));
++        assert!(!is_seqlower(0x200, 0x100));
++        assert!(is_seqlower(0xffff_ff00, 0x100)); // da la vuelta
++        assert!(is_seqhigher(0x100, 0xffff_ff00));
++        assert!(is_seqlower_eq(0x1ff, 0x100)); // los bits bajos no cuentan
++        assert_eq!(find_diff(0x300, 0x100), 2);
++        assert_eq!(find_diff(0x100, 0xffff_ff00), 2);
++        assert_eq!(find_diff(0x100, 0x100), 0);
++    }
++
++    #[test]
++    fn escritor_espera_y_el_desbloqueo_se_lo_da() {
++        let mut t = tabla();
++        // un escritor tiene el cerrojo (L=0x100); otro escritor llega con L=0x200
++        let (r, w) = con(|d| t.lock(TIPO_ESCRITURA, A, 0x200 | KE | PTH_RWL_WBIT, 0, 0x100, 0, 7, 0, d));
++        assert_eq!(r, Ok(Bloqueo::Espera(0)));
++        assert!(w.is_empty());
++        // el dueño suelta: L=0x200, U=0x100 -> falta uno, que ya está en la cola
++        let (r, w) = con(|d| t.unlock(A, 0x200 | KE | PTH_RWL_WBIT, 0x100, 0x102, 0, 0, d));
++        assert_eq!(r, Ok(PTHRW_INC | KE));
++        assert_eq!(w, [(7, PTHRW_INC | KE)]);
++        t.wqrelease(0, 0);
++        assert_eq!(t.kwqs[0].iocount, 0);
++        assert!(t.kwqs[0].en_libre);
++    }
++
++    #[test]
++    fn desbloqueo_antes_que_el_escritor_prepost() {
++        let mut t = tabla();
++        // el desbloqueo llega primero: nadie en la cola -> prepost de 1, devuelve L
++        let (r, w) = con(|d| t.unlock(A, 0x200 | KE, 0x100, 0x102, 0, 0, d));
++        assert_eq!(r, Ok(0x200 | KE));
++        assert!(w.is_empty());
++        assert_eq!(t.kwqs[0].pp_count, 1);
++        // llega el escritor: se lo queda sin dormir
++        let (r, _) = con(|d| t.lock(TIPO_ESCRITURA, A, 0x200 | KE, 0, 0x100, 0, 7, 0, d));
++        assert_eq!(r, Ok(Bloqueo::Concedido(PTHRW_INC | KE)));
++        assert!(!t.kwqs[0].is_used());
++    }
++
++    #[test]
++    fn lectores_sin_escritores_entran_todos_y_se_solapan() {
++        let mut t = tabla();
++        let w0 = PTH_RWL_WBIT | KE;
++        assert_eq!(con(|d| t.lock(TIPO_LECTURA, A, 0x200 | w0, 0, 0x100, 0, 1, 0, d)).0, Ok(Bloqueo::Espera(0)));
++        assert_eq!(con(|d| t.lock(TIPO_LECTURA, A, 0x300 | w0, 0, 0x100, 0, 2, 0, d)).0, Ok(Bloqueo::Espera(0)));
++        let (r, w) = con(|d| t.unlock(A, 0x300 | w0, 0x100, 0x106, 0, 0, d));
++        assert_eq!(r, Ok(0x200));
++        assert_eq!(w, [(1, 0x200), (2, 0x200)]);
++        t.wqrelease(0, 0);
++        t.wqrelease(0, 0);
++        // otro lector que entró en el núcleo antes de ver el cambio: se solapa (entra ya, con el bit M)
++        let (r, _) = con(|d| t.lock(TIPO_LECTURA, A, 0x400 | KE, 0, 0x100, 0, 3, 0, d));
++        assert_eq!(r, Ok(Bloqueo::Concedido(PTHRW_INC | PTH_RWL_MBIT)));
++    }
++
++    #[test]
++    fn lector_antes_que_escritor_solo_entra_el_lector() {
++        let mut t = tabla();
++        let w0 = PTH_RWL_WBIT | KE;
++        assert_eq!(con(|d| t.lock(TIPO_LECTURA, A, 0x200 | w0, 0, 0x100, 0, 1, 0, d)).0, Ok(Bloqueo::Espera(0)));
++        assert_eq!(con(|d| t.lock(TIPO_ESCRITURA, A, 0x300 | w0, 0, 0x100, 0, 2, 0, d)).0, Ok(Bloqueo::Espera(0)));
++        let (r, w) = con(|d| t.unlock(A, 0x300 | w0, 0x100, 0x106, 0, 0, d));
++        // un lector entra; el escritor sigue esperando (W y K puestos)
++        let v = PTHRW_INC | PTH_RWL_WBIT | PTH_RWL_KBIT;
++        assert_eq!(r, Ok(v));
++        assert_eq!(w, [(1, v)]);
++        assert_eq!(t.kwqs[0].colas[KSYN_QUEUE_WRITE].count, 1);
++        // el lector suelta (L=0x300, U=0x200): ahora le toca al escritor
++        let (r, w) = con(|d| t.unlock(A, 0x300 | w0, 0x200, 0x202, 0, 0, d));
++        assert_eq!(r, Ok(PTHRW_INC | KE));
++        assert_eq!(w, [(2, PTHRW_INC | KE)]);
++    }
++
++    #[test]
++    fn la_cola_se_ordena_por_secuencia() {
++        let mut t = tabla();
++        for (seq, id) in [(0x500, 5), (0x300, 3), (0x400, 4), (0x200, 2)] {
++            let r = con(|d| t.lock(TIPO_ESCRITURA, A, seq | KE, 0, 0x100, 0, id, 0, d)).0;
++            assert_eq!(r, Ok(Bloqueo::Espera(0)));
++        }
++        let q = &t.kwqs[0].colas[KSYN_QUEUE_WRITE];
++        assert_eq!(q.items().iter().map(|e| e.espera).collect::<Vec<_>>(), [2, 3, 4, 5]);
++        assert_eq!((q.firstnum, q.lastnum), (0x200, 0x500));
++        assert_eq!((t.kwqs[0].lowseq, t.kwqs[0].highseq), (0x200, 0x500));
++        // misma secuencia dos veces: EBUSY, como XNU
++        let r = con(|d| t.lock(TIPO_ESCRITURA, A, 0x200 | KE, 0, 0x100, 0, 9, 0, d)).0;
++        assert_eq!(r, Err(EBUSY));
++        // el primero sale con W (quedan más escritores)
++        let (_, w) = con(|d| t.unlock(A, 0x500 | KE, 0x100, 0x102, 0, 0, d));
++        assert_eq!(w, [(2, PTHRW_INC | KE | PTH_RWL_WBIT)]);
++        assert_eq!(t.kwqs[0].lowseq, 0x300);
++    }
++
++    #[test]
++    fn desbloqueo_espurio_se_ignora() {
++        let mut t = tabla();
++        assert!(con(|d| t.lock(TIPO_ESCRITURA, A, 0x300 | KE, 0, 0x100, 0, 1, 0, d)).0.is_ok());
++        assert!(con(|d| t.unlock(A, 0x300 | KE, 0x200, 0x202, 0, 0, d)).0.is_ok()); // lastunlockseq = 0x200
++        let (r, w) = con(|d| t.unlock(A, 0x300 | KE, 0x100, 0x102, 0, 0, d));
++        assert_eq!(r, Ok(0));
++        assert!(w.is_empty());
++    }
++
++    #[test]
++    fn colas_sin_uso_se_liberan_a_los_10_s() {
++        let mut t = tabla();
++        assert!(con(|d| t.unlock(A, 0x100, 0x100, 0x100, 0, 100, d)).0.is_ok()); // diff 0: nadie
++        assert!(t.kwqs[0].en_libre && t.kwqs[0].en_hash);
++        t.limpiar(105);
++        assert!(t.kwqs[0].en_hash); // todavía no
++        t.limpiar(110);
++        assert!(!t.kwqs[0].en_hash);
++        // un prepost pendiente la mantiene viva
++        assert!(con(|d| t.unlock(A, 0x200, 0x100, 0x100, 0, 200, d)).0.is_ok());
++        t.limpiar(1000);
++        assert!(t.kwqs[0].en_hash && t.kwqs[0].pp_count == 1);
++    }
++
++    #[test]
++    fn reinicio_del_cerrojo_borra_preposts() {
++        let mut t = tabla();
++        assert!(con(|d| t.unlock(A, 0x300, 0x100, 0x100, 0, 0, d)).0.is_ok()); // prepost de 2
++        assert_eq!(t.kwqs[0].pp_count, 2);
++        // pthread_rwlock_init otra vez: L lleva el bit I
++        let r = con(|d| t.lock(TIPO_ESCRITURA, A, 0x100 | PTH_RWL_IBIT | KE, 0, 0, 0, 1, 0, d)).0;
++        assert_eq!(r, Ok(Bloqueo::Espera(0)));
++        assert_eq!(t.kwqs[0].pp_count, 0);
++        assert_eq!(t.kwqs[0].kflags & KSYN_KWF_INITCLEARED, KSYN_KWF_INITCLEARED);
++    }
++
++    #[test]
++    fn varias_direcciones_y_tabla_llena() {
++        let mut t = tabla();
++        for k in 0..KWQS as u64 {
++            let r = con(|d| t.lock(TIPO_ESCRITURA, 0x1000 + k * 64, 0x200 | KE, 0, 0x100, 0, k, 0, d)).0;
++            assert_eq!(r, Ok(Bloqueo::Espera(k as usize)));
++        }
++        let r = con(|d| t.lock(TIPO_ESCRITURA, 0x9999_0000, 0x200 | KE, 0, 0x100, 0, 1, 0, d)).0;
++        assert_eq!(r, Err(ENOMEM));
++    }
++}

@@ -1,0 +1,39 @@
+From 01ec72f9df02cb2cb8a73fe9148cd201ea7227d0 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 21:55:29 -0600
+Subject: [PATCH 23/57] =?UTF-8?q?Emulador:=20el=20nombre=20de=20la=20memor?=
+ =?UTF-8?q?ia=20compartida=20no=20se=20sale=20del=20b=C3=BAfer?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_proc.c: snprintf devuelve la longitud que habría escrito, que es
+  mayor que el búfer cuando trunca. El puntero que se calculaba con
+  ese valor quedaba fuera del búfer, y el terminador final se
+  escribía fuera de él. Ahora se comprueba la longitud y se devuelve
+  error si el prefijo no cabe.
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_proc.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/tahoe-run/emu_proc.c b/tahoe-run/emu_proc.c
+index afb7b5f..29cb583 100644
+--- a/tahoe-run/emu_proc.c
++++ b/tahoe-run/emu_proc.c
+@@ -86,7 +86,11 @@ static int shm_host_name(uint64_t addr, char* out, size_t cap) {
+ 	char g[256];
+ 	(void)port_exists(0);                       // fuerza la creación/apertura de la región compartida (fija TAHOE_PORTS_OWNER)
+ 	if (safe_string(addr, g, sizeof g) != 0) return -1;
+-	char* o = out + snprintf(out, cap, "/dev/shm/tahoe.%s.", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
++	// snprintf devuelve la longitud que habría escrito, que es mayor que el búfer si trunca: el puntero quedaría
++	// fuera de él y el terminador se escribiría fuera. Con el prefijo largo se devuelve error antes de eso.
++	int n = snprintf(out, cap, "/dev/shm/tahoe.%s.", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
++	if (n < 0 || n >= (int)cap) return -1;
++	char* o = out + n;
+ 	for (char* s = g; *s && o < out + cap - 1; s++) *o++ = (*s == '/') ? '_' : *s;
+ 	*o = 0;
+ 	return 0;

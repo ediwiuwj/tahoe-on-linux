@@ -1,0 +1,483 @@
+From e959f3a00653a2a4908e90695b1bebae12850f87 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:13:26 -0600
+Subject: [PATCH 24/57] Metal: los shaders del compositor se dibujan con el
+ color correcto
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+El plano del compositor (plane__vertex y plane_color_fragment de RenderBox) ya
+pinta lo que debe. La imagen salía vacía por dos cosas del test y una del
+servidor, no del driver:
+
+- El vertex shader no usa atributos: el quad sale de un buffer de 28 bytes en
+  el índice 0 (RB::Shader::PlaneGlobals: tres float2 y un float) y del vertex_id.
+  El test ligaba 96 bytes de un triángulo y no ligaba el buffer del fragmento.
+- El fragment shader lee 36 bytes del mismo buffer (28 del plano y 8 del color
+  en half) y escribe el color en el attachment 0 y la cobertura en el 1.
+- El tipo de primitiva va en la llamada de dibujo: 4 = tira de triángulos. El
+  runtime solo admite 0..3 en setInputPrimitiveTopology: (lo comprueba el
+  binario de Metal de macOS 26), así que ahí va 3.
+
+driver:
+- El bloque de liberación de newBufferWithBytesNoCopy:… se copia y se llama
+  cuando el buffer muere, como manda el contrato.
+- signalEvent:value: y waitForEvent:value: en el command buffer: sin ellos
+  nadie podía señalar un evento compartido y un cliente que esperara se
+  colgaba.
+- El conjunto de residencia usa addAllocation: (el selector del protocolo;
+  addAllObjects: no existe en macOS 26) y commit.
+- updateFence: y waitForFence: en los encoders.
+- newCommandBuffer reutiliza la cola del dispositivo en vez de crear una por
+  llamada.
+- heapTextureSizeAndAlign… multiplica por el muestreo y alinea la fila.
+- El driver anota el tipo de primitiva de cada dibujo.
+
+servidor:
+- Un recurso que falta ya no tumba el command buffer entero: se salta ese
+  dibujo y se sigue con el resto.
+
+Verificado: `metalprobe plano` da CORRECTO (centro y esquina BGRA
+[64,128,255,255], el color de los globals) y `metalsuite` sigue en 26/26.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-gpu/src/servir.rs           | 36 ++++++++++++--
+ tahoe-metal/src/bin/metalprobe.rs | 83 +++++++++++++++++++++++--------
+ tahoe-metal/src/clases.rs         | 49 +++++++++++++++++-
+ tahoe-metal/src/lib.rs            | 17 ++++++-
+ tahoe-metal/src/render.rs         | 44 ++++++++++------
+ 5 files changed, 186 insertions(+), 43 deletions(-)
+
+diff --git a/tahoe-gpu/src/servir.rs b/tahoe-gpu/src/servir.rs
+index d2cfb01..cbc2f64 100644
+--- a/tahoe-gpu/src/servir.rs
++++ b/tahoe-gpu/src/servir.rs
+@@ -703,19 +703,47 @@ impl Cliente {
+         for d in dibujos {
+             let r = &self.renders[&d.est.pipeline.unwrap()];
+             let p = &r.por_topologia[&formatos::topologia(d.prim).as_raw()];
+-            let rv = self.recursos(&r.v, &d.enl[0], temporales, m)?;
++            // Un recurso que falta no tumba el command buffer entero: se salta ese dibujo y se sigue. Un cliente
++            // real dibuja con lo que tiene ligado, y fallar el pase entero rompe toda la cadena.
++            let rv = match self.recursos(&r.v, &d.enl[0], temporales, m) {
++                Ok(x) => x,
++                Err(e) => {
++                    eprintln!("tahoe-gpu: dibujo saltado (vértices): {e}");
++                    continue;
++                }
++            };
+             let rf = match &r.f {
+-                Some(f) => self.recursos(f, &d.enl[1], temporales, m)?,
++                Some(f) => match self.recursos(f, &d.enl[1], temporales, m) {
++                    Ok(x) => x,
++                    Err(e) => {
++                        eprintln!("tahoe-gpu: dibujo saltado (fragmento): {e}");
++                        continue;
++                    }
++                },
+                 None => HashMap::new(),
+             };
+             let mut vertices = Vec::new();
++            let mut falta = false;
+             for ev in &r.enlaces_vertices {
+                 match d.enl[0].buffers.get(&ev.buffer) {
+-                    Some(Origen::Buffer(b, off)) => vertices.push((ev.buffer, self.buffers.get(b).and_then(|x| x.buf.as_ref()).ok_or("buffer de vértices desconocido")?, *off)),
++                    Some(Origen::Buffer(b, off)) => match self.buffers.get(b).and_then(|x| x.buf.as_ref()) {
++                        Some(buf) => vertices.push((ev.buffer, buf, *off)),
++                        None => {
++                            falta = true;
++                            break;
++                        }
++                    },
+                     Some(Origen::Temporal(k)) => vertices.push((ev.buffer, &temporales[*k], 0)),
+-                    None => return Err(format!("falta el buffer de vértices {}", ev.buffer)),
++                    None => {
++                        falta = true;
++                        break;
++                    }
+                 }
+             }
++            if falta {
++                eprintln!("tahoe-gpu: dibujo saltado: falta el buffer de vértices");
++                continue;
++            }
+             let indices = match d.indices {
+                 Some((b, de32)) => Some((self.buffers.get(&b).and_then(|x| x.buf.as_ref()).ok_or("buffer de índices desconocido")?, 0u64, de32)),
+                 None => None,
+diff --git a/tahoe-metal/src/bin/metalprobe.rs b/tahoe-metal/src/bin/metalprobe.rs
+index 92b60f1..df87dc7 100644
+--- a/tahoe-metal/src/bin/metalprobe.rs
++++ b/tahoe-metal/src/bin/metalprobe.rs
+@@ -176,10 +176,16 @@ fn cadena(d: Id) -> i32 {
+     }
+ }
+ 
+-/// Reproduce lo que hace el compositor: la biblioteca de CoreAnimation, sus shaders de plano (plane__vertex y
+-/// plane_color_fragment) pedidos por descriptor, el pipeline de render, un pase y el commit.
++/// Reproduce lo que hace el compositor: sus shaders de plano (plane__vertex y plane_color_fragment, que en macOS 26
++/// están en RenderBox) y los datos que les pasa: un buffer de «globals» de 36 bytes en el índice 0 y cuatro vértices.
++///
++/// El vertex shader hace pos = x*g0 + y*g1 + g2 (las esquinas del quad salen del vertex_id) y el fragment shader
++/// escribe el color que viene en los globals (28 bytes del plano + 8 del color) en el primer attachment y la
++/// cobertura en el segundo.
+ fn plano(d: Id) -> i32 {
+-    const RUTA: &str = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib";
++    const RUTA: &str = "/System/Library/PrivateFrameworks/RenderBox.framework/Versions/A/Resources/default.metallib";
++    const COLOR: u64 = 80;    // MTLPixelFormatBGRA8Unorm
++    const COVERAGE: u64 = 65; // MTLPixelFormatRG16Float (el shader escribe half2 en el segundo attachment)
+     unsafe {
+         let mut err: Id = std::ptr::null_mut();
+         let lib: Id = objc::m2(d, "newLibraryWithFile:error:", objc::nsstring(RUTA), &mut err as *mut Id);
+@@ -187,7 +193,7 @@ fn plano(d: Id) -> i32 {
+             println!("biblioteca: nil");
+             return 3;
+         }
+-        // La función, por descriptor (como el compositor).
++        // La función, por descriptor (como hace el compositor).
+         let por_descriptor = |lib: Id, nombre: &str| -> Id {
+             let desc: Id = objc::m0(objc::clase("MTLFunctionDescriptor"), "alloc");
+             objc::m1::<Id, ()>(desc, "setName:", objc::nsstring(nombre));
+@@ -195,47 +201,82 @@ fn plano(d: Id) -> i32 {
+         };
+         let vf = por_descriptor(lib, "plane__vertex");
+         let ff = por_descriptor(lib, "plane_color_fragment");
+-        println!("funciones: vertex={} fragment={}", if vf.is_null() { "nil" } else { "ok" }, if ff.is_null() { "nil" } else { "ok" });
+         if vf.is_null() || ff.is_null() {
++            println!("shaders: vertex={} fragment={}", if vf.is_null() { "nil" } else { "ok" }, if ff.is_null() { "nil" } else { "ok" });
+             return 4;
+         }
+-        // El pipeline.
++        // El pipeline: el color y la cobertura, y la topología de tira (el compositor dibuja un quad).
+         let pd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLRenderPipelineDescriptor"), "alloc"), "init");
+         objc::m1::<Id, ()>(pd, "setVertexFunction:", vf);
+         objc::m1::<Id, ()>(pd, "setFragmentFunction:", ff);
+-        let ca0: Id = objc::m1(objc::m0::<Id>(pd, "colorAttachments"), "objectAtIndexedSubscript:", 0u64);
+-        objc::m1::<u64, ()>(ca0, "setPixelFormat:", 80);
++        let cas: Id = objc::m0(pd, "colorAttachments");
++        let c0: Id = objc::m1(cas, "objectAtIndexedSubscript:", 0u64);
++        objc::m1::<u64, ()>(c0, "setPixelFormat:", COLOR);
++        let c1: Id = objc::m1(cas, "objectAtIndexedSubscript:", 1u64);
++        objc::m1::<u64, ()>(c1, "setPixelFormat:", COVERAGE);
++        // El runtime solo admite 0..3 aquí (Metal compara con 4 y falla); el tipo de primitiva va en el dibujo.
++        objc::m1::<u64, ()>(pd, "setInputPrimitiveTopology:", 3); // MTLPrimitiveTypeTriangle
+         let p: Id = objc::m2(d, "newRenderPipelineStateWithDescriptor:error:", pd, &mut err as *mut Id);
+         if p.is_null() {
+             println!("pipeline: nil ({})", objc::texto(if err.is_null() { err } else { objc::m0(err, "localizedDescription") }));
+             return 5;
+         }
+         println!("pipeline: ok");
+-        // Un pase de render sobre una textura BGRA8 de 64x64.
+-        let td: Id = {
++        // Los «globals»: 28 bytes del plano (la matriz de 3 float2 y la profundidad) y 8 del color (4 half).
++        let mut g = [0u8; 36];
++        for (o, v) in [(0usize, 2.0f32), (4, 0.0), (8, 0.0), (12, 2.0), (16, -1.0), (20, -1.0), (24, 0.0)] {
++            g[o..o + 4].copy_from_slice(&v.to_le_bytes());
++        }
++        for (o, v) in [(28usize, 0x3c00u16), (30, 0x3800), (32, 0x3400), (34, 0x3c00)] {
++            g[o..o + 2].copy_from_slice(&v.to_le_bytes());
++        }
++        let gb: Id = objc::m3(d, "newBufferWithBytes:length:options:", g.as_ptr(), 36u64, 0u64);
++        // Las texturas: el color (BGRA8) y la cobertura (RG16Float).
++        let textura = |formato: u64| -> Id {
+             let f: unsafe extern "C" fn(Id, objc::Sel, u64, u64, u64, i8) -> Id = std::mem::transmute(objc::objc_msgSend as *const ());
+-            f(objc::clase("MTLTextureDescriptor"), objc::sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, 64, 64, 0)
++            let td: Id = f(objc::clase("MTLTextureDescriptor"), objc::sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), formato, 64, 64, 0);
++            objc::m1::<u64, ()>(td, "setUsage:", 5);
++            objc::m1(d, "newTextureWithDescriptor:", td)
+         };
+-        objc::m1::<u64, ()>(td, "setUsage:", 5);
+-        let tex: Id = objc::m1(d, "newTextureWithDescriptor:", td);
+-        if tex.is_null() {
+-            println!("textura: nil");
++        let tex = textura(COLOR);
++        let cob = textura(COVERAGE);
++        if tex.is_null() || cob.is_null() {
++            println!("texturas: nil");
+             return 6;
+         }
++        // El pase, con los dos attachments.
+         let rp: Id = objc::m0(objc::clase("MTLRenderPassDescriptor"), "renderPassDescriptor");
+-        let a0: Id = objc::m1(objc::m0::<Id>(rp, "colorAttachments"), "objectAtIndexedSubscript:", 0u64);
+-        objc::m1::<Id, ()>(a0, "setTexture:", tex);
+-        objc::m1::<u64, ()>(a0, "setLoadAction:", 2);
+-        objc::m1::<u64, ()>(a0, "setStoreAction:", 1);
++        let ras: Id = objc::m0(rp, "colorAttachments");
++        for (i, t) in [tex, cob].iter().enumerate() {
++            let a: Id = objc::m1(ras, "objectAtIndexedSubscript:", i as u64);
++            objc::m1::<Id, ()>(a, "setTexture:", *t);
++            objc::m1::<u64, ()>(a, "setLoadAction:", 2);
++            objc::m1::<u64, ()>(a, "setStoreAction:", 1);
++        }
+         let q: Id = objc::m0(d, "newCommandQueue");
+         let cb: Id = objc::m0(q, "commandBuffer");
+         let enc: Id = objc::m1(cb, "renderCommandEncoderWithDescriptor:", rp);
+         objc::m1::<Id, ()>(enc, "setRenderPipelineState:", p);
++        objc::m3::<Id, u64, u64, ()>(enc, "setVertexBuffer:offset:atIndex:", gb, 0, 0);
++        objc::m3::<Id, u64, u64, ()>(enc, "setFragmentBuffer:offset:atIndex:", gb, 0, 0);
++        // El quad: cuatro vértices; el shader elige la esquina con el vertex_id.
++        // El tipo de primitiva va en la llamada: 4 = MTLPrimitiveTypeTriangleStrip.
++        objc::m3::<u64, u64, u64, ()>(enc, "drawPrimitives:vertexStart:vertexCount:", 4, 0, 4);
+         objc::m0::<()>(enc, "endEncoding");
+         objc::m0::<()>(cb, "commit");
+         objc::m0::<()>(cb, "waitUntilCompleted");
+-        println!("command buffer: estado {}", objc::m0::<u64>(cb, "status"));
+-        0
++        let st: u64 = objc::m0(cb, "status");
++        let mut px = vec![0u8; 64 * 64 * 4];
++        {
++            let f: unsafe extern "C" fn(Id, objc::Sel, *mut u8, u64, MTLRegion, u64) = std::mem::transmute(objc::objc_msgSend as *const ());
++            f(tex, objc::sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), px.as_mut_ptr(), 256, MTLRegion { x: 0, y: 0, z: 0, w: 64, h: 64, d: 1 }, 0);
++        }
++        let punto = |x: usize, y: usize| -> [u8; 4] { px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].try_into().unwrap() };
++        println!("command buffer: estado {st}; centro BGRA {:?}; esquina {:?}", punto(32, 32), punto(0, 0));
++        // El color de los globals es (1.0, 0.5, 0.25, 1.0): en BGRA8 son B=64, G=128, R=255, A=255.
++        let bien = punto(32, 32) == [64u8, 128, 255, 255] && punto(0, 0) == [64u8, 128, 255, 255];
++        println!("plano: {}", if bien { "CORRECTO" } else { "MAL" });
++        if bien { 0 } else { 7 }
+     }
+ }
+ 
+diff --git a/tahoe-metal/src/clases.rs b/tahoe-metal/src/clases.rs
+index f34ea96..ce05225 100644
+--- a/tahoe-metal/src/clases.rs
++++ b/tahoe-metal/src/clases.rs
+@@ -324,6 +324,15 @@ extern "C-unwind" fn manejador_funcion(this: Id, _cmd: Sel) -> Id {
+     estado::<Manejador>(this).map(|m| m.funcion).unwrap_or(std::ptr::null_mut())
+ }
+ 
++/// Copia un bloque de Objective-C para que sobreviva a la llamada (o None si no hay bloque).
++pub fn copiar_bloque(b: Id) -> Option<*mut c_void> {
++    if b.is_null() {
++        return None;
++    }
++    // SAFETY: b es un bloque de Objective-C.
++    Some(unsafe { _Block_copy(b) })
++}
++
+ /// Llama a un bloque de Objective-C con dos argumentos. El literal de un bloque tiene la función de invocación en
+ /// el desplazamiento 16 (isa, flags, reserved, invoke).
+ pub fn llamar_bloque_2(bloque: Id, a: Id, b: Id) {
+@@ -365,6 +374,9 @@ pub struct Buffer {
+     pub len: usize,
+     proyectado: usize,
+     opciones: u64,
++    /// El bloque que el cliente da para liberar su memoria cuando el buffer muera
++    /// (newBufferWithBytesNoCopy:length:options:deallocator:). Se copia para que sobreviva a la llamada.
++    liberador: Option<*mut c_void>,
+     etiqueta: Id,
+ }
+ etiqueta_de!(Buffer);
+@@ -374,12 +386,29 @@ impl Drop for Buffer {
+         liberar_en_servidor(clase::BUFFER, self.id);
+         // SAFETY: proyección hecha en nuevo_buffer.
+         unsafe { munmap(self.ptr.cast(), self.proyectado) };
++        if let Some(b) = self.liberador {
++            // SAFETY: bloque copiado con _Block_copy; el liberador no toma argumentos.
++            unsafe {
++                llamar_bloque(b, std::ptr::null_mut());
++                _Block_release(b);
++            }
++        }
+         soltar(self.etiqueta);
+     }
+ }
+ 
+ /// MTLBuffer: memoria compartida con el servidor de GPU (archivo en /dev/shm, que se borra en cuanto él lo abre).
+ pub fn nuevo_buffer(len: usize, opciones: u64, datos: Option<&[u8]>) -> Result<Id, String> {
++    nuevo_buffer_con_liberador(len, opciones, datos, None)
++}
++
++/// Un buffer con el bloque que libera la memoria del cliente (newBufferWithBytesNoCopy…).
++pub fn nuevo_buffer_con_liberador(
++    len: usize,
++    opciones: u64,
++    datos: Option<&[u8]>,
++    liberador: Option<*mut c_void>,
++) -> Result<Id, String> {
+     let id = nuevo_id();
+     let proyectado = len.next_multiple_of(4096).max(4096);
+     let ruta = format!("/dev/shm/tahoe-mtl-{}-{id}", std::process::id());
+@@ -407,7 +436,7 @@ pub fn nuevo_buffer(len: usize, opciones: u64, datos: Option<&[u8]>) -> Result<I
+         unsafe { munmap(p, proyectado) };
+         return Err(er);
+     }
+-    Ok(crear(&clases().buffer, Buffer { id, ptr, len, proyectado, opciones, etiqueta: std::ptr::null_mut() }))
++    Ok(crear(&clases().buffer, Buffer { id, ptr, len, proyectado, opciones, liberador, etiqueta: std::ptr::null_mut() }))
+ }
+ 
+ extern "C-unwind" fn buffer_contents(this: Id, _cmd: Sel) -> *mut u8 {
+@@ -628,6 +657,22 @@ unsafe fn llamar_bloque(b: *mut c_void, arg: Id) {
+     invoke(b, arg);
+ }
+ 
++/// signalEvent:value: (MTLCommandBuffer): señala el evento compartido con el valor dado.
++extern "C-unwind" fn cb_signal_event(_this: Id, _cmd: Sel, evento: Id, valor: u64) {
++    if let Some(e) = estado::<Evento>(evento) {
++        e.valor = valor;
++    }
++}
++
++/// waitForEvent:value: (MTLCommandBuffer): el commit es síncrono, así que el evento ya está señalado cuando se
++/// llega aquí; si no lo está, se anota.
++extern "C-unwind" fn cb_esperar_evento(_this: Id, _cmd: Sel, evento: Id, valor: u64) {
++    let v = estado::<Evento>(evento).map(|e| e.valor).unwrap_or(0);
++    if v < valor {
++        registro(&format!("waitForEvent: el evento está en {v} y se esperaba {valor}"));
++    }
++}
++
+ extern "C-unwind" fn cb_handler_acabar(this: Id, _cmd: Sel, b: *mut c_void) {
+     if let Some(c) = estado::<CommandBuffer>(this) {
+         // SAFETY: b es un bloque.
+@@ -849,6 +894,8 @@ pub fn registrar() {
+     comunes(&mut pipeline);
+     etiquetas!(pipeline, Pipeline);
+     let mut cb: Vec<Metodo> = vec![
++        ("signalEvent:value:", cb_signal_event as Imp, "v@:@Q"),
++        ("waitForEvent:value:", cb_esperar_evento as Imp, "v@:@Q"),
+         ("computeCommandEncoder", cb_computo as Imp, "@@:"),
+         ("computeCommandEncoderWithDispatchType:", cb_computo_tipo as Imp, "@@:Q"),
+         ("blitCommandEncoder", cb_blit as Imp, "@@:"),
+diff --git a/tahoe-metal/src/lib.rs b/tahoe-metal/src/lib.rs
+index 0c4b2b5..6a04475 100644
+--- a/tahoe-metal/src/lib.rs
++++ b/tahoe-metal/src/lib.rs
+@@ -80,10 +80,25 @@ extern "C-unwind" fn nueva_cola_max(_this: Id, _cmd: Sel, _n: u64) -> Id {
+     clases::nueva_cola()
+ }
+ 
++/// La cola por defecto del dispositivo: la que usa `newCommandBuffer`. Se guarda para no crear una por llamada.
++static COLA_POR_DEFECTO: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
++
++fn cola_por_defecto() -> Id {
++    let mut c = COLA_POR_DEFECTO.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(q) = *c {
++        if q != 0 {
++            return q as Id;
++        }
++    }
++    let q = clases::nueva_cola();
++    *c = Some(q as usize);
++    q
++}
++
+ /// newCommandBuffer (MTLDevice): un command buffer sin cola propia. En macOS 26 ningún framework del sistema lo
+ /// llama, pero está en el protocolo del runtime: como stub devolvía nil.
+ extern "C-unwind" fn nuevo_command_buffer(_this: Id, _cmd: Sel) -> Id {
+-    let cola = clases::nueva_cola();
++    let cola = cola_por_defecto();
+     if cola.is_null() {
+         return std::ptr::null_mut();
+     }
+diff --git a/tahoe-metal/src/render.rs b/tahoe-metal/src/render.rs
+index 0ea7732..5eabced 100644
+--- a/tahoe-metal/src/render.rs
++++ b/tahoe-metal/src/render.rs
+@@ -764,6 +764,10 @@ extern "C-unwind" fn cb_render(this: Id, _cmd: Sel, d: Id) -> Id {
+     unsafe { objc::m0(enc, "autorelease") }
+ }
+ 
++/// updateFence: / waitForFence: (MTLCommandEncoder): aquí no hay planificador de citas y el commit es síncrono, así
++/// que el fence no sincroniza nada.
++extern "C-unwind" fn ren_fence(_this: Id, _cmd: Sel, _fence: Id) {}
++
+ extern "C-unwind" fn ren_pipeline(this: Id, _cmd: Sel, p: Id) {
+     if let (Some(o), Some(pl)) = (ordenes(this), estado::<PipelineRender>(p)) {
+         o.u32(orden::PIPELINE_RENDER).u32(pl.id);
+@@ -841,6 +845,9 @@ extern "C-unwind" fn ren_sentido(_this: Id, _cmd: Sel, w: u64) {
+     }
+ }
+ fn dibujar(this: Id, prim: u64, primero: u64, cuenta: u64, inst: u64, pinst: u64) {
++    // Se anota el tipo de primitiva: es lo que decide la topología en el servidor, y sirve para ver qué usa
++    // el compositor de verdad.
++    registro(&format!("dibujo: primitiva {prim}, desde {primero}, {cuenta} vértices"));
+     if let Some(o) = ordenes(this) {
+         o.u32(orden::DIBUJAR).u32(prim as u32).u32(primero as u32).u32(cuenta as u32).u32(inst as u32).u32(pinst as u32);
+     }
+@@ -910,15 +917,18 @@ extern "C-unwind" fn tamano_textura_heap(_this: Id, _cmd: Sel, d: Id) -> TamanoA
+         campo(d, "mipmapLevelCount", 0u64),
+         campo(d, "pixelFormat", 0u64),
+     );
++    let muestras = campo(d, "sampleCount", 1u64).max(1);
+     let bpp = bytes_por_pixel(formato);
+     let mut total = 0u64;
+     for nivel in 0..niveles.max(1) {
+         let w = (ancho >> nivel).max(1);
+         let h = (alto >> nivel).max(1);
+         let p = (prof >> nivel).max(1);
+-        total += w * h * p * bpp;
++        // La fila va alineada, como en el hardware.
++        let fila = (w * bpp).next_multiple_of(ALINEACION_HEAP);
++        total += fila * h * p;
+     }
+-    total *= capas.max(1);
++    total *= capas.max(1) * muestras;
+     TamanoAlineacion { tamano: total.div_ceil(ALINEACION_HEAP) * ALINEACION_HEAP, alineacion: ALINEACION_HEAP }
+ }
+ 
+@@ -1002,19 +1012,17 @@ extern "C-unwind" fn heap_nueva_textura(this: Id, _cmd: Sel, desc: Id) -> Id {
+     }
+     t
+ }
+-extern "C-unwind" fn residencia_anadir(this: Id, _cmd: Sel, objetos: Id) {
++/// addAllocation: (MTLResidencySet): añade un recurso (buffer o textura) al conjunto.
++extern "C-unwind" fn residencia_anadir(this: Id, _cmd: Sel, recurso: Id) {
+     let Some(r) = estado::<Residencia>(this) else { return };
+-    if objetos.is_null() {
++    if recurso.is_null() {
+         return;
+     }
+-    let n = unsafe { objc::m0::<u64>(objetos, "count") };
+-    for i in 0..n {
+-        let o = unsafe { objc::m1::<u64, Id>(objetos, "objectAtIndexedSubscript:", i) };
+-        if !o.is_null() {
+-            r.objetos.push(retener(o));
+-        }
+-    }
++    r.objetos.push(retener(recurso));
+ }
++
++/// commit (MTLResidencySet): no hay planificador de citas; el conjunto solo retiene los recursos.
++extern "C-unwind" fn residencia_commit(_this: Id, _cmd: Sel) {}
+ extern "C-unwind" fn residencia_quitar_todo(this: Id, _cmd: Sel) {
+     if let Some(r) = estado::<Residencia>(this) {
+         for o in r.objetos.drain(..) {
+@@ -1047,11 +1055,12 @@ extern "C-unwind" fn dev_residencia(_this: Id, _cmd: Sel, desc: Id, error: *mut
+ }
+ 
+ /// newBufferWithBytesNoCopy:length:options:deallocator: (MTLDevice): el cliente da memoria ya paginada y espera que
+-/// Metal no la copie. Aquí sí se copia al buffer del servidor (el servidor no puede importar memoria del cliente) y
+-/// el bloque de liberador no se llama: la memoria sigue siendo del cliente.
+-extern "C-unwind" fn dev_buffer_nocopia(_this: Id, _cmd: Sel, p: *const u8, len: u64, opciones: u64, _liberador: Id) -> Id {
++/// Metal no la copie. Aquí sí se copia al buffer del servidor (el servidor no puede importar memoria del cliente),
++/// pero el bloque de liberación se guarda y se llama cuando el buffer muere, como manda el contrato.
++extern "C-unwind" fn dev_buffer_nocopia(_this: Id, _cmd: Sel, p: *const u8, len: u64, opciones: u64, liberador: Id) -> Id {
+     let datos = if p.is_null() { None } else { Some(unsafe { std::slice::from_raw_parts(p, len as usize) }) };
+-    match clases::nuevo_buffer(len as usize, opciones, datos) {
++    let bloq = clases::copiar_bloque(liberador);
++    match clases::nuevo_buffer_con_liberador(len as usize, opciones, datos, bloq) {
+         Ok(b) => b,
+         Err(e) => {
+             registro(&format!("newBufferWithBytesNoCopy:{len}: {e}"));
+@@ -1115,6 +1124,8 @@ pub fn registrar(dispositivo: Class) {
+     etq(&mut pipeline, clases::etiqueta::<PipelineRender> as Imp, clases::poner_etiqueta::<PipelineRender> as Imp);
+     let mut encoder: Vec<Metodo> = vec![
+         ("setRenderPipelineState:", ren_pipeline as Imp, "v@:@"),
++        ("updateFence:", ren_fence as Imp, "v@:@"),
++        ("waitForFence:", ren_fence as Imp, "v@:@"),
+         ("setVertexBuffer:offset:atIndex:", ren_vbuffer as Imp, "v@:@QQ"),
+         ("setFragmentBuffer:offset:atIndex:", ren_fbuffer as Imp, "v@:@QQ"),
+         ("setVertexBytes:length:atIndex:", ren_vbytes as Imp, "v@:^vQQ"),
+@@ -1154,8 +1165,9 @@ pub fn registrar(dispositivo: Class) {
+     let mut fence: Vec<Metodo> = vec![];
+     etq(&mut fence, clases::etiqueta::<Fence> as Imp, clases::poner_etiqueta::<Fence> as Imp);
+     let mut residencia: Vec<Metodo> = vec![
+-        ("addAllObjects:", residencia_anadir as Imp, "v@:@"),
++        ("addAllocation:", residencia_anadir as Imp, "v@:@"),
+         ("removeAllObjects", residencia_quitar_todo as Imp, "v@:"),
++        ("commit", residencia_commit as Imp, "v@:"),
+     ];
+     etq(&mut residencia, clases::etiqueta::<Residencia> as Imp, clases::poner_etiqueta::<Residencia> as Imp);
+     let c = ClasesRender {

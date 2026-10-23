@@ -1,0 +1,30 @@
+From 020e87631277efa1499a545d731f9f8412b0276e Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 01:11:45 -0600
+Subject: [PATCH 56/57] Emulador: se quita el include de stdarg que no se usa
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_mach.c: no queda ninguna lista de argumentos variable en el
+  fichero, así que el include sobra.
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_mach.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/tahoe-run/emu_mach.c b/tahoe-run/emu_mach.c
+index 8722979..10560d8 100644
+--- a/tahoe-run/emu_mach.c
++++ b/tahoe-run/emu_mach.c
+@@ -10,7 +10,6 @@
+ #include <sys/syscall.h>
+ #include <pthread.h>
+ #include <errno.h>
+-#include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>

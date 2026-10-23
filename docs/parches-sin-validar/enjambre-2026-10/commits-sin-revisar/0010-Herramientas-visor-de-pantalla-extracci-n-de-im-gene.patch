@@ -1,0 +1,3731 @@
+From d278f50cce0ac6431f07d5eba32978fc6d2e6a97 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:41:25 -0600
+Subject: [PATCH 10/57] =?UTF-8?q?Herramientas:=20visor=20de=20pantalla,=20?=
+ =?UTF-8?q?extracci=C3=B3n=20de=20im=C3=A1genes=20y=20preconfiguraci=C3=B3?=
+ =?UTF-8?q?n?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- tools/tahoe-view: el visor en Linux de la pantalla del macOS emulado
+  (SDL), que manda también el teclado y el ratón a la cola de HID.
+- tools/macos: decmpfs, para rehacer los archivos con compresión de APFS
+  (usa compression_decode_buffer de libcompression, que es la única con
+  LZBITMAP). Los .tbd de Apple no se versionan.
+- tools/macos-rs: el linker y el generador de los .tbd, en Rust.
+- tools/historico_darling: las herramientas de cuando se probó Darling
+  (ya no se usan; ver NOTA.md).
+- tools/xar.py, yaa.py: los formatos de los paquetes de actualización y de
+  los archivos de imagen.
+- tools/preconfigurar.sh: la preconfiguración como en las empresas (usuario
+  administrador, idioma y región, sin Asistente), reversible con deshacer.
+- tools/smbios.sh: la identidad del equipo con macserial.
+- tools/inventario_total.sh: ejecutar los 1167 programas de la shell y
+  clasificarlos.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tools/datos_macos.py                          |   55 +
+ tools/dsc_dis.py                              |  119 +
+ tools/fix_symlinks.sh                         |   38 +
+ tools/historico_darling/NOTA.md               |   14 +
+ .../build_darling_codespace.sh                |   34 +
+ tools/historico_darling/compare_syscalls.py   |   47 +
+ tools/historico_darling/dyld_iterate.py       |  105 +
+ tools/inventario_total.sh                     |   68 +
+ tools/macos-rs/LEEME.md                       |   20 +
+ tools/macos-rs/gen_tbd.py                     |   44 +
+ tools/macos/.gitignore                        |    2 +
+ tools/macos/build.sh                          |   17 +
+ tools/macos/decmpfs.c                         |   84 +
+ tools/preconfigurar.py                        |  186 ++
+ tools/preconfigurar.sh                        |   15 +
+ tools/smbios.sh                               |   31 +
+ tools/tahoe-view/.gitignore                   |    1 +
+ tools/tahoe-view/Cargo.lock                   | 1965 +++++++++++++++++
+ tools/tahoe-view/Cargo.toml                   |   15 +
+ tools/tahoe-view/src/entrada.rs               |  106 +
+ tools/tahoe-view/src/main.rs                  |  330 +++
+ tools/xar.py                                  |   58 +
+ tools/yaa.py                                  |  163 ++
+ 23 files changed, 3517 insertions(+)
+ create mode 100755 tools/datos_macos.py
+ create mode 100644 tools/dsc_dis.py
+ create mode 100755 tools/fix_symlinks.sh
+ create mode 100644 tools/historico_darling/NOTA.md
+ create mode 100755 tools/historico_darling/build_darling_codespace.sh
+ create mode 100644 tools/historico_darling/compare_syscalls.py
+ create mode 100644 tools/historico_darling/dyld_iterate.py
+ create mode 100755 tools/inventario_total.sh
+ create mode 100644 tools/macos-rs/LEEME.md
+ create mode 100644 tools/macos-rs/gen_tbd.py
+ create mode 100644 tools/macos/.gitignore
+ create mode 100755 tools/macos/build.sh
+ create mode 100644 tools/macos/decmpfs.c
+ create mode 100755 tools/preconfigurar.py
+ create mode 100755 tools/preconfigurar.sh
+ create mode 100755 tools/smbios.sh
+ create mode 100644 tools/tahoe-view/.gitignore
+ create mode 100644 tools/tahoe-view/Cargo.lock
+ create mode 100644 tools/tahoe-view/Cargo.toml
+ create mode 100644 tools/tahoe-view/src/entrada.rs
+ create mode 100644 tools/tahoe-view/src/main.rs
+ create mode 100755 tools/xar.py
+ create mode 100755 tools/yaa.py
+
+diff --git a/tools/datos_macos.py b/tools/datos_macos.py
+new file mode 100755
+index 0000000..8982cbd
+--- /dev/null
++++ b/tools/datos_macos.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++# datos_macos.py <raíz>: prepara el volumen de datos de un macOS completo extraído (tools/yaa.py), como hace el instalador
++# en un Mac recién instalado:
++#   1. /System/Volumes/Data se crea copiando la plantilla /System/Library/Templates/Data (con permisos, fechas, enlaces y
++#      atributos extendidos), si aún no existe.
++#   2. Los firmlinks de /usr/share/firmlinks (/Applications, /Library, /Users, /private...) unen el volumen del sistema con
++#      el de datos. Linux no los tiene: cada uno se presenta como un enlace simbólico relativo hacia
++#      System/Volumes/Data/<destino>. Si en el lado del sistema había contenido, se mueve antes al lado de datos.
++# Es idempotente: se puede repetir sin estropear nada.
++# Algunas carpetas de la plantilla son solo de root en macOS (p. ej. private/var/db/dslocal/nodes/Default, sin permiso de
++# paso para nadie más): sin ser root, el script se vuelve a ejecutar en un espacio de usuario donde el usuario es root
++# (unshare -r), igual que tahoe-run, y así puede leerlas; los archivos siguen siendo del usuario.
++import os, shutil, sys
++
++def copia(src, dst):
++    if os.path.lexists(dst): return
++    tmp = dst + ".copiando"                                # a medias no cuenta: se copia aparte y se renombra al final
++    if os.path.lexists(tmp): shutil.rmtree(tmp)
++    shutil.copytree(src, tmp, symlinks=True, copy_function=shutil.copy2)
++    shutil.copystat(src, tmp)
++    os.rename(tmp, dst)
++
++def mezcla(src, dst):
++    """Mueve el contenido de src (lado del sistema) a dst (lado de datos) sin pisar lo que ya haya en dst."""
++    os.makedirs(dst, exist_ok=True)
++    for n in os.listdir(src):
++        a, b = os.path.join(src, n), os.path.join(dst, n)
++        if os.path.isdir(a) and not os.path.islink(a) and os.path.isdir(b) and not os.path.islink(b): mezcla(a, b)
++        elif not os.path.lexists(b): os.rename(a, b)
++    shutil.rmtree(src)
++
++def main():
++    if os.getuid() != 0:
++        os.execvp("unshare", ["unshare", "-r", sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
++    root = os.path.abspath(sys.argv[1])
++    data = os.path.join(root, "System/Volumes/Data")
++    tmpl = os.path.join(root, "System/Library/Templates/Data")
++    if not os.path.isdir(data) or not os.listdir(data):
++        if os.path.isdir(data): os.rmdir(data)
++        copia(tmpl, data); print("volumen de datos creado desde la plantilla")
++    n = 0
++    for line in open(os.path.join(root, "usr/share/firmlinks")):
++        if not line.strip(): continue
++        sysp, datap = line.rstrip("\n").split("\t")
++        s = os.path.join(root, sysp.lstrip("/")); d = os.path.join(data, datap)
++        if os.path.islink(s): continue                                    # ya hecho
++        if os.path.isdir(s): mezcla(s, d)
++        else: os.makedirs(d, exist_ok=True)
++        os.makedirs(os.path.dirname(s), exist_ok=True)
++        os.symlink(os.path.relpath(d, os.path.dirname(s)), s)
++        n += 1
++    print(f"firmlinks: {n}")
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/dsc_dis.py b/tools/dsc_dis.py
+new file mode 100644
+index 0000000..6f7bd88
+--- /dev/null
++++ b/tools/dsc_dis.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++"""Desensambla código x86_64 de una dyld_shared_cache de macOS (ipsw solo desensambla arm64).
++
++Lee los bytes de la dirección pedida en el archivo de la caché que la mapea (principal o subcachés .01, .02...),
++los pasa por `objdump -b binary -m i386:x86-64` y anota los destinos de call/jmp/lea con los nombres de las listas
++de símbolos de ~/.cache/tahoe-syms (las que genera tahoe-run al arrancar).
++
++Uso: dsc_dis.py <caché> <símbolo o 0xdirección> [bytes]   (por defecto 0x400 bytes)
++"""
++import glob
++import os
++import re
++import struct
++import subprocess
++import sys
++import tempfile
++
++
++def mapeos(ruta):
++    with open(ruta, 'rb') as f:
++        h = f.read(0x40)
++        off, cnt = struct.unpack_from('<II', h, 0x10)
++        f.seek(off)
++        crudo = f.read(32 * cnt)
++    return [struct.unpack_from('<QQQII', crudo, 32 * i)[:3] for i in range(cnt)]   # dirección, tamaño, posición
++
++
++def leer(cache, dir_, n):
++    for arch in sorted(glob.glob(cache + '*')):
++        if arch.endswith('.map') or arch.endswith('.atlas'):
++            continue
++        try:
++            ms = mapeos(arch)
++        except (OSError, struct.error):
++            continue
++        for addr, tam, pos in ms:
++            if addr <= dir_ < addr + tam:
++                with open(arch, 'rb') as f:
++                    f.seek(pos + dir_ - addr)
++                    return f.read(min(n, addr + tam - dir_))
++    sys.exit(f'0x{dir_:x} no está en la caché')
++
++
++def simbolos():
++    tabla = {}
++    for txt in glob.glob(os.path.expanduser('~/.cache/tahoe-syms/*/*.txt')):
++        img = os.path.basename(txt)[:-4]
++        with open(txt, errors='replace') as f:
++            for ln in f:
++                m = re.match(r'(0x[0-9a-f]+): \([^)]*\)\s+(\S.*)$', ln.strip())
++                if m:
++                    tabla.setdefault(int(m.group(1), 16), f'{m.group(2)} [{img}]')
++    return tabla
++
++
++def main():
++    cache, quien = sys.argv[1], sys.argv[2]
++    n = int(sys.argv[3], 0) if len(sys.argv) > 3 else 0x400
++    sims = simbolos()
++    if quien.startswith('0x'):
++        dir_ = int(quien, 16)
++    else:
++        cands = [a for a, s in sims.items() if s.split(' [')[0] == quien]
++        if not cands:
++            sys.exit(f'no encuentro {quien}')
++        dir_ = cands[0]
++    datos = leer(cache, dir_, n)
++    with tempfile.NamedTemporaryFile(suffix='.bin') as t:
++        t.write(datos)
++        t.flush()
++        sal = subprocess.run(['objdump', '-D', '-b', 'binary', '-m', 'i386:x86-64', f'--adjust-vma=0x{dir_:x}', t.name],
++                             capture_output=True, text=True).stdout
++    def cadena(a):
++        try:
++            b = leer(cache, a, 200)
++        except SystemExit:
++            return None
++        z = b.split(b'\0')[0]
++        if 3 <= len(z) and all(32 <= c < 127 for c in z):
++            return z.decode()
++        return None
++
++    def puntero(a):
++        try:
++            b = leer(cache, a, 8)
++        except SystemExit:
++            return None
++        if len(b) < 8:
++            return None
++        return struct.unpack('<Q', b)[0] & 0xfffffffffff   # sin los bits altos de las cadenas de punteros
++
++    for ln in sal.splitlines():
++        m = re.search(r'0x([0-9a-f]{9,})', ln)
++        if m:
++            a = int(m.group(1), 16)
++            if a in sims:
++                ln += f'    ; {sims[a]}'
++            else:
++                c = cadena(a)
++                q = puntero(a)
++                if c:
++                    ln += f'    ; "{c}"'
++                elif q and q in sims:
++                    ln += f'    ; -> {sims[q]}'
++                elif q and cadena(q):
++                    ln += f'    ; -> "{cadena(q)}"'
++                elif q:
++                    # CFString constante: {isa, flags, char*, longitud}
++                    r = puntero(a + 16)
++                    if r and cadena(r):
++                        ln += f'    ; @"{cadena(r)}"'
++        m2 = re.match(r'\s*([0-9a-f]+):', ln)
++        if m2 and int(m2.group(1), 16) in sims and int(m2.group(1), 16) != dir_:
++            print(f'--- {sims[int(m2.group(1), 16)]}')
++        print(ln)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/fix_symlinks.sh b/tools/fix_symlinks.sh
+new file mode 100755
+index 0000000..5983146
+--- /dev/null
++++ b/tools/fix_symlinks.sh
+@@ -0,0 +1,38 @@
++#!/bin/bash
++# fix_symlinks.sh [raíz] [--aplicar]: repara los enlaces simbólicos absolutos del sistema de macOS extraído.
++# En macOS muchos enlaces son absolutos (/etc/rc.cdrom -> /usr/libexec/rc_script_wrapper). En Linux es el kernel quien los
++# sigue, así que deben apuntar a la ruta dentro de la raíz (raíz + destino); tahoe-run le quita ese prefijo a readlink y el
++# programa ve el destino original. Al extraer, algunos quedaron apuntando a una ruta del anfitrión que no existe (p. ej. sin
++# la carpeta «macOS Base System»): sin ellos no arranca, entre otros, /etc/rc.cdrom (las tareas de arranque de la Recovery).
++# Solo toca enlaces absolutos ROTOS cuyo destino se encuentre dentro de la raíz; sin --aplicar solo los lista.
++#   tools/fix_symlinks.sh                       # raíz por omisión: ~/macos26/base/macOS Base System
++#   tools/fix_symlinks.sh "$TAHOE_ROOT" --aplicar
++ROOT="${1:-$HOME/macos26/base/macOS Base System}"
++[ "$1" = "--aplicar" ] && ROOT="$HOME/macos26/base/macOS Base System"
++APLICAR=0; for a in "$@"; do [ "$a" = "--aplicar" ] && APLICAR=1; done
++ROOT="$(cd "$ROOT" && pwd)" || exit 1
++n=0; sin=0
++while IFS= read -r -d '' l; do
++	t="$(readlink "$l")"
++	case "$t" in /*) ;; *) continue;; esac
++	[ -e "$l" ] && continue                                   # el enlace funciona: no se toca
++	case "$t" in "$ROOT"/*) rest="${t#"$ROOT"}";; *) rest="$t";; esac
++	# el destino de macOS es el sufijo más largo de la ruta que exista dentro de la raíz (quita prefijos del anfitrión)
++	# (de más largo a más corto, con al menos dos componentes para no casar por un nombre suelto)
++	nuevo=""; s="$rest"
++	while :; do
++		case "$s" in /*/*) ;; *) break;; esac
++		if [ -e "$ROOT$s" ] || [ -L "$ROOT$s" ]; then nuevo="$ROOT$s"; break; fi
++		s="/${s#/*/}"
++	done
++	# sin destino dentro de la raíz (también falta en macOS, p. ej. /etc/localtime): si la ruta es la de la carpeta que contiene
++	# la raíz (el prefijo que dejó la extracción), se pone la raíz en su lugar y el enlace queda colgando como en macOS
++	PADRE="$(dirname "$ROOT")"
++	case "$t" in "$ROOT"/*) ;; "$PADRE"/*) [ -z "$nuevo" ] && nuevo="$ROOT${t#"$PADRE"}";; esac
++	rel="${l#"$ROOT"}"
++	if [ -z "$nuevo" ]; then sin=$((sin + 1)); echo "sin destino: $rel -> $t"; continue; fi
++	echo "$rel -> ${nuevo#"$ROOT"}"
++	[ $APLICAR = 1 ] && ln -sfn "$nuevo" "$l"
++	n=$((n + 1))
++done < <(find "$ROOT" -xdev -type l -print0)
++echo "enlaces a reparar: $n (sin destino en la raíz: $sin)$([ $APLICAR = 1 ] && echo ', reparados' || echo '; con --aplicar se reparan')"
+diff --git a/tools/historico_darling/NOTA.md b/tools/historico_darling/NOTA.md
+new file mode 100644
+index 0000000..74ead0e
+--- /dev/null
++++ b/tools/historico_darling/NOTA.md
+@@ -0,0 +1,14 @@
++# Herramientas históricas de Darling (no usar)
++
++Estas tres herramientas son de la primera etapa del proyecto, de antes de que existiera `tahoe-run`, cuando se
++probó si [Darling](https://github.com/darlinghq/darling) servía para arrancar macOS 26. La conclusión fue hacer una
++capa propia: **`tahoe-run` no usa código de Darling** ni necesita estas herramientas para compilarse, arrancar macOS ni
++probarse. Se guardan solo como registro de cómo se llegó a esa decisión.
++
++| Herramienta | Qué hacía |
++|---|---|
++| `build_darling_codespace.sh` | En un GitHub Codespace, clonaba Darling con sus submódulos y compilaba dos piezas suyas: `mldr` (su cargador de programas Mach-O) y `darlingserver` (su servidor que imita al núcleo). No compila nada de este proyecto. |
++| `dyld_iterate.py` | Ejecutaba un programa de macOS 26 dentro de Darling y, cada vez que faltaba una biblioteca, la sacaba de la `dyld_shared_cache` y reintentaba, para ver hasta dónde llegaba Darling. |
++| `compare_syscalls.py` | Contaba cuántas llamadas al sistema BSD y trampas Mach del XNU de Apple implementa Darling. |
++
++Las compilaciones de `tahoe-run` son ligeras (`tahoe-run/build.sh`, unos segundos) y se hacen en la propia PC.
+diff --git a/tools/historico_darling/build_darling_codespace.sh b/tools/historico_darling/build_darling_codespace.sh
+new file mode 100755
+index 0000000..61ac665
+--- /dev/null
++++ b/tools/historico_darling/build_darling_codespace.sh
+@@ -0,0 +1,34 @@
++#!/bin/bash
++# Compila las partes de Linux de Darling (mldr y darlingserver) en un GitHub Codespace.
++# Probado en un codespace "standardLinux32gb" (4 núcleos, 16 GB, Ubuntu 24.04) con Darling 60ba801d.
++#
++#   gh codespace create -R <usuario>/<repo> -m standardLinux32gb --idle-timeout 30m --retention-period 24h
++#   gh codespace ssh -c <nombre> -- 'bash -s' < tools/build_darling_codespace.sh
++#
++# Notas aprendidas:
++#  * Compilar en /tmp: está en un disco aparte (~118 GB). /workspaces solo tiene ~12 GB libres.
++#  * git-lfs está instalado en el codespace y el submódulo src/external/swift intenta bajar bibliotecas
++#    precompiladas de un servidor que pide credenciales. GIT_LFS_SKIP_SMUDGE=1 lo evita.
++#  * Si el clon se aborta a mitad, los submódulos quedan con el commit correcto pero SIN archivos
++#    (solo el fichero .git). "git submodule status" no lo delata: hay que forzar un reset en cada uno.
++set -euxo pipefail
++export DEBIAN_FRONTEND=noninteractive GIT_LFS_SKIP_SMUDGE=1
++
++sudo apt-get update -qq
++sudo apt-get install -y -qq cmake clang bison flex libfuse-dev libudev-dev pkg-config libc6-dev-i386 \
++  gcc-multilib libcairo2-dev libgl1-mesa-dev libtiff-dev libfreetype6-dev libelf-dev libxml2-dev \
++  libegl1-mesa-dev libglu1-mesa-dev libfontconfig1-dev libbsd-dev ninja-build libxrandr-dev \
++  libxcursor-dev libgif-dev libavcodec-dev libavformat-dev libswresample-dev libavutil-dev \
++  libpulse-dev libdbus-1-dev libxkbfile-dev libcap-dev llvm-dev libvulkan-dev libcap2-bin python3 lld
++
++cd /tmp
++[ -d darling ] || git clone --depth 1 --recurse-submodules --shallow-submodules -j4 https://github.com/darlinghq/darling.git darling || true
++cd darling
++git submodule update --init --recursive --depth 1 -j4
++git submodule foreach --recursive --quiet 'git reset --hard -q HEAD'
++
++mkdir -p build && cd build
++cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DTARGET_i386=OFF -DENABLE_METAL=OFF \
++  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
++ninja -j4 mldr darlingserver
++ls -la src/startup/mldr/mldr src/external/darlingserver/darlingserver
+diff --git a/tools/historico_darling/compare_syscalls.py b/tools/historico_darling/compare_syscalls.py
+new file mode 100644
+index 0000000..ee8e08e
+--- /dev/null
++++ b/tools/historico_darling/compare_syscalls.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++"""Compara las syscalls BSD y las trampas Mach de un XNU de Apple con las que implementa Darling.
++
++Uso: compare_syscalls.py <xnu> <darling>
++  <xnu>     fuente de apple-oss-distributions/xnu (p. ej. xnu-12377.121.6)
++  <darling> clon de darlinghq/darling con submódulos
++
++Darling implementa las syscalls en espacio de usuario (libsystem_kernel/emulation); aquí se cuentan las
++entradas de sus tablas. Es una medida aproximada: una syscall puede resolverse por otra vía.
++"""
++import glob
++import os
++import re
++import sys
++
++xnu, darling = sys.argv[1:3]
++emu = f'{darling}/src/external/xnu/darling/src/libsystem_kernel/emulation/src/xnu_syscall'
++
++# --- syscalls BSD
++table = open(f'{emu}/bsd/bsd_syscall_table.c').read()
++have = {int(n): v for n, v in re.findall(r'^\s*\[(\d+)\]\s*=\s*([A-Za-z_0-9]+),', table, re.M)}
++want = {}
++for line in open(f'{xnu}/bsd/kern/syscalls.master'):
++    g = re.match(r'^(\d+)\s+(\S+)\s+(\S+)\s+\{\s*(.*?)\s*\}', line)
++    if not g or 'nosys' in g.group(4):
++        continue
++    nm = re.search(r'(\w+)\s*\(', g.group(4))
++    want[int(g.group(1))] = nm.group(1) if nm else '?'
++missing = sorted(n for n in want if n not in have)
++newer = [n for n in missing if n > max(have)]
++print(f'BSD: XNU {len(want)} reales, Darling {len(have)} -> faltan {len(missing)} '
++      f'({len(newer)} con número posterior a {max(have)})')
++print('  nuevas:', ', '.join(f'{n}:{want[n]}' for n in newer))
++
++# --- trampas Mach
++x = open(f'{xnu}/osfmk/kern/syscall_sw.c').read()
++x = x[x.index('mach_trap_table'):]
++traps = {int(n): v for n, v in re.findall(r'/\*\s*(\d+)\s*\*/\s*MACH_TRAP\(\s*(\w+)', x)}
++traps = {n: v for n, v in traps.items() if 'invalid' not in v}
++mach = {}
++for f in glob.glob(f'{emu}/mach/**/*.c', recursive=True):
++    if re.search(r'table|trap', os.path.basename(f)):
++        for n, v in re.findall(r'\[(\d+)\]\s*=\s*([A-Za-z_0-9]+)', open(f, errors='ignore').read()):
++            mach[int(n)] = v
++mm = sorted(n for n in traps if n not in mach)
++print(f'Mach: XNU {len(traps)} reales, Darling {len(mach)} -> faltan {len(mm)}')
++print('  ', ', '.join(f'{n}:{traps[n]}' for n in mm))
+diff --git a/tools/historico_darling/dyld_iterate.py b/tools/historico_darling/dyld_iterate.py
+new file mode 100644
+index 0000000..61c2dab
+--- /dev/null
++++ b/tools/historico_darling/dyld_iterate.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++"""Ejecuta un binario de macOS 26 en Darling y, cada vez que dyld dice "Library not loaded", extrae la
++librería que falta de la dyld_shared_cache de Tahoe y reintenta. Sirve para mapear la cadena de
++dependencias y ver en qué punto falla de verdad.
++
++Requisitos: `darling` con el prefijo arrancado, `ipsw` (extractor de la caché) y el sistema base de
++macOS 26 ya extraído del recovery. No modifica el prefijo de Darling: usa DYLD_LIBRARY_PATH y
++DYLD_FRAMEWORK_PATH apuntando a la carpeta de extracción.
++
++Uso: dyld_iterate.py <caché> <carpeta_extracción> <ejecutable> [--max N]
++"""
++import os
++import re
++import subprocess
++import sys
++import tempfile
++import time
++
++
++def extract(cache, out, install_name):
++    """Extrae `install_name` de la caché y lo deja en la ruta que dyld buscará."""
++    tmp = tempfile.mkdtemp(dir=out)
++    r = subprocess.run(['ipsw', 'dyld', 'extract', cache, install_name, '-o', tmp],
++                       capture_output=True, text=True)
++    found = [os.path.join(tmp, f) for f in os.listdir(tmp)]
++    if not found:
++        return None, (r.stdout + r.stderr)[-300:]
++    src = found[0]
++    if '.framework/' in install_name:      # /System/Library/Frameworks/X.framework/Versions/A/X
++        rel = install_name.split('/Library/', 1)[1]
++        dest = os.path.join(out, 'fw', *rel.split('/')[1:])   # fw/Frameworks/X.framework/...
++    else:                                   # /usr/lib/libfoo.dylib  -> plano, por nombre
++        dest = os.path.join(out, os.path.basename(install_name))
++    os.makedirs(os.path.dirname(dest), exist_ok=True)
++    os.replace(src, dest)
++    os.rmdir(tmp)
++    return dest, ''
++
++
++def run_once(out, exe, log, timeout=25):
++    script = os.path.join(out, 'run.sh')
++    host = '/Volumes/SystemRoot'
++    fw = f'{host}{out}/fw/Frameworks:{host}{out}/fw/PrivateFrameworks'
++    with open(script, 'w') as f:
++        f.write(f'''#!/bin/bash
++export DYLD_LIBRARY_PATH="{host}{out}"
++export DYLD_FRAMEWORK_PATH="{fw}"
++export DYLD_PRINT_LIBRARIES=1
++"{host}{exe}" > "{host}{log}" 2>&1
++echo "salida: $?" >> "{host}{log}"
++''')
++    os.chmod(script, 0o755)
++    if os.path.exists(log):
++        os.remove(log)
++    p = subprocess.Popen(['darling', 'shell', f'{host}{script}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    end = time.time() + timeout
++    text = ''
++    while time.time() < end:
++        time.sleep(1)
++        if os.path.exists(log):
++            text = open(log, errors='replace').read()
++            if 'salida:' in text:
++                break
++    else:
++        text += '\n[sin terminar en %ds: el proceso sigue vivo]' % timeout
++    p.kill()
++    return text
++
++
++def main():
++    args = sys.argv[1:]
++    mx = 12
++    if '--max' in args:
++        i = args.index('--max')
++        mx = int(args[i + 1])
++        del args[i:i + 2]
++    cache, out, exe = args
++    out = os.path.abspath(out)
++    log = os.path.join(out, 'run.log')
++    seen = set()
++    for n in range(1, mx + 1):
++        text = run_once(out, exe, log)
++        loaded = len(re.findall(r'dyld: loaded', text))
++        m = re.search(r'Library not loaded: (\S+)', text)
++        print(f'[{n}] librerías cargadas: {loaded}', end='  ')
++        if not m:
++            print('-> no hay "Library not loaded". Fin de la cadena de dependencias.')
++            print('\n'.join(text.strip().splitlines()[-8:]))
++            return
++        lib = m.group(1)
++        if lib in seen:
++            print(f'-> {lib} sigue sin cargar tras extraerla (el fallo es otro):')
++            print('\n'.join(text.strip().splitlines()[-6:]))
++            return
++        seen.add(lib)
++        dest, err = extract(cache, out, lib)
++        if not dest:
++            print(f'-> falta {lib} y NO está en la caché. {err}')
++            return
++        print(f'-> extraída {lib}')
++    print('límite de iteraciones alcanzado')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/inventario_total.sh b/tools/inventario_total.sh
+new file mode 100755
+index 0000000..2f03f43
+--- /dev/null
++++ b/tools/inventario_total.sh
+@@ -0,0 +1,68 @@
++#!/bin/bash
++# inventario_total.sh: ejecuta TODOS los programas de /bin, /sbin, /usr/bin y /usr/sbin del macOS (por omisión el
++# completo, ~/macos26/completo/macOS) dentro de la shell de macOS unida a launchd, uno a uno, sin argumentos, con la
++# entrada en /dev/null y un plazo (PLAZO s, 6). Cada resultado se escribe al momento en <raíz>/private/var/tmp/inventario.txt
++# («n|programa|pid|código|segundos|primera línea de la salida»), así que si el arranque se corta (guardián de memoria) se
++# retoma con DESDE=<n> sin perder lo hecho. Al final, tools/diag/inventario.py lo clasifica con el registro de tahoe-run.
++#   ESPERA: segundos de arranque antes de empezar (180). PLAZO: segundos por programa (6). DESDE: primer número (1).
++#   TAHOE_RUN: otro binario de tahoe-run. Siempre limpia.
++# Se saltan los que acaban o alteran el arranque (reboot, halt, shutdown, killall, pkill...) y los servicios de launchd del propio sistema
++# (su programa está en un plist de LaunchDaemons/LaunchAgents): otra copia sin argumentos estorbaría a la que ya corre.
++TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
++D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
++export TAHOE_ROOT="${TAHOE_ROOT:-$HOME/macos26/completo/macOS}"
++R="$TAHOE_ROOT"; E="${ESPERA:-180}"; PLAZO="${PLAZO:-6}"; DESDE="${DESDE:-1}"
++LISTA="$R/private/var/tmp/inventario-lista.txt"; OUT="$R/private/var/tmp/inventario.txt"
++[ -d "$R/private/var/tmp" ] || { echo "no encuentro $R/private/var/tmp" >&2; exit 1; }
++# Lista: programas ejecutables, menos los saltados.
++python3 - "$R" > "$LISTA" <<'EOF'
++import glob, os, plistlib, sys
++R = sys.argv[1]
++salta = {"/sbin/reboot", "/sbin/halt", "/sbin/shutdown", "/sbin/fastboot", "/sbin/fasthalt", "/sbin/launchd",
++         "/sbin/init", "/usr/sbin/sshd", "/usr/sbin/httpd", "/usr/sbin/apachectl", "/usr/sbin/postfix",
++         "/usr/bin/ssh-agent", "/usr/sbin/newsyslog", "/usr/bin/killall", "/usr/bin/pkill"}
++normales = {"/bin/bash", "/usr/bin/true", "/usr/bin/csrutil", "/sbin/pfctl", "/sbin/mount_nfs", "/usr/sbin/asr",
++            "/usr/sbin/vsdbutil"}
++for f in glob.glob(R + "/System/Library/LaunchDaemons/*.plist") + glob.glob(R + "/System/Library/LaunchAgents/*.plist"):
++    try:
++        p = plistlib.load(open(f, "rb"))
++    except Exception:
++        continue
++    prog = p.get("Program") or (p.get("ProgramArguments") or [None])[0]
++    if prog and prog not in normales:
++        salta.add(prog)
++for d in ("/bin", "/sbin", "/usr/bin", "/usr/sbin"):
++    for n in sorted(os.listdir(R + d)):
++        g = d + "/" + n
++        h = R + g
++        if os.path.isfile(h) and not os.path.islink(h) and os.access(h, os.X_OK):
++            print(("SALTA " if g in salta else "") + g)
++EOF
++total=$(wc -l < "$LISTA")
++[ "$DESDE" = 1 ] && : > "$OUT"
++echo "inventario: $total programas (desde el $DESDE), plazo ${PLAZO}s; resultados en $OUT"
++# Dentro de macOS: cada programa en su propio grupo de procesos (set -m) para poder matarlo con sus hijos.
++SCRIPT="set -m; i=0
++while read -r l; do
++ i=\$((i+1)); [ \$i -lt $DESDE ] && continue
++ case \"\$l\" in SALTA\\ *) echo \"\$i|\${l#SALTA }|-|saltada|0|\" >> /private/var/tmp/inventario.txt; continue;; esac
++ f=/private/var/tmp/.inv.out; rm -f \$f
++ t0=\$SECONDS
++ ( \"\$l\" < /dev/null > \$f 2>&1 ) & p=\$!
++ k=0; while kill -0 \$p 2>/dev/null && [ \$k -lt $((PLAZO * 5)) ]; do sleep 0.2; k=\$((k+1)); done
++ if kill -0 \$p 2>/dev/null; then kill -9 -- -\$p 2>/dev/null; kill -9 \$p 2>/dev/null; wait \$p 2>/dev/null; r=COLGADA
++ else wait \$p; r=\$?; fi
++ s=\$(head -c 2000 \$f 2>/dev/null | tr -d '\\r' | grep -v '^\\s*\$' | head -1 | tr '|' '/' | cut -c1-160)
++ echo \"\$i|\$l|\$p|\$r|\$((SECONDS-t0))|\$s\" >> /private/var/tmp/inventario.txt
++done < /private/var/tmp/inventario-lista.txt
++echo @@fin"
++TAHOE_BOOT_WAIT=$E timeout -s TERM -k 10 $(( E + total * (PLAZO + 3) + 300 )) \
++	"$TOOLS/macos-shell.sh" --depurar --launchd -c "$SCRIPT" > "$D/inventario_total.out" 2>&1
++LOG="${TAHOE_LOGFILE:-/tmp/tahoe-shell-$USER.log}"
++n=$(LC_ALL=C grep -an "<1> cargado launchd " "$LOG" | tail -1 | cut -d: -f1)
++[ -n "$n" ] && tail -n +"$n" "$LOG" > "$D/inventario_total.log"
++cp "$OUT" "$D/inventario_total.txt" 2>/dev/null
++"$TOOLS/diag/clean.sh" > /dev/null 2>&1
++grep -a "guardián" "$D/inventario_total.out" | head -1
++echo "hechos: $(wc -l < "$OUT") de $total (si faltan, sigue con DESDE=$(( $(wc -l < "$OUT") + 1 )))"
++python3 "$TOOLS/diag/inventario.py" "$D/inventario_total.txt" "$D/inventario_total.log"
+diff --git a/tools/macos-rs/LEEME.md b/tools/macos-rs/LEEME.md
+new file mode 100644
+index 0000000..41a5f51
+--- /dev/null
++++ b/tools/macos-rs/LEEME.md
+@@ -0,0 +1,20 @@
++# Rust para el macOS de tahoe-run
++
++Programas y bibliotecas en Rust (con `std`) que se ejecutan *dentro* del macOS de tahoe-run, sin Xcode ni el SDK de
++Apple: el driver Metal (`tahoe-metal`) y herramientas de prueba.
++
++1. `rustup target add x86_64-apple-darwin` (la biblioteca estándar de Rust para macOS).
++2. Descripciones de las bibliotecas de macOS, sacadas de la caché de dyld de tu copia (no se sube nada de Apple):
++   `python3 tools/macos-rs/gen_tbd.py ~/.cache/tahoe-syms/<caché> ~/.cache/tahoe-tbd`
++3. En el proyecto, `.cargo/config.toml`:
++   ```toml
++   [target.x86_64-apple-darwin]
++   linker = "rust-lld"
++   rustflags = ["-C", "linker-flavor=ld64.lld", "-C", "link-arg=-L/ruta/a/.cache/tahoe-tbd",
++                "-C", "link-arg=-platform_version", "-C", "link-arg=macos", "-C", "link-arg=11.0", "-C", "link-arg=26.0",
++                "-C", "link-arg=-arch", "-C", "link-arg=x86_64"]
++   ```
++4. `cargo build --release --target x86_64-apple-darwin`, copiar el binario dentro de macOS y ejecutarlo, p. ej.
++   `tools/macos-shell.sh -c /private/var/tmp/programa`.
++
++Probado con un programa con `Vec`, `println!` y `thread::spawn`/`join` (que destapó un fallo de `bsdthread_create`).
+diff --git a/tools/macos-rs/gen_tbd.py b/tools/macos-rs/gen_tbd.py
+new file mode 100644
+index 0000000..1856ec9
+--- /dev/null
++++ b/tools/macos-rs/gen_tbd.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++# gen_tbd.py <símbolos> <salida>: descripciones .tbd de las bibliotecas de macOS para enlazar programas en Rust (o C)
++# hechos aquí para el macOS de tahoe-run, sin el SDK de Apple. <símbolos> es la carpeta de listados de símbolos de la
++# caché de dyld (~/.cache/tahoe-syms/<caché>/, una por imagen: «0xdirección: (tipo) símbolo»); <salida> recibe
++# libSystem.tbd (con todo lo que libSystem.B.dylib reexporta: libsystem_*, libdyld, libdispatch, libxpc...), los
++# alias libc/libm/libiconv y libobjc.tbd. Se genera a partir del macOS de cada cual: no se sube nada de Apple.
++# Uso con Cargo: ver tools/macos-rs/LEEME.md.
++import glob, os, re, sys
++
++if len(sys.argv) != 3: sys.exit(__doc__ if __doc__ else "uso: gen_tbd.py <símbolos> <salida>")
++src, out = sys.argv[1], sys.argv[2]
++os.makedirs(out, exist_ok=True)
++SISTEMA = ["libsystem_", "libdyld", "libunwind", "libcompiler_rt", "libdispatch", "libxpc", "libcache", "libcommonCrypto",
++           "libcopyfile", "libremovefile", "libkeymgr", "libquarantine", "libmacho", "libcorecrypto"]
++
++def exportados(f):
++    s = set()
++    for l in open(f, errors="replace"):
++        m = re.match(r"0x([0-9a-f]+):\s+\(([^)]*)\)\s+(\S+)", l)
++        if not m or int(m.group(1), 16) == 0 or "private" in m.group(2): continue
++        k = m.group(2)
++        if "regular" in k or "external" in k or "re-exported" in k or "resolver" in k: s.add(m.group(3))
++    return s
++
++def tbd(nombre, instalacion, simbolos, objc=()):
++    with open(os.path.join(out, nombre), "w") as o:
++        o.write("--- !tapi-tbd\ntbd-version: 4\ntargets: [ x86_64-macos ]\n")
++        o.write(f"install-name: '{instalacion}'\ncurrent-version: 1\nexports:\n  - targets: [ x86_64-macos ]\n")
++        o.write("    symbols: [ " + ", ".join(f"'{x}'" for x in sorted(simbolos)) + " ]\n")
++        if objc: o.write("    objc-classes: [ " + ", ".join(sorted(objc)) + " ]\n")
++        o.write("...\n")
++
++sistema = set()
++for f in glob.glob(os.path.join(src, "*.txt")):
++    if any(os.path.basename(f).startswith(p) for p in SISTEMA): sistema |= exportados(f)
++tbd("libSystem.tbd", "/usr/lib/libSystem.B.dylib", sistema)
++for alias in ("libc", "libm", "libiconv", "libpthread"):
++    d = os.path.join(out, alias + ".tbd")
++    if os.path.lexists(d): os.remove(d)
++    os.symlink("libSystem.tbd", d)
++objc = exportados(os.path.join(src, "libobjc.A.dylib.txt"))
++clases = {x[len("_OBJC_CLASS_$_"):] for x in objc if x.startswith("_OBJC_CLASS_$_")}
++tbd("libobjc.tbd", "/usr/lib/libobjc.A.dylib", {x for x in objc if not x.startswith(("_OBJC_CLASS_$_", "_OBJC_METACLASS_$_"))}, clases)
++print(f"{out}: libSystem ({len(sistema)} símbolos), libobjc ({len(objc)})")
+diff --git a/tools/macos/.gitignore b/tools/macos/.gitignore
+new file mode 100644
+index 0000000..cd42ee3
+--- /dev/null
++++ b/tools/macos/.gitignore
+@@ -0,0 +1,2 @@
++bin/
++obj/
+diff --git a/tools/macos/build.sh b/tools/macos/build.sh
+new file mode 100755
+index 0000000..d354d2c
+--- /dev/null
++++ b/tools/macos/build.sh
+@@ -0,0 +1,17 @@
++#!/bin/bash
++# build.sh: compila desde Linux los programas de macOS de esta carpeta (x86_64, Mach-O) con clang y ld64.lld, sin SDK de
++# Apple: las bibliotecas del sistema se describen con stubs .tbd mínimos (solo los símbolos que se usan). Se ejecutan en
++# tahoe-run (tools/macos-shell.sh). Uso: tools/macos/build.sh  -> tools/macos/bin/
++cd "$(dirname "$(readlink -f "$0")")" || exit 1
++mkdir -p bin obj
++tbd() {   # tbd <install-name> <símbolos...>
++	printf -- '--- !tapi-tbd\ntbd-version: 4\ntargets: [ x86_64-macos ]\ninstall-name: '"'%s'"'\nexports:\n  - targets: [ x86_64-macos ]\n    symbols: [ %s ]\n...\n' "$1" "$(shift; echo "$@" | sed 's/ /, /g')"
++}
++tbd /usr/lib/libSystem.B.dylib _open _read _write _close _lseek _malloc _free _unlink _printf _strlen _memcpy _snprintf _getline ___stdinp ___stack_chk_fail ___stack_chk_guard dyld_stub_binder > obj/libSystem.tbd
++tbd /usr/lib/libcompression.dylib _compression_decode_buffer > obj/libcompression.tbd
++for src in *.c; do
++	n="${src%.c}"
++	clang -target x86_64-apple-macos13 -O2 -ffreestanding -fno-builtin -nostdinc -c "$src" -o "obj/$n.o" || exit 1
++	ld64.lld -arch x86_64 -platform_version macos 13.0 26.0 -o "bin/$n" "obj/$n.o" obj/libSystem.tbd obj/libcompression.tbd || exit 1
++	echo "bin/$n"
++done
+diff --git a/tools/macos/decmpfs.c b/tools/macos/decmpfs.c
+new file mode 100644
+index 0000000..5158e04
+--- /dev/null
++++ b/tools/macos/decmpfs.c
+@@ -0,0 +1,84 @@
++// decmpfs: reconstruye archivos con compresión transparente de APFS/HFS+ (decmpfs) que un extractor dejó como tres piezas:
++// el archivo vacío, "archivo:com.apple.decmpfs" (cabecera) y "archivo:com.apple.ResourceFork" (bloques comprimidos).
++// Es un programa de macOS (se ejecuta dentro de tahoe-run) porque usa compression_decode_buffer de libcompression de
++// Apple, la única que trae LZBITMAP. Lee de la entrada estándar las rutas de los archivos (una por línea), escribe cada
++// uno descomprimido en su lugar y borra las dos piezas. Compilar: tools/macos/build.sh
++//
++// Cabecera decmpfs (16 bytes, little endian): "fpmc", tipo (u32), tamaño sin comprimir (u64); en los tipos «attr» los
++// datos van detrás de la cabecera, en los «rsrc» en el resource fork: una tabla de desplazamientos u32 (bloques de 64 KB)
++// seguida de los bloques. Un bloque que empieza por 0xFF (lzfse/lzbitmap) o 0x06 (lzvn) va sin comprimir.
++typedef unsigned long size_t; typedef long ssize_t; typedef unsigned int u32; typedef unsigned long long u64;
++int open(const char*, int, ...); ssize_t read(int, void*, size_t); ssize_t write(int, const void*, size_t); int close(int);
++long lseek(int, long, int); void* malloc(size_t); void free(void*); int unlink(const char*); int printf(const char*, ...);
++size_t strlen(const char*); void* memcpy(void*, const void*, size_t); int snprintf(char*, size_t, const char*, ...);
++ssize_t getline(char**, size_t*, void*); extern void* __stdinp;
++size_t compression_decode_buffer(unsigned char*, size_t, const unsigned char*, size_t, void*, int);
++enum { ALG_ZLIB = 0x205, ALG_LZFSE = 0x801, ALG_LZVN = 0x900, ALG_LZBITMAP = 0x702 };
++#define O_WRONLY 1
++#define O_TRUNC 0x400
++#define CHUNK 65536
++
++static unsigned char* slurp(const char* p, long* n) {
++	int fd = open(p, 0); if (fd < 0) return 0;
++	long sz = lseek(fd, 0, 2); lseek(fd, 0, 0);
++	unsigned char* b = malloc(sz ? sz : 1); long got = 0;
++	while (got < sz) { ssize_t r = read(fd, b + got, sz - got); if (r <= 0) break; got += r; }
++	close(fd); *n = got; return got == sz ? b : 0;
++}
++static int alg_of(u32 t) {
++	switch (t) { case 3: case 4: return ALG_ZLIB; case 7: case 8: return ALG_LZVN; case 11: case 12: return ALG_LZFSE; case 13: case 14: return ALG_LZBITMAP; }
++	return -1;
++}
++// un bloque: sin comprimir si empieza por la marca correspondiente; si no, decodificar (zlib de decmpfs lleva cabecera
++// de 2 bytes de zlib que libcompression no quiere)
++static long chunk(int alg, const unsigned char* in, long n, unsigned char* out, long cap) {
++	if (n == 0) return 0;
++	if ((alg == ALG_LZVN && in[0] == 0x06) || (alg != ALG_LZVN && alg != ALG_ZLIB && in[0] == 0xFF) || (alg == ALG_ZLIB && (in[0] & 0x0F) == 0x0F)) {
++		if (n - 1 > cap) return -1; memcpy(out, in + 1, n - 1); return n - 1;
++	}
++	if (alg == ALG_ZLIB) { in += 2; n -= 2; }
++	return (long)compression_decode_buffer(out, cap, in, n, 0, alg);
++}
++static int one(const char* path) {
++	char hp[4096], rp[4096]; snprintf(hp, sizeof hp, "%s:com.apple.decmpfs", path); snprintf(rp, sizeof rp, "%s:com.apple.ResourceFork", path);
++	long hn; unsigned char* h = slurp(hp, &hn);
++	if (!h || hn < 16 || h[0] != 'f' || h[1] != 'p' || h[2] != 'm' || h[3] != 'c') { printf("cabecera mala: %s\n", path); return 1; }
++	u32 type; u64 size; memcpy(&type, h + 4, 4); memcpy(&size, h + 8, 8);
++	int alg = alg_of(type);
++	unsigned char* out = malloc(size ? size : 1); long done = 0;
++	if (type == 1) { memcpy(out, h + 16, size); done = size; }                      // sin comprimir, en la cabecera
++	else if (alg < 0) { printf("tipo %u no soportado: %s\n", type, path); return 1; }
++	else if (type % 2 == 1) { done = chunk(alg, h + 16, hn - 16, out, size); }        // datos tras la cabecera
++	else {
++		long rn; unsigned char* r = slurp(rp, &rn);
++		if (!r) { printf("sin resource fork: %s\n", path); return 1; }
++		if (type == 4) {                                                       // zlib: formato clásico de resource fork
++			u32 doff = (u32)r[0] << 24 | r[1] << 16 | r[2] << 8 | r[3];
++			const unsigned char* t = r + doff + 4; u32 cnt; memcpy(&cnt, t, 4);
++			for (u32 i = 0; i < cnt && done >= 0; i++) { u32 o, l; memcpy(&o, t + 4 + i * 8, 4); memcpy(&l, t + 8 + i * 8, 4);
++				long k = chunk(alg, t + o, l, out + done, size - done); if (k < 0) done = -1; else done += k; }
++		} else {
++			u32 first; memcpy(&first, r, 4); u32 cnt = first / 4 - 1;
++			for (u32 i = 0; i < cnt && done >= 0; i++) { u32 a, b; memcpy(&a, r + i * 4, 4); memcpy(&b, r + i * 4 + 4, 4);
++				long cap = size - done < CHUNK ? (long)(size - done) : CHUNK;
++				long k = chunk(alg, r + a, (long)b - a, out + done, cap); if (k <= 0 && cap > 0) done = -1; else done += k; }
++		}
++		free(r);
++	}
++	if (done != (long)size) { printf("tamaño %ld en vez de %llu (tipo %u): %s\n", done, size, type, path); return 1; }
++	int fd = open(path, O_WRONLY | O_TRUNC); if (fd < 0) { printf("no puedo escribir: %s\n", path); return 1; }
++	long w = 0; while (w < done) { ssize_t k = write(fd, out + w, done - w); if (k <= 0) break; w += k; }
++	close(fd); free(out); free(h);
++	if (w != done) { printf("escritura corta: %s\n", path); return 1; }
++	unlink(hp); unlink(rp);
++	return 0;
++}
++int main(void) {
++	char* line = 0; size_t cap = 0; ssize_t n; int ok = 0, mal = 0;
++	while ((n = getline(&line, &cap, __stdinp)) > 0) {
++		if (line[n - 1] == '\n') line[--n] = 0;
++		if (n) { if (one(line)) mal++; else ok++; }
++	}
++	printf("descomprimidos %d, con error %d\n", ok, mal);
++	return mal != 0;
++}
+diff --git a/tools/preconfigurar.py b/tools/preconfigurar.py
+new file mode 100755
+index 0000000..2df4a06
+--- /dev/null
++++ b/tools/preconfigurar.py
+@@ -0,0 +1,186 @@
++#!/usr/bin/env python3
++"""preconfigurar.py: deja el macOS completo configurado como lo hacen las empresas, sin pasar por el Asistente de
++configuración, para probar con un usuario normal y no dudar de si algo falla «porque macOS no está configurado».
++
++  preconfigurar.py aplicar <raíz> <usuario> [nombre completo] [idioma]   (idioma por omisión es_MX)
++  preconfigurar.py deshacer <raíz>
++
++Se ejecuta desde tools/preconfigurar.sh, dentro de un espacio de usuarios de Linux en el que se es root (igual que
++tahoe-run): parte de /private/var/db/dslocal no es legible para el usuario de Linux.
++
++aplicar:
++  1. Copia de seguridad de lo que se toca en ~/.config/tahoe-run/preconfig/ (fuera del repositorio).
++  2. Crea un administrador como lo haría sysadminctl: registro en dslocal (uid 501, grupo staff 20, shell zsh, UUID
++     propio), contraseña con SALTED-SHA512-PBKDF2 (lo que guarda macOS en ShadowHashData; la contraseña se pide aquí y no
++     se guarda en ningún sitio), alta en el grupo admin y carpeta /Users/<usuario> copiada de la plantilla de macOS.
++  3. Idioma y región en /Library/Preferences/.GlobalPreferences.plist (AppleLanguages, AppleLocale) y en las del
++     usuario (~/Library/Preferences/.GlobalPreferences.plist), como deja el Asistente.
++  4. /private/var/db/.AppleSetupDone: el Asistente de configuración se da por hecho. El índice de dslocal (sqlindex) se
++     aparta para que opendirectoryd lo rehaga con el usuario nuevo.
++  Si algo falla a mitad, se deshace lo hecho.
++deshacer: restaura la copia de seguridad, borra el usuario y su carpeta y quita .AppleSetupDone.
++"""
++import getpass
++import hashlib
++import json
++import os
++import plistlib
++import shutil
++import sys
++import time
++import uuid
++
++GUARDA = os.path.expanduser("~/.config/tahoe-run/preconfig")
++DSLOCAL = "private/var/db/dslocal/nodes/Default"
++GLOBAL = "Library/Preferences/.GlobalPreferences.plist"
++SETUPDONE = "private/var/db/.AppleSetupDone"
++UID = 501
++ITERACIONES = 45000                          # del orden de lo que usa macOS para las cuentas locales
++
++
++def leer(p):
++    with open(p, "rb") as f:
++        return plistlib.load(f)
++
++
++def escribir(p, d):
++    tmp = p + ".tmp"
++    with open(tmp, "wb") as f:
++        plistlib.dump(d, f, fmt=plistlib.FMT_BINARY)
++    os.replace(tmp, p)
++
++
++def respaldo(raiz, rels):
++    os.makedirs(GUARDA, exist_ok=True)
++    estado = os.path.join(GUARDA, "estado.json")
++    if os.path.exists(estado):
++        sys.exit("ya hay una preconfiguración aplicada (usa «deshacer» antes de volver a aplicar)")
++    copias = {}
++    for rel in rels:
++        src = os.path.join(raiz, rel)
++        if os.path.exists(src):
++            dst = os.path.join(GUARDA, rel.replace("/", "__"))
++            shutil.copy2(src, dst)
++            copias[rel] = dst
++        else:
++            copias[rel] = None                   # no existía: al deshacer se borra
++    return estado, copias
++
++
++def aplicar(raiz, usuario, nombre, idioma):
++    if not usuario.isascii() or not usuario.replace("_", "").isalnum() or usuario[0].isdigit() or usuario != usuario.lower():
++        sys.exit("el nombre corto debe ser minúsculas, letras y números (p. ej. «ana»)")
++    users = os.path.join(raiz, DSLOCAL, "users")
++    if os.path.exists(os.path.join(raiz, "Users", usuario)):
++        sys.exit(f"ya existe /Users/{usuario}")
++    if os.path.exists(os.path.join(users, usuario + ".plist")):
++        sys.exit(f"el usuario {usuario} ya existe en este macOS")
++    for f in os.listdir(users):                  # uid libre
++        try:
++            if str(UID) in leer(os.path.join(users, f)).get("uid", []):
++                sys.exit(f"el uid {UID} ya está en uso ({f})")
++        except Exception:
++            pass
++    clave = getpass.getpass(f"Contraseña para {usuario} en macOS: ")
++    if clave != getpass.getpass("Repítela: "):
++        sys.exit("no coinciden")
++    if not clave:
++        sys.exit("la contraseña no puede estar vacía")
++
++    # El índice de dslocal (sqlindex) se aparta como hacen las herramientas de despliegue: opendirectoryd lo rehace al
++    # arrancar con el usuario nuevo. Se devuelve al deshacer.
++    indices = [f"{DSLOCAL}/{n}" for n in ("sqlindex", "sqlindex-shm", "sqlindex-wal")]
++    rels = [f"{DSLOCAL}/groups/admin.plist", GLOBAL, SETUPDONE] + indices
++    estado, copias = respaldo(raiz, rels)
++    with open(estado, "w") as f:               # apuntado antes de tocar nada: si algo falla, se puede deshacer
++        json.dump({"usuario": usuario, "casa": f"/Users/{usuario}", "copias": copias, "fecha": time.strftime("%Y-%m-%d %H:%M")}, f, indent=1)
++    try:
++        hacer(raiz, usuario, nombre, idioma, clave, indices)
++    except BaseException:
++        print("algo falló: se deshace lo hecho", file=sys.stderr)
++        deshacer(raiz)
++        raise
++    print(f"listo: usuario «{usuario}» (uid {UID}, administrador), idioma {idioma}, Asistente de configuración saltado.")
++    print("para volver atrás: tools/preconfigurar.sh deshacer")
++
++
++def hacer(raiz, usuario, nombre, idioma, clave, indices):
++    users = os.path.join(raiz, DSLOCAL, "users")
++    # 2. el usuario (formato de dslocal: cada valor es una lista)
++    sal = os.urandom(32)
++    entropia = hashlib.pbkdf2_hmac("sha512", clave.encode(), sal, ITERACIONES, 128)
++    shadow = plistlib.dumps({"SALTED-SHA512-PBKDF2": {"entropy": entropia, "iterations": ITERACIONES, "salt": sal}},
++                            fmt=plistlib.FMT_BINARY)
++    guid = str(uuid.uuid4()).upper()
++    casa = f"/Users/{usuario}"
++    escribir(os.path.join(users, usuario + ".plist"), {
++        "name": [usuario], "realname": [nombre], "uid": [str(UID)], "gid": ["20"], "home": [casa],
++        "shell": ["/bin/zsh"], "generateduid": [guid], "passwd": ["********"],
++        "authentication_authority": [";ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>"], "ShadowHashData": [shadow],
++        "hint": [""], "_writers_passwd": [usuario], "_writers_hint": [usuario], "_writers_picture": [usuario],
++        "_writers_realname": [usuario], "_writers_UserCertificate": [usuario], "_writers_jpegphoto": [usuario],
++    })
++    admin_p = os.path.join(raiz, DSLOCAL, "groups", "admin.plist")
++    admin = leer(admin_p)
++    admin.setdefault("users", []).append(usuario)
++    admin.setdefault("groupmembers", []).append(guid)
++    escribir(admin_p, admin)
++
++    plantilla = os.path.join(raiz, "System/Library/User Template")
++    destino = os.path.join(raiz, casa.lstrip("/"))
++    shutil.copytree(os.path.join(plantilla, "Non_localized"), destino, symlinks=True)
++    loc = os.path.join(plantilla, "Spanish.lproj")
++    if os.path.isdir(loc):
++        shutil.copytree(loc, destino, symlinks=True, dirs_exist_ok=True)
++
++    # 3. idioma y región
++    gp_p = os.path.join(raiz, GLOBAL)
++    # vacía (como viene en la imagen) o sin crear: sin preferencias; si tiene algo que no se puede leer, falla (y se deshace)
++    gp = leer(gp_p) if os.path.exists(gp_p) and os.path.getsize(gp_p) > 0 else {}
++    lengua = idioma.split("_")[0]
++    gp["AppleLanguages"] = [idioma.replace("_", "-"), lengua]
++    gp["AppleLocale"] = idioma
++    escribir(gp_p, gp)
++    # y en las del propio usuario, como deja el Asistente (defaults read -g lee estas)
++    up = os.path.join(destino, "Library/Preferences")
++    os.makedirs(up, exist_ok=True)
++    escribir(os.path.join(up, ".GlobalPreferences.plist"), {"AppleLanguages": gp["AppleLanguages"], "AppleLocale": idioma})
++
++    # 4. Asistente de configuración hecho
++    open(os.path.join(raiz, SETUPDONE), "w").close()
++    for rel in indices:
++        p = os.path.join(raiz, rel)
++        if os.path.exists(p):
++            os.remove(p)
++
++
++def deshacer(raiz):
++    estado = os.path.join(GUARDA, "estado.json")
++    if not os.path.exists(estado):
++        sys.exit("no hay ninguna preconfiguración aplicada")
++    e = json.load(open(estado))
++    for rel, copia in e["copias"].items():
++        dst = os.path.join(raiz, rel)
++        if copia and os.path.exists(copia):
++            shutil.copy2(copia, dst)
++            os.remove(copia)
++        elif os.path.exists(dst):
++            os.remove(dst)
++    u = os.path.join(raiz, DSLOCAL, "users", e["usuario"] + ".plist")
++    if os.path.exists(u):
++        os.remove(u)
++    casa = os.path.join(raiz, e["casa"].lstrip("/"))
++    if os.path.isdir(casa):
++        shutil.rmtree(casa)
++    os.remove(estado)
++    print(f"deshecho: sin el usuario «{e['usuario']}», idioma y Asistente de configuración como estaban.")
++
++
++if __name__ == "__main__":
++    if len(sys.argv) >= 4 and sys.argv[1] == "aplicar":
++        aplicar(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else sys.argv[3],
++                sys.argv[5] if len(sys.argv) > 5 else "es_MX")
++    elif len(sys.argv) == 3 and sys.argv[1] == "deshacer":
++        deshacer(sys.argv[2])
++    else:
++        sys.exit(__doc__)
+diff --git a/tools/preconfigurar.sh b/tools/preconfigurar.sh
+new file mode 100755
+index 0000000..38303c6
+--- /dev/null
++++ b/tools/preconfigurar.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++# preconfigurar.sh: configura el macOS completo como lo hacen las empresas (usuario administrador, idioma y región, sin
++# Asistente de configuración), o lo deshace. Ver tools/preconfigurar.py.
++#
++#   tools/preconfigurar.sh aplicar <usuario> ["Nombre Completo"] [idioma, p. ej. es_MX]
++#   tools/preconfigurar.sh deshacer
++#
++# TAHOE_ROOT: el macOS (por omisión ~/macos26/completo/macOS). La contraseña se pide al aplicar y no se guarda.
++# Se ejecuta como root dentro de un espacio de usuarios (como tahoe-run): parte de dslocal no la puede leer el usuario de
++# Linux. Con macOS arrancado no se toca nada.
++TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
++ROOT="${TAHOE_ROOT:-$HOME/macos26/completo/macOS}"
++if pgrep -x tahoe-run > /dev/null; then echo "hay un macOS arrancado (tahoe-run): ciérralo antes" >&2; exit 1; fi
++[ -d "$ROOT/private/var/db/dslocal" ] || { echo "no encuentro un macOS en $ROOT (define TAHOE_ROOT)" >&2; exit 1; }
++exec unshare --user --map-root-user python3 "$TOOLS/preconfigurar.py" "$1" "$ROOT" "${@:2}"
+diff --git a/tools/smbios.sh b/tools/smbios.sh
+new file mode 100755
+index 0000000..8e0c0b3
+--- /dev/null
++++ b/tools/smbios.sh
+@@ -0,0 +1,31 @@
++#!/bin/bash
++# smbios.sh: genera la identidad del equipo que presenta tahoe-run (como en un Hackintosh con OpenCore): modelo, placa
++# (board-id), número de serie y MLB con macserial de OpenCore, y UUID y ROM aleatorios (no la MAC real). Se guarda en
++# ~/.config/tahoe-run/smbios.json (o TAHOE_SMBIOS_FILE), fuera del repositorio: es única de cada instalación.
++# tools/macos-shell.sh se la pasa a tahoe-run, que la pone en IOPlatformExpertDevice, hw.model/hw.target y la NVRAM (MLB, ROM).
++#
++#   tools/smbios.sh [modelo]          # por omisión MacBookPro16,2: portátil Intel con solo gráfica integrada, admitido por macOS 26
++#
++# Modelos Intel admitidos por macOS 26: MacBookPro16,1/16,2/16,4, iMac20,1/20,2, MacPro7,1. No sobrescribe un archivo existente.
++set -e
++MODELO="${1:-MacBookPro16,2}"
++DEST="${TAHOE_SMBIOS_FILE:-$HOME/.config/tahoe-run/smbios.json}"
++[ -e "$DEST" ] && { echo "ya existe $DEST: no se toca (bórralo para generar otro)" >&2; exit 1; }
++declare -A PLACA=([MacBookPro16,1]=Mac-E1008331FDC96864 [MacBookPro16,2]=Mac-5F9802EFE386AA28 [MacBookPro16,4]=Mac-A61BADE1FDAD7B05
++	[iMac20,1]=Mac-CFF7D910A743CAAF [iMac20,2]=Mac-AF89B6D9451A490B [MacPro7,1]=Mac-27AD2F918AE68F61)
++[ -n "${PLACA[$MODELO]}" ] || { echo "modelo no admitido por macOS 26 en Intel: $MODELO" >&2; exit 1; }
++OC="${XDG_CACHE_HOME:-$HOME/.cache}/tahoe-run/opencore"
++MS="$OC/Utilities/macserial/macserial.linux"
++if [ ! -x "$MS" ]; then
++	mkdir -p "$OC"
++	URL=$(curl -sL https://api.github.com/repos/acidanthera/OpenCorePkg/releases/latest | grep -o 'https://[^"]*RELEASE.zip' | head -1)
++	curl -sL -o "$OC/oc.zip" "$URL" && (cd "$OC" && unzip -o -q oc.zip 'Utilities/macserial/*') && chmod +x "$MS"
++fi
++L=$("$MS" -m "$MODELO" -g -n 1 | grep '|' | head -1)
++S=$(echo "$L" | cut -d'|' -f1 | tr -d ' '); M=$(echo "$L" | cut -d'|' -f2 | tr -d ' ')
++[ -n "$S" ] && [ -n "$M" ] || { echo "macserial no dio número de serie" >&2; exit 1; }
++U=$(tr a-f A-F < /proc/sys/kernel/random/uuid); R=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n' | tr a-f A-F)
++umask 077; mkdir -p "$(dirname "$DEST")"
++printf '{\n "modelo": "%s",\n "placa": "%s",\n "serie": "%s",\n "mlb": "%s",\n "uuid": "%s",\n "rom": "%s",\n "origen": "macserial -m %s -g; uuid y rom aleatorios"\n}\n' \
++	"$MODELO" "${PLACA[$MODELO]}" "$S" "$M" "$U" "$R" "$MODELO" > "$DEST"
++echo "generado $DEST ($MODELO); número de serie: $("$MS" -i "$S" | grep -m1 SystemModel | sed 's/.*: //')"
+diff --git a/tools/tahoe-view/.gitignore b/tools/tahoe-view/.gitignore
+new file mode 100644
+index 0000000..2f7896d
+--- /dev/null
++++ b/tools/tahoe-view/.gitignore
+@@ -0,0 +1 @@
++target/
+diff --git a/tools/tahoe-view/Cargo.lock b/tools/tahoe-view/Cargo.lock
+new file mode 100644
+index 0000000..bea7b21
+--- /dev/null
++++ b/tools/tahoe-view/Cargo.lock
+@@ -0,0 +1,1965 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "ab_glyph"
++version = "0.2.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "01c0457472c38ea5bd1c3b5ada5e368271cb550be7a4ca4a0b4634e9913f6cc2"
++dependencies = [
++ "ab_glyph_rasterizer",
++ "owned_ttf_parser",
++]
++
++[[package]]
++name = "ab_glyph_rasterizer"
++version = "0.1.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
++
++[[package]]
++name = "ahash"
++version = "0.8.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
++dependencies = [
++ "cfg-if",
++ "getrandom 0.3.4",
++ "once_cell",
++ "version_check",
++ "zerocopy",
++]
++
++[[package]]
++name = "android-activity"
++version = "0.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0f2a1bb052857d5dd49572219344a7332b31b76405648eabac5bc68978251bcd"
++dependencies = [
++ "android-properties",
++ "bitflags 2.13.2",
++ "cc",
++ "jni",
++ "libc",
++ "log",
++ "ndk",
++ "ndk-context",
++ "ndk-sys",
++ "num_enum",
++ "thiserror 2.0.21",
++]
++
++[[package]]
++name = "android-properties"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fc7eb209b1518d6bb87b283c20095f5228ecda460da70b44f0802523dea6da04"
++
++[[package]]
++name = "arrayref"
++version = "0.3.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
++
++[[package]]
++name = "arrayvec"
++version = "0.7.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
++
++[[package]]
++name = "as-raw-xcb-connection"
++version = "1.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "175571dd1d178ced59193a6fc02dde1b972eb0bc56c892cde9beeceac5bf0f6b"
++
++[[package]]
++name = "atomic-waker"
++version = "1.1.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
++
++[[package]]
++name = "bitflags"
++version = "1.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
++
++[[package]]
++name = "bitflags"
++version = "2.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
++
++[[package]]
++name = "block2"
++version = "0.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2c132eebf10f5cad5289222520a4a058514204aed6d791f1cf4fe8088b82d15f"
++dependencies = [
++ "objc2 0.5.3",
++]
++
++[[package]]
++name = "bumpalo"
++version = "3.20.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
++
++[[package]]
++name = "bytemuck"
++version = "1.25.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
++dependencies = [
++ "bytemuck_derive",
++]
++
++[[package]]
++name = "bytemuck_derive"
++version = "1.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6a1f896587b6f2c069c73d2f0913e2d590c3990285cd2f0b6aa02b786b4c679c"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.8",
++]
++
++[[package]]
++name = "bytes"
++version = "1.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
++
++[[package]]
++name = "calloop"
++version = "0.13.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b99da2f8558ca23c71f4fd15dc57c906239752dd27ff3c00a1d56b685b7cbfec"
++dependencies = [
++ "bitflags 2.13.2",
++ "log",
++ "polling",
++ "rustix 0.38.44",
++ "slab",
++ "thiserror 1.0.69",
++]
++
++[[package]]
++name = "calloop-wayland-source"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "95a66a987056935f7efce4ab5668920b5d0dac4a7c99991a67395f13702ddd20"
++dependencies = [
++ "calloop",
++ "rustix 0.38.44",
++ "wayland-backend",
++ "wayland-client",
++]
++
++[[package]]
++name = "cc"
++version = "1.8.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6651c9ed80effdc7db0ff72512157f901af5e3549e341e24b1dd4887d836d838"
++dependencies = [
++ "find-msvc-tools",
++ "jobserver",
++ "libc",
++ "shlex",
++]
++
++[[package]]
++name = "cfg-if"
++version = "1.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
++
++[[package]]
++name = "cfg_aliases"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
++
++[[package]]
++name = "combine"
++version = "4.6.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cfc320937d09e6de266b31b9afb480f197d7a861be86be7cb2ea7e5d1bfffc5e"
++dependencies = [
++ "bytes",
++ "memchr",
++]
++
++[[package]]
++name = "concurrent-queue"
++version = "2.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
++dependencies = [
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "core-foundation"
++version = "0.9.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "91e195e091a93c46f7102ec7818a2aa394e1e1771c3ab4825963fa03e45afb8f"
++dependencies = [
++ "core-foundation-sys",
++ "libc",
++]
++
++[[package]]
++name = "core-foundation-sys"
++version = "0.8.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
++
++[[package]]
++name = "core-graphics"
++version = "0.23.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c07782be35f9e1140080c6b96f0d44b739e2278479f64e02fdab4e32dfd8b081"
++dependencies = [
++ "bitflags 1.3.2",
++ "core-foundation",
++ "core-graphics-types",
++ "foreign-types",
++ "libc",
++]
++
++[[package]]
++name = "core-graphics-types"
++version = "0.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "45390e6114f68f718cc7a830514a96f903cccd70d02a8f6d9f643ac4ba45afaf"
++dependencies = [
++ "bitflags 1.3.2",
++ "core-foundation",
++ "libc",
++]
++
++[[package]]
++name = "crossbeam-utils"
++version = "0.8.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
++
++[[package]]
++name = "ctor"
++version = "0.10.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "83cf0d42651b16c6dfe68685716d18480d18a9c39c62d76e8cf3eb6ed5d8bcbf"
++dependencies = [
++ "dtor",
++]
++
++[[package]]
++name = "cursor-icon"
++version = "1.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
++
++[[package]]
++name = "dispatch"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bd0c93bb4b0c6d9b77f4435b0ae98c24d17f1c45b2ff844c6151a07256ca923b"
++
++[[package]]
++name = "dispatch2"
++version = "0.3.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
++dependencies = [
++ "bitflags 2.13.2",
++ "objc2 0.6.5",
++]
++
++[[package]]
++name = "dlib"
++version = "0.5.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
++dependencies = [
++ "libloading",
++]
++
++[[package]]
++name = "downcast-rs"
++version = "1.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
++
++[[package]]
++name = "dpi"
++version = "0.1.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
++
++[[package]]
++name = "drm"
++version = "0.14.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "80bc8c5c6c2941f70a55c15f8d9f00f9710ebda3ffda98075f996a0e6c92756f"
++dependencies = [
++ "bitflags 2.13.2",
++ "bytemuck",
++ "drm-ffi",
++ "drm-fourcc",
++ "libc",
++ "rustix 0.38.44",
++]
++
++[[package]]
++name = "drm-ffi"
++version = "0.9.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "51a91c9b32ac4e8105dec255e849e0d66e27d7c34d184364fb93e469db08f690"
++dependencies = [
++ "drm-sys",
++ "rustix 1.1.5",
++]
++
++[[package]]
++name = "drm-fourcc"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0aafbcdb8afc29c1a7ee5fbe53b5d62f4565b35a042a662ca9fecd0b54dae6f4"
++
++[[package]]
++name = "drm-sys"
++version = "0.8.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ecc8e1361066d91f5ffccff060a3c3be9c3ecde15be2959c1937595f7a82a9f8"
++dependencies = [
++ "libc",
++ "linux-raw-sys 0.9.4",
++]
++
++[[package]]
++name = "dtor"
++version = "0.8.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "edf234dd1594d6dd434a8fb8cada51ddbbc593e40e4a01556a0b31c62da2775b"
++
++[[package]]
++name = "equivalent"
++version = "1.0.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
++
++[[package]]
++name = "errno"
++version = "0.3.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
++dependencies = [
++ "libc",
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "fastrand"
++version = "2.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
++
++[[package]]
++name = "find-msvc-tools"
++version = "0.1.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
++
++[[package]]
++name = "foreign-types"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d737d9aa519fb7b749cbc3b962edcf310a8dd1f4b67c91c4f83975dbdd17d965"
++dependencies = [
++ "foreign-types-macros",
++ "foreign-types-shared",
++]
++
++[[package]]
++name = "foreign-types-macros"
++version = "0.2.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ea5190182e6915eb873ddbc16e23b711b6eb1f9c00a0d0a3a91b5f6228475225"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.8",
++]
++
++[[package]]
++name = "foreign-types-shared"
++version = "0.3.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
++
++[[package]]
++name = "futures-core"
++version = "0.3.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
++
++[[package]]
++name = "futures-task"
++version = "0.3.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
++
++[[package]]
++name = "futures-util"
++version = "0.3.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
++dependencies = [
++ "futures-core",
++ "futures-task",
++ "pin-project-lite",
++ "slab",
++]
++
++[[package]]
++name = "gethostname"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
++dependencies = [
++ "rustix 1.1.5",
++ "windows-link",
++]
++
++[[package]]
++name = "getrandom"
++version = "0.3.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "r-efi 5.3.0",
++ "wasip2",
++]
++
++[[package]]
++name = "getrandom"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "r-efi 6.0.0",
++]
++
++[[package]]
++name = "hashbrown"
++version = "0.17.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
++
++[[package]]
++name = "hermit-abi"
++version = "0.5.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
++
++[[package]]
++name = "indexmap"
++version = "2.14.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
++dependencies = [
++ "equivalent",
++ "hashbrown",
++]
++
++[[package]]
++name = "jni"
++version = "0.22.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5efd9a482cf3a427f00d6b35f14332adc7902ce91efb778580e180ff90fa3498"
++dependencies = [
++ "cfg-if",
++ "combine",
++ "jni-macros",
++ "jni-sys 0.4.1",
++ "log",
++ "simd_cesu8",
++ "thiserror 2.0.21",
++ "walkdir",
++ "windows-link",
++]
++
++[[package]]
++name = "jni-macros"
++version = "0.22.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a00109accc170f0bdb141fed3e393c565b6f5e072365c3bd58f5b062591560a3"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "rustc_version",
++ "simd_cesu8",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "jni-sys"
++version = "0.3.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "41a652e1f9b6e0275df1f15b32661cf0d4b78d4d87ddec5e0c3c20f097433258"
++dependencies = [
++ "jni-sys 0.4.1",
++]
++
++[[package]]
++name = "jni-sys"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c6377a88cb3910bee9b0fa88d4f42e1d2da8e79915598f65fb0c7ee14c878af2"
++dependencies = [
++ "jni-sys-macros",
++]
++
++[[package]]
++name = "jni-sys-macros"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "38c0b942f458fe50cdac086d2f946512305e5631e720728f2a61aabcd47a6264"
++dependencies = [
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "jobserver"
++version = "0.1.35"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
++dependencies = [
++ "getrandom 0.4.3",
++ "libc",
++]
++
++[[package]]
++name = "js-sys"
++version = "0.3.106"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7883d941dae510fb2d978fc3fe018c71c9e2892fd38854de3e8b92c2e5ad9cc5"
++dependencies = [
++ "cfg-if",
++ "futures-util",
++ "wasm-bindgen",
++]
++
++[[package]]
++name = "libc"
++version = "0.2.190"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
++
++[[package]]
++name = "libloading"
++version = "0.8.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
++dependencies = [
++ "cfg-if",
++ "windows-link",
++]
++
++[[package]]
++name = "libredox"
++version = "0.1.25"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
++dependencies = [
++ "bitflags 2.13.2",
++ "libc",
++ "plain",
++ "redox_syscall 0.9.4",
++]
++
++[[package]]
++name = "linux-raw-sys"
++version = "0.4.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
++
++[[package]]
++name = "linux-raw-sys"
++version = "0.9.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cd945864f07fe9f5371a27ad7b52a172b4b499999f1d97574c9fa68373937e12"
++
++[[package]]
++name = "linux-raw-sys"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
++
++[[package]]
++name = "log"
++version = "0.4.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
++
++[[package]]
++name = "memchr"
++version = "2.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
++[[package]]
++name = "memmap2"
++version = "0.9.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
++dependencies = [
++ "libc",
++]
++
++[[package]]
++name = "ndk"
++version = "0.9.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c3f42e7bbe13d351b6bead8286a43aac9534b82bd3cc43e47037f012ebfd62d4"
++dependencies = [
++ "bitflags 2.13.2",
++ "jni-sys 0.3.1",
++ "log",
++ "ndk-sys",
++ "num_enum",
++ "raw-window-handle",
++ "thiserror 1.0.69",
++]
++
++[[package]]
++name = "ndk-context"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
++
++[[package]]
++name = "ndk-sys"
++version = "0.6.0+11769913"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
++dependencies = [
++ "jni-sys 0.3.1",
++]
++
++[[package]]
++name = "num_enum"
++version = "0.7.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5d0bca838442ec211fa11de3a8b0e0e8f3a4522575b5c4c06ed722e005036f26"
++dependencies = [
++ "num_enum_derive",
++ "rustversion",
++]
++
++[[package]]
++name = "num_enum_derive"
++version = "0.7.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
++dependencies = [
++ "proc-macro-crate",
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "objc-sys"
++version = "0.3.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cdb91bdd390c7ce1a8607f35f3ca7151b65afc0ff5ff3b34fa350f7d7c7e4310"
++
++[[package]]
++name = "objc2"
++version = "0.5.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "19d5490aaf8f1d7cf7688dfa9b0ce07900e168852c45cd2c03f534dfd27cfd0b"
++dependencies = [
++ "objc-sys",
++ "objc2-encode",
++]
++
++[[package]]
++name = "objc2"
++version = "0.6.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "08849bbd4767dfae9457696856ae1c84fe4e0281bbe4a7abff2d0e06fb7981f8"
++dependencies = [
++ "objc2-encode",
++]
++
++[[package]]
++name = "objc2-app-kit"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e4e89ad9e3d7d297152b17d39ed92cd50ca8063a89a9fa569046d41568891eff"
++dependencies = [
++ "bitflags 2.13.2",
++ "block2",
++ "libc",
++ "objc2 0.5.3",
++ "objc2-core-data",
++ "objc2-core-image",
++ "objc2-foundation 0.2.2",
++ "objc2-quartz-core 0.2.2",
++]
++
++[[package]]
++name = "objc2-cloud-kit"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "74dd3b56391c7a0596a295029734d3c1c5e7e510a4cb30245f8221ccea96b009"
++dependencies = [
++ "bitflags 2.13.2",
++ "block2",
++ "objc2 0.5.3",
++ "objc2-core-location",
++ "objc2-foundation 0.2.2",
++]
++
++[[package]]
++name = "objc2-contacts"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a5ff520e9c33812fd374d8deecef01d4a840e7b41862d849513de77e44aa4889"
++dependencies = [
++ "block2",
++ "objc2 0.5.3",
++ "objc2-foundation 0.2.2",
++]
++
++[[package]]
++name = "objc2-core-data"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "617fbf49e071c178c0b24c080767db52958f716d9eabdf0890523aeae54773ef"
++dependencies = [
++ "bitflags 2.13.2",
++ "block2",
++ "objc2 0.5.3",
++ "objc2-foundation 0.2.2",
++]
++
++[[package]]
++name = "objc2-core-foundation"
++version = "0.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
++dependencies = [
++ "bitflags 2.13.2",
++ "dispatch2",
++ "objc2 0.6.5",
++]
++
++[[package]]
++name = "objc2-core-graphics"
++version = "0.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
++dependencies = [
++ "bitflags 2.13.2",
++ "dispatch2",
++ "objc2 0.6.5",
++ "objc2-core-foundation",
++ "objc2-io-surface",
++]
++
++[[package]]
++name = "objc2-core-image"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "55260963a527c99f1819c4f8e3b47fe04f9650694ef348ffd2227e8196d34c80"
++dependencies = [
++ "block2",
++ "objc2 0.5.3",
++ "objc2-foundation 0.2.2",
++ "objc2-metal",
++]
++
++[[package]]
++name = "objc2-core-location"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "000cfee34e683244f284252ee206a27953279d370e309649dc3ee317b37e5781"
++dependencies = [
++ "block2",
++ "objc2 0.5.3",
++ "objc2-contacts",
++ "objc2-foundation 0.2.2",
++]
++
++[[package]]
++name = "objc2-encode"
++version = "4.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
++
++[[package]]
++name = "objc2-foundation"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0ee638a5da3799329310ad4cfa62fbf045d5f56e3ef5ba4149e7452dcf89d5a8"
++dependencies = [
++ "bitflags 2.13.2",
++ "block2",
++ "dispatch",
++ "libc",
++ "objc2 0.5.3",
++]
++
++[[package]]
++name = "objc2-foundation"
++version = "0.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
++dependencies = [
++ "bitflags 2.13.2",
++ "objc2 0.6.5",
++ "objc2-core-foundation",
++]
++
++[[package]]
++name = "objc2-io-surface"
++version = "0.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
++dependencies = [
++ "bitflags 2.13.2",
++ "objc2 0.6.5",
++ "objc2-core-foundation",
++]
++
++[[package]]
++name = "objc2-link-presentation"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a1a1ae721c5e35be65f01a03b6d2ac13a54cb4fa70d8a5da293d7b0020261398"
++dependencies = [
++ "block2",
++ "objc2 0.5.3",
++ "objc2-app-kit",
++ "objc2-foundation 0.2.2",
++]
++
++[[package]]
++name = "objc2-metal"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dd0cba1276f6023976a406a14ffa85e1fdd19df6b0f737b063b95f6c8c7aadd6"
++dependencies = [
++ "bitflags 2.13.2",
++ "block2",
++ "objc2 0.5.3",
++ "objc2-foundation 0.2.2",
++]
++
++[[package]]
++name = "objc2-quartz-core"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e42bee7bff906b14b167da2bac5efe6b6a07e6f7c0a21a7308d40c960242dc7a"
++dependencies = [
++ "bitflags 2.13.2",
++ "block2",
++ "objc2 0.5.3",
++ "objc2-foundation 0.2.2",
++ "objc2-metal",
++]
++
++[[package]]
++name = "objc2-quartz-core"
++version = "0.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "96c1358452b371bf9f104e21ec536d37a650eb10f7ee379fff67d2e08d537f1f"
++dependencies = [
++ "bitflags 2.13.2",
++ "objc2 0.6.5",
++ "objc2-core-foundation",
++ "objc2-foundation 0.3.2",
++]
++
++[[package]]
++name = "objc2-symbols"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0a684efe3dec1b305badae1a28f6555f6ddd3bb2c2267896782858d5a78404dc"
++dependencies = [
++ "objc2 0.5.3",
++ "objc2-foundation 0.2.2",
++]
++
++[[package]]
++name = "objc2-ui-kit"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b8bb46798b20cd6b91cbd113524c490f1686f4c4e8f49502431415f3512e2b6f"
++dependencies = [
++ "bitflags 2.13.2",
++ "block2",
++ "objc2 0.5.3",
++ "objc2-cloud-kit",
++ "objc2-core-data",
++ "objc2-core-image",
++ "objc2-core-location",
++ "objc2-foundation 0.2.2",
++ "objc2-link-presentation",
++ "objc2-quartz-core 0.2.2",
++ "objc2-symbols",
++ "objc2-uniform-type-identifiers",
++ "objc2-user-notifications",
++]
++
++[[package]]
++name = "objc2-uniform-type-identifiers"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "44fa5f9748dbfe1ca6c0b79ad20725a11eca7c2218bceb4b005cb1be26273bfe"
++dependencies = [
++ "block2",
++ "objc2 0.5.3",
++ "objc2-foundation 0.2.2",
++]
++
++[[package]]
++name = "objc2-user-notifications"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "76cfcbf642358e8689af64cee815d139339f3ed8ad05103ed5eaf73db8d84cb3"
++dependencies = [
++ "bitflags 2.13.2",
++ "block2",
++ "objc2 0.5.3",
++ "objc2-core-location",
++ "objc2-foundation 0.2.2",
++]
++
++[[package]]
++name = "once_cell"
++version = "1.21.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
++
++[[package]]
++name = "orbclient"
++version = "0.3.55"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5df339f526ea9a60e371768d50efc2f2508c7203290731565d1f7a6f71d21747"
++dependencies = [
++ "libc",
++ "libredox",
++]
++
++[[package]]
++name = "owned_ttf_parser"
++version = "0.25.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
++dependencies = [
++ "ttf-parser",
++]
++
++[[package]]
++name = "percent-encoding"
++version = "2.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
++
++[[package]]
++name = "pin-project"
++version = "1.1.13"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
++dependencies = [
++ "pin-project-internal",
++]
++
++[[package]]
++name = "pin-project-internal"
++version = "1.1.13"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "pin-project-lite"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
++
++[[package]]
++name = "pkg-config"
++version = "0.3.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
++
++[[package]]
++name = "plain"
++version = "0.2.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
++
++[[package]]
++name = "polling"
++version = "3.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5d0e4f59085d47d8241c88ead0f274e8a0cb551f3625263c05eb8dd897c34218"
++dependencies = [
++ "cfg-if",
++ "concurrent-queue",
++ "hermit-abi",
++ "pin-project-lite",
++ "rustix 1.1.5",
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "proc-macro-crate"
++version = "3.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
++dependencies = [
++ "toml_edit",
++]
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.107"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quick-xml"
++version = "0.41.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
++dependencies = [
++ "memchr",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "r-efi"
++version = "5.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
++
++[[package]]
++name = "r-efi"
++version = "6.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
++
++[[package]]
++name = "raw-window-handle"
++version = "0.6.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
++
++[[package]]
++name = "redox_syscall"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4722d768eff46b75989dd134e5c353f0d6296e5aaa3132e776cbdb56be7731aa"
++dependencies = [
++ "bitflags 1.3.2",
++]
++
++[[package]]
++name = "redox_syscall"
++version = "0.5.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
++dependencies = [
++ "bitflags 2.13.2",
++]
++
++[[package]]
++name = "redox_syscall"
++version = "0.9.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "737970939a87c6fa31e7acad13307bccbb017a073b695b6089a2c484f929e20e"
++dependencies = [
++ "bitflags 2.13.2",
++]
++
++[[package]]
++name = "rustc_version"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
++dependencies = [
++ "semver",
++]
++
++[[package]]
++name = "rustix"
++version = "0.38.44"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
++dependencies = [
++ "bitflags 2.13.2",
++ "errno",
++ "libc",
++ "linux-raw-sys 0.4.15",
++ "windows-sys 0.59.0",
++]
++
++[[package]]
++name = "rustix"
++version = "1.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
++dependencies = [
++ "bitflags 2.13.2",
++ "errno",
++ "libc",
++ "linux-raw-sys 0.12.1",
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "rustversion"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
++
++[[package]]
++name = "same-file"
++version = "1.0.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
++dependencies = [
++ "winapi-util",
++]
++
++[[package]]
++name = "scoped-tls"
++version = "1.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
++
++[[package]]
++name = "sctk-adwaita"
++version = "0.10.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6277f0217056f77f1d8f49f2950ac6c278c0d607c45f5ee99328d792ede24ec"
++dependencies = [
++ "ab_glyph",
++ "log",
++ "memmap2",
++ "smithay-client-toolkit",
++ "tiny-skia",
++]
++
++[[package]]
++name = "semver"
++version = "1.0.28"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
++
++[[package]]
++name = "serde"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
++dependencies = [
++ "serde_core",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.8",
++]
++
++[[package]]
++name = "shlex"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
++
++[[package]]
++name = "simd_cesu8"
++version = "1.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "11031e251abf8611c80f460e19dbdeb54a66db918e49c65a7065b46ac7aec520"
++dependencies = [
++ "rustc_version",
++ "simdutf8",
++]
++
++[[package]]
++name = "simdutf8"
++version = "0.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
++
++[[package]]
++name = "slab"
++version = "0.4.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
++
++[[package]]
++name = "smallvec"
++version = "1.16.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
++
++[[package]]
++name = "smithay-client-toolkit"
++version = "0.19.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3457dea1f0eb631b4034d61d4d8c32074caa6cd1ab2d59f2327bd8461e2c0016"
++dependencies = [
++ "bitflags 2.13.2",
++ "calloop",
++ "calloop-wayland-source",
++ "cursor-icon",
++ "libc",
++ "log",
++ "memmap2",
++ "rustix 0.38.44",
++ "thiserror 1.0.69",
++ "wayland-backend",
++ "wayland-client",
++ "wayland-csd-frame",
++ "wayland-cursor",
++ "wayland-protocols",
++ "wayland-protocols-wlr",
++ "wayland-scanner",
++ "xkeysym",
++]
++
++[[package]]
++name = "smol_str"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
++dependencies = [
++ "serde",
++]
++
++[[package]]
++name = "softbuffer"
++version = "0.4.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "aac18da81ebbf05109ab275b157c22a653bb3c12cf884450179942f81bcbf6c3"
++dependencies = [
++ "as-raw-xcb-connection",
++ "bytemuck",
++ "drm",
++ "fastrand",
++ "js-sys",
++ "memmap2",
++ "ndk",
++ "objc2 0.6.5",
++ "objc2-core-foundation",
++ "objc2-core-graphics",
++ "objc2-foundation 0.3.2",
++ "objc2-quartz-core 0.3.2",
++ "raw-window-handle",
++ "redox_syscall 0.5.18",
++ "rustix 1.1.5",
++ "tiny-xlib",
++ "tracing",
++ "wasm-bindgen",
++ "wayland-backend",
++ "wayland-client",
++ "wayland-sys",
++ "web-sys",
++ "windows-sys 0.61.2",
++ "x11rb",
++]
++
++[[package]]
++name = "strict-num"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6637bab7722d379c8b41ba849228d680cc12d0a45ba1fa2b48f2a30577a06731"
++
++[[package]]
++name = "syn"
++version = "2.0.119"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "syn"
++version = "3.0.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "01016da373cd8f7ef12624f796309f5c31ba8d646dd08856c02cd741d823c622"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "tahoe-view"
++version = "0.1.0"
++dependencies = [
++ "memmap2",
++ "softbuffer",
++ "winit",
++]
++
++[[package]]
++name = "thiserror"
++version = "1.0.69"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
++dependencies = [
++ "thiserror-impl 1.0.69",
++]
++
++[[package]]
++name = "thiserror"
++version = "2.0.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
++dependencies = [
++ "thiserror-impl 2.0.21",
++]
++
++[[package]]
++name = "thiserror-impl"
++version = "1.0.69"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "thiserror-impl"
++version = "2.0.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.8",
++]
++
++[[package]]
++name = "tiny-skia"
++version = "0.11.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "83d13394d44dae3207b52a326c0c85a8bf87f1541f23b0d143811088497b09ab"
++dependencies = [
++ "arrayref",
++ "arrayvec",
++ "bytemuck",
++ "cfg-if",
++ "log",
++ "tiny-skia-path",
++]
++
++[[package]]
++name = "tiny-skia-path"
++version = "0.11.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
++dependencies = [
++ "arrayref",
++ "bytemuck",
++ "strict-num",
++]
++
++[[package]]
++name = "tiny-xlib"
++version = "0.2.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a90a0ca3ee6a69f2ad28fd11621a4c3f03b371f366be500b64df260c4ffbafb4"
++dependencies = [
++ "as-raw-xcb-connection",
++ "ctor",
++ "libloading",
++ "pkg-config",
++ "tracing",
++]
++
++[[package]]
++name = "tokio"
++version = "1.53.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
++dependencies = [
++ "pin-project-lite",
++]
++
++[[package]]
++name = "toml_datetime"
++version = "1.1.2+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2b86d767906c6c42421dcba507eb9d203e779497710a47782a224bb871653053"
++dependencies = [
++ "serde_core",
++]
++
++[[package]]
++name = "toml_edit"
++version = "0.25.17+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e3641d5bbb5349a79e1020a242d251efbc546ad8048d133958323ce9c40a9c9c"
++dependencies = [
++ "indexmap",
++ "toml_datetime",
++ "toml_parser",
++ "winnow",
++]
++
++[[package]]
++name = "toml_parser"
++version = "1.1.5+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
++dependencies = [
++ "winnow",
++]
++
++[[package]]
++name = "tracing"
++version = "0.1.44"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
++dependencies = [
++ "pin-project-lite",
++ "tracing-core",
++]
++
++[[package]]
++name = "tracing-core"
++version = "0.1.36"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
++
++[[package]]
++name = "ttf-parser"
++version = "0.25.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.27"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
++
++[[package]]
++name = "unicode-segmentation"
++version = "1.13.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
++
++[[package]]
++name = "version_check"
++version = "0.9.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
++
++[[package]]
++name = "walkdir"
++version = "2.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
++dependencies = [
++ "same-file",
++ "winapi-util",
++]
++
++[[package]]
++name = "wasip2"
++version = "1.0.4+wasi-0.2.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
++dependencies = [
++ "wit-bindgen",
++]
++
++[[package]]
++name = "wasm-bindgen"
++version = "0.2.129"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9bb54f33acc68fd454578d9820b0bde1a1a3d17aa17bb7b6595806d02886d409"
++dependencies = [
++ "cfg-if",
++ "once_cell",
++ "rustversion",
++ "wasm-bindgen-macro",
++ "wasm-bindgen-shared",
++]
++
++[[package]]
++name = "wasm-bindgen-futures"
++version = "0.4.79"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3cbab34de2d982e9b48e18d216d04c4a6f641066ff19ffb699980f591ee3610e"
++dependencies = [
++ "js-sys",
++ "tokio",
++ "wasm-bindgen",
++]
++
++[[package]]
++name = "wasm-bindgen-macro"
++version = "0.2.129"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2e29d0c35b16e224a7eeb5cd2d25e3e1968fbd65604117b44d3b789d00ee8535"
++dependencies = [
++ "quote",
++ "wasm-bindgen-macro-support",
++]
++
++[[package]]
++name = "wasm-bindgen-macro-support"
++version = "0.2.129"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6f501a8bc3719dba86ef8ae4728879c08001bea749eb1333ac5b91e040e2a6b7"
++dependencies = [
++ "bumpalo",
++ "proc-macro2",
++ "quote",
++ "syn 3.0.8",
++ "wasm-bindgen-shared",
++]
++
++[[package]]
++name = "wasm-bindgen-shared"
++version = "0.2.129"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "wayland-backend"
++version = "0.3.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "38a91b4eaddff87b1cd1074985e3713da4af2c49742d1b356b2c01670a67a078"
++dependencies = [
++ "cc",
++ "downcast-rs",
++ "rustix 1.1.5",
++ "scoped-tls",
++ "smallvec",
++ "wayland-sys",
++]
++
++[[package]]
++name = "wayland-client"
++version = "0.31.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e3c36a0f861ad76d0901f2800b46321410d9f73f2ea88aac0650d86c32688073"
++dependencies = [
++ "bitflags 2.13.2",
++ "rustix 1.1.5",
++ "wayland-backend",
++ "wayland-scanner",
++]
++
++[[package]]
++name = "wayland-csd-frame"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "625c5029dbd43d25e6aa9615e88b829a5cad13b2819c4ae129fdbb7c31ab4c7e"
++dependencies = [
++ "bitflags 2.13.2",
++ "cursor-icon",
++ "wayland-backend",
++]
++
++[[package]]
++name = "wayland-cursor"
++version = "0.31.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4a52d18780be9b1314328a3de5f930b73d2200112e3849ca6cb11822793fb34d"
++dependencies = [
++ "rustix 1.1.5",
++ "wayland-client",
++ "xcursor",
++]
++
++[[package]]
++name = "wayland-protocols"
++version = "0.32.13"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "23d0c813de3daa2ed6520af85a3bd49b0e722a3078506899aa9686fea58dc4b6"
++dependencies = [
++ "bitflags 2.13.2",
++ "wayland-backend",
++ "wayland-client",
++ "wayland-scanner",
++]
++
++[[package]]
++name = "wayland-protocols-plasma"
++version = "0.3.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2b6d8cf1eb2c1c31ed1f5643c88a6e53538129d4af80030c8cabd1f9fa884d91"
++dependencies = [
++ "bitflags 2.13.2",
++ "wayland-backend",
++ "wayland-client",
++ "wayland-protocols",
++ "wayland-scanner",
++]
++
++[[package]]
++name = "wayland-protocols-wlr"
++version = "0.3.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "eb04e52f7836d7c7976c78ca0250d61e33873c34156a2a1fc9474828ec268234"
++dependencies = [
++ "bitflags 2.13.2",
++ "wayland-backend",
++ "wayland-client",
++ "wayland-protocols",
++ "wayland-scanner",
++]
++
++[[package]]
++name = "wayland-scanner"
++version = "0.31.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "338e30461b3a2b67d70eb30a6d89f8e0c93a833e07d2ae89085cd070c4a00ac0"
++dependencies = [
++ "proc-macro2",
++ "quick-xml",
++ "quote",
++]
++
++[[package]]
++name = "wayland-sys"
++version = "0.31.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
++dependencies = [
++ "dlib",
++ "log",
++ "once_cell",
++ "pkg-config",
++]
++
++[[package]]
++name = "web-sys"
++version = "0.3.106"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "88261b9deccee56594c11a3460c462c41f58d148598fe70ad77070126a68aba4"
++dependencies = [
++ "js-sys",
++ "wasm-bindgen",
++]
++
++[[package]]
++name = "web-time"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
++dependencies = [
++ "js-sys",
++ "wasm-bindgen",
++]
++
++[[package]]
++name = "winapi-util"
++version = "0.1.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
++dependencies = [
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "windows-link"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
++
++[[package]]
++name = "windows-sys"
++version = "0.52.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
++dependencies = [
++ "windows-targets",
++]
++
++[[package]]
++name = "windows-sys"
++version = "0.59.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
++dependencies = [
++ "windows-targets",
++]
++
++[[package]]
++name = "windows-sys"
++version = "0.61.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
++dependencies = [
++ "windows-link",
++]
++
++[[package]]
++name = "windows-targets"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9b724f72796e036ab90c1021d4780d4d3d648aca59e491e6b98e725b84e99973"
++dependencies = [
++ "windows_aarch64_gnullvm",
++ "windows_aarch64_msvc",
++ "windows_i686_gnu",
++ "windows_i686_gnullvm",
++ "windows_i686_msvc",
++ "windows_x86_64_gnu",
++ "windows_x86_64_gnullvm",
++ "windows_x86_64_msvc",
++]
++
++[[package]]
++name = "windows_aarch64_gnullvm"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3"
++
++[[package]]
++name = "windows_aarch64_msvc"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469"
++
++[[package]]
++name = "windows_i686_gnu"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8e9b5ad5ab802e97eb8e295ac6720e509ee4c243f69d781394014ebfe8bbfa0b"
++
++[[package]]
++name = "windows_i686_gnullvm"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66"
++
++[[package]]
++name = "windows_i686_msvc"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
++
++[[package]]
++name = "windows_x86_64_gnu"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "147a5c80aabfbf0c7d901cb5895d1de30ef2907eb21fbbab29ca94c5b08b1a78"
++
++[[package]]
++name = "windows_x86_64_gnullvm"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d"
++
++[[package]]
++name = "windows_x86_64_msvc"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
++
++[[package]]
++name = "winit"
++version = "0.30.13"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d"
++dependencies = [
++ "ahash",
++ "android-activity",
++ "atomic-waker",
++ "bitflags 2.13.2",
++ "block2",
++ "bytemuck",
++ "calloop",
++ "cfg_aliases",
++ "concurrent-queue",
++ "core-foundation",
++ "core-graphics",
++ "cursor-icon",
++ "dpi",
++ "js-sys",
++ "libc",
++ "memmap2",
++ "ndk",
++ "objc2 0.5.3",
++ "objc2-app-kit",
++ "objc2-foundation 0.2.2",
++ "objc2-ui-kit",
++ "orbclient",
++ "percent-encoding",
++ "pin-project",
++ "raw-window-handle",
++ "redox_syscall 0.4.1",
++ "rustix 0.38.44",
++ "sctk-adwaita",
++ "smithay-client-toolkit",
++ "smol_str",
++ "tracing",
++ "unicode-segmentation",
++ "wasm-bindgen",
++ "wasm-bindgen-futures",
++ "wayland-backend",
++ "wayland-client",
++ "wayland-protocols",
++ "wayland-protocols-plasma",
++ "web-sys",
++ "web-time",
++ "windows-sys 0.52.0",
++ "x11-dl",
++ "x11rb",
++ "xkbcommon-dl",
++]
++
++[[package]]
++name = "winnow"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
++dependencies = [
++ "memchr",
++]
++
++[[package]]
++name = "wit-bindgen"
++version = "0.57.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
++
++[[package]]
++name = "x11-dl"
++version = "2.21.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "38735924fedd5314a6e548792904ed8c6de6636285cb9fec04d5b1db85c1516f"
++dependencies = [
++ "libc",
++ "once_cell",
++ "pkg-config",
++]
++
++[[package]]
++name = "x11rb"
++version = "0.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9993aa5be5a26815fe2c3eacfc1fde061fc1a1f094bf1ad2a18bf9c495dd7414"
++dependencies = [
++ "as-raw-xcb-connection",
++ "gethostname",
++ "libc",
++ "libloading",
++ "once_cell",
++ "rustix 1.1.5",
++ "x11rb-protocol",
++]
++
++[[package]]
++name = "x11rb-protocol"
++version = "0.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
++
++[[package]]
++name = "xcursor"
++version = "0.3.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "163b33ed8786455e2fa5d72f554057ce3f3182425434f756cd39c99839d88e23"
++
++[[package]]
++name = "xkbcommon-dl"
++version = "0.4.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d039de8032a9a8856a6be89cea3e5d12fdd82306ab7c94d74e6deab2460651c5"
++dependencies = [
++ "bitflags 2.13.2",
++ "dlib",
++ "log",
++ "once_cell",
++ "xkeysym",
++]
++
++[[package]]
++name = "xkeysym"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
++
++[[package]]
++name = "zerocopy"
++version = "0.8.62"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "86502bf56ac7c77571a32e2647bb2a15894565e981fb2a48d7bde2d91c965a9d"
++dependencies = [
++ "zerocopy-derive",
++]
++
++[[package]]
++name = "zerocopy-derive"
++version = "0.8.62"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5457206954b06561e2608c7e19cf58b1926586d999c246eebe4502f7e2039d1a"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
+diff --git a/tools/tahoe-view/Cargo.toml b/tools/tahoe-view/Cargo.toml
+new file mode 100644
+index 0000000..b5df604
+--- /dev/null
++++ b/tools/tahoe-view/Cargo.toml
+@@ -0,0 +1,15 @@
++[package]
++name = "tahoe-view"
++version = "0.1.0"
++edition = "2021"
++description = "Muestra en una ventana de Linux la pantalla del macOS que corre en tahoe-run"
++license = "MIT"
++
++[dependencies]
++winit = "0.30"
++softbuffer = "0.4"
++memmap2 = "0.9"
++
++[profile.release]
++opt-level = 3
++lto = "thin"
+diff --git a/tools/tahoe-view/src/entrada.rs b/tools/tahoe-view/src/entrada.rs
+new file mode 100644
+index 0000000..6850bd3
+--- /dev/null
++++ b/tools/tahoe-view/src/entrada.rs
+@@ -0,0 +1,106 @@
++//! Teclado y ratón hacia macOS. tahoe-run (dentro de WindowServer, que en macOS lleva el sistema de eventos HID) escucha
++//! en un socket Unix de datagramas, `/dev/shm/tahoe-input-<id>` (el mismo `<id>` que la memoria de vídeo), y convierte
++//! cada mensaje en un evento de los servicios IOHIDEventDriver que publica (ver `tahoe-run/emu_iokit.inc`).
++//!
++//! Mensaje: 16 bytes, cuatro enteros de 32 bits en little endian `[tipo, a, b, c]`:
++//! - 1 tecla: a = página de uso HID (7, teclado), b = uso, c = 1 pulsada / 0 soltada.
++//! - 2 puntero: a = x, b = y en píxeles de la pantalla de macOS, c = botones (bit 0 izquierdo, 1 derecho, 2 central).
++//! - 3 rueda: a = desplazamiento horizontal, b = vertical (líneas; positivo hacia arriba / a la izquierda).
++
++use std::os::unix::net::UnixDatagram;
++use std::path::{Path, PathBuf};
++
++use winit::keyboard::KeyCode;
++
++pub const TECLA: u32 = 1;
++pub const PUNTERO: u32 = 2;
++pub const RUEDA: u32 = 3;
++
++/// El socket de entrada del mismo arranque: tahoe-fb-<id> -> tahoe-input-<id>.
++pub fn ruta_entrada(fb: &Path) -> Option<PathBuf> {
++    let name = fb.file_name()?.to_str()?;
++    Some(fb.with_file_name(format!("tahoe-input-{}", name.strip_prefix("tahoe-fb-")?)))
++}
++
++pub fn mensaje(tipo: u32, a: i32, b: i32, c: i32) -> [u8; 16] {
++    let mut m = [0u8; 16];
++    m[0..4].copy_from_slice(&tipo.to_le_bytes());
++    m[4..8].copy_from_slice(&a.to_le_bytes());
++    m[8..12].copy_from_slice(&b.to_le_bytes());
++    m[12..16].copy_from_slice(&c.to_le_bytes());
++    m
++}
++
++/// Envía a tahoe-run; si macOS aún no escucha (o WindowServer se reinició), el mensaje se pierde sin más.
++pub struct Entrada {
++    sock: Option<UnixDatagram>,
++    ruta: PathBuf,
++}
++
++impl Entrada {
++    pub fn new(ruta: PathBuf) -> Entrada {
++        Entrada { sock: UnixDatagram::unbound().ok(), ruta }
++    }
++    pub fn enviar(&self, tipo: u32, a: i32, b: i32, c: i32) {
++        if let Some(s) = &self.sock {
++            let _ = s.send_to(&mensaje(tipo, a, b, c), &self.ruta);
++        }
++    }
++}
++
++/// Uso HID (página 7, teclado) de una tecla física. La distribución (español, etc.) la aplica macOS, como con un
++/// teclado USB de verdad: aquí solo va la posición de la tecla.
++pub fn uso_hid(k: KeyCode) -> Option<u32> {
++    use KeyCode::*;
++    let u = match k {
++        KeyA => 0x04, KeyB => 0x05, KeyC => 0x06, KeyD => 0x07, KeyE => 0x08, KeyF => 0x09, KeyG => 0x0a,
++        KeyH => 0x0b, KeyI => 0x0c, KeyJ => 0x0d, KeyK => 0x0e, KeyL => 0x0f, KeyM => 0x10, KeyN => 0x11,
++        KeyO => 0x12, KeyP => 0x13, KeyQ => 0x14, KeyR => 0x15, KeyS => 0x16, KeyT => 0x17, KeyU => 0x18,
++        KeyV => 0x19, KeyW => 0x1a, KeyX => 0x1b, KeyY => 0x1c, KeyZ => 0x1d,
++        Digit1 => 0x1e, Digit2 => 0x1f, Digit3 => 0x20, Digit4 => 0x21, Digit5 => 0x22, Digit6 => 0x23,
++        Digit7 => 0x24, Digit8 => 0x25, Digit9 => 0x26, Digit0 => 0x27,
++        Enter => 0x28, Escape => 0x29, Backspace => 0x2a, Tab => 0x2b, Space => 0x2c, Minus => 0x2d,
++        Equal => 0x2e, BracketLeft => 0x2f, BracketRight => 0x30, Backslash => 0x31, Semicolon => 0x33,
++        Quote => 0x34, Backquote => 0x35, Comma => 0x36, Period => 0x37, Slash => 0x38, CapsLock => 0x39,
++        F1 => 0x3a, F2 => 0x3b, F3 => 0x3c, F4 => 0x3d, F5 => 0x3e, F6 => 0x3f, F7 => 0x40, F8 => 0x41,
++        F9 => 0x42, F10 => 0x43, F11 => 0x44,
++        PrintScreen => 0x46, ScrollLock => 0x47, Pause => 0x48, Insert => 0x49, Home => 0x4a, PageUp => 0x4b,
++        Delete => 0x4c, End => 0x4d, PageDown => 0x4e, ArrowRight => 0x4f, ArrowLeft => 0x50,
++        ArrowDown => 0x51, ArrowUp => 0x52, NumLock => 0x53, NumpadDivide => 0x54, NumpadMultiply => 0x55,
++        NumpadSubtract => 0x56, NumpadAdd => 0x57, NumpadEnter => 0x58, Numpad1 => 0x59, Numpad2 => 0x5a,
++        Numpad3 => 0x5b, Numpad4 => 0x5c, Numpad5 => 0x5d, Numpad6 => 0x5e, Numpad7 => 0x5f, Numpad8 => 0x60,
++        Numpad9 => 0x61, Numpad0 => 0x62, NumpadDecimal => 0x63,
++        IntlBackslash => 0x64, // la tecla < > de los teclados ISO (español)
++        ContextMenu => 0x65,
++        ControlLeft => 0xe0, ShiftLeft => 0xe1, AltLeft => 0xe2, SuperLeft => 0xe3, // Super (Windows) = Comando
++        ControlRight => 0xe4, ShiftRight => 0xe5, AltRight => 0xe6, SuperRight => 0xe7,
++        _ => return None,
++    };
++    Some(u)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn ruta() {
++        assert_eq!(ruta_entrada(Path::new("/dev/shm/tahoe-fb-abc")), Some(PathBuf::from("/dev/shm/tahoe-input-abc")));
++        assert_eq!(ruta_entrada(Path::new("/dev/shm/otra")), None);
++    }
++
++    #[test]
++    fn formato() {
++        assert_eq!(mensaje(TECLA, 7, 0x04, 1), [1, 0, 0, 0, 7, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0]);
++        assert_eq!(&mensaje(PUNTERO, -1, 2, 0)[4..8], &[0xff; 4]);
++    }
++
++    #[test]
++    fn teclas() {
++        assert_eq!(uso_hid(KeyCode::KeyA), Some(0x04));
++        assert_eq!(uso_hid(KeyCode::Enter), Some(0x28));
++        assert_eq!(uso_hid(KeyCode::SuperLeft), Some(0xe3));
++        assert_eq!(uso_hid(KeyCode::IntlBackslash), Some(0x64));
++        assert_eq!(uso_hid(KeyCode::F12), None); // F12 cierra el visor
++    }
++}
+diff --git a/tools/tahoe-view/src/main.rs b/tools/tahoe-view/src/main.rs
+new file mode 100644
+index 0000000..b4eba8e
+--- /dev/null
++++ b/tools/tahoe-view/src/main.rs
+@@ -0,0 +1,330 @@
++//! tahoe-view: muestra en una ventana de Linux la pantalla del macOS que corre en tahoe-run.
++//!
++//! WindowServer dibuja en la memoria de vídeo emulada (`/dev/shm/tahoe-fb-<id>`, ver `tahoe-run/emu_iokit.inc`). En la
++//! última página del archivo va una cabecera "TFB1" con ancho, alto, bytes por fila y formato (0 = B, G, R, X por píxel,
++//! que es justo el formato de softbuffer: un u32 0RGB en little endian). El cursor, por software, está en
++//! `/dev/shm/tahoe-fbcursor-<id>` (StdFBShmem_t): aquí solo se marca su posición (`cursorLoc`, +28).
++//!
++//! El teclado y el ratón de la ventana van a macOS (ver `entrada.rs`).
++//!
++//! Uso: `tahoe-view [archivo]` (por omisión, el `/dev/shm/tahoe-fb-*` más reciente; espera a que aparezca). F12 cierra.
++
++mod entrada;
++
++use std::fs::File;
++use std::num::NonZeroU32;
++use std::path::{Path, PathBuf};
++use std::rc::Rc;
++use std::time::{Duration, Instant};
++
++use memmap2::Mmap;
++use winit::application::ApplicationHandler;
++use winit::dpi::PhysicalSize;
++use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
++use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
++use winit::keyboard::{Key, NamedKey, PhysicalKey};
++
++use entrada::Entrada;
++use winit::window::{Window, WindowId};
++
++const HDR_PAGE: usize = 4096;
++const FRAME: Duration = Duration::from_millis(16); // ~60 Hz
++
++/// Cabecera de la memoria de vídeo (struct fb_hdr de emu_iokit.inc).
++#[derive(Clone, Copy, Debug, PartialEq)]
++struct Header {
++    width: u32,
++    height: u32,
++    bytes_per_row: u32,
++}
++
++fn u32_at(b: &[u8], off: usize) -> u32 {
++    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
++}
++
++/// Valida la cabecera (`page`: la última página del archivo) para una memoria de vídeo de `data_len` bytes (lo que
++/// precede a esa página); None si el archivo aún no está listo o no es una memoria de vídeo de tahoe-run.
++fn parse_header(page: &[u8], data_len: usize) -> Option<Header> {
++    if page.len() < 20 || &page[0..4] != b"TFB1" || u32_at(page, 16) != 0 {
++        return None;
++    }
++    let hdr = Header { width: u32_at(page, 4), height: u32_at(page, 8), bytes_per_row: u32_at(page, 12) };
++    let need = (hdr.bytes_per_row as usize).checked_mul(hdr.height as usize)?;
++    let ok = hdr.width > 0 && hdr.height > 0 && hdr.bytes_per_row as u64 >= hdr.width as u64 * 4 && need <= data_len;
++    ok.then_some(hdr)
++}
++
++/// La memoria de vídeo más reciente de /dev/shm.
++fn newest_framebuffer() -> Option<PathBuf> {
++    std::fs::read_dir("/dev/shm")
++        .ok()?
++        .filter_map(Result::ok)
++        .filter(|e| e.file_name().to_string_lossy().starts_with("tahoe-fb-"))
++        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
++        .max_by_key(|(t, _)| *t)
++        .map(|(_, p)| p)
++}
++
++/// El cursor compartido del mismo arranque: tahoe-fb-<id> -> tahoe-fbcursor-<id>.
++fn cursor_path(fb: &Path) -> Option<PathBuf> {
++    let name = fb.file_name()?.to_str()?;
++    Some(fb.with_file_name(format!("tahoe-fbcursor-{}", name.strip_prefix("tahoe-fb-")?)))
++}
++
++/// Proyección de solo lectura de un archivo de /dev/shm que otro proceso (WindowServer) escribe mientras tanto.
++/// El contenido cambia por debajo, así que nunca se presta como `&[u8]` de larga vida: se copia con lecturas volátiles.
++struct Shared {
++    map: Mmap,
++}
++
++impl Shared {
++    fn open(path: &Path) -> Option<Shared> {
++        let file = File::open(path).ok()?;
++        // SAFETY: la proyección es de solo lectura y solo se lee con copias (read_volatile); que otro proceso la
++        // modifique a la vez puede dar un fotograma a medias, nunca un acceso fuera de la proyección.
++        let map = unsafe { Mmap::map(&file) }.ok()?;
++        Some(Shared { map })
++    }
++    fn len(&self) -> usize {
++        self.map.len()
++    }
++    /// Copia `dst.len()` píxeles (u32) desde el desplazamiento `off`, comprobando los límites.
++    fn copy_u32(&self, off: usize, dst: &mut [u32]) {
++        let bytes = dst.len() * 4;
++        assert!(off.checked_add(bytes).is_some_and(|end| end <= self.map.len()));
++        let src = self.map.as_ptr();
++        for (i, px) in dst.iter_mut().enumerate() {
++            // SAFETY: off + 4 * i + 4 <= len, comprobado arriba; lectura volátil de memoria compartida.
++            let raw = unsafe { std::ptr::read_volatile(src.add(off + 4 * i).cast::<[u8; 4]>()) };
++            *px = u32::from_le_bytes(raw) & 0x00ff_ffff;
++        }
++    }
++    fn i16_at(&self, off: usize) -> Option<i16> {
++        if off + 2 > self.map.len() {
++            return None;
++        }
++        // SAFETY: límites comprobados justo arriba.
++        let raw = unsafe { std::ptr::read_volatile(self.map.as_ptr().add(off).cast::<[u8; 2]>()) };
++        Some(i16::from_le_bytes(raw))
++    }
++    fn snapshot_header(&self) -> Option<Header> {
++        let data_len = self.len().checked_sub(HDR_PAGE).filter(|&n| n > 0)?;
++        let page: Vec<u8> = (0..HDR_PAGE)
++            // SAFETY: data_len + i < len; lectura volátil de memoria compartida.
++            .map(|i| unsafe { std::ptr::read_volatile(self.map.as_ptr().add(data_len + i)) })
++            .collect();
++        parse_header(&page, data_len)
++    }
++}
++
++struct Screen {
++    fb: Shared,
++    cursor: Option<Shared>,
++    hdr: Header,
++}
++
++impl Screen {
++    fn open(path: &Path) -> Option<Screen> {
++        let fb = Shared::open(path)?;
++        let hdr = fb.snapshot_header()?;
++        let cursor = cursor_path(path).and_then(|p| Shared::open(&p));
++        eprintln!("tahoe-view: {}: {}x{}", path.display(), hdr.width, hdr.height);
++        Some(Screen { fb, cursor, hdr })
++    }
++    /// Colocación de la pantalla en una ventana de `w`×`h`: escala entera hacia abajo si la ventana es más pequeña
++    /// (si no, 1:1), centrada. Devuelve (escala, x, y, ancho, alto) de la imagen en la ventana.
++    fn layout(&self, w: usize, h: usize) -> (usize, usize, usize, usize, usize) {
++        let (sw, sh) = (self.hdr.width as usize, self.hdr.height as usize);
++        let scale = (sw.div_ceil(w.max(1))).max(sh.div_ceil(h.max(1))).max(1);
++        let (dw, dh) = (sw / scale, sh / scale);
++        (scale, (w - dw.min(w)) / 2, (h - dh.min(h)) / 2, dw, dh)
++    }
++    /// Punto de la ventana -> píxel de la pantalla de macOS (dentro de sus límites).
++    fn to_screen(&self, x: f64, y: f64, w: usize, h: usize) -> (i32, i32) {
++        let (scale, ox, oy, _, _) = self.layout(w, h);
++        let sx = ((x - ox as f64) * scale as f64).clamp(0.0, self.hdr.width as f64 - 1.0);
++        let sy = ((y - oy as f64) * scale as f64).clamp(0.0, self.hdr.height as f64 - 1.0);
++        (sx as i32, sy as i32)
++    }
++    /// Dibuja la pantalla de macOS (escalada al tamaño de la ventana, sin deformar) en `out` (ancho `w`).
++    fn draw(&self, out: &mut [u32], w: usize, h: usize) {
++        out.fill(0);
++        let sw = self.hdr.width as usize;
++        let (scale, ox, oy, dw, dh) = self.layout(w, h);
++        let mut row = vec![0u32; sw];
++        for y in 0..dh.min(h) {
++            self.fb.copy_u32(y * scale * self.hdr.bytes_per_row as usize, &mut row);
++            let dst = &mut out[(oy + y) * w + ox..(oy + y) * w + ox + dw.min(w - ox)];
++            for (x, px) in dst.iter_mut().enumerate() {
++                *px = row[x * scale];
++            }
++        }
++        // posición del cursor (StdFBShmem_t.cursorLoc): una cruz pequeña
++        if let Some(c) = &self.cursor {
++            if let (Some(cx), Some(cy)) = (c.i16_at(28), c.i16_at(30)) {
++                let (cx, cy) = (cx as isize / scale as isize + ox as isize, cy as isize / scale as isize + oy as isize);
++                for d in -3isize..=3 {
++                    for (x, y) in [(cx + d, cy), (cx, cy + d)] {
++                        if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
++                            out[y as usize * w + x as usize] = 0x00ff_ffff;
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++struct App {
++    path: Option<PathBuf>,
++    window: Option<Rc<Window>>,
++    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
++    screen: Option<Screen>,
++    next: Instant,
++    entrada: Option<Entrada>,
++    pos: (i32, i32),
++    botones: i32,
++}
++
++impl App {
++    fn try_open(&mut self) {
++        if self.screen.is_some() {
++            return;
++        }
++        let path = self.path.clone().or_else(newest_framebuffer);
++        if let Some(p) = path {
++            self.screen = Screen::open(&p);
++            if self.screen.is_some() {
++                self.entrada = entrada::ruta_entrada(&p).map(Entrada::new);
++            }
++            if let (Some(s), Some(w)) = (&self.screen, &self.window) {
++                let _ = w.request_inner_size(PhysicalSize::new(s.hdr.width, s.hdr.height));
++            }
++        }
++    }
++}
++
++impl ApplicationHandler for App {
++    fn resumed(&mut self, el: &ActiveEventLoop) {
++        if self.window.is_some() {
++            return;
++        }
++        let attrs = Window::default_attributes().with_title("macOS (tahoe-run)").with_inner_size(PhysicalSize::new(1280, 800));
++        let window = Rc::new(el.create_window(attrs).expect("no se pudo crear la ventana"));
++        let ctx = softbuffer::Context::new(window.clone()).expect("softbuffer: contexto");
++        self.surface = Some(softbuffer::Surface::new(&ctx, window.clone()).expect("softbuffer: superficie"));
++        self.window = Some(window);
++        self.try_open();
++    }
++
++    fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
++        match event {
++            WindowEvent::CloseRequested
++            | WindowEvent::KeyboardInput {
++                event: KeyEvent { logical_key: Key::Named(NamedKey::F12), state: ElementState::Pressed, .. },
++                ..
++            } => el.exit(),
++            WindowEvent::RedrawRequested => {
++                let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else { return };
++                let size = window.inner_size();
++                let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
++                if surface.resize(w, h).is_err() {
++                    return;
++                }
++                let Ok(mut buf) = surface.buffer_mut() else { return };
++                match &self.screen {
++                    Some(s) => s.draw(&mut buf, w.get() as usize, h.get() as usize),
++                    None => buf.fill(0),
++                }
++                let _ = buf.present();
++            }
++            WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(k), state, repeat: false, .. }, .. } => {
++                // sin las repeticiones de Linux: macOS repite por su cuenta mientras la tecla siga pulsada
++                if let (Some(e), Some(u)) = (&self.entrada, entrada::uso_hid(k)) {
++                    e.enviar(entrada::TECLA, 7, u as i32, (state == ElementState::Pressed) as i32);
++                }
++            }
++            WindowEvent::CursorMoved { position, .. } => {
++                let (Some(s), Some(win)) = (&self.screen, &self.window) else { return };
++                let size = win.inner_size();
++                self.pos = s.to_screen(position.x, position.y, size.width as usize, size.height as usize);
++                if let Some(e) = &self.entrada {
++                    e.enviar(entrada::PUNTERO, self.pos.0, self.pos.1, self.botones);
++                }
++            }
++            WindowEvent::MouseInput { state, button, .. } => {
++                let bit = match button {
++                    MouseButton::Left => 1,
++                    MouseButton::Right => 2,
++                    MouseButton::Middle => 4,
++                    _ => return,
++                };
++                if state == ElementState::Pressed { self.botones |= bit } else { self.botones &= !bit }
++                if let Some(e) = &self.entrada {
++                    e.enviar(entrada::PUNTERO, self.pos.0, self.pos.1, self.botones);
++                }
++            }
++            WindowEvent::MouseWheel { delta, .. } => {
++                let (dx, dy) = match delta {
++                    MouseScrollDelta::LineDelta(x, y) => (x.round() as i32, y.round() as i32),
++                    MouseScrollDelta::PixelDelta(p) => ((p.x / 20.0).round() as i32, (p.y / 20.0).round() as i32),
++                };
++                if let (Some(e), true) = (&self.entrada, dx != 0 || dy != 0) {
++                    e.enviar(entrada::RUEDA, dx, dy, 0);
++                }
++            }
++            _ => {}
++        }
++    }
++
++    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
++        let now = Instant::now();
++        if now >= self.next {
++            self.try_open(); // hasta que WindowServer cree la memoria de vídeo
++            if let Some(w) = &self.window {
++                w.request_redraw();
++            }
++            self.next = now + if self.screen.is_some() { FRAME } else { Duration::from_millis(500) };
++        }
++        el.set_control_flow(ControlFlow::WaitUntil(self.next));
++    }
++}
++
++fn main() {
++    let path = std::env::args_os().nth(1).map(PathBuf::from);
++    let el = EventLoop::new().expect("no hay servidor gráfico (Wayland o X11)");
++    let mut app = App { path, window: None, surface: None, screen: None, next: Instant::now(), entrada: None, pos: (0, 0), botones: 0 };
++    el.run_app(&mut app).expect("bucle de eventos");
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn page(w: u32, h: u32, bpr: u32) -> Vec<u8> {
++        let mut v = vec![0u8; HDR_PAGE];
++        v[0..4].copy_from_slice(b"TFB1");
++        v[4..8].copy_from_slice(&w.to_le_bytes());
++        v[8..12].copy_from_slice(&h.to_le_bytes());
++        v[12..16].copy_from_slice(&bpr.to_le_bytes());
++        v
++    }
++
++    #[test]
++    fn cabecera_valida() {
++        assert_eq!(parse_header(&page(64, 32, 256), 256 * 32), Some(Header { width: 64, height: 32, bytes_per_row: 256 }));
++    }
++
++    #[test]
++    fn cabecera_rechaza_tamanos_imposibles() {
++        assert_eq!(parse_header(&page(64, 100_000, 256), 256 * 32), None); // más alto que el archivo
++        assert_eq!(parse_header(&page(64, 32, 100), 256 * 32), None); // fila más corta que el ancho
++        assert_eq!(parse_header(&page(64, 32, u32::MAX), 256 * 32), None); // fila enorme: no cabe en el archivo
++        assert_eq!(parse_header(b"corto", 0), None);
++    }
++
++    #[test]
++    fn ruta_del_cursor() {
++        assert_eq!(cursor_path(Path::new("/dev/shm/tahoe-fb-abc")), Some(PathBuf::from("/dev/shm/tahoe-fbcursor-abc")));
++    }
++}
+diff --git a/tools/xar.py b/tools/xar.py
+new file mode 100755
+index 0000000..0263e19
+--- /dev/null
++++ b/tools/xar.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++# xar.py: lista o extrae archivos de un paquete xar de Apple (InstallAssistant.pkg, .pkg de instalación).
++#   tools/xar.py lista  <paquete.pkg>
++#   tools/xar.py saca   <paquete.pkg> <nombre> <destino>     # p. ej. SharedSupport.dmg
++# Formato: cabecera (magic "xar!", tamaño de cabecera, versión, índice comprimido y sin comprimir, algoritmo de suma),
++# índice XML comprimido con zlib y, a continuación, el montón con los datos de cada archivo (desplazamiento relativo).
++# Los datos pueden ir sin comprimir (application/octet-stream) o con zlib/bzip2; se copian por bloques, sin cargarlos.
++import bz2, hashlib, struct, sys, zlib
++import xml.etree.ElementTree as ET
++
++def toc(f):
++    h = f.read(28)
++    magic, hsize, ver, clen, ulen, cksum = struct.unpack(">4sHHQQI", h)
++    if magic != b"xar!": sys.exit("no es un archivo xar")
++    f.seek(hsize)
++    x = zlib.decompress(f.read(clen))
++    return ET.fromstring(x), hsize + clen
++
++def files(root, base=""):
++    for e in root.findall("file"):
++        name = base + e.findtext("name", "")
++        yield name, e
++        yield from files(e, name + "/")
++
++def main():
++    op, pkg = sys.argv[1], sys.argv[2]
++    with open(pkg, "rb") as f:
++        t, heap = toc(f)
++        tocnode = t.find("toc")
++        for name, e in files(tocnode):
++            d = e.find("data")
++            if op == "lista":
++                if d is None: print(f"{'':>14}  {name}/"); continue
++                print(f"{int(d.findtext('size')):>14}  {name}  ({d.find('encoding').get('style')})")
++            elif op == "saca" and name == sys.argv[3] and d is not None:
++                off, length = int(d.findtext("offset")), int(d.findtext("length"))
++                enc = d.find("encoding").get("style")
++                sumtag = d.find("extracted-checksum")
++                h = hashlib.new(sumtag.get("style")) if sumtag is not None else None
++                dec = zlib.decompressobj() if "gzip" in enc or "zlib" in enc else bz2.BZ2Decompressor() if "bzip2" in enc else None
++                f.seek(heap + off)
++                left = length
++                with open(sys.argv[4], "wb") as o:
++                    while left:
++                        b = f.read(min(left, 1 << 24)); left -= len(b)
++                        if not b: sys.exit("archivo truncado")
++                        if dec: b = dec.decompress(b)
++                        if h: h.update(b)
++                        o.write(b)
++                if h:
++                    ok = h.hexdigest() == sumtag.text.strip()
++                    print(f"suma {sumtag.get('style')}: {'correcta' if ok else 'NO COINCIDE'}")
++                    if not ok: sys.exit(1)
++                return
++    if op == "saca": sys.exit("no está: " + sys.argv[3])
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/yaa.py b/tools/yaa.py
+new file mode 100755
+index 0000000..b2b360c
+--- /dev/null
++++ b/tools/yaa.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python3
++# yaa.py: extrae los archivos Apple Archive (YAA/AA01) de un paquete de actualización de macOS (payloadv2 de un OTA o del
++# instalador completo) en una carpeta de Linux, conservando lo que tahoe-run necesita:
++#   - archivos, directorios, enlaces simbólicos y duros, con sus permisos y fechas;
++#   - enlaces simbólicos absolutos guardados dentro de la raíz (el kernel de Linux los sigue; tahoe-run quita el prefijo en
++#     readlink), como deja tools/fix_symlinks.sh;
++#   - banderas BSD en el atributo user.tahoe.flags (sin UF_COMPRESSED: los datos se escriben sin comprimir);
++#   - atributos extendidos de macOS como user.<nombre>;
++#   - propietario distinto de root en user.tahoe.owner ("uid:gid"), porque sin ser root no se puede aplicar.
++#   tools/yaa.py <paquete.zip> <raíz destino> [miembro...]     # por omisión, AssetData/payloadv2/payload.NNN en orden
++#   tools/yaa.py --enlaces <paquete.zip> <raíz destino>        # solo los enlaces duros de links.txt
++# Formato: cada miembro es un flujo pbzx (bloques xz) con entradas: "YAA1"/"AA01", u16 tamaño de cabecera y campos
++# CLAVE(3)+subtipo(1): 1/2/4/8 enteros, P ruta (u16+bytes), T fecha (s+ns, 12 bytes), S fecha (8), A/B/C tamaño de un
++# bloque de datos (u16/u32/u64) que va detrás de la cabecera, F/G/H/I sumas (20/32/48/64 bytes).
++import lzma, os, struct, sys, zipfile
++
++FIELD_LEN = {"1": 1, "2": 2, "4": 4, "8": 8, "T": 12, "S": 8, "F": 20, "G": 32, "H": 48, "I": 64}
++BLOB_LEN = {"A": 2, "B": 4, "C": 8}
++UF_COMPRESSED = 0x20
++
++def pbzx_chunks(f):
++    if f.read(4) != b"pbzx": raise SystemExit("no es pbzx")
++    f.read(8)
++    while True:
++        h = f.read(16)
++        if len(h) < 16: return
++        usize, csize = struct.unpack(">QQ", h)
++        d = f.read(csize)
++        yield lzma.decompress(d) if (csize < usize or d[:6] == b"\xfd7zXZ\x00") else d
++
++class Extractor:
++    def __init__(self, root):
++        self.root = os.path.abspath(root); self.dirs = []; self.n = 0; self.skipped = {}
++    def host(self, p):
++        p = p.decode("utf-8", "surrogateescape").lstrip("/")
++        return os.path.join(self.root, p) if p else self.root
++    def xattrs(self, path, blob):
++        i = 0
++        while i + 4 <= len(blob):
++            total = struct.unpack_from("<I", blob, i)[0]
++            if total < 5: break
++            ent = blob[i + 4:i + total]; z = ent.index(b"\0")
++            name, value = ent[:z].decode("utf-8", "surrogateescape"), ent[z + 1:]
++            if name not in ("com.apple.decmpfs", "com.apple.ResourceFork"):
++                try: os.setxattr(path, "user." + name, value, follow_symlinks=False)
++                except OSError: pass
++            i += total
++    def entry(self, f, data, xat):
++        t = chr(f.get("TYP", 0)); path = f.get("PAT", b""); hp = self.host(path)
++        mode = f.get("MOD", 0o644); flags = f.get("FLG", 0) & ~UF_COMPRESSED
++        if t == "D":
++            os.makedirs(hp, exist_ok=True); self.dirs.append((hp, mode, f.get("MTM")))
++        elif t == "F":
++            os.makedirs(os.path.dirname(hp), exist_ok=True)
++            if os.path.lexists(hp): os.chmod(hp, 0o644, follow_symlinks=False) if not os.path.islink(hp) else os.unlink(hp)
++            with open(hp, "wb") as o: o.write(data)
++            os.chmod(hp, mode & 0o7777)
++        elif t == "L":
++            os.makedirs(os.path.dirname(hp), exist_ok=True)
++            tgt = f.get("LNK", b"").decode("utf-8", "surrogateescape")
++            if tgt.startswith("/"): tgt = self.root + tgt
++            if os.path.lexists(hp): os.unlink(hp)
++            os.symlink(tgt, hp)
++        elif t == "H":
++            os.makedirs(os.path.dirname(hp), exist_ok=True)
++            src = self.host(f.get("LNK", b""))
++            if os.path.lexists(hp): os.unlink(hp)
++            os.link(src, hp)
++        else:
++            self.skipped[t] = self.skipped.get(t, 0) + 1; return
++        if t != "D" and t != "H" and "MTM" in f:
++            s, ns = f["MTM"]; os.utime(hp, ns=(s * 10**9 + ns, s * 10**9 + ns), follow_symlinks=False)
++        if flags and t in "DF":
++            try: os.setxattr(hp, "user.tahoe.flags", struct.pack("<I", flags))
++            except OSError: pass
++        uid, gid = f.get("UID", 0), f.get("GID", 0)
++        if (uid or gid) and t in "DF":
++            try: os.setxattr(hp, "user.tahoe.owner", f"{uid}:{gid}".encode())
++            except OSError: pass
++        if xat and t in "DF": self.xattrs(hp, xat)
++        self.n += 1
++    def finish(self):
++        for hp, mode, mtm in reversed(self.dirs):          # de dentro afuera: los modos de solo lectura, al final
++            try:
++                os.chmod(hp, mode & 0o7777)
++                if mtm: os.utime(hp, ns=(mtm[0] * 10**9 + mtm[1],) * 2)
++            except OSError: pass
++
++def parse(buf, pos, ex):
++    """Procesa las entradas completas de buf desde pos; devuelve la posición de la primera incompleta."""
++    while pos + 6 <= len(buf):
++        if buf[pos:pos + 4] not in (b"YAA1", b"AA01"): raise SystemExit(f"cabecera desconocida {buf[pos:pos+4]!r}")
++        hs = struct.unpack_from("<H", buf, pos + 4)[0]
++        if pos + hs > len(buf): return pos
++        q = pos + 6; f = {}; blobs = []
++        while q < pos + hs:
++            k = buf[q:q + 3].decode("latin1"); st = chr(buf[q + 3]); q += 4
++            if st == "P":
++                l = struct.unpack_from("<H", buf, q)[0]; f[k] = bytes(buf[q + 2:q + 2 + l]); q += 2 + l
++            elif st in BLOB_LEN:
++                n = BLOB_LEN[st]; blobs.append((k, int.from_bytes(buf[q:q + n], "little"))); q += n
++            elif st == "T":
++                s, ns = struct.unpack_from("<qI", buf, q); f[k] = (s, ns); q += 12
++            elif st == "S":
++                f[k] = (struct.unpack_from("<q", buf, q)[0], 0); q += 8
++            elif st in FIELD_LEN:
++                n = FIELD_LEN[st]
++                if st in "1248": f[k] = int.from_bytes(buf[q:q + n], "little")
++                q += n
++            elif st == "*":
++                pass
++            else:
++                raise SystemExit(f"subtipo desconocido {k}{st}")
++        total = hs + sum(n for _, n in blobs)
++        if pos + total > len(buf): return pos
++        q = pos + hs; data = b""; xat = b""
++        for k, n in blobs:
++            if k == "DAT": data = bytes(buf[q:q + n])
++            elif k == "XAT": xat = bytes(buf[q:q + n])
++            q += n
++        ex.entry(f, data, xat)
++        pos += total
++    return pos
++
++def hardlinks(z, root):
++    """links.txt: el paquete guarda cada archivo una sola vez; «=ruta» es el original y cada «+ruta» siguiente, un enlace
++    duro a él."""
++    try: txt = z.read("AssetData/payloadv2/links.txt").decode("utf-8", "surrogateescape")
++    except KeyError: return
++    src = None; n = falta = 0
++    for line in txt.splitlines():
++        if not line: continue
++        op, rel = line[0], line[1:]
++        hp = os.path.join(root, rel)
++        if op == "=": src = hp
++        elif op == "+" and src:
++            if not os.path.lexists(src): falta += 1; continue
++            os.makedirs(os.path.dirname(hp), exist_ok=True)
++            if os.path.lexists(hp): os.unlink(hp)
++            os.link(src, hp, follow_symlinks=False); n += 1
++    print(f"enlaces duros: {n} (sin original: {falta})")
++
++def main():
++    if sys.argv[1] == "--enlaces":                     # solo links.txt, sobre una extracción ya hecha
++        hardlinks(zipfile.ZipFile(sys.argv[2]), os.path.abspath(sys.argv[3])); return
++    zpath, root = sys.argv[1], sys.argv[2]
++    z = zipfile.ZipFile(zpath)
++    members = sys.argv[3:] or sorted(n for n in z.namelist() if n.startswith("AssetData/payloadv2/payload.") and n.rsplit(".", 1)[1].isdigit())
++    ex = Extractor(root)
++    for m in members:
++        buf = bytearray(); pos = 0
++        for chunk in pbzx_chunks(z.open(m)):
++            buf += chunk
++            pos = parse(buf, pos, ex)
++            if pos > (1 << 24): del buf[:pos]; pos = 0
++        if pos != len(buf): print(f"{m}: {len(buf) - pos} bytes sin consumir al final", flush=True)
++        print(f"{m}: hecho ({ex.n} entradas)", flush=True)
++    ex.finish()
++    print(f"total {ex.n} entradas; sin crear (tipo: cuántas): {ex.skipped}")
++    if not sys.argv[3:]: hardlinks(z, ex.root)
++
++if __name__ == "__main__":
++    main()

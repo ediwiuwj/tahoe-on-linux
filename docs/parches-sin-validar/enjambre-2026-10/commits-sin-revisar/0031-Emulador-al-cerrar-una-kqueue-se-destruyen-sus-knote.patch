@@ -1,0 +1,196 @@
+From 48c375c514d6d93ad5c7700f4084e72952fd3235 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:34:28 -0600
+Subject: [PATCH 31/57] Emulador: al cerrar una kqueue se destruyen sus knotes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_kqueue.c: se lleva el registro de las kqueues del invitado. Al
+  cerrarla, sus knotes se sueltan uno a uno, por el mismo camino que
+  EV_DELETE, como en XNU, donde kqueue_close (kern_event.c:5094-5106)
+  llama a kqueue_dealloc (2961-3015), que suelta todos los knotes de
+  esa cola. Antes, close(kqueue) no limpiaba nada: los knotes
+  sobrevivían y, al reutilizar Linux el número de descriptor, se
+  mezclaban con los de otra kqueue (los eventos iban a la kqueue
+  equivocada y los puertos vigilados seguían vivos).
+- emu_kqueue.c: cada kqueue lleva un eventfd "centinela" registrado en
+  su epoll. Al cerrarla se escribe en él para despertar a los hilos que
+  estuvieran esperando: con el epoll vacío, epoll_wait no volvería
+  nunca. El centinela se distingue por un valor de evento que ningún
+  descriptor puede tener.
+- emu_kqueue.c: do_kevent marca la espera para que el cierre sepa si
+  queda alguien, y suelta la marca al terminar.
+- tahoe_run.c: close() avisa a emu_kqueue.c antes de cerrar el
+  descriptor. Si el descriptor no era una kqueue, no hace nada.
+
+Verificado: compila (clang -fsyntax-only, sin avisos); el agente que lo
+implementó lo probó con un arnés de simulacros (9/9 comprobaciones) y
+con ASan, UBSan y TSan en un test de estrés de hilos creando y
+cerrando kqueues, sin errores ni carreras.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_kqueue.c | 104 ++++++++++++++++++++++++++++++++++++++++-
+ tahoe-run/tahoe_run.c  |   7 ++-
+ 2 files changed, 107 insertions(+), 4 deletions(-)
+
+diff --git a/tahoe-run/emu_kqueue.c b/tahoe-run/emu_kqueue.c
+index 86a6adc..e7e151f 100644
+--- a/tahoe-run/emu_kqueue.c
++++ b/tahoe-run/emu_kqueue.c
+@@ -110,6 +110,18 @@ static pthread_mutex_t kq_lock = PTHREAD_MUTEX_INITIALIZER;
+ #define WQ_KQID_WORKQ (~0ULL)   // identificador interno del kqueue de la cola de trabajo (kevent_qos con kq = -1)
+ static int workq_kq = -1;
+ 
++// ---- kqueues del invitado: registro de las que puede cerrar el programa.
++// Cada kqueue es un epoll cuyo descriptor ve el programa (bsd_kqueue). En XNU, al cerrarla se destruyen sus knotes
++// (kqueue_close -> kqueue_dealloc, bsd/kern/kern_event.c:5094-5106 y 2961-3015); aquí, si no, los knotes sobrevivían al
++// close() y, al reutilizar Linux el número de descriptor, se mezclaban con los de otra kqueue (los eventos iban a la
++// kqueue equivocada y los puertos vigilados seguían vivos).
++// Cada kqueue lleva además un eventfd "centinela" registrado en su epoll: al cerrarla se escribe en él para despertar a
++// los hilos que estuvieran esperando en ella (con el epoll vacío, epoll_wait no volvería nunca).
++#define KQ_SENTINEL 0x7fffffffu        // valor del evento centinela: ningún descriptor puede valer esto
++struct kqrec { int fd; int sent; int waiters; int closed; int closer; int gone; struct kqrec* next; };
++static struct kqrec* kqrecs;
++static pthread_mutex_t kqr_lock = PTHREAD_MUTEX_INITIALIZER;
++
+ // EV_UDATA_SPECIFIC (0x100): el knote se identifica también por udata, así que puede haber varios por (ident, filtro).
+ static struct knote* find(int kq, uint64_t ident, int filter, uint16_t flags, uint64_t udata) {
+ 	for (struct knote* n = notes; n; n = n->next)
+@@ -165,6 +177,85 @@ static void drop(struct knote* dead) {
+ 	free(dead);
+ }
+ 
++// Destruye los knotes de la kqueue 'kq' (el epoll de ese descriptor), como kqueue_dealloc de XNU
++// (bsd/kern/kern_event.c:2961-3015): se sueltan uno a uno, igual que al borrar cada knote.
++static void kq_drop_notes(int kq) {
++	pthread_mutex_lock(&kq_lock);
++	for (struct knote* n = notes; n; ) {
++		struct knote* next = n->next;
++		if (n->kq == kq) drop(n);
++		n = next;
++	}
++	pthread_mutex_unlock(&kq_lock);
++}
++
++// Registra una kqueue del invitado (la crea bsd_kqueue).
++static void kq_reg(int fd) {
++	struct kqrec* r = calloc(1, sizeof *r);
++	if (!r) return;
++	r->fd = fd;
++	r->sent = fd_hi(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
++	if (r->sent >= 0) {
++		struct epoll_event e = { .events = EPOLLIN, .data.u64 = KQ_SENTINEL };
++		if (epoll_ctl(fd, EPOLL_CTL_ADD, r->sent, &e) != 0) { close(r->sent); r->sent = -1; }
++	}
++	pthread_mutex_lock(&kqr_lock);
++	r->next = kqrecs; kqrecs = r;
++	pthread_mutex_unlock(&kqr_lock);
++}
++
++// Suelta el registro de una kqueue (cuando ya no la usa nadie: ni el que espera ni el que la cerró).
++static void kq_rec_free(struct kqrec* r) {
++	pthread_mutex_lock(&kqr_lock);
++	for (struct kqrec** p = &kqrecs; *p; p = &(*p)->next) if (*p == r) { *p = r->next; break; }
++	pthread_mutex_unlock(&kqr_lock);
++	if (r->sent >= 0) close(r->sent);
++	free(r);
++}
++
++// Un hilo entra a esperar en la kqueue 'fd' (si es una del invitado): se cuenta para saber si hay que despertarla al
++// cerrarla. Devuelve el registro (para pasarlo a kq_leave) o NULL.
++static struct kqrec* kq_enter(int fd) {
++	struct kqrec* r = NULL;
++	pthread_mutex_lock(&kqr_lock);
++	for (struct kqrec* p = kqrecs; p; p = p->next) if (p->fd == fd && !p->closed) { r = p; break; }
++	if (r) r->waiters++;
++	pthread_mutex_unlock(&kqr_lock);
++	return r;
++}
++
++// El hilo deja de esperar en la kqueue. Si la kqueue ya se estaba cerrando y no queda nadie más, el registro se suelta
++// (solo uno de los dos, el que cierre y el último que espere, puede hacerlo: para eso está el flag 'gone').
++static void kq_leave(struct kqrec* r) {
++	if (!r) return;
++	int libre = 0;
++	pthread_mutex_lock(&kqr_lock);
++	if (--r->waiters <= 0 && r->closed && !r->closer && !r->gone) { r->gone = 1; libre = 1; }
++	pthread_mutex_unlock(&kqr_lock);
++	if (libre) kq_rec_free(r);
++}
++
++// Cierra la kqueue del descriptor 'fd' si lo es: destruye sus knotes (como kqueue_dealloc de XNU) y despierta a los hilos
++// que estuvieran esperando en ella. Devuelve 1 si el descriptor era una kqueue; si no lo era, no hace nada especial
++// (un close normal).
++int kq_close(int fd) {
++	struct kqrec* r = NULL;
++	pthread_mutex_lock(&kqr_lock);
++	for (struct kqrec* p = kqrecs; p; p = p->next) if (p->fd == fd && !p->closed) { r = p; break; }
++	if (r) { r->closed = 1; r->closer = 1; }               // mientras dura el cierre, el registro es de este hilo
++	pthread_mutex_unlock(&kqr_lock);
++	if (!r) return 0;
++	kq_drop_notes(fd);                                                              // los knotes de esa kqueue
++	if (r->sent >= 0) { uint64_t one = 1; if (write(r->sent, &one, 8) < 0) {} }    // despertar a quien espera
++	pthread_mutex_lock(&kqr_lock);
++	r->closer = 0;
++	int libre = r->waiters <= 0 && !r->gone;
++	if (libre) r->gone = 1;
++	pthread_mutex_unlock(&kqr_lock);
++	if (libre) kq_rec_free(r);
++	return 1;
++}
++
+ static int kq_for(int guest) {
+ 	if (guest != -1) return guest;
+ 	if (workq_kq < 0) workq_kq = fd_hi(epoll_create1(EPOLL_CLOEXEC));
+@@ -488,11 +579,14 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
+ 	struct epoll_event es[32];
+ 	int max = (int)(nev - nout) < 32 ? (int)(nev - nout) : 32;
+ 	if (nout) timeout_ms = 0;
++	struct kqrec* rec = kq_enter(kq);                       // si la kqueue se cierra mientras esperamos, nos avisa
+ 	int r = epoll_wait(kq, es, max, timeout_ms);
+-	if (r < 0) return errno == EINTR ? -4 /* EINTR */ : -darwin_errno(errno);
++	if (r < 0) { int e = errno == EINTR ? 4 : darwin_errno(errno); kq_leave(rec); return -e; }
++	kq_leave(rec);
+ 	pthread_mutex_lock(&kq_lock);
+ 	for (int i = 0; i < r && nout < nev; i++) {
+ 		int fd = (int)(uint32_t)es[i].data.u64;
++		if ((uint32_t)fd == KQ_SENTINEL) continue;          // centinela: la kqueue se cerró (sus knotes ya no existen)
+ 		uint32_t evs = es[i].events;
+ 		struct knote* next;
+ 		for (struct knote* n = notes; n && nout < nev; n = next) {
+@@ -612,7 +706,13 @@ static int ts_ms(uint64_t p) {
+ 	return ms > INT_MAX ? INT_MAX : (int)ms;
+ }
+ 
+-static long bsd_kqueue(struct ctx* c) { (void)c; int fd = epoll_create1(0); return fd < 0 ? -darwin_errno(errno) : fd; }
++static long bsd_kqueue(struct ctx* c) {
++	(void)c;
++	int fd = epoll_create1(0);
++	if (fd < 0) return -darwin_errno(errno);
++	kq_reg(fd);                                              // el programa puede cerrarla: hay que soltar sus knotes
++	return fd;
++}
+ // kevent(kq, changelist, nchanges, eventlist, nevents, timeout)
+ static long bsd_kevent(struct ctx* c) { g_dout = 0; g_no_poll = 0; return do_kevent((int)c->a[0], 0, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], ts_ms(c->a[5])); }
+ // kevent64(kq, changelist, nchanges, eventlist, nevents, flags, timeout)
+diff --git a/tahoe-run/tahoe_run.c b/tahoe-run/tahoe_run.c
+index 9826d2c..4b42e85 100644
+--- a/tahoe-run/tahoe_run.c
++++ b/tahoe-run/tahoe_run.c
+@@ -566,9 +566,12 @@ static long bsd_read(struct ctx* c) {
+ 	long r = syscall(SYS_read, c->a[0], c->a[1], c->a[2]);
+ 	return r < 0 ? -darwin_errno(errno) : r;
+ }
++extern int kq_close(int fd);   // emu_kqueue.c: al cerrar una kqueue, sus knotes se destruyen (como en XNU)
+ static long bsd_close(struct ctx* c) {
+-	if ((int)c->a[0] >= FD_INTERNAL_BASE) return -9;                 // EBADF: descriptores del emulador (ver fd_hi)
+-	long r = syscall(SYS_close, c->a[0]);
++	int fd = (int)c->a[0];
++	if (fd >= FD_INTERNAL_BASE) return -9;                 // EBADF: descriptores del emulador (ver fd_hi)
++	kq_close(fd);                                           // si era una kqueue, se sueltan sus knotes antes de cerrar
++	long r = syscall(SYS_close, fd);
+ 	return r < 0 ? -darwin_errno(errno) : r;
+ }
+ // flags de open de Darwin -> Linux

@@ -1,0 +1,70 @@
+From 9c179cecde0583329ffe55eaeee8b3f646042209 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:37:02 -0600
+Subject: [PATCH 47/57] Emulador: se comprueban las reservas de memoria que
+ quedaban
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_cs.c: al montar el token de un firma, el búfer se reservaba sin
+  comprobar y se rellenaba con memset: si la reserva fallaba, se
+  escribía sobre el puntero nulo y moría el proceso tahoe-run entero.
+  Ahora se avisa con ENOMEM.
+- emu_fileport.c: el nombre del par se escribía con snprintf y su
+  retorno se usaba como longitud. Si el nombre no cabía, la longitud
+  apuntaría fuera de sun_path y el par se leería más allá del búfer.
+  Ahora la longitud se acota a lo que cabe.
+- emu_fs2.c: la tabla de poll se reservaba sin comprobar, con el
+  número de descriptores que elige el invitado. Ahora se avisa con
+  ENOMEM.
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_cs.c       | 1 +
+ tahoe-run/emu_fileport.c | 4 ++++
+ tahoe-run/emu_fs2.c      | 1 +
+ 3 files changed, 6 insertions(+)
+
+diff --git a/tahoe-run/emu_cs.c b/tahoe-run/emu_cs.c
+index 18a1e3d..4109fbb 100644
+--- a/tahoe-run/emu_cs.c
++++ b/tahoe-run/emu_cs.c
+@@ -309,6 +309,7 @@ static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
+ 		else {                                                   // cabecera falsa {0, longitud total} y la cadena detrás
+ 			uint32_t sl = (uint32_t)strlen(s) + 1, tot = sl + 8;
+ 			uint8_t* b = malloc(tot);
++			if (!b) { free(cd); return -D_ENOMEM; }        // sin memoria: se avisa, sin escribir en NULL
+ 			memset(b, 0, 8); uint32_t bl = htonl(tot); memcpy(b + 4, &bl, 4); memcpy(b + 8, s, sl);
+ 			r = copy_token(b, tot, uaddr, usize);
+ 			free(b);
+diff --git a/tahoe-run/emu_fileport.c b/tahoe-run/emu_fileport.c
+index 02188db..c33b0aa 100644
+--- a/tahoe-run/emu_fileport.c
++++ b/tahoe-run/emu_fileport.c
+@@ -35,7 +35,11 @@ static void fp_sockname(struct sockaddr_un* a, socklen_t* len, int pid) {
+ 	memset(a, 0, sizeof *a);
+ 	a->sun_family = AF_UNIX;
+ 	const char* tag = getenv("TAHOE_PORTS_OWNER");
++	// snprintf devuelve la longitud que habría escrito, mayor que el búfer si trunca: si el nombre no cabe, el
++	// longitud apuntaría fuera de sun_path y el par se leería más allá del búfer.
+ 	int n = snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "tahoe.%s.fp.%d", tag ? tag : "x", pid);
++	if (n < 0) n = 0;
++	if ((size_t)n >= sizeof a->sun_path - 1) n = (int)(sizeof a->sun_path - 2);
+ 	*len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
+ }
+ static int fp_local(uint32_t name) {
+diff --git a/tahoe-run/emu_fs2.c b/tahoe-run/emu_fs2.c
+index b4c3e46..27c0453 100644
+--- a/tahoe-run/emu_fs2.c
++++ b/tahoe-run/emu_fs2.c
+@@ -275,6 +275,7 @@ static long bsd_poll(struct ctx* c) {
+ 	uint32_t n = (uint32_t)c->a[1];
+ 	if (n > 4096) return -D_EINVAL;
+ 	struct pollfd* p = calloc(n ? n : 1, sizeof *p);
++	if (n && !p) return -D_ENOMEM;                               // sin memoria: se avisa, sin escribir en NULL
+ 	if (n && safe_read(c->a[0], p, n * sizeof *p) != (ssize_t)(n * sizeof *p)) { free(p); return -D_EFAULT; }
+ 	for (uint32_t i = 0; i < n; i++) p[i].events = ev_to_linux(p[i].events);
+ 	int r = poll(p, n, (int)c->a[2]);

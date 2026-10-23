@@ -1,0 +1,1350 @@
+diff -ruN a/tahoe-run/emu_fs.c b/tahoe-run/emu_fs.c
+--- a/tahoe-run/emu_fs.c
++++ b/tahoe-run/emu_fs.c
+@@ -113,6 +113,96 @@
+ 	return id[i];
+ }
+ int sys_volume_present(int k) { return k >= 0 && (size_t)k < NSYSVOL && sysvol_mnt((size_t)k) != 0; }
++
++// ---- Espacio de los volúmenes APFS emulados
++// El contenedor APFS que ve macOS es el sistema de archivos del anfitrión donde vive TAHOE_ROOT (un disco virtual ext4 con
++// el macOS instalado). Los volúmenes del contenedor son carpetas de ese mismo sistema de archivos: el del sistema
++// (TAHOE_ROOT), el de datos (TAHOE_ROOT/System/Volumes/Data) y el Preboot (TAHOE_ROOT/System/Volumes/Preboot), que en un
++// macOS completo son volúmenes APFS aparte. En APFS los volúmenes comparten el espacio del contenedor: la capacidad de
++// cada uno es la del contenedor (salvo que tenga cuota) y el «usado» de cada uno es el de sus archivos.
++// Aquí el contenedor se reparte entre los volúmenes en cuotas proporcionales a lo que ocupa cada uno: así cada volumen
++// tiene su propio tamaño (y no el del contenedor, que es lo que se veía) y las cifras cuadran: lo que usan todos los
++// volúmenes es lo que usa el contenedor. El usado de cada volumen lo mide tools/volsize.sh (du sobre su árbol: tarda
++// minutos) y lo deja en un archivo; sin ese archivo, todo el usado del disco se atribuye al volumen del sistema (como
++// antes) y los volúmenes de datos y Preboot salen con 0 B.
++#define VOLFILE_SUFFIX "/.config/tahoe-run/volsize"
++static const char* volfile_path(void) {
++	const char* p = getenv("TAHOE_VOLFILE");
++	if (p && *p) return p;
++	static char path[1024]; static int known;
++	if (!known) {
++		known = 1;
++		const char* h = getenv("HOME");
++		snprintf(path, sizeof path, "%s%s", h && *h ? h : "/root", VOLFILE_SUFFIX);
++	}
++	return path;
++}
++// «data <bytes>» y «preboot <bytes>»: lo que ocupa cada volumen (lo escribe tools/volsize.sh). Los demás volúmenes de
++// System/Volumes (BaseSystem, Recovery, Update...) no se emulan: su espacio está dentro del árbol del sistema y va con él.
++static int vol_used_file(uint64_t* data, uint64_t* pre, uint64_t* other) {
++	FILE* f = fopen(volfile_path(), "r");
++	if (!f) return 0;
++	char line[256]; int got = 0;
++	while (fgets(line, sizeof line, f)) {
++		char key[32]; unsigned long long v;
++		if (sscanf(line, "%31s %llu", key, &v) != 2) continue;
++		if (!strcmp(key, "data")) { *data = v; got |= 1; }
++		else if (!strcmp(key, "preboot")) { *pre = v; got |= 2; }
++		else if (!strcmp(key, "other")) { *other = v; got |= 4; }
++	}
++	fclose(f);
++	return (got & 3) == 3;
++}
++void tahoe_vol_space(struct tahoe_volspace* vs) {
++	static struct tahoe_volspace cache; static int done; static int cached_full;
++	memset(vs, 0, sizeof *vs);
++	struct statfs sf;
++	uint64_t size = 0, used = 0;
++	if (tahoe_root && statfs(tahoe_root, &sf) == 0) {
++		uint64_t bs = sf.f_bsize ? (uint64_t)sf.f_bsize : 4096;
++		size = (uint64_t)sf.f_blocks * bs;
++		used = (uint64_t)(sf.f_blocks - sf.f_bfree) * bs;
++	}
++	if (!size) size = 64ULL << 30;
++	size &= ~4095ULL;
++	// Los volúmenes de datos y Preboot solo existen en un macOS completo (en la Recovery, /System/Volumes/Data es un tmpfs).
++	int full = sys_volume_present(0) && sys_volume_present(1);
++	if (done && cached_full == full) { *vs = cache; return; }   // ya está calculado (y los volúmenes no han cambiado)
++	uint64_t ud = 0, up = 0, uo = 0;
++	int medido = full && vol_used_file(&ud, &up, &uo);
++	// Si la medida no cabe en el disco (está vieja: el disco se limpió después de medir) no se usa: se queda lo de antes,
++	// con todo el disco en el volumen del sistema. Si cabe, el sistema se queda con lo que sobra.
++	if (medido && ud + up > used) medido = 0;
++	if (!medido) { ud = 0; up = 0; }
++	// El volumen del sistema es el árbol de la raíz de macOS: lo que queda del disco después de los volúmenes de datos y
++	// de preboot (que son carpetas dentro de él). Los demás volúmenes de System/Volumes (BaseSystem, Recovery, Update...)
++	// también están dentro del árbol del sistema, así que su espacio va con él («other»).
++	(void)uo;
++	uint64_t us = used > ud + up ? used - ud - up : 0;
++	vs->size = size; vs->used = used; vs->free = size > used ? size - used : 0;
++	vs->nvol = full ? 3 : 1;
++	vs->medido = medido;
++	const char* nq = getenv("TAHOE_VOL_QUOTA");
++	int quota = !(nq && !strcmp(nq, "0"));
++	uint64_t q[TAHOE_VOL_N] = { 0, 0, 0 };
++	// Sin medidas no hay cuotas: cada volumen se queda con la capacidad del contenedor (como en un Mac donde no se pone
++	// ninguna, y como se veía antes de repartirlas).
++	if (!quota || !medido) for (int i = 0; i < TAHOE_VOL_N; i++) q[i] = size;
++	else {
++		// El reparto puede ajustar la medida (si no cuadra con el disco): las cifras que se enseñan son las ajustadas.
++		uint64_t vused[TAHOE_VOL_N] = { us, ud, up };
++		tahoe_vol_quotas(size, used, vused, q);
++		us = vused[TAHOE_VOL_SYS]; ud = vused[TAHOE_VOL_DATA]; up = vused[TAHOE_VOL_PRE];
++	}
++	vs->vol[TAHOE_VOL_SYS].used = us;
++	vs->vol[TAHOE_VOL_DATA].used = ud;
++	vs->vol[TAHOE_VOL_PRE].used = up;
++	for (int i = 0; i < TAHOE_VOL_N; i++) {
++		vs->vol[i].quota = q[i];
++		vs->vol[i].free = q[i] > vs->vol[i].used ? q[i] - vs->vol[i].used : 0;
++	}
++	cache = *vs; done = 1; cached_full = full;
++}
+ // Driver Metal de tahoe-run (tahoe-metal): con TAHOE_METAL=<carpeta del anfitrión con TahoeMetal.bundle>, las rutas de
+ // macOS /System/Library/Extensions/TahoeMetal.bundle[/...] llevan a esa carpeta (sin distinguir mayúsculas, como APFS).
+ // macOS ve el bundle donde Metal busca los drivers (MetalPluginName del IOAccelerator) y su copia no se toca. (Un overlayfs
+@@ -592,6 +682,57 @@
+ 	return 0;
+ }
+ 
++// ---- fcntl de XNU: F_PREALLOCATE, F_SETSIZE, F_RDADVISE y F_PUNCHHOLE ----
++// Referencia: bsd/kern/kern_descrip.c y bsd/man/man2/fcntl.2 de XNU 12377.
++//
++// Estructuras de Darwin (bsd/sys/fcntl.h):
++//   fstore_t:     u32 fst_flags; i32 fst_posmode; off_t fst_offset; off_t fst_length; off_t fst_bytesalloc (32 bytes)
++//   fpunchhole_t: u32 fp_flags; u32 reserved; off_t fp_offset; off_t fp_length                           (24 bytes)
++//   radvisory_t:  off_t ra_offset; i32 ra_count                                                         (12 bytes)
++#define UF_APPEND 0x00000004
++#define SF_APPEND 0x00040000
++#define F_ALLOCATECONTIG  0x00000002
++#define F_ALLOCATEALL     0x00000004
++#define F_ALLOCATEPERSIST 0x00000008
++#define F_PEOFPOSMODE 3
++#define F_VOLPOSMODE  4
++// Si el descriptor real (Linux) permite escritura: XNU exige FWRITE en F_PREALLOCATE y F_SETSIZE (EBADF)
++// y en F_PUNCHHOLE (EPERM). -1 si el descriptor ya no existe.
++static int fd_writable(int fd) {
++	int f = fcntl(fd, F_GETFL);
++	if (f < 0) return -1;
++	return (f & O_ACCMODE) != O_RDONLY;
++}
++// 1 si el descriptor corresponde a un vnode de XNU (DTYPE_VNODE), 0 si no lo es y -1 si el descriptor no existe.
++// En XNU una tubería (DTYPE_PIPE) o un socket (DTYPE_SOCKET) no son vnodes: EBADF. Un FIFO de POSIX sí lo es
++// (vfifo), pero en Linux el FIFO y la tubería son los dos S_ISFIFO: se distinguen por el enlace de /proc.
++static int fd_is_vnode(int fd) {
++	struct stat st;
++	if (fstat(fd, &st) != 0) return -1;
++	if (S_ISSOCK(st.st_mode)) return 0;
++	char link[64], p[64];
++	snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
++	ssize_t n = readlink(link, p, sizeof p - 1);
++	if (n > 0) {
++		p[n] = 0;
++		if (!strncmp(p, "pipe:[", 6) || !strncmp(p, "/anon_inode/", 12)) return 0;
++	}
++	return 1;
++}
++// Tipo del vnode del descriptor: 0 fichero normal, 1 directorio, 2 otro (un dispositivo...), -1 si no existe.
++static int fd_vnodeclass(int fd) {
++	struct stat st;
++	if (fstat(fd, &st) != 0) return -1;
++	if (S_ISREG(st.st_mode)) return 0;
++	if (S_ISDIR(st.st_mode)) return 1;
++	return 2;
++}
++// Bloque del sistema de ficheros (alineación de F_PUNCHHOLE y redondeo de fst_bytesalloc).
++static uint64_t fs_blocksize(int fd) {
++	struct statfs sb;
++	if (fstatfs(fd, &sb) == 0 && sb.f_bsize > 0) return (uint64_t)sb.f_bsize;
++	return 4096;
++}
+ // fcntl de Darwin: solo los comandos que usa el arranque
+ static long bsd_fcntl(struct ctx* c) {
+ 	int fd = (int)c->a[0], cmd = (int)c->a[1];
+@@ -603,6 +744,94 @@
+ 	case 3: { int f = fcntl(fd, F_GETFL); if (f < 0) return err(); return (f & 3) | ((f & O_NONBLOCK) ? 4 : 0) | ((f & O_APPEND) ? 8 : 0); }
+ 	case 4: { int f = (int)c->a[2], lf = 0; if (f & 4) lf |= O_NONBLOCK; if (f & 8) lf |= O_APPEND; RET(fcntl(fd, F_SETFL, lf)); }
+ 	case 45: case 48: case 51: return 0;                  // F_RDAHEAD, F_NOCACHE, F_FULLFSYNC: sin efecto
++	case 42: {                                            // F_PREALLOCATE (fstore_t), XNU kern_descrip.c:3371
++		// XNU: si no es un vnode o no se abrió para escribir, EBADF; copyin de la fstore_t, EFAULT;
++		// el posmode decide dónde se reserva (F_PEOFPOSMODE: desde el EOF; F_VOLPOSMODE: desde un punto
++		// del volumen); un posmode desconocido, EINVAL (y entonces la estructura no se copia de vuelta);
++		// y al final se copia la fstore_t con fst_bytesalloc = bytes reservados (tb. si la reserva falla).
++		int w = fd_writable(fd);
++		if (w < 0) return err();                          // el descriptor no existe
++		if (!w) return -D_EBADF;                          // XNU: sin FWRITE, EBADF
++		int v = fd_is_vnode(fd);
++		if (v < 0) return err();                           // el descriptor no existe
++		if (!v) return -D_EBADF;                           // XNU: DTYPE_VNODE
++		uint8_t fs[32];
++		if (safe_read(c->a[2], fs, 32) != 32) return -D_EFAULT;
++		uint32_t aflags; int32_t pmode; int64_t off, len;
++		memcpy(&aflags, fs, 4); memcpy(&pmode, fs + 4, 4); memcpy(&off, fs + 8, 8); memcpy(&len, fs + 16, 8);
++		int64_t base;
++		if (pmode == F_PEOFPOSMODE) {
++			if (off != 0) return -D_EINVAL;               // XNU: F_PEOFPOSMODE con offset distinto de 0
++			struct stat st;
++			if (fstat(fd, &st) != 0) return err();
++			base = st.st_size;                            // XNU: se reserva desde el EOF físico
++		} else if (pmode == F_VOLPOSMODE) {
++			if (off <= 0) return -D_EINVAL;               // XNU: F_VOLPOSMODE con offset <= 0
++			// XNU reserva desde una posición del volumen, que en Linux no existe: se usa como
++			// desplazamiento dentro del fichero (la posición en el volumen no es representable).
++			base = off;
++		} else return -D_EINVAL;                          // XNU: posmode que no es ninguno de los dos
++		if (len < 0) return -D_EINVAL;
++		// Solo los ficheros normales se preasignan: en un directorio o en un dispositivo la operación del
++		// vnode no existe y XNU devuelve ENOTSUP (la operación por defecto de un vnode, vfs_init.c).
++		if (fd_vnodeclass(fd) != 0) return -D_ENOTSUP;
++		// F_ALLOCATEALL: fallocate() reserva el rango entero o falla (igual que "todo o nada").
++		// F_ALLOCATECONTIG: Linux no puede garantizar la contigüidad (la decide el fs): se ignora, como
++		//   permite el manual de fcntl(2) ("the file system may ignore this request").
++		// F_ALLOCATEPERSIST: en Linux los bloques reservados no se sueltan al cerrar el fichero.
++		// KEEP_SIZE: el tamaño del fichero no cambia (XNU tampoco lo cambia al preasignar).
++		uint64_t bytesalloc = 0;
++		if (len > 0) {
++			if (fallocate(fd, FALLOC_FL_KEEP_SIZE, (off_t)base, (off_t)len) != 0) {
++				int e = errno;
++				memcpy(fs + 24, &bytesalloc, 8);          // XNU copia la estructura aunque la reserva falle
++				safe_write(c->a[2], fs, 32);
++				if (trace_all) logf_("    F_PREALLOCATE(fd=%d, flags=0x%x, base=%lld, len=%lld) -> %s\n", fd, aflags, (long long)base, (long long)len, strerror(e));
++				return -darwin_errno(e);                  // ENOSPC si no hay sitio, EFBIG si no cabe
++			}
++			uint64_t bs = fs_blocksize(fd);               // los bytes reservados, redondeados al bloque
++			// Los bloques que reserva el fs cubren el rango [base, base+len) redondeado a los bloques: eso
++			// es lo que informa fst_bytesalloc (el manual dice que puede ser mayor que lo pedido). Con
++			// F_PEOFPOSMODE el origen es el EOF, que casi nunca está alineado: por eso se redondea el rango
++			// entero y no solo la longitud.
++			uint64_t lo = (uint64_t)base / bs * bs;
++			uint64_t hi = ((uint64_t)base + (uint64_t)len + bs - 1) / bs * bs;
++			bytesalloc = hi - lo;
++		}
++		memcpy(fs + 24, &bytesalloc, 8);
++		if (trace_all) logf_("    F_PREALLOCATE(fd=%d, flags=0x%x, base=%lld, len=%lld) -> %llu bytes\n", fd, aflags, (long long)base, (long long)len, (unsigned long long)bytesalloc);
++		return safe_write(c->a[2], fs, 32) == 32 ? 0 : -D_EFAULT;
++	}
++	case 43: {                                            // F_SETSIZE (off_t), XNU kern_descrip.c:3619
++		// XNU: si no es un vnode o no se abrió para escribir, EBADF; copyin del off_t, EFAULT; con el
++		// fichero de solo-anexar (APPEND), EPERM; y si quien llama no es root, EACCES (el privilegio de
++		// truncar sin rellenar con ceros ya no existe: se trunca como truncate(2), rellenando con ceros).
++		int w = fd_writable(fd);
++		if (w < 0) return err();                          // el descriptor no existe
++		if (!w) return -D_EBADF;                          // XNU: sin FWRITE, EBADF
++		int v = fd_is_vnode(fd);
++		if (v < 0) return err();                           // el descriptor no existe
++		if (!v) return -D_EBADF;                           // XNU: DTYPE_VNODE
++		int64_t sz;
++		if (safe_read(c->a[2], &sz, 8) != 8) return -D_EFAULT;
++		if (tahoe_flags_fd(fd) & (UF_APPEND | SF_APPEND)) return -D_EPERM;   // XNU: vnode_isappendonly
++		if (cred_euid() != 0) return -D_EACCES;            // XNU: hace falta ser root
++		if (fd_vnodeclass(fd) == 1) return -D_EISDIR;       // XNU: en un directorio el tamano no tiene sentido
++		RET(ftruncate(fd, (off_t)sz));                     // en otro tipo de vnode, EINVAL (como en XNU)
++	}
++	case 44: {                                            // F_RDADVISE (radvisory_t), XNU kern_descrip.c:3786
++		// XNU: si no es un vnode, EBADF; copyin de la radvisory_t, EFAULT; offset o cuenta negativos,
++		// EINVAL; y luego se pasa al fs, que solo hace una lectura preventiva (no copia nada al usuario).
++		int v = fd_is_vnode(fd);
++		if (v < 0) return err();                            // el descriptor no existe
++		if (!v) return -D_EBADF;                            // XNU: DTYPE_VNODE
++		uint8_t rv[12];
++		if (safe_read(c->a[2], rv, 12) != 12) return -D_EFAULT;
++		int64_t off; int32_t cnt;
++		memcpy(&off, rv, 8); memcpy(&cnt, rv + 8, 4);
++		if (off < 0 || cnt < 0) return -D_EINVAL;
++		return 0;
++	}
+ 	case 50: case 102: {                                  // F_GETPATH / F_GETPATH_NOFIRMLINK: ruta del descriptor
+ 		char link[64], path[4096];
+ 		snprintf(link, sizeof link, "/proc/thread-self/fd/%d", fd);
+@@ -659,11 +888,36 @@
+ 	case 74: case 63: case 77: return 0;                    // F_GETNOSIGPIPE, F_GETPROTECTIONCLASS, F_GETPROTECTIONLEVEL: 0
+ 	case 64: return 0;                                      // F_SETPROTECTIONCLASS: sin clases de protección
+ 	case 85: RET(fdatasync(fd));                            // F_BARRIERFSYNC
+-	case 99: {                                              // F_PUNCHHOLE(fpunchhole_t: flags, reservado, offset, length)
+-		uint64_t ph[3]; uint8_t raw[24];
++	case 99: {                                              // F_PUNCHHOLE (fpunchhole_t), XNU kern_descrip.c:3463
++		// XNU: si no es un vnode, EBADF; sin permiso de escritura, EPERM; copyin de la fpunchhole_t,
++		// EFAULT; offset o longitud negativos, o banderas/reservado distintos de cero, EINVAL; y si el
++		// offset y la longitud son los dos desalineados respecto al bloque del fs, EINVAL. El rango se
++		// desasigna (se lee como ceros) y el tamaño del fichero no cambia.
++		int v = fd_is_vnode(fd);
++		if (v < 0) return err();                               // el descriptor no existe
++		if (!v) return -D_EBADF;                               // XNU: DTYPE_VNODE
++		int w = fd_writable(fd);
++		if (w < 0) return err();                            // el descriptor no existe
++		if (!w) return -D_EPERM;                             // XNU: sin FWRITE, EPERM
++		uint8_t raw[24];
+ 		if (safe_read(c->a[2], raw, 24) != 24) return -D_EFAULT;
+-		memcpy(&ph[1], raw + 8, 8); memcpy(&ph[2], raw + 16, 8);
+-		RET(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)ph[1], (off_t)ph[2]));
++		uint32_t fl, rsv; int64_t off, len;
++		memcpy(&fl, raw, 4); memcpy(&rsv, raw + 4, 4); memcpy(&off, raw + 8, 8); memcpy(&len, raw + 16, 8);
++		if (off < 0 || len < 0) return -D_EINVAL;
++		if (fl || rsv) return -D_EINVAL;                     // fp_flags y reserved tienen que ser 0
++		if (fd_vnodeclass(fd) != 0) return -D_ENOTSUP;       // el fs solo desasigna en ficheros normales
++		uint64_t bs = fs_blocksize(fd);
++		if ((off % (int64_t)bs) && (len % (int64_t)bs)) return -D_EINVAL;   // XNU: los dos desalineados
++		// Si solo uno de los dos está desalineado, XNU no falla (el manual solo da EINVAL cuando los dos
++		// lo están): el fs redondea el rango al bloque. Se redondea aquí por lo mismo, y porque el
++		// fallocate() de Linux trabaja con bloques enteros.
++		int64_t lo = off / (int64_t)bs * (int64_t)bs;
++		int64_t hi = (off + len + (int64_t)bs - 1) / (int64_t)bs * (int64_t)bs;
++		struct stat st;
++		if (fstat(fd, &st) == 0 && hi > st.st_size) hi = st.st_size;   // el agujero no pasa del final
++		if (hi <= lo) return 0;                                          // no hay nada que desasignar
++		// PUNCH_HOLE desasigna el rango (luego se lee como ceros) sin cambiar el tamaño del fichero.
++		RET(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)lo, (off_t)(hi - lo)));
+ 	}
+ 	case 106: RET(fcntl(fd, F_SETLEASE, (int)c->a[2] == 1 ? F_RDLCK : (int)c->a[2] == 3 ? F_WRLCK : F_UNLCK));
+ 	case 107: { int l = fcntl(fd, F_GETLEASE); if (l < 0) return err(); return l == F_RDLCK ? 1 : l == F_WRLCK ? 3 : 2; }
+@@ -703,15 +957,36 @@
+ 	if (dm >= 0) { id[0] = darwin_dev(EMU_DISK_MAJOR, dm); id[1] = m->ftype; }
+ 	else { id[0] = (uint32_t)s->f_fsid.__val[0]; id[1] = (uint32_t)s->f_fsid.__val[1]; }
+ }
++// Volumen APFS emulado al que pertenece un montaje (0 el del sistema, 1 el de datos, 2 el Preboot), o -1 si el montaje no
++// es uno de ellos (un tmpfs, como el /System/Volumes/Data de la Recovery, o devfs).
++static int vol_of_mount(const struct gmount* m) {
++	if (!strcmp(m->type, "tmpfs")) return -1;
++	if (!strcmp(m->on, "/")) return TAHOE_VOL_SYS;
++	for (size_t k = 0; k < NSYSVOL; k++) if (!strcmp(m->on, sys_volumes[k].on)) return TAHOE_VOL_SYS + 1 + (int)k;
++	return -1;
++}
+ static void put_statfs(uint64_t out, const struct statfs* s, const struct gmount* m) {
+ 	uint8_t d[2168];
+ 	memset(d, 0, sizeof d);
++	// Cada volumen APFS tiene su capacidad (su cuota del contenedor) y su espacio libre; el contenedor reparte el suyo
++	// entre ellos. Los tmpfs y devfs siguen con los del anfitrión, y los volúmenes sin medidas (sin el archivo que
++	// tools/volsize.sh escribe) siguen con los del sistema de archivos, como antes.
++	uint64_t f_blocks = s->f_blocks, f_bfree = s->f_bfree, f_bavail = s->f_bavail;
++	int v = vol_of_mount(m);
++	if (v >= 0) {
++		struct tahoe_volspace vs; tahoe_vol_space(&vs);
++		if (vs.medido && vs.vol[v].quota) {
++			uint64_t bs = s->f_bsize ? (uint64_t)s->f_bsize : 4096;
++			f_blocks = vs.vol[v].quota / bs;
++			f_bfree = f_bavail = vs.vol[v].free / bs;
++		}
++	}
+ #define W(type, off, v) do { type t_ = (type)(v); memcpy(d + (off), &t_, sizeof t_); } while (0)
+ 	W(uint32_t, 0, s->f_bsize);
+ 	W(int32_t, 4, m->iosize);
+-	W(uint64_t, 8, s->f_blocks);
+-	W(uint64_t, 16, s->f_bfree);
+-	W(uint64_t, 24, s->f_bavail);
++	W(uint64_t, 8, f_blocks);
++	W(uint64_t, 16, f_bfree);
++	W(uint64_t, 24, f_bavail);
+ 	W(uint64_t, 32, s->f_files);
+ 	W(uint64_t, 40, s->f_ffree);
+ 	{ uint32_t id[2]; fsid_of(s, m, id); W(uint32_t, 48, id[0]); W(uint32_t, 52, id[1]); }
+@@ -998,11 +1273,24 @@
+ 		PUTREF(gpath);
+ 	}
+ 	uint64_t bs = sf.f_bsize ? (uint64_t)sf.f_bsize : 4096;
++	// Los atributos de volumen son los del volumen al que pertenece la ruta: su capacidad (su cuota del contenedor), su
++	// libre y lo que ocupa. Los tmpfs (el /System/Volumes/Data de la Recovery) y los volúmenes sin medidas siguen con los
++	// del anfitrión.
++	uint64_t vsize = sf.f_blocks * bs, vfree = sf.f_bfree * bs, vavail = sf.f_bavail * bs;
++	uint64_t vused = (sf.f_blocks - sf.f_bfree) * bs, vquota = 0;
++	int vvol = vol_of_mount(vm);
++	if (vvol >= 0) {
++		struct tahoe_volspace vs; tahoe_vol_space(&vs);
++		if (vs.medido && vs.vol[vvol].quota) {
++			vsize = vs.vol[vvol].quota; vfree = vavail = vs.vol[vvol].free;
++			vused = vs.vol[vvol].used; vquota = vs.vol[vvol].quota;
++		}
++	}
+ 	if (vol & 0x1) PUTU32(0x1c);                           // FSTYPE (número de vfs; apfs)
+ 	if (vol & 0x2) PUTU32(0x4244);                         // SIGNATURE
+-	if (vol & 0x4) PUTU64(sf.f_blocks * bs);               // SIZE
+-	if (vol & 0x8) PUTU64(sf.f_bfree * bs);                // SPACEFREE
+-	if (vol & 0x10) PUTU64(sf.f_bavail * bs);              // SPACEAVAIL
++	if (vol & 0x4) PUTU64(vsize);                          // SIZE
++	if (vol & 0x8) PUTU64(vfree);                          // SPACEFREE
++	if (vol & 0x10) PUTU64(vavail);                        // SPACEAVAIL
+ 	if (vol & 0x20) PUTU64(bs);                            // MINALLOCATION
+ 	if (vol & 0x40) PUTU64(bs);                            // ALLOCATIONCLUMP
+ 	if (vol & 0x80) PUTU32(bs);                            // IOBLOCKSIZE
+@@ -1037,8 +1325,8 @@
+ 	if (vol & 0x100000) PUTREF(vm->type);                 // FSTYPENAME
+ 	if (vol & 0x200000) PUTU32(0);                         // FSSUBTYPE
+ 	if (vol & 0x400000) PUTU32(0);                         // OWNER (root)
+-	if (vol & 0x800000) PUTU64((sf.f_blocks - sf.f_bfree) * bs);   // SPACEUSED
+-	if (vol & 0x10000000) PUTU64(0);                       // QUOTA_SIZE
++	if (vol & 0x800000) PUTU64(vused);                     // SPACEUSED
++	if (vol & 0x10000000) PUTU64(vquota);                  // QUOTA_SIZE
+ 	if (vol & 0x20000000) PUTU64(0);                       // RESERVED_SIZE
+ 	if (vol & 0x40000000) {                                // ATTRIBUTES: vol_attributes_attr_t (válidos y nativos)
+ 		uint32_t va[10] = { 0xffffffff, 0xF0FFFFFF, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xF0FFFFFF, 0xffffffff, 0xffffffff, 0xffffffff };
+diff -ruN a/tahoe-run/emu_iokit.inc b/tahoe-run/emu_iokit.inc
+--- a/tahoe-run/emu_iokit.inc
++++ b/tahoe-run/emu_iokit.inc
+@@ -336,11 +336,11 @@
+ }
+ static uint64_t io_disk_size;                                  // bytes del disco virtual (io_disks), para la ruta EFI de arranque
+ static void io_disks(int bus) {
+-	struct statfs sf;
+-	uint64_t size = 0, used = 0;
+-	if (tahoe_root && statfs(tahoe_root, &sf) == 0) { size = (uint64_t)sf.f_blocks * sf.f_bsize; used = (uint64_t)(sf.f_blocks - sf.f_bfree) * sf.f_bsize; }
+-	if (!size) size = 64ULL << 30;
+-	size &= ~4095ULL;
++	// El contenedor es el disco de Linux donde vive el macOS; cada volumen tiene su capacidad (su cuota del contenedor) y
++	// lo que ocupa, así que diskutil no ve el tamaño del contenedor en todos los volúmenes (tahoe_vol_space, emu_fs.c).
++	struct tahoe_volspace vs;
++	tahoe_vol_space(&vs);
++	uint64_t size = vs.size, used = vs.used;
+ 	io_disk_size = size;
+ 	int dev = ent_add(bus, "Tahoe Virtual Disk", "IOBlockStorageDevice", "IORegistryEntry IOService", "1f,2", PL_SERVICE, 0);
+ 	// "Virtual Interface": en una Recovery real el sistema base (BaseSystem.dmg) es una imagen de disco y diskutil la presenta
+@@ -375,7 +375,7 @@
+ 	int full = sys_volume_present(0) && sys_volume_present(1);
+ 	const char* sysname = full ? "Macintosh HD" : "macOS Base System";
+ 	int vol = ent_add(cont, sysname, "AppleAPFSVolume", "IORegistryEntry IOService IOStorage IOMedia", "1", PL_SERVICE, 0);
+-	disk_media(vol, "disk1s1", 1, 3, size, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
++	disk_media(vol, "disk1s1", 1, 3, vs.vol[TAHOE_VOL_SYS].quota, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
+ 	p_str(vol, "UUID", BOOT_VOLUME_UUID); p_str(vol, "VolGroupUUID", BOOT_VOLUME_UUID);
+ 	p_num(vol, "Partition ID", 1, 32); p_str(vol, "FullName", sysname);
+ 	if (!full) return;
+@@ -387,7 +387,7 @@
+ 	struct val* r = v_new(V_ARRAY); v_add(r, NULL, v_str("System")); v_set(io_e[vol].props, "Role", r); p_num(vol, "RoleValue", 1, 16);
+ 	for (size_t i = 0; i < sizeof more / sizeof more[0]; i++) {
+ 		int v = ent_add(cont, more[i].name, "AppleAPFSVolume", "IORegistryEntry IOService IOStorage IOMedia", more[i].bsd + 6, PL_SERVICE, 0);
+-		disk_media(v, more[i].bsd, 1, more[i].minor, size, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
++		disk_media(v, more[i].bsd, 1, more[i].minor, vs.vol[TAHOE_VOL_DATA + i].quota, "41504653-0000-11AA-AA11-00306543ECAC", 0, 1);
+ 		p_str(v, "UUID", more[i].uuid); p_str(v, "VolGroupUUID", more[i].group ? BOOT_VOLUME_UUID : more[i].uuid);
+ 		p_num(v, "Partition ID", (uint64_t)more[i].id, 32); p_str(v, "FullName", more[i].name);
+ 		struct val* ro = v_new(V_ARRAY); v_add(ro, NULL, v_str(more[i].role)); v_set(io_e[v].props, "Role", ro);
+@@ -1373,19 +1373,21 @@
+ 	if (c->selector == 8) {
+ 		// Diccionario por nombre BSD: el contenedor (disk1: size, used, reserve, «Max volume count») y cada volumen (disk1sN:
+ 		// fs_used, fs_reserve, fs_quota). storagekitd lo recorre (_addToExtendedDiskInfoCacheWithDictionary:) y cada valor
+-		// tiene que ser otro diccionario. Los volúmenes comparten el sistema de archivos de Linux: lo usado va al del sistema.
++		// tiene que ser otro diccionario. Los volúmenes comparten el sistema de archivos de Linux: lo usado de cada uno es el
++		// de sus archivos (tools/volsize.sh lo mide) y su cuota, su parte del contenedor (tahoe_vol_space, emu_fs.c).
+ 		if (!c->ool_out || !c->ool_out_size) return kIOReturnBadArgument;
+-		struct statfs sf; uint64_t size = io_disk_size, used = 0;
+-		if (tahoe_root && statfs(tahoe_root, &sf) == 0) used = (uint64_t)(sf.f_blocks - sf.f_bfree) * sf.f_bsize;
+-		int nvol = (sys_volume_present(0) && sys_volume_present(1)) ? 3 : 1;
++		struct tahoe_volspace vs;
++		tahoe_vol_space(&vs);
++		uint64_t size = vs.size, used = vs.used;
++		int nvol = vs.nvol;
+ 		char d[2048];
+ 		int n = snprintf(d, sizeof d, "<dict><key>disk1</key><dict><key>size</key><integer size=\"64\">%llu</integer><key>used</key>"
+ 		                 "<integer size=\"64\">%llu</integer><key>reserve</key><integer size=\"64\">0</integer>"
+ 		                 "<key>Max volume count</key><integer size=\"32\">100</integer></dict>", (unsigned long long)size, (unsigned long long)used);
+ 		for (int v = 1; v <= nvol && n > 0 && (size_t)n < sizeof d; v++)
+ 			n += snprintf(d + n, sizeof d - n, "<key>disk1s%d</key><dict><key>fs_used</key><integer size=\"64\">%llu</integer>"
+-			              "<key>fs_reserve</key><integer size=\"64\">0</integer><key>fs_quota</key><integer size=\"64\">0</integer></dict>",
+-			              v, (unsigned long long)(v == 1 ? used : 0));
++			              "<key>fs_reserve</key><integer size=\"64\">0</integer><key>fs_quota</key><integer size=\"64\">%llu</integer></dict>",
++			              v, (unsigned long long)vs.vol[v - 1].used, (unsigned long long)vs.vol[v - 1].quota);
+ 		if (n > 0 && (size_t)n < sizeof d) n += snprintf(d + n, sizeof d - n, "</dict>");
+ 		if (n < 0 || (size_t)n + 1 > sizeof d || (size_t)n + 1 > c->ool_out_size) return kIOReturnNoMemory;
+ 		memcpy((void*)c->ool_out, d, (size_t)n + 1); *c->ool_out_len = (uint64_t)n + 1; *c->noutband = 0; *c->nsout = 0;
+diff -ruN a/tahoe-run/emu_mach.c b/tahoe-run/emu_mach.c
+--- a/tahoe-run/emu_mach.c
++++ b/tahoe-run/emu_mach.c
+@@ -290,6 +290,211 @@
+ 	return n + 16;
+ }
+ 
++// ---------------------------------------------------------------- mach_vm_region (id 4816)
++// Sabores de vm_region (osfmk/mach/vm_region.h) y tamaño de sus estructuras (en natural_t, como las cuenta XNU).
++#define VR_BASIC_INFO_64        9        // VM_REGION_BASIC_INFO_64
++#define VR_BASIC_INFO          10        // VM_REGION_BASIC_INFO (el viejo de 32 bits: XNU lo convierte al de 64)
++#define VR_EXTENDED_INFO       13        // VM_REGION_EXTENDED_INFO
++#define VR_BASIC_COUNT_64      10        // VM_REGION_BASIC_INFO_COUNT_64  (40 bytes / 4: la estructura tiene 8 bytes de «offset» y 4 de relleno)
++#define VR_EXTENDED_COUNT       9        // VM_REGION_EXTENDED_INFO_COUNT  (36 bytes / 4)
++
++// Una región del mapa de la tarea. Las de Linux: el invitado comparte el espacio de direcciones con el emulador, así que
++// /proc/<pid>/maps es el mapa de la tarea (lo que en XNU es su vm_map).
++struct vregion { uint64_t start, end, off; int prot, shared; };
++
++// Región que contiene la dirección; si no hay ninguna, la siguiente por encima (como XNU: «si la dirección indicada no
++// está asignada, se describe el siguiente intervalo de direcciones más alto», osfmk/mach/mach_vm.defs). Devuelve 0 si no
++// hay ninguna por encima (entonces XNU responde KERN_NO_SPACE).
++static int vm_region_of(int32_t pid, uint64_t addr, struct vregion* out) {
++	char path[64];
++	snprintf(path, sizeof path, "/proc/%d/maps", (int)pid);
++	FILE* f = fopen(path, "r");
++	if (!f) return 0;
++	char ln[512];
++	int found = 0;
++	uint64_t ns = 0, ne = 0, no = 0; int np = 0, nsh = 0, hay = 0;
++	while (fgets(ln, sizeof ln, f)) {
++		unsigned long lo, hi; char pr[8]; unsigned long long o;
++		if (sscanf(ln, "%lx-%lx %7s %llx", &lo, &hi, pr, &o) < 4) continue;
++		uint64_t s = (uint64_t)lo, e = (uint64_t)hi;
++		int p = (pr[0] == 'r' ? 1 : 0) | (pr[1] == 'w' ? 2 : 0) | (pr[2] == 'x' ? 4 : 0);
++		int sh = pr[3] == 's';                            // 's' = mapa compartido, 'p' = privado (como el «shared» de XNU)
++		if (s <= addr && addr < e) {                       // la región que contiene la dirección
++			out->start = s; out->end = e; out->off = (uint64_t)o; out->prot = p; out->shared = sh;
++			found = 1;
++			break;
++		}
++		if (s > addr) {                                    // la siguiente por encima (el mapa va ordenado)
++			ns = s; ne = e; no = (uint64_t)o; np = p; nsh = sh; hay = 1;
++			break;
++		}
++	}
++	fclose(f);
++	if (!found && hay) { out->start = ns; out->end = ne; out->off = no; out->prot = np; out->shared = nsh; found = 1; }
++	return found;
++}
++
++// mach_vm_region (id 4816): información de una región del espacio de direcciones de una tarea.
++// La petición es simple (sin descriptores): cabecera (24) + NDR (8) + argumentos, y los argumentos van en el orden de
++// mach_vm.defs: address (inout, 8), size (out, 8), flavor (4), count (4, el CountInOut de `info`). La tarea es el puerto
++// remoto del mensaje: las rutinas del subsistema mach_vm son «_external» en XNU (el sufijo lo añade KERNEL_SERVER,
++// osfmk/mach/mach_vm.defs:90), o sea que el objetivo es el puerto de destino y no un argumento del cuerpo.
++// O sea: cabecera (24) + NDR (24..31) + address (32..39) + flavor (40..43) + count (44..47) = 48 bytes. Lo comprobó el
++// cliente de macOS 26 (libsystem_kernel, `_mach_vm_region` de la caché de dyld): escribe el NDR en +24, la dirección en
++// +32, el sabor en +40 y min(cuenta,10) en +44, y el mensaje mide 48 bytes.
++// La respuesta es compleja: `object_name` es un puerto de salida -> cabecera (24) + nº de descriptores (4) + descriptor de
++// puerto (12) + NDR (8) + address (8) + size (8) + count (4) + info[count]. El mismo cliente comprueba ese reparto: la
++// respuesta debe medir 68 + 4*count bytes, el descriptor de puerto va en +28 (con la disposición en +38) y el contador en
++// +64; sin el bit «complejo» (0x80000000) en msgh_bits, el cliente toma la respuesta por un error.
++static size_t mig_mach_vm_region(const struct hdr* req, const uint8_t* m, uint8_t* r) {
++	uint64_t addr = 0;
++	int32_t flavor = 0, count = 0;
++	if (req->size < 48) return reply_begin(r, req, KERN_INVALID_ARG);   // petición corta: faltan los argumentos
++	memcpy(&addr, m + 32, 8);                          // address (in/out)
++	memcpy(&flavor, m + 40, 4);                        // flavor
++	memcpy(&count, m + 44, 4);                         // count (CountInOut de info)
++	if (flavor == VR_BASIC_INFO) flavor = VR_BASIC_INFO_64;   // como XNU (osfmk/vm/vm_user.c:1452)
++	uint32_t need = 0;
++	if (flavor == VR_BASIC_INFO_64) need = VR_BASIC_COUNT_64;
++	else if (flavor == VR_EXTENDED_INFO) need = VR_EXTENDED_COUNT;
++	else return reply_begin(r, req, KERN_INVALID_ARG);        // sabor desconocido: como XNU (vm_map.c: «default»)
++	// XNU solo comprueba que la cuenta quepa (osfmk/vm/vm_map.c: «if (*count < VM_REGION_BASIC_INFO_COUNT_64)»): si no,
++	// KERN_INVALID_ARGUMENT. Si sobra, devuelve la cuenta que necesita y el cliente se queda con lo que pidió.
++	if (count < (int32_t)need) return reply_begin(r, req, KERN_INVALID_ARG);
++	int32_t pid = (int32_t)getpid();
++	int kt;
++	if (req->remote != 0x103 && !(kobj_lookup(req->remote, &kt, &pid) && (kt == KO_TASK || kt == KO_TASK_NAME)))
++		pid = (int32_t)getpid();
++	struct vregion vm;
++	if (!vm_region_of(pid, addr, &vm)) return reply_begin(r, req, KERN_NO_SPACE_);   // no hay nada por encima
++	uint32_t info[VR_BASIC_COUNT_64] = { 0 };
++	if (flavor == VR_BASIC_INFO_64) {
++		// struct vm_region_basic_info_64 (osfmk/mach/vm_region.h:88), con su reparto real: protection (0),
++		// max_protection (4), inheritance (8), shared (12), reserved (16), 4 bytes de relleno (20), offset (24, 8 bytes),
++		// behavior (32), user_wired_count (36) y 2 de relleno (38). XNU escribe la estructura tal cual en el búfer del
++		// cliente (vm_map.c: «basic = (vm_region_basic_info_64_t) info»), así que el relleno también cuenta.
++		info[0] = (uint32_t)vm.prot;              // protección actual (los bits de Linux son los de vm_prot_t)
++		info[1] = (uint32_t)vm.prot;              // protección máxima: en Linux no hay más que la actual
++		info[2] = 1;                              // VM_INHERIT_COPY (Linux no tiene atributo de herencia)
++		info[3] = (uint32_t)vm.shared;            // shared: el mapa es compartido (MAP_SHARED) si el Kernel lo dice
++		info[4] = 0;                              // reserved (is_sub_map)
++		memcpy(info + 6, &vm.off, 8);             // offset dentro del objeto (el desplazamiento del archivo)
++		info[8] = 0;                              // VM_BEHAVIOR_DEFAULT
++		info[9] = 0;                              // user_wired_count
++	} else {
++		// struct vm_region_extended_info (osfmk/mach/vm_region.h:186): protección, etiqueta y páginas.
++		info[0] = (uint32_t)vm.prot;              // protection
++		info[1] = 0;                              // user_tag
++		info[2] = 0;                              // pages_resident (XNU también lo deja a cero sin objeto de memoria)
++		info[3] = 0;                              // pages_shared_now_private
++		info[4] = 0;                              // pages_swapped_out
++		info[5] = 0;                              // pages_dirtied
++		info[6] = 0;                              // ref_count
++		info[7] = 0;                              // shadow_depth, external_pager y share_mode
++		info[8] = 0;                              // pages_reusable
++	}
++	if (mach_trace()) logf_("    MT pid=%d vm_region 0x%lx sabor %d cuenta %d -> 0x%lx+0x%lx prot=%d\n",
++		(int)getpid(), (unsigned long)addr, flavor, count, (unsigned long)vm.start, (unsigned long)(vm.end - vm.start), vm.prot);
++	// Respuesta compleja: el puerto de salida `object_name` va en un descriptor (aquí nulo: no hay objetos de memoria).
++	struct hdr nh = { .bits = 0x80000000u, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = req->id + 100 };
++	memcpy(r, &nh, sizeof nh);
++	uint32_t one = 1; memcpy(r + 24, &one, 4);
++	uint8_t desc[12] = { 0 };
++	desc[10] = 17;                                  // MACH_MSG_TYPE_COPY_SEND: el derecho de envío que se devuelve
++	desc[11] = 0;                                   // MACH_MSG_PORT_DESCRIPTOR
++	memcpy(r + 28, desc, 12);
++	memcpy(r + 40, NDR_LE, 8);
++	size_t n = 48;
++	uint64_t start = vm.start, size = vm.end - vm.start;
++	memcpy(r + n, &start, 8); n += 8;
++	memcpy(r + n, &size, 8); n += 8;
++	int32_t c32 = (int32_t)need; memcpy(r + n, &c32, 4); n += 4;
++	memcpy(r + n, info, need * 4); n += need * 4;
++	return n;
++}
++
++// mach_vm_region_recurse (id 4815): como mach_vm_region, pero además de la profundidad de anidamiento (los «submap» de
++// XNU). Aquí no hay submaps, así que la profundidad no cambia y la región es la misma.
++// La petición: cabecera (24) + NDR (8) + address (8, inout) + nesting_depth (4, inout) + count (4) = 48 bytes; lo comprobó
++// el cliente de macOS 26 (`_mach_vm_region_recurse` en la caché de dyld): NDR en +24, dirección en +32, profundidad en +40
++// y min(cuenta,19) en +44, y el mensaje mide 48 bytes.
++// La respuesta: cabecera (24) + NDR (8) + retcode (4) + address (8) + size (8) + nesting_depth (4) + count (4) +
++// info[count]: el tamaño es 60 + 4*count y el cliente lee la dirección en +36, el tamaño en +44, la profundidad en +52 y
++// el contador en +56.
++#define VR_RECURSE_SHORT_COUNT  13        // VM_REGION_SUBMAP_SHORT_INFO_COUNT_64
++#define VR_RECURSE_V0_COUNT     17        // VM_REGION_SUBMAP_INFO_V0_COUNT_64
++#define VR_RECURSE_V1_COUNT     18        // VM_REGION_SUBMAP_INFO_V1_COUNT_64
++#define VR_RECURSE_MAX_COUNT    19        // el arreglo del cliente: type vm_region_recurse_info_t = array[*:19] (mach_types.defs:573)
++static size_t mig_mach_vm_region_recurse(const struct hdr* req, const uint8_t* m, uint8_t* r) {
++	uint64_t addr = 0;
++	int32_t depth = 0, count = 0;
++	if (req->size < 48) return reply_begin(r, req, KERN_INVALID_ARG);
++	memcpy(&addr, m + 32, 8);                          // address (in/out)
++	memcpy(&depth, m + 40, 4);                         // nesting_depth (in/out)
++	memcpy(&count, m + 44, 4);                         // count (CountInOut de info)
++	// Como XNU (osfmk/vm/vm_map.c: vm_map_region_recurse_64): si el búfer no cabe ni la versión corta, KERN_INVALID_ARGUMENT;
++	// si sobra, se devuelve la versión que cabe (V0, V1 o V2 según lo que pidiera).
++	if (count < VR_RECURSE_SHORT_COUNT) return reply_begin(r, req, KERN_INVALID_ARG);
++	uint32_t need = VR_RECURSE_V0_COUNT;
++	if (count >= VR_RECURSE_V1_COUNT) need = VR_RECURSE_V1_COUNT;
++	if (need > VR_RECURSE_MAX_COUNT) need = VR_RECURSE_MAX_COUNT;    // el arreglo del cliente no da para más
++	int32_t pid = (int32_t)getpid();
++	int kt;
++	if (req->remote != 0x103 && !(kobj_lookup(req->remote, &kt, &pid) && (kt == KO_TASK || kt == KO_TASK_NAME)))
++		pid = (int32_t)getpid();
++	struct vregion vm;
++	if (!vm_region_of(pid, addr, &vm)) return reply_begin(r, req, KERN_NO_SPACE_);
++	// struct vm_region_submap_info_64 (osfmk/mach/vm_region.h:271), con su reparto real (los huecos también cuentan,
++	// porque XNU escribe la estructura tal cual en el búfer del cliente):
++	// protection (0), max_protection (4), inheritance (8), relleno (12), offset (16, 8 bytes), user_tag (24),
++	// pages_resident (28), pages_shared_now_private (32), pages_swapped_out (36), pages_dirtied (40), ref_count (44),
++	// shadow_depth (48), external_pager (50), share_mode (51), is_submap (52), behavior (56), object_id (60),
++	// user_wired_count (64), flags (66), pages_reusable (68).
++	uint32_t info[VR_RECURSE_V1_COUNT] = { 0 };
++	info[0] = (uint32_t)vm.prot;               // protection (0)
++	info[1] = (uint32_t)vm.prot;               // max_protection (4)
++	info[2] = 1;                               // inheritance: VM_INHERIT_COPY (8)
++	memcpy(info + 4, &vm.off, 8);              // offset (16): el desplazamiento del archivo
++	info[11] = 0;                              // ref_count (44)
++	info[12] = (uint32_t)(vm.shared ? 4 : 2) << 24;   // share_mode (51): SM_SHARED o SM_PRIVATE
++	info[13] = 0;                              // is_submap (52): aquí no hay submaps
++	info[16] = 0;                              // user_wired_count (64) y flags (66)
++	info[17] = 0;                              // pages_reusable (68)
++	if (mach_trace()) logf_("    MT pid=%d vm_region_recurse 0x%lx profundidad %d cuenta %d -> 0x%lx+0x%lx prot=%d\n",
++		(int)getpid(), (unsigned long)addr, depth, count, (unsigned long)vm.start, (unsigned long)(vm.end - vm.start), vm.prot);
++	size_t n = reply_begin(r, req, KERN_SUCCESS_);
++	uint64_t start = vm.start, size = vm.end - vm.start;
++	memcpy(r + n, &start, 8); n += 8;
++	memcpy(r + n, &size, 8); n += 8;
++	memcpy(r + n, &depth, 4); n += 4;
++	int32_t c32 = (int32_t)need; memcpy(r + n, &c32, 4); n += 4;
++	memcpy(r + n, info, need * 4); n += need * 4;
++	return n;
++}
++
++// mach_port_space_basic_info (id 3235): información básica del espacio IPC de una tarea.
++// La petición es simple: cabecera (24) + NDR (8) + argumentos; la tarea es el puerto remoto del mensaje (como en las
++// demás rutinas del subsistema mach_port: en mach_port_get_attributes, id 3217, el nombre del puerto está en +32, o sea
++// que la tarea no se repite en el cuerpo).
++// La respuesta es simple: cabecera (24) + NDR (8) + código de retorno (4) + ipc_info_space_basic_t (6 natural_t).
++static size_t mig_mach_port_space_basic_info(const struct hdr* req, const uint8_t* m, uint8_t* r) {
++	(void)m;
++	int32_t pid = (int32_t)getpid();
++	int kt;
++	if (req->remote != 0x103 && !(kobj_lookup(req->remote, &kt, &pid) && (kt == KO_TASK || kt == KO_TASK_NAME)))
++		pid = (int32_t)getpid();
++	uint32_t inuse = 0, tsize = 0;
++	port_space_counts(pid, &inuse, &tsize);
++	uint32_t info[6] = { 0 };
++	info[0] = 0xff;                 // iisb_genno_mask = MACH_PORT_NGEN(MACH_PORT_DEAD) (osfmk/ipc/port.h:72)
++	info[1] = tsize;                 // iisb_table_size
++	info[2] = 0;                     // iisb_table_next (sin uso en XNU)
++	info[3] = inuse;                 // iisb_table_inuse
++	size_t n = reply_begin(r, req, KERN_SUCCESS_);
++	memcpy(r + n, info, sizeof info);
++	return n + sizeof info;
++}
++
+ // host_statistics (216) y host_statistics64 (219): NDR, sabor, capacidad (en enteros de 32 bits). Datos de Linux:
+ //   HOST_LOAD_INFO (1):      avenrun[3] (carga × 1000, LOAD_SCALE) y mach_factor[3], de /proc/loadavg.
+ //   HOST_VM_INFO (2):        vm_statistics (15 natural_t), solo en host_statistics.
+@@ -456,6 +661,53 @@
+ 	return n + 4;
+ }
+ 
++// task_policy_get (id 3421): la política de una tarea (el papel, el nivel de QoS, la supresión o el estado de importancia).
++// La petición: cabecera (24) + NDR (8) + flavor (4) + count (4) + get_default (4) = 44 bytes; la respuesta: cabecera (24) +
++// NDR (8) + retcode (4) + count (4) + info[count] + get_default (4) = 44 + 4*count bytes. (Lo comprobó el cliente de macOS 26:
++// `_task_policy_get` en la caché de dyld, que pide min(cuenta,16) y lee el get_default al final, en +40+4*count.)
++// En XNU (osfmk/kern/task_policy.c:575) hay cuatro sabores: TASK_CATEGORY_POLICY (1), TASK_SUPPRESSION_POLICY (3),
++// TASK_POLICY_STATE (4, que solo puede leer root), TASK_BASE_QOS_POLICY (8) y TASK_OVERRIDE_QOS_POLICY (9). Aquí las tareas no
++// tienen papel, QoS ni supresión: se devuelven los valores «sin especificar», que son los mismos que da XNU con get_default.
++#define TP_CATEGORY_POLICY      1        // TASK_CATEGORY_POLICY
++#define TP_SUPPRESSION_POLICY   3        // TASK_SUPPRESSION_POLICY
++#define TP_POLICY_STATE         4        // TASK_POLICY_STATE
++#define TP_BASE_QOS_POLICY      8        // TASK_BASE_QOS_POLICY
++#define TP_OVERRIDE_QOS_POLICY  9        // TASK_OVERRIDE_QOS_POLICY
++static size_t mig_task_policy_get(const struct hdr* req, const uint8_t* m, uint8_t* r) {
++	int32_t flavor = 0, count = 0, gd = 0;
++	if (req->size < 44) return reply_begin(r, req, KERN_INVALID_ARG);
++	memcpy(&flavor, m + 32, 4);                       // flavor
++	memcpy(&count, m + 36, 4);                        // count (CountInOut de info)
++	memcpy(&gd, m + 40, 4);                           // get_default (entrada y salida)
++	uint32_t info[16] = { 0 };
++	uint32_t need = 0;                                   // palabras que ocupa la estructura del sabor
++	if (flavor == TP_CATEGORY_POLICY) {
++		need = 1;
++		if (count < (int32_t)need) return reply_begin(r, req, KERN_INVALID_ARG);
++		info[0] = 0;                                  // role: TASK_UNSPECIFIED (task_policy.h:120)
++	} else if (flavor == TP_BASE_QOS_POLICY || flavor == TP_OVERRIDE_QOS_POLICY) {
++		need = 2;
++		if (count < (int32_t)need) return reply_begin(r, req, KERN_INVALID_ARG);
++		info[0] = 0;                                  // task_latency_qos_tier: LATENCY_QOS_TIER_UNSPECIFIED
++		info[1] = 0;                                  // task_throughput_qos_tier: THROUGHPUT_QOS_TIER_UNSPECIFIED
++	} else if (flavor == TP_SUPPRESSION_POLICY) {
++		need = 16;                                   // nada suprimido (task_policy_private.h:118)
++		if (count < (int32_t)need) return reply_begin(r, req, KERN_INVALID_ARG);
++	} else if (flavor == TP_POLICY_STATE) {
++		need = 16;                                   // requested, effective, pending... (task_policy_private.h:133)
++		if (count < (int32_t)need) return reply_begin(r, req, KERN_INVALID_ARG);
++		if (cred_euid() != 0) return reply_begin(r, req, 2 /* KERN_PROTECTION_FAILURE: solo root */);
++	} else return reply_begin(r, req, KERN_INVALID_ARG);   // sabor desconocido: como XNU
++	// XNU no cambia la cuenta (solo la comprueba): la respuesta lleva los mismos números que la petición (el cliente los
++	// limita a 16), y XNU escribe la estructura al principio del búfer. Aquí, lo mismo: los valores al principio y el resto a cero.
++	uint32_t out = (count > 16 ? 16 : (uint32_t)count);
++	size_t n = reply_begin(r, req, KERN_SUCCESS_);
++	memcpy(r + n, &out, 4); n += 4;
++	memcpy(r + n, info, out * 4); n += out * 4;
++	memcpy(r + n, &gd, 4); n += 4;                     // get_default: XNU no lo cambia, se devuelve el que pidió
++	return n;
++}
++
+ // Conjuntos de procesadores (top, ps): uno solo, como en un Mac. host_processor_sets (419) da su nombre, y
+ // host_processor_set_priv (420) el puerto con privilegios, con el que processor_set_tasks (4005) da un puerto de tarea por
+ // cada proceso de macOS vivo (los pid del espacio de nombres son los de macOS).
+@@ -1089,6 +1341,7 @@
+ 		n = reply_begin(rep, &h, port_set_attributes(nm, (int)fl, in, cnt));
+ 		break;
+ 	}
++	case 3235: n = mig_mach_port_space_basic_info(&h, req, rep); break;   // estado del espacio IPC de la tarea (top)
+ 	case 3228: {                                                  // mach_port_get_context(task, name) -> context
+ 		uint32_t nm; memcpy(&nm, req + 32, 4);
+ 		n = reply_begin(rep, &h, port_exists(nm) ? KERN_SUCCESS_ : 15 /* KERN_INVALID_NAME */);
+@@ -1144,6 +1397,8 @@
+ 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;
+ 	case 4817: n = mig_make_memory_entry(&h, req, rep); break;
+ 	case 4813: n = mig_mach_vm_remap(&h, req, rep); break;
++	case 4816: n = mig_mach_vm_region(&h, req, rep); break;   // las regiones del mapa de la tarea (top, vmmap)
++	case 4815: n = mig_mach_vm_region_recurse(&h, req, rep); break;   // lo mismo, con la profundidad de anidamiento (top)
+ 	case 4807: {                                                  // mach_vm_copy(task, src, size, dst): el destino ya está asignado
+ 		uint64_t src, size, dst; memcpy(&src, req + 32, 8); memcpy(&size, req + 40, 8); memcpy(&dst, req + 48, 8);
+ 		// Las dos direcciones son del invitado: sin comprobarlas, un rango inválido mataba el proceso emulado
+@@ -1207,6 +1462,7 @@
+ 	case 3409: n = mig_task_get_special_port(&h, req, rep); break;
+ 	case 3410: n = mig_task_set_special_port(&h, req, rep); break;
+ 	case 3405: n = mig_task_info(&h, req, rep); break;
++	case 3421: n = mig_task_policy_get(&h, req, rep); break;   // la política de la tarea (rol, QoS) (top)
+ 	default:
+ 		if (h.id >= 2800 && h.id < 2900) {                          // IOKit (device.defs): sin registro de E/S todavía -> kIOReturnNotFound
+ 			{ int hd; size_t r2 = mig_iokit(&h, req, rep, &hd); if (hd) { n = r2; break; } }
+diff -ruN a/tahoe-run/emu_net.c b/tahoe-run/emu_net.c
+--- a/tahoe-run/emu_net.c
++++ b/tahoe-run/emu_net.c
+@@ -163,6 +163,8 @@
+ // ---- Terminales: struct termios de Darwin (flags de 8 bytes, c_cc[20], velocidades) <-> la de Linux. Los bits y los
+ // índices de c_cc son distintos en cada sistema; se traducen uno a uno.
+ #include <termios.h>
++#define D_FREAD  0x0001                              // XNU bsd/sys/fcntl.h: FREAD (vaciar la entrada)
++#define D_FWRITE 0x0002                              // XNU bsd/sys/fcntl.h: FWRITE (vaciar la salida)
+ struct dtermios { uint64_t iflag, oflag, cflag, lflag; uint8_t cc[20]; uint8_t pad[4]; uint64_t ispeed, ospeed; };
+ struct bitmap { uint64_t d; tcflag_t l; };
+ static const struct bitmap IMAP[] = { {0x1,IGNBRK},{0x2,BRKINT},{0x4,IGNPAR},{0x8,PARMRK},{0x10,INPCK},{0x20,ISTRIP},{0x40,INLCR},
+@@ -174,7 +176,23 @@
+ // índice de c_cc de Darwin -> de Linux (-1: no existe)
+ static const int CCMAP[20] = { VEOF, VEOL, VEOL2, VERASE, VWERASE, VKILL, VREPRINT, -1, VINTR, VQUIT, VSUSP, -1, VSTART, VSTOP,
+ 	VLNEXT, VDISCARD, VMIN, VTIME, -1, -1 };
++// Velocidad: en Darwin c_ispeed/c_ospeed son la velocidad en baudios (XNU bsd/sys/termios.h: B9600=9600, B38400=38400);
++// en Linux la velocidad la guarda el núcleo en los bits CBAUD de c_cflag y glibc la expone con cfgetospeed/cfgetispeed.
++// Se aceptan las dos convenciones (los baudios o el código del núcleo) para no depender de la de glibc.
++struct speed { unsigned code; uint64_t baud; };
++static const struct speed SPEEDS[] = {
++	{ 0, 0 }, { 1, 50 }, { 2, 75 }, { 3, 110 }, { 4, 134 }, { 5, 150 }, { 6, 200 }, { 7, 300 },
++	{ 8, 600 }, { 9, 1200 }, { 10, 1800 }, { 11, 2400 }, { 12, 4800 }, { 13, 9600 }, { 14, 19200 }, { 15, 38400 },
++	{ 0x201, 57600 }, { 0x202, 115200 }, { 0x203, 230400 }, { 0x204, 460800 }, { 0x205, 500000 },
++	{ 0x206, 576000 }, { 0x207, 921600 }, { 0x209, 1152000 }, { 0x20a, 1500000 }, { 0x20c, 2500000 },
++	{ 0x20d, 3000000 }, { 0x20e, 3500000 }, { 0x20f, 4000000 },
++};
+ #define NB(a) (sizeof a / sizeof a[0])
++static uint64_t speed_to_darwin(speed_t v) {
++	for (size_t i = 0; i < NB(SPEEDS); i++) if (SPEEDS[i].baud == (uint64_t)v) return SPEEDS[i].baud;   // los baudios
++	for (size_t i = 0; i < NB(SPEEDS); i++) if (SPEEDS[i].code == v) return SPEEDS[i].baud;                // el código del núcleo
++	return 38400;                                    // velocidad que no está en la tabla de XNU
++}
+ static tcflag_t to_l(uint64_t d, const struct bitmap* m, size_t n) { tcflag_t r = 0; for (size_t i = 0; i < n; i++) if (d & m[i].d) r |= m[i].l; return r; }
+ static uint64_t to_d(tcflag_t l, const struct bitmap* m, size_t n) { uint64_t r = 0; for (size_t i = 0; i < n; i++) if ((l & m[i].l) == m[i].l) r |= m[i].d; return r; }
+ static void term_to_darwin(const struct termios* t, struct dtermios* d) {
+@@ -184,16 +202,20 @@
+ 	d->cflag = to_d(t->c_cflag, CMAP, NB(CMAP)) | (uint64_t)(((t->c_cflag & CSIZE) >> 4) << 8);   // CS5..CS8
+ 	d->lflag = to_d(t->c_lflag, LMAP, NB(LMAP));
+ 	for (int i = 0; i < 20; i++) d->cc[i] = CCMAP[i] >= 0 ? t->c_cc[CCMAP[i]] : 0xff;              // _POSIX_VDISABLE
+-	d->ispeed = d->ospeed = 38400;
++	d->ispeed = speed_to_darwin(cfgetispeed(t));
++	d->ospeed = speed_to_darwin(cfgetospeed(t));
+ }
+ static void term_to_linux(const struct dtermios* d, struct termios* t) {
+-	speed_t sp = cfgetospeed(t);
+ 	t->c_iflag = to_l(d->iflag, IMAP, NB(IMAP));
+ 	t->c_oflag = to_l(d->oflag, OMAP, NB(OMAP));
+-	t->c_cflag = (t->c_cflag & CBAUD) | to_l(d->cflag, CMAP, NB(CMAP)) | (tcflag_t)(((d->cflag >> 8) & 3) << 4);
++	t->c_cflag = (t->c_cflag & ~(CBAUD | CIBAUD)) | to_l(d->cflag, CMAP, NB(CMAP)) | (tcflag_t)(((d->cflag >> 8) & 3) << 4);
+ 	t->c_lflag = to_l(d->lflag, LMAP, NB(LMAP));
+ 	for (int i = 0; i < 20; i++) if (CCMAP[i] >= 0) t->c_cc[CCMAP[i]] = d->cc[i] == 0xff ? _POSIX_VDISABLE : d->cc[i];
+-	cfsetospeed(t, sp); cfsetispeed(t, sp);
++	// La velocidad de Darwin son los baudios, los mismos valores que las constantes B* de Linux; si Linux no la acepta
++	// (cfsetospeed da EINVAL), se deja la que había.
++	speed_t sp = cfgetospeed(t);
++	if (d->ospeed && cfsetospeed(t, (speed_t)d->ospeed) < 0) { if (sp) cfsetospeed(t, sp); }
++	if (d->ispeed && cfsetispeed(t, (speed_t)d->ispeed) < 0) { if (sp) cfsetispeed(t, sp); }
+ }
+ static long tty_ioctl(int fd, uint32_t req, uint64_t arg, int* handled) {
+ 	*handled = 1;
+@@ -214,10 +236,37 @@
+ 	case 0x80087467: { struct winsize w; if (safe_read(arg, &w, 8) != 8) return -D_EFAULT; return ioctl(fd, TIOCSWINSZ, &w) < 0 ? err() : 0; }  // TIOCSWINSZ
+ 	case 0x40047477: { int g = tcgetpgrp(fd); if (g < 0) return err(); return safe_write(arg, &g, 4) == 4 ? 0 : -D_EFAULT; }                    // TIOCGPGRP
+ 	case 0x80047476: { int g; if (safe_read(arg, &g, 4) != 4) return -D_EFAULT; return tcsetpgrp(fd, g) < 0 ? err() : 0; }                    // TIOCSPGRP
+-	case 0x20007461: return ioctl(fd, TIOCSCTTY, 0) < 0 ? err() : 0;                                                                         // TIOCSCTTY
++	case 0x20007461: {                                        // TIOCSCTTY (XNU bsd/kern/tty.c:1454)
++		pid_t s = tcgetsid(fd);                              // sesión a la que pertenece el terminal
++		if (s > 0 && s == getsid(0)) return 0;               // ya es el terminal de control de la sesión: XNU devuelve 0
++		if (ioctl(fd, TIOCSCTTY, 0) < 0) return errno == EBUSY ? -D_EPERM : err();   // XNU: si la sesión ya tiene terminal, EPERM (Linux: EBUSY)
++		return 0;
++	}
+ 	case 0x20007471: return ioctl(fd, TIOCNOTTY) < 0 ? err() : 0;                                                                            // TIOCNOTTY
+ 	case 0x40047473: { int n; if (ioctl(fd, TIOCOUTQ, &n) < 0) return err(); return safe_write(arg, &n, 4) == 4 ? 0 : -D_EFAULT; }           // TIOCOUTQ
+ 	case 0x80017472: { char ch; if (safe_read(arg, &ch, 1) != 1) return -D_EFAULT; return ioctl(fd, TIOCSTI, &ch) < 0 ? err() : 0; }        // TIOCSTI
++	case 0x80047410: {                                        // TIOCFLUSH: XNU (bsd/kern/tty.c:1155) lee un int con FREAD/FWRITE: si es 0,
++		int f; if (safe_read(arg, &f, 4) != 4) return -D_EFAULT;              // vacía las dos colas; si no, solo las que digan FREAD/FWRITE.
++		int fl = f ? (f & (D_FREAD | D_FWRITE)) : (D_FREAD | D_FWRITE);       // La libc pasa el selector de POSIX tal cual
++		if (fl & D_FREAD) { if (tcflush(fd, TCIFLUSH) < 0) return err(); }    // (TCIFLUSH=0, TCIOFLUSH=1, TCOFLUSH=2)
++		if (fl & D_FWRITE) { if (tcflush(fd, TCOFLUSH) < 0) return err(); }
++		return 0;
++	}
++	case 0x20007454: case 0x20007452: {                   // TIOCPTYGRANT / TIOCPTYUNLK
++		unsigned n = 0;
++		if (ioctl(fd, TIOCGPTN, &n) < 0) return -25;      // no es un maestro de pseudoterminal: ENOTTY, como en XNU
++		int unlock = 0;                                    // en Linux el esclavo está bloqueado hasta que se desbloquea: sin esto,
++		if (ioctl(fd, TIOCSPTLCK, &unlock) < 0) return err();   // al abrirlo da EIO (es lo que hacen grantpt/unlockpt de glibc)
++		return 0;                                          // el dueño y el modo del esclavo los pone ya Linux
++	}
++	case 0x40807453: {                                        // TIOCPTYGNAME: nombre del esclavo (bsd/kern/tty_dev.c:1115)
++		char nm[128];
++		unsigned n = 0;
++		if (ioctl(fd, TIOCGPTN, &n) < 0) return -25;
++		snprintf(nm, sizeof nm, "/dev/ttys%03u", n);         // en macOS los esclavos son /dev/ttysNNN (aquí /dev/pts/N)
++		size_t l = strlen(nm) + 1;
++		return safe_write(arg, nm, l) == (ssize_t)l ? 0 : -D_EFAULT;
++	}
+ 	case 0x4004667a: {                                        // FIODTYPE: tipo de dispositivo (D_TTY = 3)
+ 		if (!isatty(fd)) return -25;
+ 		int t = 3; return safe_write(arg, &t, 4) == 4 ? 0 : -D_EFAULT;
+@@ -576,6 +625,37 @@
+ }
+ static long net_pathconf(struct ctx* c) { long v = pc_value((int)c->a[1]); return v < 0 ? -D_EINVAL : v; }
+ 
++// Indicadores de necp_open (bsd/net/necp.h:614).
++#define NECP_OPEN_FLAG_OBSERVER       0x01
++#define NECP_OPEN_FLAG_BACKGROUND     0x02
++#define NECP_OPEN_FLAG_PUSH_OBSERVER  0x04
++
++// Los descriptores de cliente NECP. En XNU sus operaciones de archivo no hacen nada (bsd/net/necp_client.c:413,
++// necp_fd_ops: fo_read = fo_no_read → ENXIO, fo_write = fo_no_write → ENXIO, fo_ioctl = fo_no_ioctl → ENOTTY;
++// fo_no_read y fo_no_write devuelven ENXIO en bsd/kern/kern_descrip.c:6268 y 6296, y fo_no_ioctl, ENOTTY, en 6337).
++// Aquí no hay políticas NECP (ni de filtros ni de proveedores de datos), así que el descriptor solo existe: se abre el de
++// /dev/null (para que se pueda cerrar como cualquier otro) y las llamadas de archivo se responden con esos errores.
++#define NECP_FDS 64
++static int necp_fds[NECP_FDS];
++int net_necp_fd(int fd) { for (int i = 0; i < NECP_FDS; i++) if (necp_fds[i] == fd) return 1; return 0; }
++void net_necp_fd_closed(int fd) { for (int i = 0; i < NECP_FDS; i++) if (necp_fds[i] == fd) necp_fds[i] = 0; }
++static void net_necp_fd_new(int fd) { for (int i = 0; i < NECP_FDS; i++) if (!necp_fds[i]) { necp_fds[i] = fd; return; } }
++
++// necp_open (syscall 501): en XNU (bsd/net/necp_client.c:8098, necp_open) abre un descriptor de cliente NECP con los
++// indicadores dados. Los indicadores de observador exigen el privilegio de estadísticas de red
++// (PRIV_NET_PRIVILEGED_NETWORK_STATISTICS) o el de skywalk: sin ellos, EACCES, como en XNU. Aquí el privilegio se
++// aproxima con «root» (uid 0), que es quien lo tiene en un Mac.
++static long net_necp_open(struct ctx* c) {
++	int flags = (int)c->a[0];
++	if (flags & (NECP_OPEN_FLAG_OBSERVER | NECP_OPEN_FLAG_PUSH_OBSERVER))
++		if (cred_euid() != 0) return -D_EACCES;
++	int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);   // como en XNU, el descriptor se crea con FP_CLOEXEC
++	if (fd < 0) return err();
++	net_necp_fd_new(fd);
++	if (trace_all) logf_("    necp_open(0x%x) -> %d\n", flags, fd);
++	return fd;
++}
++
+ // coalition(op, id*, tipo, flags): solo se emula la creación (id sintético) y la consulta
+ static long net_coalition(struct ctx* c) {
+ 	static uint64_t next = 100;
+@@ -592,4 +672,5 @@
+ 	reg_bsd(28, net_sendmsg); reg_bsd(402, net_sendmsg); reg_bsd(27, net_recvmsg); reg_bsd(401, net_recvmsg);
+ 	reg_bsd(191, net_pathconf); reg_bsd(192, net_pathconf);
+ 	reg_bsd(458, net_coalition); reg_bsd(459, net_coalition); reg_bsd(532, net_coalition);   // coalition, coalition_info, coalition_ledger
++	reg_bsd(501, net_necp_open);                                                       // necp_open: descriptor de cliente NECP
+ }
+diff -ruN a/tahoe-run/emu_port.c b/tahoe-run/emu_port.c
+--- a/tahoe-run/emu_port.c
++++ b/tahoe-run/emu_port.c
+@@ -1161,6 +1161,24 @@
+ 	return n;
+ }
+ int port_rpid(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p ? p->rpid : -1; unlock(); return r; }
++// Estado del espacio IPC de un proceso: cuántas entradas (nombres de puerto) usa y de qué tamaño es la tabla.
++// En XNU cada tarea tiene su propia tabla de nombres (osfmk/ipc/ipc_space.c) y mach_port_space_basic_info
++// (osfmk/ipc/mach_debug.c:357) informa de su tamaño y de las entradas en uso. Una entrada es un nombre del espacio: un
++// derecho de recepción o un derecho de envío que el proceso tiene (los urefs no cuentan: en XNU es un nombre por entrada).
++// Aquí la tabla de puertos es única para todo el sistema: el «tamaño» es la marca más alta usada (los huecos se
++// reutilizan, como en XNU la tabla nunca encoge) y las «entradas en uso» son las del proceso: sus puertos y los derechos
++// de envío que tiene sobre los de otros.
++void port_space_counts(int32_t pid, uint32_t* inuse, uint32_t* tsize) {
++	uint32_t n = 0;
++	lock();
++	for (int i = 0; i < (int)shm->hiwater; i++)
++		if (shm->ports[i].used && shm->ports[i].owner == pid) n++;
++	for (int i = 0; i < (int)shm->sh_hw; i++)
++		if (shm->sh[i].port && shm->sh[i].holder == pid) n++;      // derechos de envío que tiene (uno por nombre)
++	*tsize = (uint32_t)shm->hiwater;
++	*inuse = n;
++	unlock();
++}
+ static int owns(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p && p->owner == (int32_t)getpid(); unlock(); return r; }
+ // Diagnóstico: una destrucción que se ignora porque el puerto consta de otro dueño (las primeras 20 por proceso).
+ static void no_es_mio(const char* que, uint32_t name) {
+diff -ruN a/tahoe-run/emu_proc.c b/tahoe-run/emu_proc.c
+--- a/tahoe-run/emu_proc.c
++++ b/tahoe-run/emu_proc.c
+@@ -113,11 +113,7 @@
+ 	if (e) return -e;                                            // EFAULT o ENAMETOOLONG, como en XNU
+ 	return unlink(h) ? -darwin_errno(errno) : 0;
+ }
+-// ioctl: no se traduce ninguna petición todavía; 25 = ENOTTY ("no es un terminal"), lo correcto para isatty().
+-static long bsd_ioctl(struct ctx* c) {
+-	if (trace_all) logf_("    ioctl(fd=%d, 0x%lx)\n", (int)c->a[0], c->a[1]);
+-	return -25;
+-}
++// ioctl: lo emula emu_net.c (net_ioctl), que se registra después y sustituye a esta.
+ 
+ #include <sys/socket.h>
+ // socket(dominio, tipo, protocolo): AF_INET6 vale 30 en Darwin y 10 en Linux; el resto coincide.
+@@ -1843,7 +1839,6 @@
+ 	reg_bsd(499, bsd_work_interval_ctl);
+ 	reg_bsd(440, bsd_proc_rlimit_control);   // memorystatus_control: sin efecto reg_bsd(444, bsd_proc_rlimit_control);   // change_fdguard_np
+ 	reg_bsd(552, bsd_proc_rlimit_control);   // record_system_event: sin efecto
+-	reg_bsd(50, bsd_proc_rlimit_control);   // setlogin: sin efecto
+ 	reg_bsd(367, bsd_workq_open); reg_bsd(368, bsd_workq_kernreturn);
+ 	reg_bsd(360, bsd_bsdthread_create); reg_bsd(361, bsd_bsdthread_terminate);
+ 	reg_bsd(478, bsd_bsdthread_ctl);
+@@ -1858,7 +1853,7 @@
+ 	reg_bsd(98, bsd_connect);
+ 	reg_bsd(97, bsd_socket);
+ 	reg_bsd(267, bsd_shm_unlink);
+-	reg_bsd(116, bsd_gettimeofday); reg_bsd(266, bsd_shm_open); reg_bsd(54, bsd_ioctl);
++	reg_bsd(116, bsd_gettimeofday); reg_bsd(266, bsd_shm_open);
+ 	reg_bsd(366, bsd_bsdthread_register);
+ }
+ 
+diff -ruN a/tahoe-run/tahoe.h b/tahoe-run/tahoe.h
+--- a/tahoe-run/tahoe.h
++++ b/tahoe-run/tahoe.h
+@@ -41,6 +41,49 @@
+ extern uint64_t cache_ino;
+ void dsmos_unprotect(uint8_t* seg, uint64_t fileoff, uint64_t filesize, const char* path);   // emu_dsmos.c
+ int sys_volume_present(int k);   // emu_fs.c: 1 si el volumen k (0 Data, 1 Preboot) del macOS completo está montado
++// Espacio de los volúmenes APFS emulados (emu_fs.c). El contenedor es el sistema de archivos del anfitrión donde vive
++// TAHOE_ROOT; cada volumen es una carpeta de ese sistema (el del sistema, el de datos y el Preboot). En APFS los volúmenes
++// comparten el espacio del contenedor: la capacidad de cada uno es la del contenedor (o su cuota, si tiene una) y el
++// «usado» de cada uno es el de sus archivos. Aquí el contenedor se reparte entre los volúmenes en cuotas proporcionales a
++// lo que ocupa cada uno (así cada volumen tiene su tamaño y las cifras cuadran); el usado lo mide tools/volsize.sh.
++enum { TAHOE_VOL_SYS = 0, TAHOE_VOL_DATA, TAHOE_VOL_PRE, TAHOE_VOL_N };
++struct tahoe_vol { uint64_t quota;      // capacidad del volumen (su parte del contenedor)
++                    uint64_t used;       // bytes que ocupa
++                    uint64_t free; };    // quota - used
++struct tahoe_volspace { uint64_t size, used, free;    // el contenedor
++                         int nvol; int medido;         // medido: hay medidas de lo que ocupa cada volumen
++                         struct tahoe_vol vol[TAHOE_VOL_N]; };
++void tahoe_vol_space(struct tahoe_volspace* vs);
++// Reparte la capacidad del contenedor entre los volúmenes, en proporción a lo que ocupa cada uno (emu_fs.c).
++//   size: la capacidad del contenedor; used: lo que usa el contenedor.
++//   vused[i]: lo que ocupa el volumen i; se ajusta a la baja si la medición no cuadra con el disco (una medición vieja:
++//     el disco se limpió después de medir), para que lo que ocupan los volúmenes sea lo que usa el contenedor.
++//   quota[i]: la parte de la capacidad del contenedor que le toca a cada volumen.
++// Invariantes: la suma de las cuotas es la capacidad del contenedor; ningún volumen tiene una cuota menor que lo que
++// ocupa (su libre nunca es negativo); si no hay nada usado, cada volumen se queda con el contenedor entero (que es lo que
++// se veía antes de repartir).
++static inline void tahoe_vol_quotas(uint64_t size, uint64_t used, uint64_t* vused, uint64_t* quota) {
++	uint64_t tot = 0;
++	for (int i = 0; i < TAHOE_VOL_N; i++) tot += vused[i];
++	if (tot > used) {                                   // la medición no cuadra con el disco: se ajusta a la baja
++		uint64_t acc = 0;
++		for (int i = 0; i < TAHOE_VOL_N; i++) {
++			vused[i] = (uint64_t)((__uint128_t)vused[i] * used / tot);
++			acc += vused[i];
++		}
++		vused[TAHOE_VOL_SYS] += used - acc;            // el resto va al volumen del sistema (la suma ha de ser exacta)
++		tot = used;
++	}
++	if (!used || !tot) { for (int i = 0; i < TAHOE_VOL_N; i++) quota[i] = size; return; }
++	uint64_t sum = 0;
++	for (int i = 0; i < TAHOE_VOL_N; i++) {
++		uint64_t q = (uint64_t)((__uint128_t)size * vused[i] / used);
++		q &= ~((1ULL << 20) - 1);                       // a megas enteras
++		if (q < vused[i]) q = vused[i];                 // nunca menos de lo que ocupa (su libre no puede ser negativo)
++		quota[i] = q; sum += q;
++	}
++	if (sum < size) quota[TAHOE_VOL_SYS] += size - sum; // lo que sobra (del redondeo) va al volumen del sistema
++}
+ int cs_file_platform(int fd);     // emu_cs.c: 1 si el archivo lleva firma de plataforma de Apple, 0 si no, -1 sin firma
+ void sys_volumes_mount(void);       // emu_fs.c: volúmenes Data y Preboot de un macOS completo (en el PID 1)
+ extern const char *g_cache_path, *g_dyld_path, *g_self_exe;   // para relanzar tahoe-run en execve   // raíz del sistema de archivos de macOS 26 (TAHOE_ROOT)
+@@ -97,6 +140,7 @@
+ static inline int wl_trace_on(void) { static int v = -1; if (v < 0) v = mach_trace() || trace_file_on("/dev/shm/tahoe-wl-trace"); return v; }
+ int port_rpid(uint32_t name);
+ int port_list_owned(uint32_t* names, uint32_t* types, int max);
++void port_space_counts(int32_t pid, uint32_t* inuse, uint32_t* tsize);   // estado del espacio IPC de un proceso (mach_port_space_basic_info)
+ uint64_t port_get_context(uint32_t name);
+ int port_set_context(uint32_t name, uint64_t v);   // kern_return_t
+ int port_guard(uint32_t name, uint64_t guard, int strict);
+@@ -111,6 +155,8 @@
+ void diag_dump_threads(void);
+ void diag_breakpoints(void);
+ uint32_t cred_euid(void);
++int net_necp_fd(int fd);              // emu_net.c: 1 si el descriptor es de cliente NECP (lectura y escritura: ENXIO)
++void net_necp_fd_closed(int fd);      // emu_net.c: se olvida al cerrar el descriptor
+ uint32_t cred_egid(void);
+ uint32_t cred_auid(void);           // emu_cred.c: sesión de auditoría del proceso (auid, asid)
+ uint32_t cred_asid(void);
+@@ -213,4 +259,4 @@
+ void reenable_dispatch(void);   // el kernel no hereda la interceptación de syscalls en el hijo de un fork
+ 
+ // Códigos de error de Darwin
+-enum { D_EPERM = 1, D_ENOENT = 2, D_ESRCH = 3, D_EBADF = 9, D_ENOMEM = 12, D_EFAULT = 14, D_EINVAL = 22, D_ENOSYS = 78, D_ERANGE = 34 };
++enum { D_EPERM = 1, D_ENOENT = 2, D_ESRCH = 3, D_EBADF = 9, D_ENOMEM = 12, D_EACCES = 13, D_EFAULT = 14, D_EINVAL = 22, D_ENOSYS = 78, D_ERANGE = 34, D_EISDIR = 21, D_ENOTSUP = 102 };
+Los archivos binarios a/tahoe-run/tahoe-run y b/tahoe-run/tahoe-run son distintos
+diff -ruN a/tahoe-run/tahoe_run.c b/tahoe-run/tahoe_run.c
+--- a/tahoe-run/tahoe_run.c
++++ b/tahoe-run/tahoe_run.c
+@@ -16,6 +16,7 @@
+ #include <fcntl.h>
+ #include <glob.h>
+ #include <linux/prctl.h>
++#include <pthread.h>
+ #include <signal.h>
+ #include <stdarg.h>
+ #include <stdint.h>
+@@ -559,10 +560,12 @@
+ 		struct stat st;
+ 		if (fstat((int)fd, &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == makedev(1, 3)) fd = (unsigned long)logfd;
+ 	}
++	if (net_necp_fd((int)fd)) return -6;               // ENXIO: como fo_no_write del descriptor NECP (XNU)
+ 	long r = syscall(SYS_write, fd, c->a[1], c->a[2]);
+ 	return r < 0 ? -darwin_errno(errno) : r;
+ }
+ static long bsd_read(struct ctx* c) {
++	if (net_necp_fd((int)c->a[0])) return -6;           // ENXIO: como fo_no_read del descriptor NECP (XNU)
+ 	long r = syscall(SYS_read, c->a[0], c->a[1], c->a[2]);
+ 	return r < 0 ? -darwin_errno(errno) : r;
+ }
+@@ -571,6 +574,7 @@
+ 	int fd = (int)c->a[0];
+ 	if (fd >= FD_INTERNAL_BASE) return -9;                 // EBADF: descriptores del emulador (ver fd_hi)
+ 	kq_close(fd);                                           // si era una kqueue, se sueltan sus knotes antes de cerrar
++	net_necp_fd_closed(fd);                                 // si era un descriptor de cliente NECP, se olvida
+ 	long r = syscall(SYS_close, fd);
+ 	return r < 0 ? -darwin_errno(errno) : r;
+ }
+@@ -647,11 +651,63 @@
+ 	c2.a[2] = c->a[4];
+ 	return bsd_open(&c2);
+ }
+-// getlogin(búfer, tamaño): el usuario de la sesión (los servicios corren como root).
++// ---- Nombre de usuario de la sesión (getlogin/setlogin)
++// En XNU el nombre lo guarda la sesión (session.s_login, MAXLOGNAME bytes) y lo pone setlogin; getlogin lo devuelve
++// (bsd/kern/kern_prot.c:1566 y :1619). Aquí se guarda por sesión de Linux (getsid), que es lo más parecido a la sesión de
++// XNU: los procesos que comparten sesión comparten el nombre. Al principio es "root" (todo el arranque corre como root).
++#define MAXLOGNAME 255                               // XNU bsd/sys/param.h
++static struct { int usado; pid_t sid; char name[MAXLOGNAME + 1]; } login_ses[64];
++static pthread_mutex_t login_lock = PTHREAD_MUTEX_INITIALIZER;
++static void login_get(char* out, size_t cap) {
++	pid_t sid = getsid(0);
++	pthread_mutex_lock(&login_lock);
++	for (int i = 0; i < 64; i++)
++		if (login_ses[i].usado && login_ses[i].sid == sid) {
++			snprintf(out, cap, "%s", login_ses[i].name);
++			pthread_mutex_unlock(&login_lock);
++			return;
++		}
++	pthread_mutex_unlock(&login_lock);
++	snprintf(out, cap, "root");
++}
++static void login_set(const char* name) {
++	pid_t sid = getsid(0);
++	pthread_mutex_lock(&login_lock);
++	for (int i = 0; i < 64; i++) {
++		if (!login_ses[i].usado) {
++			login_ses[i].usado = 1; login_ses[i].sid = sid;
++			snprintf(login_ses[i].name, sizeof login_ses[i].name, "%s", name);
++			pthread_mutex_unlock(&login_lock);
++			return;
++		}
++		if (login_ses[i].sid == sid) {
++			snprintf(login_ses[i].name, sizeof login_ses[i].name, "%s", name);
++			pthread_mutex_unlock(&login_lock);
++			return;
++		}
++	}
++	pthread_mutex_unlock(&login_lock);
++}
++// getlogin(búfer, tamaño): el nombre de usuario de la sesión. XNU (bsd/kern/kern_prot.c:1566): el tamaño se recorta a
++// MAXLOGNAME y se copian exactamente esos bytes del nombre de la sesión (con ceros detrás); nunca da ERANGE.
+ static long bsd_getlogin(struct ctx* c) {
+-	static const char u[] = "root";
+-	if (c->a[1] < sizeof u) return -34;                   // ERANGE
+-	return safe_write(c->a[0], u, sizeof u) == (ssize_t)sizeof u ? 0 : -14;
++	size_t n = (size_t)c->a[1];
++	char buf[MAXLOGNAME + 1];
++	if (n > MAXLOGNAME) n = MAXLOGNAME;
++	memset(buf, 0, sizeof buf);
++	login_get(buf, MAXLOGNAME);
++	return safe_write(c->a[0], buf, n) == (ssize_t)n ? 0 : -14;
++}
++// setlogin(nombre): fija el nombre de usuario de la sesión. XNU (bsd/kern/kern_prot.c:1619): primero proc_suser (EPERM
++// si no es el superusuario), luego copyinstr con un máximo de MAXLOGNAME-1 (ENAMETOOLONG -> EINVAL). A partir de
++// aquí getlogin devuelve ese nombre.
++static long bsd_setlogin(struct ctx* c) {
++	char name[MAXLOGNAME + 2];
++	if (cred_euid() != 0) return -1;                                     // EPERM: proc_suser (XNU lo mira antes de la cadena)
++	if (safe_string(c->a[0], name, sizeof name) != 0) return -14;      // EFAULT: copyinstr
++	if (strlen(name) > MAXLOGNAME - 1) return -22;                       // EINVAL (ENAMETOOLONG en XNU)
++	login_set(name);
++	return 0;
+ }
+ static long bsd_enotsup(struct ctx* c) { (void)c; return -45; }   // ENOTSUP: funciones que este sistema no ofrece (personas)
+ // reboot(howto): solo launchd (pid 1 del espacio de procesos del arranque) apaga o reinicia. Aquí eso es terminar el
+@@ -905,7 +961,7 @@
+ static bsd_fn bsd_table[BSD_NAMES_N] = {
+ 	[1] = bsd_exit, [3] = bsd_read, [4] = bsd_write, [6] = bsd_close, [20] = bsd_getpid,
+ 	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [454] = bsd_system_override, [336] = bsd_proc_info,
+-	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_reboot, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload, [529] = bsd_os_fault_with_payload,
++	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [50] = bsd_setlogin, [494] = bsd_enotsup, [55] = bsd_reboot, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload, [529] = bsd_os_fault_with_payload,
+ };
+ 
+ 
+@@ -1218,6 +1274,19 @@
+ 	g[REG_RIP] += (greg_t)len;
+ 	return 1;
+ }
++// Hasta que install_dispatch() no instala los manejadores, el emulador no atiende el SIGILL: si el proceso recibe uno
++// mientras mapea la caché o carga las imágenes, muere con 132 sin dejar rastro (así se perdían las caídas de login,
++// screen, kextutil...). Este manejador temprano anota la dirección de la instrucción ilegal (con addr2line se sabe qué
++// parte del emulador la ejecutó) y sale igual.
++static void on_sigill_early(int sig, siginfo_t* si, void* v) {
++	(void)sig; (void)si;
++	const uint8_t* ip = (const uint8_t*)((ucontext_t*)v)->uc_mcontext.gregs[REG_RIP];
++	uint8_t b[4] = { 0 };
++	safe_read((uint64_t)ip, b, 4);
++	logf_("    SIGILL <%d> en el arranque del emulador, rip=0x%llx (%02x %02x %02x %02x)\n", getpid(),
++	      (unsigned long long)(uintptr_t)ip, b[0], b[1], b[2], b[3]);
++	_exit(132);
++}
+ static void on_sigsegv(int sig, siginfo_t* si, void* v) {
+ 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
+ 	if (si->si_code == 0x80 /*SI_KERNEL*/ && emulate_sidt(v)) { selector = SYSCALL_DISPATCH_FILTER_BLOCK; return; }
+@@ -1321,6 +1390,7 @@
+ 	g_argv = argv;
+ 	fd_limit_raise();                                   // antes de reservar descriptores en la zona del emulador
+ 	{ int f = fcntl(2, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE); if (f >= 0) logfd = f; }
++	{ struct sigaction sa = { .sa_sigaction = on_sigill_early, .sa_flags = SA_SIGINFO }; sigaction(SIGILL, &sa, NULL); }
+ 	if (getenv("TAHOE_LOGFILE")) {          // los procesos hijos escriben su registro en un archivo común
+ 		int f = open(getenv("TAHOE_LOGFILE"), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+ 		if (f >= 0) { int g = fcntl(f, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE); close(f); if (g >= 0) logfd = g; }
+diff -ruN a/test/vol_quotas.c b/test/vol_quotas.c
+--- a/test/vol_quotas.c
++++ b/test/vol_quotas.c
+@@ -0,0 +1,77 @@
++// Prueba del reparto de la capacidad del contenedor entre los volúmenes APFS emulados (tahoe_vol_quotas, tahoe.h).
++//
++//   clang -O1 -Wall -Wextra -o /tmp/vol_quotas test/vol_quotas.c -I tahoe-run
++//   /tmp/vol_quotas
++//
++// Lo que se comprueba (los invariantes que debe cumplir el reparto, para que las cifras que ve macOS cuadren):
++//   - la suma de las cuotas de los volúmenes es la capacidad del contenedor;
++//   - ningún volumen tiene una cuota menor que lo que ocupa (su espacio libre nunca es negativo);
++//   - lo que ocupan los volúmenes es lo que usa el contenedor;
++//   - si no hay medición (o no hay nada usado), cada volumen se queda con el contenedor entero (el comportamiento de
++//     antes de repartir);
++//   - si la medición no cuadra con el disco (está vieja), lo ocupado se ajusta a la baja y las cuotas siguen cabiendo en
++//     el contenedor.
++#include <stdint.h>
++#include <stdio.h>
++
++#include "tahoe.h"
++
++#define GIB (1ULL << 30)
++
++static int fallos;
++
++static void check(int ok, const char* what) {
++	if (!ok) { fprintf(stderr, "FALLO: %s\n", what); fallos++; }
++}
++
++// Reparte y comprueba los invariantes con una medida dada.
++static void caso(const char* nombre, uint64_t size, uint64_t used, uint64_t* vused) {
++	uint64_t q[TAHOE_VOL_N] = { 0, 0, 0 };
++	uint64_t tot = 0;
++	for (int i = 0; i < TAHOE_VOL_N; i++) tot += vused[i];
++	tahoe_vol_quotas(size, used, vused, q);
++	uint64_t suma = 0;
++	for (int i = 0; i < TAHOE_VOL_N; i++) suma += q[i];
++	check(suma == size, nombre);                                 // las cuotas caben en el contenedor
++	uint64_t suma_used = 0;
++	for (int i = 0; i < TAHOE_VOL_N; i++) {
++		check(q[i] >= vused[i], nombre);                        // el libre no puede ser negativo
++		suma_used += vused[i];
++	}
++	if (tot <= used) check(suma_used == used, nombre);           // lo que ocupan los volúmenes es lo que usa el contenedor
++	printf("  %-28s capacidad %6llu GiB  cuotas: %llu / %llu / %llu GiB   ocupado: %llu / %llu / %llu GiB\n", nombre,
++	       (unsigned long long)(size / GIB), (unsigned long long)(q[0] / GIB), (unsigned long long)(q[1] / GIB),
++	       (unsigned long long)(q[2] / GIB), (unsigned long long)(vused[0] / GIB), (unsigned long long)(vused[1] / GIB),
++	       (unsigned long long)(vused[2] / GIB));
++}
++
++int main(void) {
++	printf("reparto de la capacidad del contenedor entre los volúmenes:\n");
++	// Un macOS completo en un disco de 63,1 GB: el sistema ocupa 29 GB, los datos 10 GB y el preboot 200 MB.
++	{
++		uint64_t v[TAHOE_VOL_N] = { 29ULL * GIB, 10ULL * GIB, 200ULL << 20 };
++		caso("medida normal", 63100ULL << 20, 29ULL * GIB + 10ULL * GIB + (200ULL << 20), v);
++	}
++	// Un volumen que no ocupa nada (el preboot vacío): su cuota es 0 y la del sistema se queda con el resto.
++	{
++		uint64_t v[TAHOE_VOL_N] = { 40ULL * GIB, 0, 0 };
++		caso("volúmenes vacíos", 63100ULL << 20, 40ULL * GIB, v);
++	}
++	// Medición vieja: los volúmenes ocupan más que el disco (el disco se limpió después de medir). Lo ocupado se ajusta
++	// a la baja y las cuotas siguen cabiendo en el contenedor.
++	{
++		uint64_t v[TAHOE_VOL_N] = { 50ULL * GIB, 30ULL * GIB, 1ULL * GIB };
++		caso("medida mayor que el disco", 63100ULL << 20, 20ULL * GIB, v);
++	}
++	// Sin nada usado: cada volumen se queda con el contenedor entero (como antes de repartir).
++	{
++		uint64_t v[TAHOE_VOL_N] = { 0, 0, 0 };
++		uint64_t q[TAHOE_VOL_N] = { 0, 0, 0 };
++		tahoe_vol_quotas(63100ULL << 20, 0, v, q);
++		for (int i = 0; i < TAHOE_VOL_N; i++) check(q[i] == 63100ULL << 20, "sin uso: cada volumen, el disco entero");
++		printf("  %-28s los tres volúmenes con el disco entero\n", "sin uso");
++	}
++	if (fallos) { fprintf(stderr, "%d comprobaciones fallidas\n", fallos); return 1; }
++	printf("todas las comprobaciones bien\n");
++	return 0;
++}
+diff -ruN a/tools/volsize.sh b/tools/volsize.sh
+--- a/tools/volsize.sh
++++ b/tools/volsize.sh
+@@ -0,0 +1,45 @@
++#!/bin/bash
++# volsize.sh [raíz de macOS]: mide lo que ocupa cada volumen APFS emulado y lo deja en el archivo que lee el emulador
++# (~/.config/tahoe-run/volsize; con TAHOE_VOLFILE se cambia el sitio). El emulador (tahoe_vol_space, emu_fs.c) reparte la
++# capacidad del contenedor entre los volúmenes en proporción a lo que ocupa cada uno; sin estas medidas, todo el espacio
++# usado del disco se atribuye al volumen del sistema y los volúmenes de datos y Preboot salen con 0 B (como antes).
++#
++# Medir es lento (du sobre el árbol de cada volumen: del orden de minutos con un disco mecánico), así que se hace una vez,
++# con el macOS parado. Para volver a medir: volsize.sh otra vez (los números se quedan oldeados conforme crece el disco).
++#
++#   raíz de macOS:  por omisión $TAHOE_ROOT, o ~/macos26/completo/macOS.
++set -euo pipefail
++RAIZ="${1:-${TAHOE_ROOT:-$HOME/macos26/completo/macOS}}"
++SALIDA="${TAHOE_VOLFILE:-$HOME/.config/tahoe-run/volsize}"
++[ -d "$RAIZ" ] || { echo "no existe el directorio $RAIZ"; exit 1; }
++V="$RAIZ/System/Volumes"
++[ -d "$V" ] || { echo "$RAIZ no tiene System/Volumes: no es un macOS completo (no hay volúmenes que medir)"; exit 1; }
++# Bytes ocupados por un árbol (los bloques que tiene asignados, como los que cuenta el disco: du sin --apparent-size).
++# Los enlaces duros se cuentan una vez (du los recuerda) y los montajes de dentro no se siguen (du no cruza de sistema de
++# archivos), que es lo que quiere: el volumen de datos es la carpeta que monta sobre sí misma.
++du_bytes() { du -s --block-size=1 "$1" 2>/dev/null | cut -f1; }
++data=0; preboot=0
++for d in "$V"/*; do
++	[ -d "$d" ] || continue
++	case "$(basename "$d")" in
++		Data)    data=$(du_bytes "$d");;
++		Preboot) preboot=$(du_bytes "$d");;
++	esac
++done
++[ "$data" -gt 0 ] || { echo "no se ha podido medir $V/Data"; exit 1; }
++[ "$preboot" -gt 0 ] || { echo "no se ha podido medir $V/Preboot"; exit 1; }
++mkdir -p "$(dirname "$SALIDA")"
++tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
++{
++	echo "# Tamaño de los volúmenes APFS emulados (bytes), medido el $(date -Is)."
++	echo "# Lo lee tahoe_vol_space (emu_fs.c). El volumen del sistema ocupa lo que queda del disco."
++	echo "data $data"
++	echo "preboot $preboot"
++} > "$tmp"
++mv "$tmp" "$SALIDA"
++trap - EXIT
++echo "escrito $SALIDA"
++awk -v d="$data" -v p="$preboot" 'BEGIN {
++	printf "  datos   %13d bytes (%.2f GB)\n", d, d/1e9
++	printf "  preboot %13d bytes (%.2f GB)\n", p, p/1e9
++}'
+--- a/Pendientes.md
++++ b/Pendientes.md
+@@ -13,6 +13,12 @@
+ 
+ 
+ ## Hecho recientemente
++- **Tamaño de los volúmenes APFS.** `diskutil list` ya no pone el tamaño del contenedor (63,1 GB) en todos los volúmenes, y
++  `diskutil apfs list` dice lo que ocupa cada uno (antes 0 B en datos y Preboot). El contenedor es el disco de Linux donde
++  vive el macOS; sus volúmenes (sistema, datos, Preboot) se reparten la capacidad en cuotas proporcionales a lo que ocupa
++  cada uno, y el usado de cada uno se mide con `tools/volsize.sh` (du sobre el árbol de cada volumen: del orden de diez
++  minutos) y se deja en `~/.config/tahoe-run/volsize`. Lo mismo se ve en `statfs` y en los atributos de volumen de
++  `getattrlist`. Con `TAHOE_VOL_QUOTA=0` se vuelve al reparto de antes (todos los volúmenes con la capacidad del contenedor).
+ - **Teclado y ratón.** En macOS el sistema de eventos HID vive en WindowServer, que busca en IOKit los servicios con
+   `HIDServiceSupport`. tahoe-run publica un teclado y un puntero (IOHIDEventDriver) con su IOHIDEventServiceUserClient:
+   la cola de eventos es un IODataQueue compartido y cada evento un IOHIDSystemQueueElement (formatos de IOHIDFamily,
+@@ -152,8 +158,10 @@
+ 6. **Sesión gráfica**: con ella, `screencapture`, `osascript` y `pbcopy` (hoy se caen por no haber sesión).
+ 7. **Servicios que fallan al arrancar**: mobileassetd, softwareupdate; apsd se cae en bucle («ProductType» nil);
+    relanzados en bucle: cryptexd, watchdogd, diskmanagementstartup, triald_system, cupsd. Muchas preferencias de
+-   `/Library/Preferences` y de root se guardan vacías (0 bytes): loginwindow, dock, CoreGraphics... (¿cfprefsd?
+-   `fcntl F_PREALLOCATE` no está implementado).
++   `/Library/Preferences` y de root se guardan vacías (0 bytes): loginwindow, dock, CoreGraphics... (¿cfprefsd?).
++   `fcntl F_PREALLOCATE` ya está implementado en el emulador (`tahoe-run/emu_fs.c`, con `fst_bytesalloc` y los
++   errores de XNU; también `F_SETSIZE`, `F_PUNCHHOLE` y `F_RDADVISE`), pero **sin verificar en un arranque real**:
++   falta confirmarlo con la batería (`tools/diag/bateria.sh`), que no se pudo ejecutar aquí.
+ 8. **Sonido** dentro de macOS (teclado y ratón ya funcionan, ver «Hecho recientemente»). coreaudiod ya arranca y `say`
+    termina, pero no hay tarjeta de sonido: hace falta un dispositivo de audio que macOS vea como propio y que mande el
+    sonido a PipeWire/PulseAudio del PC (para oír un vídeo, `say`...).
+@@ -166,6 +174,7 @@
+     relacionado con kexts.
+ 11. **PR #9** (orden de la pausa y lo que venga después): fusionar en `main` cuando se quiera.
+ 12. **Para lo último** (funciona, son detalles):
+-    - `diskutil apfs list`: los volúmenes Data y Preboot dicen 0 B consumidos (comparten el disco de Linux).
+-    - `diskutil list`: cada volumen sale con el tamaño del contenedor (63,1 GB).
++    - `diskutil apfs list` y `diskutil list`: los volúmenes ya tienen su propio tamaño y lo que ocupan (medidos con
++      `tools/volsize.sh`, que deja el archivo que lee el emulador). Sin ese archivo, los volúmenes de datos y Preboot siguen
++      con 0 B consumidos y con el tamaño del contenedor (63,1 GB), como antes.
+     - `diskutil list` y `system_profiler` tardan la primera vez tras arrancar (~1 min) mientras lsd limpia su base de datos.
+--- a/README.md
++++ b/README.md
+@@ -124,10 +124,12 @@
+ | `tahoe-run/` | La capa de compatibilidad (C): syscalls BSD, trampas Mach, puertos entre procesos, kqueue/workloops, IOKit, XPC... |
+ | `tahoe-run/nucleo/` | Las partes del núcleo reescritas en Rust (biblioteca estática): descriptores de mensajes Mach, desbordamiento de mensajes grandes, `pthread_rwlock` (traducción de `kern_synch.c`) y el candado de la región de puertos entre procesos; con pruebas (`cargo test --lib`) |
+ | `tools/inventario_total.sh` | Ejecuta todos los programas de la shell del macOS completo y los clasifica con `tools/diag/inventario.py` |
++| `tools/volsize.sh` | Mide lo que ocupa cada volumen APFS emulado (`du` sobre su árbol) y lo deja en el archivo que lee el emulador (`~/.config/tahoe-run/volsize`), para que `diskutil list` y `diskutil apfs list` enseñen el tamaño y el uso de cada volumen |
+ | `patches/` | Parche para [`darlinghq/indium`](https://github.com/darlinghq/indium) (`git am`) |
+ | `tools/extract_air.py` | Saca los módulos AIR de un `.metallib` |
+ | `tools/map_dyld_cache.py` | Mapea la `dyld_shared_cache` en sus direcciones fijas y lo verifica |
+ | `test/sud_syscall_dispatch.c` | Prueba de interceptación de syscalls de macOS con syscall user dispatch |
++| `test/vol_quotas.c` | Prueba del reparto de la capacidad del contenedor APFS entre sus volúmenes (los invariantes de las cifras que ve macOS) |
+ | `tools/used_syscalls.py` | Lista las syscalls BSD y trampas Mach que invoca un Mach-O x86_64 |
+ | `tools/historico_darling/` | Herramientas antiguas de cuando se probó Darling (no se usan; ver su `NOTA.md`) |
+ | `tools/narrow_int64.py` | Quita `Int64` de un SPIR-V cuando solo se usa para indexar (conservador) |
+@@ -591,6 +593,14 @@
+   de las notificaciones IOKit (el lector de cadenas devolvía siempre el mismo búfer y la notificación de terminación retiraba
+   todos los discos nada más crearlos) y que arranque `fskitd`, que busca el servicio `com_apple_filesystems_lifs` (LiveFS).
+   Con la jerarquía, las fases `mount -P` del arranque se ejecutan de verdad.
++- **Espacio de los volúmenes**: el contenedor APFS que ve macOS es el disco de Linux donde vive la raíz de macOS, y sus
++  volúmenes (el del sistema, el de datos y el Preboot) son carpetas de ese disco. En APFS los volúmenes comparten el espacio
++  del contenedor: cada uno tiene su cuota y lo que ocupa. Aquí la capacidad del contenedor se reparte entre los volúmenes
++  en proporción a lo que ocupa cada uno (`tahoe_vol_quotas`, `tahoe-run/tahoe.h`): así la suma de las cuotas es la capacidad
++  del contenedor, ningún volumen se queda sin espacio y `diskutil list` deja de poner el tamaño del contenedor (63,1 GB) en
++  todos ellos. Lo que ocupa cada volumen lo mide `tools/volsize.sh` (`du` sobre su árbol, que tarda minutos) y lo deja en
++  `~/.config/tahoe-run/volsize`; sin ese archivo se usa lo que ocupa el disco entero, como antes. Las mismas cifras salen en
++  `statfs` (`df`) y en los atributos de volumen de `getattrlist` (`ATTR_VOL_SIZE`, `ATTR_VOL_SPACEUSED`, `ATTR_VOL_QUOTA_SIZE`).
+ 
+ 
+ ### macOS 26 completo (11 de octubre de 2026, tarde)

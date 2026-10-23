@@ -1,0 +1,406 @@
+From d7c7baaccf5bebcccf10f7f27fcf4a9bd519c6b8 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:39:10 -0600
+Subject: [PATCH 08/57] =?UTF-8?q?sysctl,=20firma=20de=20c=C3=B3digo,=20red?=
+ =?UTF-8?q?=20y=20fileports?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_sysctl.c: los MIB de Darwin (kern.proc, kern.boottime, kern.osvariant_status,
+  hw.*, vfs.generic.vfsidlist) y los meta-sysctls de XNU, con los tipos de
+  mensaje de route.h exactos para la tabla de enrutamiento.
+- emu_cs.c: el análisis de la firma (LC_CODE_SIGNATURE, superblob, CodeDirectory
+  y entitlements), los números de CS_OPS correctos, SHA-1 y SHA-256 a mano y
+  el token de copia como en csops_copy_token.
+- emu_net.c: la traducción de sockaddr en los dos sentidos, las ioctl de
+  terminal de Darwin, el socket de eventos y el ICMP sin privilegios.
+- emu_fileport.c: los fileports.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_cs.c       |  65 +++++++++++++++++---
+ tahoe-run/emu_fileport.c |   2 +-
+ tahoe-run/emu_net.c      |  10 ++-
+ tahoe-run/emu_sysctl.c   | 127 +++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 185 insertions(+), 19 deletions(-)
+
+diff --git a/tahoe-run/emu_cs.c b/tahoe-run/emu_cs.c
+index ab682cb..18a1e3d 100644
+--- a/tahoe-run/emu_cs.c
++++ b/tahoe-run/emu_cs.c
+@@ -75,20 +75,17 @@ static int64_t slice_offset(int fd) {
+ 		if (be32(h + 8 + i * 20) == 0x01000007) return be32(h + 8 + i * 20 + 8);
+ 	return -1;
+ }
++#define CS_WHOLE 0xffffffffu                                    // «ranura» especial: la firma completa
+ // Busca en la firma del ejecutable el blob de la ranura indicada. Devuelve malloc() con el blob (cabecera incluida).
+-static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
+-	char path[4096];
+-	if (exe_host_path(pid, path, sizeof path) != 0) return NULL;
+-	int fd = open(path, O_RDONLY | O_CLOEXEC);
+-	if (fd < 0) return NULL;
++static uint8_t* cs_blob_fd(int fd, uint32_t slot, uint32_t* len) {
+ 	uint8_t h[4096];
+ 	uint64_t base = 0;
+-	if (pread(fd, h, sizeof h, 0) < 32) { close(fd); return NULL; }
++	if (pread(fd, h, sizeof h, 0) < 32) return NULL;
+ 	if (be32(h) == 0xcafebabe) {                              // binario universal: rebanada x86_64
+ 		uint32_t nf = be32(h + 4);
+ 		for (uint32_t i = 0; i < nf && 8 + (i + 1) * 20 <= sizeof h; i++)
+ 			if (be32(h + 8 + i * 20) == 0x01000007) { base = be32(h + 8 + i * 20 + 8); break; }
+-		if (!base || pread(fd, h, sizeof h, (off_t)base) < 32) { close(fd); return NULL; }
++		if (!base || pread(fd, h, sizeof h, (off_t)base) < 32) return NULL;
+ 	}
+ 	uint8_t* out = NULL;
+ 	if (rd32(h) == 0xfeedfacf) {
+@@ -104,6 +101,11 @@ static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
+ 					uint8_t* sb = malloc(dsz);
+ 					if (sb && dsz >= 12 && pread(fd, sb, dsz, (off_t)(base + doff)) == (ssize_t)dsz && be32(sb) == 0xfade0cc0) {
+ 						uint32_t count = be32(sb + 8);
++						if (slot == CS_WHOLE) {                          // la firma entera (SuperBlob), para CS_OPS_BLOB
++							uint32_t tl = be32(sb + 4);
++							if (tl >= 12 && tl <= dsz && (out = malloc(tl))) { memcpy(out, sb, tl); *len = tl; }
++							count = 0;
++						}
+ 						for (uint32_t k = 0; k < count && 12 + (k + 1) * 8 <= dsz; k++) {
+ 							uint32_t type = be32(sb + 12 + k * 8), bo = be32(sb + 12 + k * 8 + 4);
+ 							if (type != slot || bo + 8 > dsz) continue;
+@@ -122,9 +124,28 @@ static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
+ 		}
+ 		free(lc);
+ 	}
++	return out;
++}
++static uint8_t* cs_blob(int pid, uint32_t slot, uint32_t* len) {
++	char path[4096];
++	if (exe_host_path(pid, path, sizeof path) != 0) return NULL;
++	int fd = open(path, O_RDONLY | O_CLOEXEC);
++	if (fd < 0) return NULL;
++	uint8_t* out = cs_blob_fd(fd, slot, len);
+ 	close(fd);
+ 	return out;
+ }
++// ¿Lleva el archivo firma de plataforma de Apple? Como en CS_OPS_STATUS: firmado, sin Team ID y no ad hoc. 1 sí, 0 no,
++// -1 sin firma. Para fcntl F_GETSIGSINFO (emu_fs.c).
++int cs_file_platform(int fd) {
++	uint32_t len = 0;
++	uint8_t* cd = cs_blob_fd(fd, 0, &len);
++	if (!cd || len < 44 || be32(cd) != 0xfade0c02) { free(cd); return -1; }
++	uint32_t team = len >= 52 && be32(cd + 8) >= 0x20200 ? be32(cd + 48) : 0;
++	int r = !team && !(be32(cd + 12) & 0x2u);
++	free(cd);
++	return r;
++}
+ 
+ // LC_UUID del ejecutable de macOS de un proceso (p_uuid de proc_pidinfo): logd lo anota en cada mensaje para encontrar después
+ // el texto de formato del programa. 0 si se encontró.
+@@ -239,10 +260,26 @@ static long copy_token(const uint8_t* blob, uint32_t len, uint64_t uaddr, uint64
+ // Núcleo común de csops y csops_audittoken. pid 0 = el propio proceso.
+ static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
+ 	switch (op) {
+-	case 0: {                                                    // CS_OPS_STATUS: sin banderas (como un binario sin restricciones)
+-		uint32_t zero = 0;
++	case 0: {                                                    // CS_OPS_STATUS
++		// Como XNU tras validar la firma al cargar: CS_VALID | CS_SIGNED más las banderas del CodeDirectory (hardened
++		// runtime, hard, kill, ad hoc...); con derechos, CS_ENTITLEMENTS_VALIDATED; y los binarios de Apple (firmados y sin
++		// Team ID) son de plataforma (CS_PLATFORM_BINARY | CS_DYLD_PLATFORM), como los que AMFI reconoce. Sin firma, 0.
++		// securityd comprueba con esto la firma dinámica de sus clientes (SecCodeCheckValidity: sin CS_VALID, «guest
++		// invalid» y el llavero del sistema no se desbloquea) y shortcuts exige ser binario de plataforma.
++		uint32_t st = 0, len = 0;
+ 		if (usize < 4) return -D_EINVAL;
+-		return safe_write(uaddr, &zero, 4) == 4 ? 0 : -D_EFAULT;
++		uint8_t* cd = cs_blob(pid, 0, &len);
++		if (cd && len >= 44 && be32(cd) == 0xfade0c02) {
++			st = 0x00000001u | 0x20000000u;                          // CS_VALID | CS_SIGNED
++			st |= be32(cd + 12) & (0x2u | 0x100u | 0x200u | 0x800u | 0x1000u | 0x2000u | 0x10000u | 0x20000u);
++			uint32_t team = len >= 52 && be32(cd + 8) >= 0x20200 ? be32(cd + 48) : 0;
++			if (!team && !(st & 0x2u)) st |= 0x04000000u | 0x02000000u;   // CS_PLATFORM_BINARY | CS_DYLD_PLATFORM
++			uint32_t el = 0; uint8_t* ent = cs_blob(pid, 5, &el);
++			if (ent) st |= 0x4000u;                                  // CS_ENTITLEMENTS_VALIDATED
++			free(ent);
++		}
++		free(cd);
++		return safe_write(uaddr, &st, 4) == 4 ? 0 : -D_EFAULT;
+ 	}
+ 	case 7: case 16: {                                           // ENTITLEMENTS_BLOB (XML, ranura 5) / DER_ENTITLEMENTS_BLOB (ranura 7)
+ 		uint32_t len = 0;
+@@ -251,6 +288,14 @@ static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
+ 		free(b);
+ 		return r;
+ 	}
++	case 10: {                                                   // BLOB: la firma entera (SuperBlob embebido), como cs_blob_get
++		uint32_t len = 0;
++		uint8_t* b = cs_blob(pid, CS_WHOLE, &len);
++		if (!b) return -D_EINVAL;                                 // sin firma
++		long r = copy_token(b, len, uaddr, usize);
++		free(b);
++		return r;
++	}
+ 	case 11: case 14: {                                          // IDENTITY / TEAMID: cadenas del CodeDirectory (ranura 0)
+ 		uint32_t len = 0;
+ 		uint8_t* cd = cs_blob(pid, 0, &len);
+diff --git a/tahoe-run/emu_fileport.c b/tahoe-run/emu_fileport.c
+index bf4e843..02188db 100644
+--- a/tahoe-run/emu_fileport.c
++++ b/tahoe-run/emu_fileport.c
+@@ -25,7 +25,7 @@
+ #include "tahoe.h"
+ 
+ #define FP_MAX 512
+-#define FP_FD_MIN 1100          // duplicados fuera del rango que usan los programas
++#define FP_FD_MIN FD_INTERNAL_BASE   // duplicados fuera del rango que usan los programas (ver fd_hi)
+ static struct { uint32_t name; int fd; } fp_tab[FP_MAX];
+ static int fp_next;             // reemplazo circular si la tabla se llena (el más antiguo)
+ static pthread_mutex_t fp_lock = PTHREAD_MUTEX_INITIALIZER;
+diff --git a/tahoe-run/emu_net.c b/tahoe-run/emu_net.c
+index 9e92270..ad6b827 100644
+--- a/tahoe-run/emu_net.c
++++ b/tahoe-run/emu_net.c
+@@ -30,7 +30,8 @@ static int sa_in(const uint8_t* d, uint32_t len, uint8_t* out, socklen_t* outlen
+ 		size_t pl = len - 2 < sizeof un.sun_path - 1 ? len - 2 : sizeof un.sun_path - 1;
+ 		char g[128] = { 0 };
+ 		memcpy(g, d + 2, pl);
+-		if (g[0] == '/' && tahoe_root) snprintf(un.sun_path, sizeof un.sun_path, "%s%s", tahoe_root, g);
++		// como con los archivos, /dev es el del anfitrión (p. ej. el socket de tahoe-gpu en /dev/shm, el driver Metal)
++		if (g[0] == '/' && tahoe_root && !tahoe_host_passthrough(g)) snprintf(un.sun_path, sizeof un.sun_path, "%s%s", tahoe_root, g);
+ 		else memcpy(un.sun_path, g, pl);
+ 		memcpy(out, &un, sizeof un);
+ 		*outlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(un.sun_path) + 1);
+@@ -100,6 +101,7 @@ static long kev_socket(void) {
+ 	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) return err();
+ 	if (sv[0] >= KEV_MAX_FD) { close(sv[0]); close(sv[1]); return -24; /* EMFILE */ }
+ 	fcntl(sv[1], F_SETFD, FD_CLOEXEC);
++	sv[1] = fd_hi(sv[1]);
+ 	struct stat st; fstat(sv[0], &st);
+ 	if (kev_ino[sv[0]] && kev_peer[sv[0]] > 0) close(kev_peer[sv[0]]);   // un socket de eventos anterior ya cerrado
+ 	kev_ino[sv[0]] = st.st_ino; kev_peer[sv[0]] = sv[1];
+@@ -199,6 +201,7 @@ static long fsev_ioctl(int fd, uint32_t req, uint64_t arg, int* handled) {
+ 	if ((req & 0xff) == 1) {                                  // FSEVENTS_CLONE(event_list*, num_events, queue_depth, int* fd)
+ 		uint64_t a[3]; if (safe_read(arg, a, 24) != 24) return -D_EFAULT;
+ 		int p[2]; if (pipe(p) < 0) return err();
++		p[1] = fd_hi(p[1]);                                   // extremo interno: fuera del alcance del programa
+ 		if (p[0] < FSEV_MAX_FD) { fsev_fd[p[0]] = 2; fsev_keep[p[0]] = p[1]; }
+ 		fcntl(p[1], F_SETFD, FD_CLOEXEC);
+ 		int32_t nfd = p[0];
+@@ -466,8 +469,9 @@ static long net_recvmsg(struct ctx* c) {
+ 	m.msg_name = d.name ? l : NULL; m.msg_namelen = d.name ? sizeof l : 0;
+ 	m.msg_iov = (struct iovec*)d.iov; m.msg_iovlen = (size_t)d.iovlen;
+ 	m.msg_control = d.control ? cbuf : NULL; m.msg_controllen = d.control ? sizeof cbuf : 0;
+-	static __thread uint8_t icin[65536], icout[65536 + 20];
+-	struct iovec iv1 = { icin, sizeof icin };
++	TLS_LAZY(uint8_t, icin, 65536);
++	TLS_LAZY(uint8_t, icout, 65536 + 20);
++	struct iovec iv1 = { icin, 65536 };
+ 	int icmp = is_icmp((int)c->a[0]);
+ 	if (icmp) { m.msg_iov = &iv1; m.msg_iovlen = 1; }
+ 	long r = recvmsg((int)c->a[0], &m, msg_flags((int)c->a[2]) & ~MSG_NOSIGNAL);
+diff --git a/tahoe-run/emu_sysctl.c b/tahoe-run/emu_sysctl.c
+index 435f532..ce86048 100644
+--- a/tahoe-run/emu_sysctl.c
++++ b/tahoe-run/emu_sysctl.c
+@@ -8,11 +8,12 @@
+ #include <string.h>
+ #include <time.h>
+ #include <unistd.h>
++#include <stdlib.h>
+ #include <sys/sysinfo.h>
+ 
+ #include "tahoe.h"
+ 
+-enum kind { K_INT, K_QUAD, K_STR, K_BOOT };
++enum kind { K_INT, K_QUAD, K_STR, K_BOOT, K_LOADAVG, K_SWAP, K_FSIDS };
+ struct entry {
+ 	const char* name;
+ 	int mib[2];
+@@ -21,6 +22,39 @@ struct entry {
+ 	const char* sval;
+ };
+ 
++// Identidad del equipo (SMBIOS): modelo, placa, número de serie, MLB, UUID y ROM generados con macserial de OpenCore para
++// esta instalación (tools/smbios.sh) y guardados fuera del repositorio; TAHOE_SMBIOS_FILE apunta al JSON. Sin archivo, los
++// valores de siempre (un MacBookPro16,1 ficticio).
++const char* smbios(const char* key, const char* def) {
++	static char buf[2048]; static int cargado;
++	if (!cargado) {
++		cargado = 1;
++		const char* p = getenv("TAHOE_SMBIOS_FILE");
++		FILE* f = p ? fopen(p, "r") : NULL;
++		if (f) { size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f); }
++	}
++	static char val[8][128]; static int k;
++	char pat[64]; snprintf(pat, sizeof pat, "\"%s\"", key);
++	const char* q = strstr(buf, pat);
++	if (!q) return def;
++	q = strchr(q + strlen(pat), ':'); if (!q) return def;
++	q = strchr(q, '"'); if (!q) return def;
++	const char* e = strchr(q + 1, '"'); if (!e || e - q - 1 >= 127) return def;
++	char* v = val[k++ % 8];
++	memcpy(v, q + 1, (size_t)(e - q - 1)); v[e - q - 1] = 0;
++	return v;
++}
++// Tipo de placa (target-type, hw.target) de cada modelo admitido por macOS 26 en Intel.
++const char* smbios_target(int ap) {
++	const char* m = smbios("modelo", "MacBookPro16,1");
++	static const struct { const char *m, *t, *ap; } t[] = {
++		{ "MacBookPro16,1", "J152F", "J152fAP" }, { "MacBookPro16,4", "J152F", "J152fAP" }, { "MacBookPro16,2", "J214K", "J214kAP" },
++		{ "MacBookPro16,3", "J223", "J223AP" }, { "iMac20,1", "J185", "J185AP" }, { "iMac20,2", "J185F", "J185fAP" }, { "MacPro7,1", "J160", "J160AP" },
++	};
++	for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) if (!strcmp(m, t[i].m)) return ap ? t[i].ap : t[i].t;
++	return ap ? "J152fAP" : "J152F";
++}
++
+ #define CTL_KERN 1
+ #define CTL_HW 6
+ static char boot_session[40] = "B0070000-0000-4000-8000-000000000003";
+@@ -40,6 +74,11 @@ static struct entry table[] = {
+ 	{ "kern.usrstack64", { CTL_KERN, 59 }, K_QUAD, (long long)STACK_TOP, NULL },
+ 	{ "kern.osversion", { CTL_KERN, 65 }, K_STR, 0, "25G83" },
+ 	{ "kern.boottime", { CTL_KERN, 21 }, K_BOOT, 0, NULL },
++	{ "vm.loadavg", { 2, 2 }, K_LOADAVG, 0, NULL },                  // CTL_VM, VM_LOADAVG: getloadavg (iostat, uptime, top)
++	{ "vm.swapusage", { 2, 5 }, K_SWAP, 0, NULL },                   // CTL_VM, VM_SWAPUSAGE: struct xsw_usage (top, sysctl)
++	{ "sysctl.proc_cputype", { 0, 0x7300 }, K_INT, 0x01000007, NULL },  // con el pid detrás: tipo de CPU de ese proceso (top)
++	{ "kern.procname", { CTL_KERN, 62 }, K_STR, 0, "" },             // KERN_PROCNAME: nombre del proceso (setproctitle lo escribe)
++	{ "vfs.generic.vfsidlist", { 3, 0x7100 }, K_FSIDS, 0, NULL },       // fsid_t de cada montaje (KernelEventAgent)
+ 	{ "kern.bootargs", { CTL_KERN, 0x7000 }, K_STR, 0, "" },
+ 	{ "kern.osproductversion", { CTL_KERN, 0x7001 }, K_STR, 0, "26.6.2" },
+ 	{ "kern.osproductversionextra", { CTL_KERN, 0x7002 }, K_STR, 0, "" },
+@@ -75,7 +114,7 @@ static struct entry table[] = {
+ 	{ "security.mac.amfi.allow_only_platform_code", { 201, 0x7213 }, K_INT, 0, NULL },
+ 	{ "vm.shared_region_pivot", { 201, 0x7214 }, K_INT, 0, NULL },
+ 	{ "hw.mempath", { 201, 0x7300 }, K_STR, 0, "" },
+-	{ "kern.bootsessionuuid", { 201, 0x7215 }, K_STR, 0, boot_session },   // UUID de esta sesión de arranque (el boot_id de Linux)
++	{ "kern.bootsessionuuid", { 201, 0x7215 }, K_STR, 0, boot_session },   // UUID de esta sesión de arranque (boot_session_mix)
+ 	{ "kern.hv_support", { 201, 0x7216 }, K_INT, 0, NULL },                  // sin Hypervisor.framework
+ 	{ "kern.hv_vmm_present", { 201, 0x7217 }, K_INT, 0, NULL },
+ 	{ "vm.darkwake_mode", { 201, 0x7218 }, K_INT, 0, NULL },
+@@ -83,14 +122,14 @@ static struct entry table[] = {
+ 	{ "security.mac.sandbox.sentinel", { 201, 0x721e }, K_STR, 0, sb_sentinel },
+ 	{ "kern.hostid", { CTL_KERN, 11 }, K_INT, 0, NULL },
+ 	{ "kern.safeboot", { CTL_KERN, 66 }, K_INT, 0, NULL },
+-	{ "hw.target", { 201, 0x721a }, K_STR, 0, "J152fAP" },              // MobileGestalt (HWModelStr) lo usa: el del MacBookPro16,1
++	{ "hw.target", { 201, 0x721a }, K_STR, 0, "J152fAP" },              // MobileGestalt (HWModelStr) lo usa: el del modelo (smbios_target)
+ 	{ "hw.osenvironment", { 201, 0x721b }, K_STR, 0, "" },
+ 	{ "hw.use_kernelmanagerd", { 201, 0x721c }, K_INT, 1, NULL },
+ 	{ "hw.willshutdown", { 201, 0x721d }, K_INT, 0, NULL },
+ 	{ "kern.netboot", { CTL_KERN, 40 }, K_INT, 0, NULL },
+ 	{ "security.mac.lockdown_mode_state", { 200, 1 }, K_INT, 0, NULL },
+ 	{ "hw.machine", { CTL_HW, 1 }, K_STR, 0, "x86_64" },
+-	{ "hw.model", { CTL_HW, 2 }, K_STR, 0, "MacBookPro16,1" },
++	{ "hw.model", { CTL_HW, 2 }, K_STR, 0, "MacBookPro16,1" },     // o el de smbios.json
+ 	{ "hw.ncpu", { CTL_HW, 3 }, K_INT, -1, NULL },            // -1: se rellena al iniciar
+ 	{ "hw.byteorder", { CTL_HW, 4 }, K_INT, 1234, NULL },
+ 	{ "hw.physmem", { CTL_HW, 5 }, K_INT, -2, NULL },
+@@ -393,6 +432,9 @@ static long sysctl_meta(struct ctx* c, int op, const int* oid, uint32_t len) {
+ 	case K_INT:  kind |= CTLTYPE_INT; fmt = "I"; break;
+ 	case K_QUAD: kind |= CTLTYPE_QUAD; fmt = "Q"; break;
+ 	case K_STR:  kind |= CTLTYPE_STRING; fmt = "A"; break;
++	case K_LOADAVG: kind |= CTLTYPE_STRUCT; fmt = "S,loadavg"; break;
++	case K_SWAP: kind |= CTLTYPE_STRUCT; fmt = "S,xsw_usage"; break;
++	case K_FSIDS: kind |= CTLTYPE_STRUCT; fmt = "S,fsid"; break;
+ 	default:     kind |= CTLTYPE_STRUCT; fmt = "S,timeval"; break;
+ 	}
+ 	memcpy(b, &kind, 4);
+@@ -401,11 +443,42 @@ static long sysctl_meta(struct ctx* c, int op, const int* oid, uint32_t len) {
+ 	return sc_out(c, b, 4 + fl);
+ }
+ 
++// kern.bootsessionuuid distinto en cada arranque de tahoe-run: el boot_id de Linux no cambia hasta reiniciar el PC, y con
++// él cientos de arranques de prueba eran para macOS una sola sesión de días. logd marca cada archivo del registro con este
++// UUID, y «log show --last 1m» tenía que leer el almacén entero (750 MB proyectados, más de 90 s). Se mezcla en la parte
++// final (nodo) el identificador del arranque, TAHOE_PORTS_OWNER, común a todos sus procesos; los primeros 8 caracteres
++// (el centinela del sandbox) quedan como estaban.
++static void boot_session_mix(void) {
++	static int done;
++	const char* t = getenv("TAHOE_PORTS_OWNER");
++	if (done || !t || strlen(boot_session) < 36) return;
++	done = 1;
++	uint64_t h = 1469598103934665603ULL;                          // FNV-1a de 64 bits
++	for (const char* q = t; *q; q++) { h ^= (uint8_t)*q; h *= 1099511628211ULL; }
++	char node[13]; snprintf(node, sizeof node, "%012llX", (unsigned long long)(h & 0xffffffffffffULL));
++	memcpy(boot_session + 24, node, 12);
++}
+ long bsd_sysctl(struct ctx* c) {
+ 	int mib[16];
++	boot_session_mix();
+ 	uint32_t n = (uint32_t)c->a[1];
+ 	if (n == 0 || n > 16 || safe_read(c->a[0], mib, n * 4) != (ssize_t)(n * 4)) return -D_EINVAL;
+ 
++	// vfs.generic: sistemas de archivos que tiene el núcleo (getvfsbyname). VFS_MAXTYPENUM (1) y VFS_CONF (2, struct vfsconf:
++	// reservado, nombre[15], typenum, refcount, flags, 2 reservados = 40 bytes). Son los que tahoe-run sabe presentar o montar,
++	// con los mismos números de tipo que statfs (emu_fs.c): mount_tmpfs ve así que tmpfs ya está y no intenta cargar su kext.
++	if (n >= 3 && mib[0] == 3 && mib[1] == 0 && (mib[2] == 1 || (mib[2] == 2 && n == 4))) {
++		static const struct { const char* name; int typenum; } vfs[] = { { "devfs", 0x13 }, { "apfs", 0x18 }, { "tmpfs", 0x1d } };
++		if (mib[2] == 1) { int32_t max = 0x1e; return sc_out(c, &max, 4); }
++		for (size_t i = 0; i < sizeof vfs / sizeof vfs[0]; i++) if (vfs[i].typenum == mib[3]) {
++			uint8_t vc[40] = { 0 };
++			strncpy((char*)vc + 4, vfs[i].name, 14);
++			memcpy(vc + 20, &vfs[i].typenum, 4);
++			int32_t refs = 1; memcpy(vc + 24, &refs, 4);
++			return sc_out(c, vc, sizeof vc);
++		}
++		return -45;                                        // ENOTSUP: no hay sistema de archivos con ese número (como XNU)
++	}
+ 	if (n >= 3 && mib[0] == 1 && mib[1] == 14) {         // kern.proc.*: KERN_PROC_ALL (0), KERN_PROC_PID (1)
+ 		uint8_t one[648];
+ 		if (n == 4 && mib[2] == 1) {
+@@ -475,6 +548,25 @@ long bsd_sysctl(struct ctx* c) {
+ 		if (trace_all || 1) logf_("    sysctl: nombre desconocido \"%s\"\n", name);
+ 		return -D_ENOENT;
+ 	}
++	if (n == 3 && mib[0] == 0 && mib[1] == 0x7300) {     // sysctl.proc_cputype.<pid>: todos los procesos son x86_64 aquí
++		char pp[32]; snprintf(pp, sizeof pp, "/proc/%d", mib[2]);
++		if (mib[2] < 0 || access(pp, F_OK) != 0) return -D_ESRCH;
++		int v = 0x01000007;                                  // CPU_TYPE_X86_64
++		return sc_out(c, &v, sizeof v);
++	}
++	if (n == 2 && mib[0] == CTL_KERN && mib[1] == 62) {     // kern.procname: la escritura (setproctitle) se acepta sin más
++		if (c->a[4] && !c->a[2]) return 0;
++		char av[1024]; size_t al = 0;
++		const char* nm = "";
++		if (guest_argv(getpid(), av, sizeof av, &al) > 0) { nm = strrchr(av, '/'); nm = nm ? nm + 1 : av; }
++		char b[17] = { 0 }; strncpy(b, nm, 16);              // MAXCOMLEN
++		return sc_out(c, b, strlen(b) + 1);
++	}
++	if (n == 2 && mib[0] == 3 && mib[1] == 0x7100) {      // vfs.generic.vfsidlist: fsid_t[] de los montajes, como getfsstat
++		uint32_t ids[2 * 32];
++		int k = vfs_fsids(ids, 32);
++		return sc_out(c, ids, (size_t)k * 8);
++	}
+ 	if (n == 2 && mib[0] == CTL_KERN && mib[1] == 0x7005) {   // kern.osvariant_status: lectura y escritura como XNU
+ 		if (c->a[4]) {
+ 			uint64_t v = 0;
+@@ -494,7 +586,32 @@ long bsd_sysctl(struct ctx* c) {
+ 			switch (e->kind) {
+ 			case K_INT:  { int v = (int)e->ival; return sc_out(c, &v, sizeof v); }
+ 			case K_QUAD: { long long v = e->ival; return sc_out(c, &v, sizeof v); }
+-			case K_STR:  return sc_out(c, e->sval, strlen(e->sval) + 1);
++			case K_STR: {
++				const char* v = e->sval;
++				if (e->mib[0] == CTL_HW && e->mib[1] == 2) v = smbios("modelo", v);   // hw.model
++				else if (!strcmp(e->name, "hw.target")) v = smbios_target(1);
++				else if (!strcmp(e->name, "kern.bootargs") && getenv("TAHOE_BOOTARGS")) v = getenv("TAHOE_BOOTARGS");   // como la NVRAM
++				return sc_out(c, v, strlen(v) + 1);
++			}
++			case K_LOADAVG: {                                   // struct loadavg { fixpt_t ldavg[3]; long fscale; }, FSCALE = 1 << 11
++				double l[3] = { 0, 0, 0 };
++				FILE* f = fopen("/proc/loadavg", "r");
++				if (f) { if (fscanf(f, "%lf %lf %lf", &l[0], &l[1], &l[2]) != 3) l[0] = l[1] = l[2] = 0; fclose(f); }
++				uint8_t la[24] = { 0 };
++				for (int i = 0; i < 3; i++) { uint32_t v = (uint32_t)(l[i] * 2048); memcpy(la + i * 4, &v, 4); }
++				long long fs = 2048; memcpy(la + 16, &fs, 8);
++				return sc_out(c, la, sizeof la);
++			}
++			case K_SWAP: {                                      // struct xsw_usage { u64 total, avail, used; u32 pagesize; boolean_t encrypted; }
++				unsigned long long tot = 0, fr = 0; char l[128];
++				FILE* f = fopen("/proc/meminfo", "r");
++				if (f) { while (fgets(l, sizeof l, f)) { sscanf(l, "SwapTotal: %llu", &tot); sscanf(l, "SwapFree: %llu", &fr); } fclose(f); }
++				uint8_t x[32] = { 0 };
++				uint64_t v[3] = { tot * 1024, fr * 1024, (tot - fr) * 1024 }; uint32_t pg = 4096, enc = 1;
++				memcpy(x, v, 24); memcpy(x + 24, &pg, 4); memcpy(x + 28, &enc, 4);
++				return sc_out(c, x, sizeof x);
++			}
++			case K_FSIDS: break;                                // se responde antes (vfs.generic.vfsidlist)
+ 			case K_BOOT: {
+ 				struct timespec up, now;
+ 				clock_gettime(CLOCK_BOOTTIME, &up);

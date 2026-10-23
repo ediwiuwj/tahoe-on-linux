@@ -1,0 +1,80 @@
+From 385de3851f2ba72826c48d70379a945dba767877 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:28:18 -0600
+Subject: [PATCH 44/57] Emulador: mach_vm_remap no copia en silencio cuando se
+ pide compartir
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Con copy = 0 el cliente pide compartir las páginas (en XNU, vm_map_remap con
+copy = FALSE mapea las mismas, osfmk/vm/vm_user.c:981-995). Si el mremap
+fallaba, el respaldo copiaba la página de origen en una nueva: el cliente
+escribía en su copia y no veía el efecto en el original. Ahora, si no se puede
+compartir, se devuelve KERN_NO_SPACE_ en vez de copiar.
+
+La copia del respaldo se hace con safe_read (que pasa por /proc/self/mem y
+falla sin tocar memoria no mapeada) en lugar de memcpy a ciegas: un origen
+inválido ya no provoca un SIGSEGV en el proceso emulado.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_mach.c | 43 ++++++++++++++++++++++++++++---------------
+ 1 file changed, 28 insertions(+), 15 deletions(-)
+
+diff --git a/tahoe-run/emu_mach.c b/tahoe-run/emu_mach.c
+index 21f9a29..1d12c42 100644
+--- a/tahoe-run/emu_mach.c
++++ b/tahoe-run/emu_mach.c
+@@ -220,23 +220,36 @@ static size_t mig_mach_vm_remap(const struct hdr* req, const uint8_t* m, uint8_t
+ 		p = want ? mremap((void*)s0, 0, len, MREMAP_MAYMOVE | MREMAP_FIXED, (void*)want) : mremap((void*)s0, 0, len, MREMAP_MAYMOVE);
+ 	}
+ 	if (p == MAP_FAILED) {
+-		uint64_t align = mask + 1 > PAGE ? mask + 1 : PAGE;
+-		if (want) p = mmap((void*)want, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | ((flags & 0x4000) ? MAP_FIXED : MAP_FIXED_NOREPLACE), -1, 0);
++		// El respaldo copia la página de origen en una nueva. Con copy = 0 (compartir) eso NO es lo que pidió el
++		// cliente: en XNU, copy = 0 mapea las mismas páginas (vm_map_remap con copy = FALSE, osfmk/vm/vm_user.c:981-995),
++		// así que una copia silenciosa haría que el cliente escribiera en su copia y no viera el efecto en el original.
++		// Aquí, si no se puede compartir, se dice que no hay espacio en vez de copiar.
++		if (!copy) kr = KERN_NO_SPACE_;
+ 		else {
+-			uint8_t* q = mmap(NULL, len + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+-			if (q != MAP_FAILED) {
+-				uint64_t a = ((uint64_t)q + align - 1) & ~(align - 1);
+-				if (a > (uint64_t)q) munmap(q, a - (uint64_t)q);
+-				if ((uint64_t)q + len + align > a + len) munmap((void*)(a + len), (uint64_t)q + len + align - (a + len));
+-				p = (void*)a;
++			uint64_t align = mask + 1 > PAGE ? mask + 1 : PAGE;
++			if (want) p = mmap((void*)want, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | ((flags & 0x4000) ? MAP_FIXED : MAP_FIXED_NOREPLACE), -1, 0);
++			else {
++				uint8_t* q = mmap(NULL, len + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++				if (q != MAP_FAILED) {
++					uint64_t a = ((uint64_t)q + align - 1) & ~(align - 1);
++					if (a > (uint64_t)q) munmap(q, a - (uint64_t)q);
++					if ((uint64_t)q + len + align > a + len) munmap((void*)(a + len), (uint64_t)q + len + align - (a + len));
++					p = (void*)a;
++				}
++			}
++			if (p == MAP_FAILED) kr = KERN_NO_SPACE_;
++			else {
++				// El origen es del invitado: se lee con safe_read, que falla sin tocar memoria no mapeada en vez de
++				// provocar un SIGSEGV en el proceso emulado (como ya se hace en mach_vm_copy).
++				uint8_t* tmp = malloc(len);
++				if (!tmp) kr = KERN_NO_SPACE_;
++				else if (safe_read(s0, tmp, (size_t)len) != (ssize_t)len) kr = KERN_INVALID_ADDR;
++				else {
++					memcpy(p, tmp, len);
++					mprotect(p, len, prot);
++				}
++				free(tmp);
+ 			}
+-		}
+-		if (p == MAP_FAILED) kr = KERN_NO_SPACE_;
+-		else {
+-			if (!(prot & 1)) mprotect((void*)s0, len, prot | PROT_READ);      // origen ilegible: leerlo para copiarlo
+-			memcpy(p, (void*)s0, len);
+-			if (!(prot & 1)) mprotect((void*)s0, len, prot);
+-			mprotect(p, len, prot);
+ 		}
+ 	}
+ 	uint64_t out = p == MAP_FAILED ? 0 : (uint64_t)p + (src - s0);

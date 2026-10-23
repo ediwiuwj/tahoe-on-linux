@@ -1,0 +1,67 @@
+From 72c0f6699bb199fd94d799843adaa8c5e3e108b7 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 21:54:59 -0600
+Subject: [PATCH 21/57] =?UTF-8?q?Emulador:=20un=20plazo=20de=20kevent=20in?=
+ =?UTF-8?q?v=C3=A1lido=20da=20EINVAL=20en=20vez=20de=20esperar=20sin=20fin?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_kqueue.c: el timespec del plazo se valida como en XNU
+  (timespec_is_valid() en kern_time.c): tv_sec entre 0 e INT32_MAX y
+  tv_nsec entre 0 y 1e9. Antes, un tv_nsec mayor que 1e9 o un tv_sec
+  negativo se truncaban al pasarlos a milisegundos y se esperaba una
+  cantidad de tiempo arbitraria.
+- emu_kqueue.c: el plazo se distingue del caso "sin plazo". -1 sigue
+  siendo espera infinita, -2 es EINVAL y -3 es EFAULT, que es lo que
+  devuelve el copyin de XNU cuando el plazo no se puede leer. Antes
+  un puntero ilegible se tomaba por "sin plazo" y la llamada se
+  quedaba esperando para siempre.
+- emu_kqueue.c: el plazo se valida antes de aplicar los cambios de la
+  cola, como en XNU, donde kevent_legacy_get_deadline va antes de
+  kevent_internal.
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_kqueue.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/tahoe-run/emu_kqueue.c b/tahoe-run/emu_kqueue.c
+index e99622f..67bc4d9 100644
+--- a/tahoe-run/emu_kqueue.c
++++ b/tahoe-run/emu_kqueue.c
+@@ -436,9 +436,13 @@ static void kev_out(int layout, uint8_t* b, const struct kev* k) {
+ 	else { memcpy(b + 12, &k->qos, 4); memcpy(b + 16, &k->udata, 8); memcpy(b + 24, &k->fflags, 4); memcpy(b + 32, &k->data, 8); memcpy(b + 40, k->ext, 32); }
+ }
+ 
+-// Núcleo común. timeout_ms: -1 = esperar, 0 = no esperar.
++// Núcleo común. timeout_ms: -1 = esperar, 0 = no esperar, -2 = EINVAL y -3 = EFAULT (plazo inválido o ilegible).
+ static __thread int g_no_poll;   // KEVENT_FLAG_ERROR_EVENTS: solo se devuelven errores de los cambios, no eventos
+ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_t evp, long nev, int timeout_ms) {
++	// XNU valida el plazo antes de tocar la cola (kevent_legacy_get_deadline va antes de kevent_internal), así que un
++	// timespec inválido se devuelve sin haber aplicado los cambios.
++	if (timeout_ms == -2) return -D_EINVAL;
++	if (timeout_ms == -3) return -D_EFAULT;
+ 	int kq = kq_for(guest_kq);
+ 	uint8_t raw[72];
+ 	long nout = 0;
+@@ -575,10 +579,16 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
+ 	return nout;
+ }
+ 
++// El plazo de kevent es un struct timespec (16 bytes: dos int64). Devuelve los milisegundos, -1 si no hay plazo
++// (espera infinita), -2 si el timespec no vale (EINVAL, como en XNU: timespec_is_valid() exige tv_sec >= 0 y
++// tv_nsec en [0, 1e9]; ver kern_time.c) o -3 si el plazo no se puede leer (EFAULT, como el copyin de XNU).
+ static int ts_ms(uint64_t p) {
+ 	if (!p) return -1;
+ 	int64_t t[2];
+-	if (safe_read(p, t, 16) != 16) return -1;
++	if (safe_read(p, t, 16) != 16) return -3;
++	if (t[0] < 0 || t[0] > INT32_MAX) return -2;        // XNU: tv_sec fuera de rango
++	if (t[1] < 0 || t[1] > 1000000000) return -2;        // XNU: tv_nsec fuera de rango
++	if (t[0] > (INT64_MAX - t[1] / 1000000) / 1000) return -2;   // sin desbordamiento
+ 	return (int)(t[0] * 1000 + t[1] / 1000000);
+ }
+ 

@@ -1,0 +1,35 @@
+From 8c8f3d491f793a2316fe39f78e611476c49f767d Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:15:04 -0600
+Subject: [PATCH 42/57] =?UTF-8?q?Emulador:=20un=20b=C3=BAfer=20de=20tama?=
+ =?UTF-8?q?=C3=B1o=200=20no=20se=20confunde=20con=20un=20fallo=20de=20memo?=
+ =?UTF-8?q?ria?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_fs.c: getattrlistbulk reservaba con malloc(gsize), y con
+  gsize = 0 el malloc puede devolver NULL, que no es un fallo: la
+  comprobación devolvía ENOMEM sin motivo. Ahora se reserva al menos
+  un byte.
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_fs.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tahoe-run/emu_fs.c b/tahoe-run/emu_fs.c
+index 6113f01..6512f85 100644
+--- a/tahoe-run/emu_fs.c
++++ b/tahoe-run/emu_fs.c
+@@ -1376,7 +1376,7 @@ static long bsd_getattrlistbulk(struct ctx* c) {
+ 	uint64_t gbuf = c->a[2], gsize = c->a[3];
+ 	if (gsize > (1ull << 30)) return -D_EINVAL;                       // un búfer de más de 1 GiB no lo pide nadie
+ 	uint8_t lin[16384];
+-	uint8_t* out = malloc(gsize);
++	uint8_t* out = malloc(gsize ? gsize : 1);                          // malloc(0) puede devolver NULL: no es un fallo
+ 	if (!out) return -D_ENOMEM;
+ 	size_t used = 0;
+ 	long count = 0, rc = 0;

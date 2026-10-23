@@ -1,0 +1,54 @@
+From 6df02722dfcef2cf1994dd2606a001287b78e93f Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:32:44 -0600
+Subject: [PATCH 28/57] Emulador: un plazo de kevent largo se satura en vez de
+ truncarse
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_kqueue.c: la comprobación de desbordamiento de ts_ms era código
+  muerto: miraba contra INT64_MAX, pero el plazo se mide en
+  milisegundos y epoll_wait los toma en un int, así que el
+  desbordamiento real era la truncación a int. Con un plazo de más de
+  24,8 días el resultado salía negativo (epoll_wait lo toma por
+  espera infinita) o, peor, el valor -2 o -3, que aquí significan
+  "timespec inválido" y "ilegible": un EINVAL o un EFAULT falsos.
+  Ahora se satura en INT_MAX.
+- emu_kqueue.c: se incluye limits.h para INT_MAX.
+
+Verificado: compila (clang -fsyntax-only, sin avisos); la saturación se
+probó aparte con 7 plazos (0, 1 s, 24,8 días y el máximo): ninguno da
+un valor negativo ni colisiona con -2 o -3.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_kqueue.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/tahoe-run/emu_kqueue.c b/tahoe-run/emu_kqueue.c
+index 67bc4d9..72c8a69 100644
+--- a/tahoe-run/emu_kqueue.c
++++ b/tahoe-run/emu_kqueue.c
+@@ -10,6 +10,7 @@
+ // llegar un evento se reparte entre todos los knotes activos de ese descriptor.
+ #define _GNU_SOURCE
+ #include <errno.h>
++#include <limits.h>
+ #include <pthread.h>
+ #include <stdatomic.h>
+ #include <stdlib.h>
+@@ -588,8 +589,11 @@ static int ts_ms(uint64_t p) {
+ 	if (safe_read(p, t, 16) != 16) return -3;
+ 	if (t[0] < 0 || t[0] > INT32_MAX) return -2;        // XNU: tv_sec fuera de rango
+ 	if (t[1] < 0 || t[1] > 1000000000) return -2;        // XNU: tv_nsec fuera de rango
+-	if (t[0] > (INT64_MAX - t[1] / 1000000) / 1000) return -2;   // sin desbordamiento
+-	return (int)(t[0] * 1000 + t[1] / 1000000);
++	// El plazo se mide en milisegundos y epoll_wait los toma en un int: un plazo de más de 24,8 días no cabe. Se satura
++	// en INT_MAX en vez de truncar, porque un truncado daría un plazo negativo (epoll_wait lo toma por infinito) o,
++	// peor, el valor -2 o -3, que aquí significan "timespec inválido" y "ilegible".
++	int64_t ms = t[0] * 1000 + t[1] / 1000000;
++	return ms > INT_MAX ? INT_MAX : (int)ms;
+ }
+ 
+ static long bsd_kqueue(struct ctx* c) { (void)c; int fd = epoll_create1(0); return fd < 0 ? -darwin_errno(errno) : fd; }

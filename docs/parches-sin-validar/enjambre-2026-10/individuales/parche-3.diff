@@ -1,0 +1,252 @@
+diff --git i/tahoe-run/emu_net.c w/tahoe-run/emu_net.c
+index 50681c3..161da47 100644
+--- i/tahoe-run/emu_net.c
++++ w/tahoe-run/emu_net.c
+@@ -163,6 +163,8 @@ static uint32_t kev_vendor(const char* name) {
+ // ---- Terminales: struct termios de Darwin (flags de 8 bytes, c_cc[20], velocidades) <-> la de Linux. Los bits y los
+ // índices de c_cc son distintos en cada sistema; se traducen uno a uno.
+ #include <termios.h>
++#define D_FREAD  0x0001                              // XNU bsd/sys/fcntl.h: FREAD (vaciar la entrada)
++#define D_FWRITE 0x0002                              // XNU bsd/sys/fcntl.h: FWRITE (vaciar la salida)
+ struct dtermios { uint64_t iflag, oflag, cflag, lflag; uint8_t cc[20]; uint8_t pad[4]; uint64_t ispeed, ospeed; };
+ struct bitmap { uint64_t d; tcflag_t l; };
+ static const struct bitmap IMAP[] = { {0x1,IGNBRK},{0x2,BRKINT},{0x4,IGNPAR},{0x8,PARMRK},{0x10,INPCK},{0x20,ISTRIP},{0x40,INLCR},
+@@ -174,7 +176,23 @@ static const struct bitmap LMAP[] = { {0x1,ECHOKE},{0x2,ECHOE},{0x4,ECHOK},{0x8,
+ // índice de c_cc de Darwin -> de Linux (-1: no existe)
+ static const int CCMAP[20] = { VEOF, VEOL, VEOL2, VERASE, VWERASE, VKILL, VREPRINT, -1, VINTR, VQUIT, VSUSP, -1, VSTART, VSTOP,
+ 	VLNEXT, VDISCARD, VMIN, VTIME, -1, -1 };
++// Velocidad: en Darwin c_ispeed/c_ospeed son la velocidad en baudios (XNU bsd/sys/termios.h: B9600=9600, B38400=38400);
++// en Linux la velocidad la guarda el núcleo en los bits CBAUD de c_cflag y glibc la expone con cfgetospeed/cfgetispeed.
++// Se aceptan las dos convenciones (los baudios o el código del núcleo) para no depender de la de glibc.
++struct speed { unsigned code; uint64_t baud; };
++static const struct speed SPEEDS[] = {
++	{ 0, 0 }, { 1, 50 }, { 2, 75 }, { 3, 110 }, { 4, 134 }, { 5, 150 }, { 6, 200 }, { 7, 300 },
++	{ 8, 600 }, { 9, 1200 }, { 10, 1800 }, { 11, 2400 }, { 12, 4800 }, { 13, 9600 }, { 14, 19200 }, { 15, 38400 },
++	{ 0x201, 57600 }, { 0x202, 115200 }, { 0x203, 230400 }, { 0x204, 460800 }, { 0x205, 500000 },
++	{ 0x206, 576000 }, { 0x207, 921600 }, { 0x209, 1152000 }, { 0x20a, 1500000 }, { 0x20c, 2500000 },
++	{ 0x20d, 3000000 }, { 0x20e, 3500000 }, { 0x20f, 4000000 },
++};
+ #define NB(a) (sizeof a / sizeof a[0])
++static uint64_t speed_to_darwin(speed_t v) {
++	for (size_t i = 0; i < NB(SPEEDS); i++) if (SPEEDS[i].baud == (uint64_t)v) return SPEEDS[i].baud;   // los baudios
++	for (size_t i = 0; i < NB(SPEEDS); i++) if (SPEEDS[i].code == v) return SPEEDS[i].baud;                // el código del núcleo
++	return 38400;                                    // velocidad que no está en la tabla de XNU
++}
+ static tcflag_t to_l(uint64_t d, const struct bitmap* m, size_t n) { tcflag_t r = 0; for (size_t i = 0; i < n; i++) if (d & m[i].d) r |= m[i].l; return r; }
+ static uint64_t to_d(tcflag_t l, const struct bitmap* m, size_t n) { uint64_t r = 0; for (size_t i = 0; i < n; i++) if ((l & m[i].l) == m[i].l) r |= m[i].d; return r; }
+ static void term_to_darwin(const struct termios* t, struct dtermios* d) {
+@@ -184,16 +202,20 @@ static void term_to_darwin(const struct termios* t, struct dtermios* d) {
+ 	d->cflag = to_d(t->c_cflag, CMAP, NB(CMAP)) | (uint64_t)(((t->c_cflag & CSIZE) >> 4) << 8);   // CS5..CS8
+ 	d->lflag = to_d(t->c_lflag, LMAP, NB(LMAP));
+ 	for (int i = 0; i < 20; i++) d->cc[i] = CCMAP[i] >= 0 ? t->c_cc[CCMAP[i]] : 0xff;              // _POSIX_VDISABLE
+-	d->ispeed = d->ospeed = 38400;
++	d->ispeed = speed_to_darwin(cfgetispeed(t));
++	d->ospeed = speed_to_darwin(cfgetospeed(t));
+ }
+ static void term_to_linux(const struct dtermios* d, struct termios* t) {
+-	speed_t sp = cfgetospeed(t);
+ 	t->c_iflag = to_l(d->iflag, IMAP, NB(IMAP));
+ 	t->c_oflag = to_l(d->oflag, OMAP, NB(OMAP));
+-	t->c_cflag = (t->c_cflag & CBAUD) | to_l(d->cflag, CMAP, NB(CMAP)) | (tcflag_t)(((d->cflag >> 8) & 3) << 4);
++	t->c_cflag = (t->c_cflag & ~(CBAUD | CIBAUD)) | to_l(d->cflag, CMAP, NB(CMAP)) | (tcflag_t)(((d->cflag >> 8) & 3) << 4);
+ 	t->c_lflag = to_l(d->lflag, LMAP, NB(LMAP));
+ 	for (int i = 0; i < 20; i++) if (CCMAP[i] >= 0) t->c_cc[CCMAP[i]] = d->cc[i] == 0xff ? _POSIX_VDISABLE : d->cc[i];
+-	cfsetospeed(t, sp); cfsetispeed(t, sp);
++	// La velocidad de Darwin son los baudios, los mismos valores que las constantes B* de Linux; si Linux no la acepta
++	// (cfsetospeed da EINVAL), se deja la que había.
++	speed_t sp = cfgetospeed(t);
++	if (d->ospeed && cfsetospeed(t, (speed_t)d->ospeed) < 0) { if (sp) cfsetospeed(t, sp); }
++	if (d->ispeed && cfsetispeed(t, (speed_t)d->ispeed) < 0) { if (sp) cfsetispeed(t, sp); }
+ }
+ static long tty_ioctl(int fd, uint32_t req, uint64_t arg, int* handled) {
+ 	*handled = 1;
+@@ -214,10 +236,37 @@ static long tty_ioctl(int fd, uint32_t req, uint64_t arg, int* handled) {
+ 	case 0x80087467: { struct winsize w; if (safe_read(arg, &w, 8) != 8) return -D_EFAULT; return ioctl(fd, TIOCSWINSZ, &w) < 0 ? err() : 0; }  // TIOCSWINSZ
+ 	case 0x40047477: { int g = tcgetpgrp(fd); if (g < 0) return err(); return safe_write(arg, &g, 4) == 4 ? 0 : -D_EFAULT; }                    // TIOCGPGRP
+ 	case 0x80047476: { int g; if (safe_read(arg, &g, 4) != 4) return -D_EFAULT; return tcsetpgrp(fd, g) < 0 ? err() : 0; }                    // TIOCSPGRP
+-	case 0x20007461: return ioctl(fd, TIOCSCTTY, 0) < 0 ? err() : 0;                                                                         // TIOCSCTTY
++	case 0x20007461: {                                        // TIOCSCTTY (XNU bsd/kern/tty.c:1454)
++		pid_t s = tcgetsid(fd);                              // sesión a la que pertenece el terminal
++		if (s > 0 && s == getsid(0)) return 0;               // ya es el terminal de control de la sesión: XNU devuelve 0
++		if (ioctl(fd, TIOCSCTTY, 0) < 0) return errno == EBUSY ? -D_EPERM : err();   // XNU: si la sesión ya tiene terminal, EPERM (Linux: EBUSY)
++		return 0;
++	}
+ 	case 0x20007471: return ioctl(fd, TIOCNOTTY) < 0 ? err() : 0;                                                                            // TIOCNOTTY
+ 	case 0x40047473: { int n; if (ioctl(fd, TIOCOUTQ, &n) < 0) return err(); return safe_write(arg, &n, 4) == 4 ? 0 : -D_EFAULT; }           // TIOCOUTQ
+ 	case 0x80017472: { char ch; if (safe_read(arg, &ch, 1) != 1) return -D_EFAULT; return ioctl(fd, TIOCSTI, &ch) < 0 ? err() : 0; }        // TIOCSTI
++	case 0x80047410: {                                        // TIOCFLUSH: XNU (bsd/kern/tty.c:1155) lee un int con FREAD/FWRITE: si es 0,
++		int f; if (safe_read(arg, &f, 4) != 4) return -D_EFAULT;              // vacía las dos colas; si no, solo las que digan FREAD/FWRITE.
++		int fl = f ? (f & (D_FREAD | D_FWRITE)) : (D_FREAD | D_FWRITE);       // La libc pasa el selector de POSIX tal cual
++		if (fl & D_FREAD) { if (tcflush(fd, TCIFLUSH) < 0) return err(); }    // (TCIFLUSH=0, TCIOFLUSH=1, TCOFLUSH=2)
++		if (fl & D_FWRITE) { if (tcflush(fd, TCOFLUSH) < 0) return err(); }
++		return 0;
++	}
++	case 0x20007454: case 0x20007452: {                   // TIOCPTYGRANT / TIOCPTYUNLK
++		unsigned n = 0;
++		if (ioctl(fd, TIOCGPTN, &n) < 0) return -25;      // no es un maestro de pseudoterminal: ENOTTY, como en XNU
++		int unlock = 0;                                    // en Linux el esclavo está bloqueado hasta que se desbloquea: sin esto,
++		if (ioctl(fd, TIOCSPTLCK, &unlock) < 0) return err();   // al abrirlo da EIO (es lo que hacen grantpt/unlockpt de glibc)
++		return 0;                                          // el dueño y el modo del esclavo los pone ya Linux
++	}
++	case 0x40807453: {                                        // TIOCPTYGNAME: nombre del esclavo (bsd/kern/tty_dev.c:1115)
++		char nm[128];
++		unsigned n = 0;
++		if (ioctl(fd, TIOCGPTN, &n) < 0) return -25;
++		snprintf(nm, sizeof nm, "/dev/ttys%03u", n);         // en macOS los esclavos son /dev/ttysNNN (aquí /dev/pts/N)
++		size_t l = strlen(nm) + 1;
++		return safe_write(arg, nm, l) == (ssize_t)l ? 0 : -D_EFAULT;
++	}
+ 	case 0x4004667a: {                                        // FIODTYPE: tipo de dispositivo (D_TTY = 3)
+ 		if (!isatty(fd)) return -25;
+ 		int t = 3; return safe_write(arg, &t, 4) == 4 ? 0 : -D_EFAULT;
+diff --git i/tahoe-run/emu_proc.c w/tahoe-run/emu_proc.c
+index c23f3a7..ebfa0b6 100644
+--- i/tahoe-run/emu_proc.c
++++ w/tahoe-run/emu_proc.c
+@@ -113,11 +113,7 @@ static long bsd_shm_unlink(struct ctx* c) {
+ 	if (e) return -e;                                            // EFAULT o ENAMETOOLONG, como en XNU
+ 	return unlink(h) ? -darwin_errno(errno) : 0;
+ }
+-// ioctl: no se traduce ninguna petición todavía; 25 = ENOTTY ("no es un terminal"), lo correcto para isatty().
+-static long bsd_ioctl(struct ctx* c) {
+-	if (trace_all) logf_("    ioctl(fd=%d, 0x%lx)\n", (int)c->a[0], c->a[1]);
+-	return -25;
+-}
++// ioctl: lo emula emu_net.c (net_ioctl), que se registra después y sustituye a esta.
+ 
+ #include <sys/socket.h>
+ // socket(dominio, tipo, protocolo): AF_INET6 vale 30 en Darwin y 10 en Linux; el resto coincide.
+@@ -1843,7 +1839,6 @@ void emu_proc_init(void) {
+ 	reg_bsd(499, bsd_work_interval_ctl);
+ 	reg_bsd(440, bsd_proc_rlimit_control);   // memorystatus_control: sin efecto reg_bsd(444, bsd_proc_rlimit_control);   // change_fdguard_np
+ 	reg_bsd(552, bsd_proc_rlimit_control);   // record_system_event: sin efecto
+-	reg_bsd(50, bsd_proc_rlimit_control);   // setlogin: sin efecto
+ 	reg_bsd(367, bsd_workq_open); reg_bsd(368, bsd_workq_kernreturn);
+ 	reg_bsd(360, bsd_bsdthread_create); reg_bsd(361, bsd_bsdthread_terminate);
+ 	reg_bsd(478, bsd_bsdthread_ctl);
+@@ -1858,7 +1853,7 @@ void emu_proc_init(void) {
+ 	reg_bsd(98, bsd_connect);
+ 	reg_bsd(97, bsd_socket);
+ 	reg_bsd(267, bsd_shm_unlink);
+-	reg_bsd(116, bsd_gettimeofday); reg_bsd(266, bsd_shm_open); reg_bsd(54, bsd_ioctl);
++	reg_bsd(116, bsd_gettimeofday); reg_bsd(266, bsd_shm_open);
+ 	reg_bsd(366, bsd_bsdthread_register);
+ }
+ 
+diff --git i/tahoe-run/tahoe_run.c w/tahoe-run/tahoe_run.c
+index 4b42e85..cd82599 100644
+--- i/tahoe-run/tahoe_run.c
++++ w/tahoe-run/tahoe_run.c
+@@ -16,6 +16,7 @@
+ #include <fcntl.h>
+ #include <glob.h>
+ #include <linux/prctl.h>
++#include <pthread.h>
+ #include <signal.h>
+ #include <stdarg.h>
+ #include <stdint.h>
+@@ -647,11 +648,63 @@ static long bsd_open_dprotected(struct ctx* c) {
+ 	c2.a[2] = c->a[4];
+ 	return bsd_open(&c2);
+ }
+-// getlogin(búfer, tamaño): el usuario de la sesión (los servicios corren como root).
++// ---- Nombre de usuario de la sesión (getlogin/setlogin)
++// En XNU el nombre lo guarda la sesión (session.s_login, MAXLOGNAME bytes) y lo pone setlogin; getlogin lo devuelve
++// (bsd/kern/kern_prot.c:1566 y :1619). Aquí se guarda por sesión de Linux (getsid), que es lo más parecido a la sesión de
++// XNU: los procesos que comparten sesión comparten el nombre. Al principio es "root" (todo el arranque corre como root).
++#define MAXLOGNAME 255                               // XNU bsd/sys/param.h
++static struct { int usado; pid_t sid; char name[MAXLOGNAME + 1]; } login_ses[64];
++static pthread_mutex_t login_lock = PTHREAD_MUTEX_INITIALIZER;
++static void login_get(char* out, size_t cap) {
++	pid_t sid = getsid(0);
++	pthread_mutex_lock(&login_lock);
++	for (int i = 0; i < 64; i++)
++		if (login_ses[i].usado && login_ses[i].sid == sid) {
++			snprintf(out, cap, "%s", login_ses[i].name);
++			pthread_mutex_unlock(&login_lock);
++			return;
++		}
++	pthread_mutex_unlock(&login_lock);
++	snprintf(out, cap, "root");
++}
++static void login_set(const char* name) {
++	pid_t sid = getsid(0);
++	pthread_mutex_lock(&login_lock);
++	for (int i = 0; i < 64; i++) {
++		if (!login_ses[i].usado) {
++			login_ses[i].usado = 1; login_ses[i].sid = sid;
++			snprintf(login_ses[i].name, sizeof login_ses[i].name, "%s", name);
++			pthread_mutex_unlock(&login_lock);
++			return;
++		}
++		if (login_ses[i].sid == sid) {
++			snprintf(login_ses[i].name, sizeof login_ses[i].name, "%s", name);
++			pthread_mutex_unlock(&login_lock);
++			return;
++		}
++	}
++	pthread_mutex_unlock(&login_lock);
++}
++// getlogin(búfer, tamaño): el nombre de usuario de la sesión. XNU (bsd/kern/kern_prot.c:1566): el tamaño se recorta a
++// MAXLOGNAME y se copian exactamente esos bytes del nombre de la sesión (con ceros detrás); nunca da ERANGE.
+ static long bsd_getlogin(struct ctx* c) {
+-	static const char u[] = "root";
+-	if (c->a[1] < sizeof u) return -34;                   // ERANGE
+-	return safe_write(c->a[0], u, sizeof u) == (ssize_t)sizeof u ? 0 : -14;
++	size_t n = (size_t)c->a[1];
++	char buf[MAXLOGNAME + 1];
++	if (n > MAXLOGNAME) n = MAXLOGNAME;
++	memset(buf, 0, sizeof buf);
++	login_get(buf, MAXLOGNAME);
++	return safe_write(c->a[0], buf, n) == (ssize_t)n ? 0 : -14;
++}
++// setlogin(nombre): fija el nombre de usuario de la sesión. XNU (bsd/kern/kern_prot.c:1619): primero proc_suser (EPERM
++// si no es el superusuario), luego copyinstr con un máximo de MAXLOGNAME-1 (ENAMETOOLONG -> EINVAL). A partir de
++// aquí getlogin devuelve ese nombre.
++static long bsd_setlogin(struct ctx* c) {
++	char name[MAXLOGNAME + 2];
++	if (cred_euid() != 0) return -1;                                     // EPERM: proc_suser (XNU lo mira antes de la cadena)
++	if (safe_string(c->a[0], name, sizeof name) != 0) return -14;      // EFAULT: copyinstr
++	if (strlen(name) > MAXLOGNAME - 1) return -22;                       // EINVAL (ENAMETOOLONG en XNU)
++	login_set(name);
++	return 0;
+ }
+ static long bsd_enotsup(struct ctx* c) { (void)c; return -45; }   // ENOTSUP: funciones que este sistema no ofrece (personas)
+ // reboot(howto): solo launchd (pid 1 del espacio de procesos del arranque) apaga o reinicia. Aquí eso es terminar el
+@@ -905,7 +958,7 @@ static long bsd_shared_region_check_np(struct ctx* c) {
+ static bsd_fn bsd_table[BSD_NAMES_N] = {
+ 	[1] = bsd_exit, [3] = bsd_read, [4] = bsd_write, [6] = bsd_close, [20] = bsd_getpid,
+ 	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [454] = bsd_system_override, [336] = bsd_proc_info,
+-	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_reboot, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload, [529] = bsd_os_fault_with_payload,
++	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [50] = bsd_setlogin, [494] = bsd_enotsup, [55] = bsd_reboot, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload, [529] = bsd_os_fault_with_payload,
+ };
+ 
+ 
+@@ -1218,6 +1271,19 @@ static int emulate_sidt(ucontext_t* uc) {
+ 	g[REG_RIP] += (greg_t)len;
+ 	return 1;
+ }
++// Hasta que install_dispatch() no instala los manejadores, el emulador no atiende el SIGILL: si el proceso recibe uno
++// mientras mapea la caché o carga las imágenes, muere con 132 sin dejar rastro (así se perdían las caídas de login,
++// screen, kextutil...). Este manejador temprano anota la dirección de la instrucción ilegal (con addr2line se sabe qué
++// parte del emulador la ejecutó) y sale igual.
++static void on_sigill_early(int sig, siginfo_t* si, void* v) {
++	(void)sig; (void)si;
++	const uint8_t* ip = (const uint8_t*)((ucontext_t*)v)->uc_mcontext.gregs[REG_RIP];
++	uint8_t b[4] = { 0 };
++	safe_read((uint64_t)ip, b, 4);
++	logf_("    SIGILL <%d> en el arranque del emulador, rip=0x%llx (%02x %02x %02x %02x)\n", getpid(),
++	      (unsigned long long)(uintptr_t)ip, b[0], b[1], b[2], b[3]);
++	_exit(132);
++}
+ static void on_sigsegv(int sig, siginfo_t* si, void* v) {
+ 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
+ 	if (si->si_code == 0x80 /*SI_KERNEL*/ && emulate_sidt(v)) { selector = SYSCALL_DISPATCH_FILTER_BLOCK; return; }
+@@ -1321,6 +1387,7 @@ int main(int argc, char** argv, char** envp) {
+ 	g_argv = argv;
+ 	fd_limit_raise();                                   // antes de reservar descriptores en la zona del emulador
+ 	{ int f = fcntl(2, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE); if (f >= 0) logfd = f; }
++	{ struct sigaction sa = { .sa_sigaction = on_sigill_early, .sa_flags = SA_SIGINFO }; sigaction(SIGILL, &sa, NULL); }
+ 	if (getenv("TAHOE_LOGFILE")) {          // los procesos hijos escriben su registro en un archivo común
+ 		int f = open(getenv("TAHOE_LOGFILE"), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+ 		if (f >= 0) { int g = fcntl(f, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE); close(f); if (g >= 0) logfd = g; }

@@ -1,0 +1,1254 @@
+From 193fb4c75f528c3edc3dcd6f69a3b50e084a31ce Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:37:23 -0600
+Subject: [PATCH 05/57] Sistema de archivos: atributos extendidos, firmlinks e
+ identificadores
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- getattrlist/getattrlistbulk: se empaquetan los atributos en el orden de
+  sys/attr.h, con attrreference_t y la regla de que los de directorio solo
+  valen para directorios. getattrlistbulk ya no devuelve ENOTSUP: es lo que
+  usa CFURLEnumerator para recorrer carpetas.
+- setattrlist/setattrlistat: fechas, modo, propietario, banderas (como xattr
+  de usuario) y FinderInfo.
+- Firmlinks: /usr/share/firmlinks de macOS. En XNU un firmlink se ve como un
+  directorio (lstat lo dice, readlink falla); aquí se reproduce eso, con la
+  ruta canónica del volumen de datos para F_GETPATH y
+  ATTR_CMNEXT_NOFIRMLINKPATH.
+- fsgetpath: tabla común de identificadores de archivo, poblada al hacer
+  stat, para resolver los que vienen de otro proceso.
+- access_extended, quotactl, faccessat, madvise con MADV_FREE.
+- Los volúmenes Data y Preboot del macOS completo se montan de verdad, con
+  su st_dev propio.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_fs.c  | 622 +++++++++++++++++++++++++++++++++++++++-----
+ tahoe-run/emu_fs2.c | 135 ++++++++--
+ 2 files changed, 683 insertions(+), 74 deletions(-)
+
+diff --git a/tahoe-run/emu_fs.c b/tahoe-run/emu_fs.c
+index 81a78ee..21a3831 100644
+--- a/tahoe-run/emu_fs.c
++++ b/tahoe-run/emu_fs.c
+@@ -5,11 +5,13 @@
+ #define _GNU_SOURCE
+ #include <errno.h>
+ #include <fcntl.h>
++#include <pthread.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
++#include <sys/statfs.h>
+ #include <sys/syscall.h>
+ #include <sys/sysmacros.h>
+ #include <unistd.h>
+@@ -17,6 +19,7 @@
+ #include <linux/falloc.h>
+ #include <dirent.h>
+ #include "tahoe.h"
++#include "nucleo.h"
+ 
+ static long err(void) { return -darwin_errno(errno); }
+ #define RET(r) do { long r_ = (r); return r_ < 0 ? err() : r_; } while (0)
+@@ -45,7 +48,7 @@ const char* tahoe_dev_alias(const char* p, char* buf, size_t cap) {
+ // Discos emulados: los nodos /dev/diskN[sM] (bloque) y /dev/rdiskN[sM] (caracteres) de los medios que anuncia IOKit
+ // (emu_iokit.inc, io_disks: BSD Major 1, Minor = posición en esta lista). /dev viene del anfitrión y no los tiene; aquí se
+ // presentan en stat/lstat y al listar /dev. No hay datos detrás (el volumen es una carpeta de Linux): abrirlos falla.
+-static const char* const emu_disks[] = { "disk0", "disk0s1", "disk1", "disk1s1" };
++static const char* const emu_disks[] = { "disk0", "disk0s1", "disk1", "disk1s1", "disk1s2", "disk1s3" };
+ #define EMU_DISK_MAJOR 1
+ static int emu_disk_node(const char* p, int* raw) {
+ 	if (strncmp(p, "/dev/", 5)) return -1;
+@@ -70,23 +73,178 @@ static void emu_disk_stat(int minor_, int raw, struct stat* s) {
+ // anfitrión) es del volumen /dev/disk1s1, como en un Mac (stat("/").st_dev = dev_t de disk1s1). Así se traduce una ruta a
+ // su disco (diskutil info /, devname). El resto (/dev, terminales...) conserva su dispositivo.
+ #define ROOT_VOLUME_MINOR 3                                           // disk1s1 en emu_disks
+-static uint32_t guest_dev(dev_t d) {
++// Volúmenes de un macOS completo: en un Mac, /System/Volumes/Data (los datos, a los que llevan los firmlinks /Library,
++// /Users, /private...) y /System/Volumes/Preboot (donde está el cryptex del sistema con la caché de dyld) son otros volúmenes
++// APFS del contenedor, con su propio dispositivo. Aquí son carpetas del mismo disco de Linux, montadas sobre sí mismas (bind)
++// en el espacio de montajes del arranque (sys_volumes_mount): mismo st_dev, pero otro id de montaje. Tras cada stat de algo
++// del disco de la raíz se mira el id de montaje (statx) y, si es el de uno de estos volúmenes, st_dev pasa a su marca, que
++// guest_dev traduce a su disco. En la Recovery no los hay (allí /System/Volumes/Data es un tmpfs).
++#ifndef STATX_MNT_ID
++#define STATX_MNT_ID 0x1000U
++#endif
++struct sys_volume { const char* on; const char* need; int minor; dev_t mark; };
++static const struct sys_volume sys_volumes[] = {
++	{ "/System/Volumes/Data",    "/private",   4, (dev_t)0xfffffffffffffffeULL },   // disk1s2 en emu_disks (marca: ningún st_dev real)
++	{ "/System/Volumes/Preboot", "/Cryptexes", 5, (dev_t)0xfffffffffffffffdULL },   // disk1s3
++};
++#define NSYSVOL (sizeof sys_volumes / sizeof sys_volumes[0])
++static dev_t root_dev(void) {
+ 	static dev_t root; static int known;
+ 	if (!known) { struct stat rs; known = 1; root = (tahoe_root && stat(tahoe_root, &rs) == 0) ? rs.st_dev : (dev_t)-1; }
+-	if (tahoe_root && d == root) return darwin_dev(EMU_DISK_MAJOR, ROOT_VOLUME_MINOR);
++	return root;
++}
++static uint64_t mnt_id_of(int dfd, const char* p, int fl) {
++	struct statx x;
++	if (statx(dfd, p, fl | AT_NO_AUTOMOUNT, STATX_MNT_ID, &x) != 0 || !(x.stx_mask & STATX_MNT_ID)) return 0;
++	return x.stx_mnt_id;
++}
++static uint64_t sysvol_mnt(size_t i) {                                  // id de montaje del volumen i, o 0 si no está montado
++	static uint64_t id[NSYSVOL]; static int known;
++	if (!known && tahoe_root) {
++		known = 1;
++		uint64_t r = mnt_id_of(AT_FDCWD, tahoe_root, 0);
++		for (size_t k = 0; k < NSYSVOL; k++) {
++			char h[4200]; struct statfs sf;
++			snprintf(h, sizeof h, "%s%s", tahoe_root, sys_volumes[k].on);
++			uint64_t d = mnt_id_of(AT_FDCWD, h, 0);
++			if (d && r && d != r && statfs(h, &sf) == 0 && sf.f_type != 0x01021994 /* tmpfs */) id[k] = d;
++		}
++	}
++	return id[i];
++}
++int sys_volume_present(int k) { return k >= 0 && (size_t)k < NSYSVOL && sysvol_mnt((size_t)k) != 0; }
++// Driver Metal de tahoe-run (tahoe-metal): con TAHOE_METAL=<carpeta del anfitrión con TahoeMetal.bundle>, las rutas de
++// macOS /System/Library/Extensions/TahoeMetal.bundle[/...] llevan a esa carpeta (sin distinguir mayúsculas, como APFS).
++// macOS ve el bundle donde Metal busca los drivers (MetalPluginName del IOAccelerator) y su copia no se toca. (Un overlayfs
++// sobre /System/Library/Extensions no vale: con la copia de macOS en un ext4 con casefold, overlayfs rechaza sus archivos.)
++#define METAL_GUEST "/System/Library/Extensions/TahoeMetal.bundle"
++int tahoe_metal_path(const char* guest, char* out, size_t cap) {
++	static const char* dir; static int known;
++	if (!known) { known = 1; dir = getenv("TAHOE_METAL"); if (dir && !*dir) dir = NULL; }
++	size_t n = sizeof METAL_GUEST - 1;
++	if (!dir || strncasecmp(guest, METAL_GUEST, n) || (guest[n] && guest[n] != '/')) return 0;
++	snprintf(out, cap, "%s/TahoeMetal.bundle%s", dir, guest + n);
++	return 1;
++}
++// Lo inverso: una ruta del anfitrión dentro de la carpeta de TAHOE_METAL -> la de macOS (F_GETPATH, getattrlist...).
++int tahoe_metal_guest(const char* host, char* out, size_t cap) {
++	const char* dir = getenv("TAHOE_METAL");
++	char pre[4200];
++	if (!dir || !*dir) return 0;
++	size_t n = (size_t)snprintf(pre, sizeof pre, "%s/TahoeMetal.bundle", dir);
++	if (strncmp(host, pre, n) || (host[n] && host[n] != '/')) return 0;
++	snprintf(out, cap, "%s%s", METAL_GUEST, host + n);
++	return 1;
++}
++// st_dev de la carpeta de TAHOE_METAL: para macOS es el volumen del sistema, como el resto de /System.
++static dev_t metal_overlay_dev(void) {
++	static dev_t d; static int known;
++	if (!known) {
++		known = 1; d = (dev_t)-1;
++		struct stat st;
++		if (getenv("TAHOE_METAL") && stat(getenv("TAHOE_METAL"), &st) == 0) d = st.st_dev;
++	}
++	return d;
++}
++void sys_volumes_mount(void) {                                         // en el PID 1 del arranque, antes que nada de macOS
++	if (!tahoe_root) return;
++	uint64_t r = mnt_id_of(AT_FDCWD, tahoe_root, 0);
++	for (size_t k = 0; k < NSYSVOL; k++) {
++		char h[4200], need[4300]; struct stat st;
++		snprintf(h, sizeof h, "%s%s", tahoe_root, sys_volumes[k].on);
++		snprintf(need, sizeof need, "%s%s", h, sys_volumes[k].need);
++		if (lstat(need, &st) != 0 || !S_ISDIR(st.st_mode)) continue;      // no está en el disco (Recovery)
++		if (mnt_id_of(AT_FDCWD, h, 0) != r) continue;                     // ya montado
++		if (syscall(SYS_mount, h, h, NULL, 4096UL /* MS_BIND */, NULL) != 0) logf_("    volumen %s: mount --bind falló: %s\n", sys_volumes[k].on, strerror(errno));
++	}
++}
++// Marca el st_dev de lo que esté en uno de esos volúmenes (mismos argumentos que fstatat/statx).
++static void vol_fix(struct stat* s, int dfd, const char* p, int fl) {
++	if (s->st_dev != root_dev() || !tahoe_root) return;
++	uint64_t m = 0;
++	for (size_t k = 0; k < NSYSVOL; k++) {
++		if (!sysvol_mnt(k)) continue;
++		if (!m && !(m = mnt_id_of(dfd, p, fl))) return;
++		if (m == sysvol_mnt(k)) { s->st_dev = sys_volumes[k].mark; return; }
++	}
++}
++static uint32_t guest_dev(dev_t d) {
++	for (size_t k = 0; k < NSYSVOL; k++) if (d == sys_volumes[k].mark) return darwin_dev(EMU_DISK_MAJOR, sys_volumes[k].minor);
++	if (tahoe_root && (d == root_dev() || d == metal_overlay_dev())) return darwin_dev(EMU_DISK_MAJOR, ROOT_VOLUME_MINOR);
+ 	return darwin_dev(major(d), minor(d));
+ }
+ 
+ // Resuelve una ruta absoluta del programa bajo TAHOE_ROOT (salvo /dev, del anfitrión).
+ static const char* resolve(const char* guest, char* buf, size_t cap) {
++	guest += tahoe_resolve_skip(guest);
++	if (tahoe_metal_path(guest, buf, cap)) return buf;
+ 	if (tahoe_root && guest[0] == '/' && !tahoe_host_passthrough(guest)) { snprintf(buf, cap, "%s%s", tahoe_root, guest); return buf; }
+ 	return tahoe_dev_alias(guest, buf, cap);                                                // /dev: siempre el del anfitrión (el de la raíz está vacío)
+ }
+ 
++// Firmlinks (/usr/share/firmlinks de macOS: /Library, /Users, /private, /System/Library/Caches...). En el árbol del anfitrión
++// son enlaces simbólicos al volumen de datos, pero en XNU un firmlink se ve como un directorio: lstat dice directorio,
++// readlink falla y la ruta canónica (F_GETPATH, getattrlist ATTR_CMN_FULLPATH) es /Library/... (la del volumen de datos,
++// /System/Volumes/Data/Library/..., solo con F_GETPATH_NOFIRMLINK o ATTR_CMNEXT_NOFIRMLINKPATH). Sin esto Security.framework
++// no reconocía el llavero del sistema por su ruta y lo «migraba» a System.keychain-db, borrando el bueno.
++static struct { char src[96], dst[128]; } fl_tab[48];
++static int fl_n;
++static pthread_once_t fl_once = PTHREAD_ONCE_INIT;
++static void fl_load(void) {
++	if (!tahoe_root) return;
++	char p[4200]; snprintf(p, sizeof p, "%s/usr/share/firmlinks", tahoe_root);
++	FILE* f = fopen(p, "r");
++	if (!f) return;
++	char l[300];
++	while (fl_n < 48 && fgets(l, sizeof l, f)) {
++		char* t = strchr(l, '\t');
++		if (!t || l[0] != '/') continue;
++		*t++ = 0; t[strcspn(t, "\r\n")] = 0;
++		snprintf(fl_tab[fl_n].src, sizeof fl_tab[fl_n].src, "%s", l);
++		snprintf(fl_tab[fl_n].dst, sizeof fl_tab[fl_n].dst, "/System/Volumes/Data/%s", t);
++		fl_n++;
++	}
++	fclose(f);
++}
++// ¿Es esta ruta del anfitrión (dentro de la raíz) el origen de un firmlink?
++static int host_is_firmlink(const char* host) {
++	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
++	if (!rl || strncmp(host, tahoe_root, rl) || host[rl] != '/') return 0;
++	pthread_once(&fl_once, fl_load);
++	const char* g = host + rl;
++	size_t gl = strlen(g); while (gl > 1 && g[gl - 1] == '/') gl--;
++	for (int i = 0; i < fl_n; i++) if (strlen(fl_tab[i].src) == gl && !strncmp(fl_tab[i].src, g, gl)) return 1;
++	return 0;
++}
++// Ruta de macOS del volumen de datos -> su forma con firmlink (/System/Volumes/Data/Library/x -> /Library/x).
++static void fl_canon(char* g, size_t cap) {
++	pthread_once(&fl_once, fl_load);
++	int best = -1; size_t bl = 0;
++	for (int i = 0; i < fl_n; i++) {
++		size_t dl = strlen(fl_tab[i].dst);
++		if (dl > bl && !strncmp(g, fl_tab[i].dst, dl) && (g[dl] == '/' || g[dl] == '\0')) { best = i; bl = dl; }
++	}
++	if (best < 0) return;
++	char t[4400]; snprintf(t, sizeof t, "%s%s", fl_tab[best].src, g + bl);
++	snprintf(g, cap, "%s", t);
++}
++
+ // ---------------------------------------------------------------- memoria
+ static long bsd_munmap(struct ctx* c) { RET(munmap((void*)c->a[0], c->a[1])); }
+ static long bsd_mprotect(struct ctx* c) { RET(mprotect((void*)c->a[0], c->a[1], (int)c->a[2] & 7)); }
+-static long bsd_madvise(struct ctx* c) { (void)c; return 0; }   // solo es una pista
++// madvise: el malloc de macOS devuelve la memoria que libera con MADV_FREE_REUSABLE (7) o MADV_FREE (5), que en Darwin
++// dejan que el núcleo descarte esas páginas (su contenido queda indefinido): es el MADV_FREE de Linux. Sin esto cada
++// proceso se quedaba con todo lo que llegó a usar (UserEventAgent ~80 MB) y con ~100 procesos la máquina no tenía memoria
++// para la caché de páginas: lsd pasaba el arranque esperando al disco. MADV_DONTNEED (4) en Darwin no borra el contenido
++// (el de Linux sí), así que ese y el resto se quedan en pista. En memoria que no es anónima privada Linux da EINVAL: igual.
++static long bsd_madvise(struct ctx* c) {
++	int adv = (int)c->a[2];
++	if (adv == 5 || adv == 7) {
++		uint64_t a = c->a[0] & ~4095ULL, end = (c->a[0] + c->a[1] + 4095) & ~4095ULL;
++		if (end > a) madvise((void*)a, end - a, MADV_FREE);
++	}
++	return 0;
++}
+ 
+ static long bsd_mmap(struct ctx* c) {
+ 	uint64_t addr = c->a[0], len = c->a[1], flags = c->a[3], off = c->a[5];
+@@ -116,13 +274,94 @@ static long bsd_access(struct ctx* c) {
+ 	int raw; if (emu_disk_node(p, &raw) >= 0) return ((int)c->a[1] & 1) ? -13 /* EACCES */ : 0;   // discos emulados: rw para root, no x
+ 	RET(access(resolve(p, b, sizeof b), (int)c->a[1] & 7));          // R_OK/W_OK/X_OK/F_OK coinciden
+ }
++// access_extended(entradas, tamaño, resultados, uid) = accessx_np: varias comprobaciones de una vez. Las entradas son
++// struct accessx_descriptor { u32 desplazamiento del nombre; i32 permisos; i32 relleno[2]; } seguidas de los nombres; un
++// desplazamiento 0 repite el nombre anterior y el del primero marca dónde acaban los descriptores. Cada resultado es 0 o
++// un errno. Los permisos extendidos (_READ_OK, _WRITE_OK, _DELETE_OK...) se reducen a leer/escribir/ejecutar. LaunchServices
++// (lsd) lo usa al servir a sus clientes; sin él lanzaba un os_fault y no terminaba de guardar su base de datos.
++static long bsd_access_extended(struct ctx* c) {
++	uint64_t base = c->a[0], size = c->a[1], out = c->a[2];
++	if (size < 16 || size > 65536) return -D_EINVAL;
++	uint8_t* buf = malloc(size + 1);
++	if (!buf) return -D_ENOMEM;
++	if (safe_read(base, buf, size) != (ssize_t)size) { free(buf); return -D_EFAULT; }
++	buf[size] = 0;
++	uint32_t first; memcpy(&first, buf, 4);
++	size_t n = first / 16;
++	if (!n || first > size) { free(buf); return -D_EINVAL; }
++	const char* name = NULL;
++	for (size_t i = 0; i < n; i++) {
++		uint32_t off; int32_t fl; memcpy(&off, buf + i * 16, 4); memcpy(&fl, buf + i * 16 + 4, 4);
++		if (off) { if (off >= size) { free(buf); return -D_EINVAL; } name = (const char*)buf + off; }
++		int mode = fl & 7;
++		if (fl & ((1 << 9) | (1 << 15) | (1 << 17) | (1 << 19))) mode |= R_OK;                       // _READ/_RATTR/_REXT/_RPERM
++		if (fl & ((1 << 10) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 16) | (1 << 18) | (1 << 20) | (1 << 21))) mode |= W_OK;
++		if (fl & (1 << 11)) mode |= X_OK;                                                                  // _EXECUTE_OK
++		char b[4200]; int32_t res = 0;
++		if (!name) res = 2;                                                                                // ENOENT
++		else if (access(resolve(name, b, sizeof b), mode) != 0) res = darwin_errno(errno);
++		if (safe_write(out + i * 4, &res, 4) != 4) { free(buf); return -D_EFAULT; }
++	}
++	free(buf);
++	return 0;
++}
++// quotactl: sin cuotas de disco (como APFS): ENOTSUP. lsd lo pregunta miles de veces mientras guarda su base de datos.
++static long bsd_quotactl(struct ctx* c) { (void)c; return -45; }
++// faccessat(dirfd, ruta, modo, flags): como access, con dirfd (AT_FDCWD de Darwin = -2) para rutas relativas. Flags de
++// Darwin: AT_EACCESS 0x10, AT_SYMLINK_NOFOLLOW 0x20 (y _ANY 0x800); en Linux AT_EACCESS 0x200 y AT_SYMLINK_NOFOLLOW 0x100,
++// que solo admite faccessat2. Lo usan su (PAM) y lwp-request.
++#ifndef SYS_faccessat2
++#define SYS_faccessat2 439
++#endif
++static long bsd_faccessat(struct ctx* c) {
++	char p[4096], b[4200];
++	if (safe_string(c->a[1], p, sizeof p) != 0) return -D_EFAULT;
++	int raw; if (emu_disk_node(p, &raw) >= 0) return ((int)c->a[2] & 1) ? -13 /* EACCES */ : 0;
++	int dir = (int)c->a[0], f = (int)c->a[3], lf = 0, mode = (int)c->a[2] & 7;
++	if (f & 0x10) lf |= AT_EACCESS;
++	if (f & (0x20 | 0x800)) lf |= AT_SYMLINK_NOFOLLOW;
++	const char* hp = (p[0] == '/' || dir == -2) ? resolve(p, b, sizeof b) : p;
++	int hd = (p[0] == '/' || dir == -2) ? AT_FDCWD : dir;
++	long r = syscall(SYS_faccessat2, hd, hp, mode, lf);
++	if (r < 0 && errno == ENOSYS) r = faccessat(hd, hp, mode, lf & AT_EACCESS);
++	return r < 0 ? err() : 0;
++}
++// Destino de un enlace tal como lo ve macOS: los absolutos se guardan dentro de la raíz (el kernel de Linux los sigue), así
++// que se les quita ese prefijo. Devuelve los bytes que caben en cap (readlink no termina en NUL).
++static ssize_t guest_link_target(const char* host, char* out, size_t cap) {
++	char t[4400];
++	ssize_t n = readlink(host, t, sizeof t - 1);
++	if (n < 0) return -1;
++	t[n] = 0;
++	const char* g = t;
++	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
++	if (rl && !strncmp(t, tahoe_root, rl) && t[rl] == '/') g = t + rl;
++	size_t gl = strlen(g); if (gl > cap) gl = cap;
++	memcpy(out, g, gl);
++	return (ssize_t)gl;
++}
+ static long bsd_readlink(struct ctx* c) {
+ 	char p[4096], b[4200], out[4096];
+ 	if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT;
+-	ssize_t n = readlink(resolve(p, b, sizeof b), out, c->a[2] < sizeof out ? c->a[2] : sizeof out);
++	if (host_is_firmlink(resolve(p, b, sizeof b))) return -D_EINVAL;   // un firmlink no es un enlace simbólico
++	ssize_t n = guest_link_target(resolve(p, b, sizeof b), out, c->a[2] < sizeof out ? c->a[2] : sizeof out);
+ 	if (n < 0) return err();
+ 	return safe_write(c->a[1], out, n) == n ? n : -D_EFAULT;
+ }
++// readlinkat(dirfd, ruta, búfer, tamaño)
++static long bsd_readlinkat(struct ctx* c) {
++	char p[4096], b[4200], out[4096], h[4400];
++	if (safe_string(c->a[1], p, sizeof p) != 0) return -D_EFAULT;
++	const char* host;
++	int dfd = (int)c->a[0] == -2 ? AT_FDCWD : (int)c->a[0];
++	if (p[0] == '/' || dfd == AT_FDCWD) host = resolve(p, b, sizeof b);
++	else { char lp[64]; snprintf(lp, sizeof lp, "/proc/self/fd/%d", dfd); char d[4096]; ssize_t dl = readlink(lp, d, sizeof d - 1);
++		if (dl < 0) return err(); d[dl] = 0; snprintf(h, sizeof h, "%s/%s", d, p); host = h; }
++	if (host_is_firmlink(host)) return -D_EINVAL;                      // un firmlink no es un enlace simbólico
++	ssize_t n = guest_link_target(host, out, c->a[3] < sizeof out ? c->a[3] : sizeof out);
++	if (n < 0) return err();
++	return safe_write(c->a[2], out, n) == n ? n : -D_EFAULT;
++}
+ 
+ // Banderas BSD (st_flags: SF_RESTRICTED, UF_HIDDEN...): Linux no las tiene; se guardan como atributo extendido del archivo.
+ // Hacen falta porque libsystem comprueba que rootless_mkdir_protected() dejó el directorio protegido.
+@@ -153,6 +392,54 @@ static void put_stat(uint64_t out, const struct stat* s, uint32_t flags) {
+ #undef W
+ 	safe_write(out, d, sizeof d);
+ }
++// Rutas por identificador de archivo, para fsgetpath: macOS resuelve así las URL de referencia de archivo
++// (/.file/id=...), que CoreFoundation y AppKit usan para volver a abrir lo que ya consultaron (p. ej. el nib de Language
++// Chooser: sin esto, «MainMenu.nib couldn't be opened» y loginwindow esperaba para siempre). En APFS el núcleo lo sabe
++// por el identificador; aquí se anota cada objeto consultado por ruta absoluta (stat, getattrlist) con los
++// identificadores que se le dan a macOS (los inodos de Linux). La tabla es común a todo el arranque
++// (/dev/shm/tahoe.<arranque>.fid, la borra la limpieza): el identificador suele venir de otro proceso (LaunchServices le
++// da a una aplicación la URL de su propio paquete), y con una tabla por proceso fsgetpath fallaba igual.
++#define FID_N 16384
++#define FID_PATH 248
++struct fid_ent { uint64_t ino; char path[FID_PATH]; };
++struct fid_shm { uint32_t lk, pad; struct fid_ent e[FID_N]; };
++static struct fid_shm* fid_tab;
++static pthread_once_t fid_once = PTHREAD_ONCE_INIT;
++static void fid_open(void) {
++	const char* tag = getenv("TAHOE_PORTS_OWNER");
++	if (!tag || !tag[0] || strchr(tag, '/')) return;
++	char path[128];
++	snprintf(path, sizeof path, "/dev/shm/tahoe.%s.fid", tag);
++	int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
++	if (fd < 0) return;
++	struct stat st;
++	if (fstat(fd, &st) != 0 || (st.st_size < (off_t)sizeof(struct fid_shm) && ftruncate(fd, sizeof(struct fid_shm)) != 0)) { close(fd); return; }
++	void* m = mmap(NULL, sizeof(struct fid_shm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++	close(fd);
++	if (m != MAP_FAILED) fid_tab = m;
++}
++static uint32_t fid_hash(uint64_t ino) { return (uint32_t)((ino * 0x9e3779b97f4a7c15ull) >> 40) % FID_N; }
++static void fid_note(uint64_t ino, const char* gpath) {
++	if (!ino || !gpath || gpath[0] != '/' || strlen(gpath) >= FID_PATH) return;
++	pthread_once(&fid_once, fid_open);
++	if (!fid_tab) return;
++	struct fid_ent* e = &fid_tab->e[fid_hash(ino)];
++	if (e->ino == ino && !strcmp(e->path, gpath)) return;       // ya estaba (lo normal): sin candado
++	nucleo_candado_tomar(&fid_tab->lk);
++	e->ino = ino; snprintf(e->path, sizeof e->path, "%s", gpath);
++	nucleo_candado_soltar(&fid_tab->lk);
++}
++// Copia la ruta del identificador en out; 1 si se conoce.
++static int fid_lookup(uint64_t ino, char* out, size_t n) {
++	pthread_once(&fid_once, fid_open);
++	if (!fid_tab) return 0;
++	int ok = 0;
++	nucleo_candado_tomar(&fid_tab->lk);
++	struct fid_ent* e = &fid_tab->e[fid_hash(ino)];
++	if (e->ino == ino && e->path[0]) { snprintf(out, n, "%s", e->path); ok = 1; }
++	nucleo_candado_soltar(&fid_tab->lk);
++	return ok;
++}
+ static long do_stat(struct ctx* c, int follow) {
+ 	char p[4096], b[4200];
+ 	struct stat s;
+@@ -160,10 +447,13 @@ static long do_stat(struct ctx* c, int follow) {
+ 	int raw, dm = emu_disk_node(p, &raw);
+ 	if (dm >= 0) { emu_disk_stat(dm, raw, &s); put_stat(c->a[1], &s, 0); return 0; }
+ 	const char* path = resolve(p, b, sizeof b);
++	if (!follow && host_is_firmlink(path)) follow = 1;            // un firmlink se ve como directorio
+ 	if ((follow ? stat(path, &s) : lstat(path, &s)) != 0) {
+ 		if (trace_all) logf_("    stat(\"%s\") -> %s\n", p, strerror(errno));
+ 		return err();
+ 	}
++	vol_fix(&s, AT_FDCWD, path, follow ? 0 : AT_SYMLINK_NOFOLLOW);
++	if (p[0] == '/') fid_note(s.st_ino, p);
+ 	put_stat(c->a[1], &s, follow ? tahoe_flags_path(path) : tahoe_flags_path(path));
+ 	return 0;
+ }
+@@ -246,23 +536,26 @@ static long bsd_listxattr(struct ctx* c) { return xlist(c, 0); }   static long b
+ static long bsd_fstat64(struct ctx* c) {
+ 	struct stat s;
+ 	if (fstat((int)c->a[0], &s) != 0) return err();
++	vol_fix(&s, (int)c->a[0], "", AT_EMPTY_PATH);
+ 	put_stat(c->a[1], &s, tahoe_flags_fd((int)c->a[0]));
+ 	return 0;
+ }
+ 
+ 
+ static long bsd_dup(struct ctx* c)  { RET(dup((int)c->a[0])); }
+-static long bsd_dup2(struct ctx* c) { RET(dup2((int)c->a[0], (int)c->a[1])); }
++static long bsd_dup2(struct ctx* c) { if ((int)c->a[1] >= FD_INTERNAL_BASE) return -9; RET(dup2((int)c->a[0], (int)c->a[1])); }   // EBADF: zona del emulador
+ 
+-// fstatat64(fd, ruta, búfer, flags): AT_FDCWD = -2 y AT_SYMLINK_NOFOLLOW = 0x20 en Darwin
++// fstatat64(fd, ruta, búfer, flags): AT_FDCWD = -2 y AT_SYMLINK_NOFOLLOW = 0x20 en Darwin. AT_SYMLINK_NOFOLLOW_ANY (0x800,
++// macOS 14) tampoco sigue los enlaces intermedios; aquí cuenta como el primero (el último componente no se sigue).
+ static long bsd_fstatat64(struct ctx* c) {
+ 	char p[4096], b[4200];
+ 	struct stat s;
+ 	if (safe_string(c->a[1], p, sizeof p) != 0) return -D_EFAULT;
+ 	int dfd = (int)c->a[0];
+ 	if (dfd == -2) dfd = AT_FDCWD;
+-	int flags = ((int)c->a[3] & 0x20) ? AT_SYMLINK_NOFOLLOW : 0;
++	int flags = ((int)c->a[3] & (0x20 | 0x800)) ? AT_SYMLINK_NOFOLLOW : 0;
+ 	if (p[0] == '\0') flags |= AT_EMPTY_PATH;
++	if ((flags & AT_SYMLINK_NOFOLLOW) && p[0] == '/' && host_is_firmlink(resolve(p, b, sizeof b))) flags &= ~AT_SYMLINK_NOFOLLOW;
+ 	{                                                                // discos emulados: por ruta absoluta o relativa a /dev
+ 		char full[4200]; int raw, dm = -1;
+ 		if (p[0] == '/') dm = emu_disk_node(p, &raw);
+@@ -280,6 +573,7 @@ static long bsd_fstatat64(struct ctx* c) {
+ 		if (trace_all) logf_("    fstatat(%d, \"%s\") -> %s\n", (int)c->a[0], p, strerror(errno));
+ 		return err();
+ 	}
++	vol_fix(&s, dfd, path, flags);
+ 	uint32_t fl = 0;
+ 	if (dfd == AT_FDCWD || p[0] == '/') fl = tahoe_flags_path(path);
+ 	else if (p[0] == '\0') fl = tahoe_flags_fd(dfd);
+@@ -292,14 +586,14 @@ static long bsd_fstatat64(struct ctx* c) {
+ static long bsd_fcntl(struct ctx* c) {
+ 	int fd = (int)c->a[0], cmd = (int)c->a[1];
+ 	switch (cmd) {
+-	case 0:  RET(fcntl(fd, F_DUPFD, (int)c->a[2]));
++	case 0:  if ((int)c->a[2] >= FD_INTERNAL_BASE) return -22; RET(fcntl(fd, F_DUPFD, (int)c->a[2]));
+ 	case 1:  RET(fcntl(fd, F_GETFD));
+ 	case 2:  RET(fcntl(fd, F_SETFD, (int)c->a[2]));
+-	case 67: RET(fcntl(fd, F_DUPFD_CLOEXEC, (int)c->a[2]));
++	case 67: if ((int)c->a[2] >= FD_INTERNAL_BASE) return -22; RET(fcntl(fd, F_DUPFD_CLOEXEC, (int)c->a[2]));
+ 	case 3: { int f = fcntl(fd, F_GETFL); if (f < 0) return err(); return (f & 3) | ((f & O_NONBLOCK) ? 4 : 0) | ((f & O_APPEND) ? 8 : 0); }
+ 	case 4: { int f = (int)c->a[2], lf = 0; if (f & 4) lf |= O_NONBLOCK; if (f & 8) lf |= O_APPEND; RET(fcntl(fd, F_SETFL, lf)); }
+ 	case 45: case 48: case 51: return 0;                  // F_RDAHEAD, F_NOCACHE, F_FULLFSYNC: sin efecto
+-	case 50: {                                            // F_GETPATH: ruta del descriptor
++	case 50: case 102: {                                  // F_GETPATH / F_GETPATH_NOFIRMLINK: ruta del descriptor
+ 		char link[64], path[4096];
+ 		snprintf(link, sizeof link, "/proc/thread-self/fd/%d", fd);
+ 		ssize_t n = readlink(link, path, sizeof path - 1);
+@@ -308,10 +602,11 @@ static long bsd_fcntl(struct ctx* c) {
+ 		const char* p = path;
+ 		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+ 		if (rl && !strncmp(path, tahoe_root, rl) && (path[rl] == '/' || path[rl] == '\0')) p = path[rl] ? path + rl : "/";    // quitar la raíz de macOS
+-		if (trace_all) logf_("    F_GETPATH(fd=%d) = \"%s\"\n", fd, p);
+-		return safe_write(c->a[2], p, strlen(p) + 1) > 0 ? 0 : -D_EFAULT;
++		char gp[4400]; if (!tahoe_metal_guest(path, gp, sizeof gp)) snprintf(gp, sizeof gp, "%s", p);
++		if (cmd != 102) fl_canon(gp, sizeof gp);                        // F_GETPATH: con firmlinks; F_GETPATH_NOFIRMLINK: sin ellos
++		if (trace_all) logf_("    F_GETPATH(fd=%d) = \"%s\"\n", fd, gp);
++		return safe_write(c->a[2], gp, strlen(gp) + 1) > 0 ? 0 : -D_EFAULT;
+ 	}
+-	case 102: { struct ctx c2 = *c; c2.a[1] = 50; return bsd_fcntl(&c2); }   // F_GETPATH_NOFIRMLINK: sin firmlinks aquí
+ 	case 7: case 8: case 9: case 90: case 91: case 92: case 93: {   // F_GETLK/SETLK/SETLKW y sus versiones OFD (por descripción abierta)
+ 		// struct flock de Darwin: l_start, l_len (off_t), l_pid, l_type, l_whence (short). La de Linux tiene otro orden.
+ 		uint8_t df[24];
+@@ -337,6 +632,18 @@ static long bsd_fcntl(struct ctx* c) {
+ 		int64_t end = st.st_size;
+ 		return safe_write(c->a[2], &end, 8) == 8 ? 0 : -D_EFAULT;   // fs_file_start de salida: fin cubierto
+ 	}
++	case 105: {                                             // F_GETSIGSINFO (fgetsigsinfo: offset, petición, es_plataforma)
++		// Como XNU: con GETSIGSINFO_PLATFORM_BINARY (1), si la firma del archivo es de plataforma de Apple; sin firma, ENOENT.
++		// Security lo pide de cada binario que revisa (system_profiler, al hacer inventario de programas).
++		uint8_t g[16];
++		if (safe_read(c->a[2], g, 16) != 16) return -D_EFAULT;
++		int32_t req; memcpy(&req, g + 8, 4);
++		if (req != 1) return -D_EINVAL;
++		int pl = cs_file_platform(fd);
++		if (pl < 0) return -D_ENOENT;
++		int32_t v = pl; memcpy(g + 12, &v, 4);
++		return safe_write(c->a[2], g, 16) == 16 ? 0 : -D_EFAULT;
++	}
+ 	case 98: case 62: case 76: case 100: case 101: return 0;   // CHECK_LV, NODIRECT, SINGLE_WRITER, TRIM_ACTIVE_FILE, SPECULATIVE_READ
+ 	case 73: return 0;                                      // F_SETNOSIGPIPE: el emulador ya evita SIGPIPE en los envíos
+ 	case 74: case 63: case 77: return 0;                    // F_GETNOSIGPIPE, F_GETPROTECTIONCLASS, F_GETPROTECTIONLEVEL: 0
+@@ -362,7 +669,6 @@ static long bsd_fcntl(struct ctx* c) {
+ //   0 f_bsize  4 f_iosize  8 f_blocks  16 f_bfree  24 f_bavail  32 f_files  40 f_ffree  48 f_fsid[2]  56 f_owner
+ //   60 f_type  64 f_flags  68 f_fssubtype  72 f_fstypename[16]  88 f_mntonname[1024]  1112 f_mntfromname[1024]
+ //   2136 f_flags_ext  2140 f_reserved[7]
+-#include <sys/statfs.h>
+ // Banderas de montaje de XNU (sys/mount.h). MNT_UPDATE (0x10000) es una orden para mount(2), no un estado del volumen.
+ #define MNT_RDONLY      0x00000001
+ #define MNT_LOCAL       0x00001000
+@@ -381,6 +687,12 @@ static const struct gmount gmounts[] = {
+ };
+ #define NGMOUNT (sizeof gmounts / sizeof gmounts[0])
+ static int is_devfs_host(const struct statfs* s) { return s->f_type == 0x1373 /* devtmpfs */ || s->f_type == 0x1cd1 /* devpts */; }
++// f_fsid: {dev_t del dispositivo, tipo de vfs}, como en XNU
++static void fsid_of(const struct statfs* s, const struct gmount* m, uint32_t id[2]) {
++	int raw, dm = emu_disk_node(m->from, &raw);
++	if (dm >= 0) { id[0] = darwin_dev(EMU_DISK_MAJOR, dm); id[1] = m->ftype; }
++	else { id[0] = (uint32_t)s->f_fsid.__val[0]; id[1] = (uint32_t)s->f_fsid.__val[1]; }
++}
+ static void put_statfs(uint64_t out, const struct statfs* s, const struct gmount* m) {
+ 	uint8_t d[2168];
+ 	memset(d, 0, sizeof d);
+@@ -392,11 +704,7 @@ static void put_statfs(uint64_t out, const struct statfs* s, const struct gmount
+ 	W(uint64_t, 24, s->f_bavail);
+ 	W(uint64_t, 32, s->f_files);
+ 	W(uint64_t, 40, s->f_ffree);
+-	{                                                                // f_fsid: {dev_t del dispositivo, tipo de vfs}, como en XNU
+-		int raw, dm = emu_disk_node(m->from, &raw);
+-		if (dm >= 0) { W(uint32_t, 48, darwin_dev(EMU_DISK_MAJOR, dm)); W(uint32_t, 52, m->ftype); }
+-		else { W(uint32_t, 48, s->f_fsid.__val[0]); W(uint32_t, 52, s->f_fsid.__val[1]); }
+-	}
++	{ uint32_t id[2]; fsid_of(s, m, id); W(uint32_t, 48, id[0]); W(uint32_t, 52, id[1]); }
+ 	W(uint32_t, 60, m->ftype);
+ 	W(uint32_t, 64, m->flags);
+ 	strncpy((char*)d + 72, m->type, 15);
+@@ -405,20 +713,95 @@ static void put_statfs(uint64_t out, const struct statfs* s, const struct gmount
+ #undef W
+ 	safe_write(out, d, sizeof d);
+ }
+-static const struct gmount* gmount_of(const struct statfs* s) { return is_devfs_host(s) ? &gmounts[1] : &gmounts[0]; }
++// tmpfs montados por macOS (mount_tmpfs: la Recovery pone uno en /System/Volumes/Data, su /private, que empieza vacío en cada
++// arranque). Son tmpfs de Linux de verdad en el espacio de montajes del arranque (unshare --mount), así que todos sus procesos
++// los ven; se leen de /proc/self/mountinfo (los que estén dentro de la raíz). Número de vfs: el que XNU asigna al cargar
++// tmpfs.kext no es fijo; se usa el siguiente libre tras los del núcleo.
++#define LINUX_TMPFS_MAGIC 0x01021994
++#define MNT_NOSUID 0x00000008
++#define MNT_NODEV  0x00000010
++struct dmount { char on[1024], host[1100]; struct gmount m; };
++static int tmpfs_mounts(struct dmount* v, int max) {
++	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
++	if (!rl) return 0;
++	FILE* f = fopen("/proc/self/mountinfo", "r");
++	if (!f) return 0;
++	char ln[4096]; int n = 0;
++	while (n < max && fgets(ln, sizeof ln, f)) {
++		char mp[2048], fs[64]; const char* sep = strstr(ln, " - ");
++		if (!sep || sscanf(sep + 3, "%63s", fs) != 1 || strcmp(fs, "tmpfs")) continue;
++		if (sscanf(ln, "%*s %*s %*s %*s %2047s", mp) != 1) continue;
++		char h[1100]; size_t k = 0;                                      // \040 y demás escapes octales de mountinfo
++		for (const char* q = mp; *q && k < sizeof h - 1; q++) {
++			if (q[0] == '\\' && q[1] >= '0' && q[1] <= '7' && q[2] && q[3]) { h[k++] = (char)((q[1] - '0') * 64 + (q[2] - '0') * 8 + (q[3] - '0')); q += 3; }
++			else h[k++] = *q;
++		}
++		h[k] = 0;
++		if (strncmp(h, tahoe_root, rl) || h[rl] != '/') continue;
++		snprintf(v[n].host, sizeof v[n].host, "%s", h);
++		snprintf(v[n].on, sizeof v[n].on, "%s", h + rl);
++		v[n].m = (struct gmount){ v[n].on, "tmpfs", "tmpfs", 0x1d, MNT_LOCAL | MNT_NOSUID | MNT_NODEV, 4096 };
++		n++;
++	}
++	fclose(f);
++	return n;
++}
++// Los volúmenes de sys_volumes como los lista mount en un Mac: «/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled,
++// nobrowse)», igual Preboot.
++static const struct gmount sysvol_gmounts[NSYSVOL] = {
++	{ "/System/Volumes/Data",    "/dev/disk1s2", "apfs", 0x18, MNT_LOCAL | MNT_DOVOLFS | MNT_JOURNALED | MNT_DONTBROWSE | MNT_MULTILABEL, 1048576 },
++	{ "/System/Volumes/Preboot", "/dev/disk1s3", "apfs", 0x18, MNT_LOCAL | MNT_DOVOLFS | MNT_JOURNALED | MNT_DONTBROWSE | MNT_MULTILABEL, 1048576 },
++};
++// Montaje de macOS al que pertenece un archivo (por su statfs y su dev_t): los tmpfs de la lista, /dev o la raíz
++static const struct gmount* gmount_of_dev(const struct statfs* s, dev_t dev) {
++	if (s->f_type == LINUX_TMPFS_MAGIC) {
++		TLS_LAZY(struct dmount, dm, 16);
++		int n = tmpfs_mounts(dm, 16);
++		for (int i = 0; i < n; i++) { struct stat st; if (stat(dm[i].host, &st) == 0 && st.st_dev == dev) return &dm[i].m; }
++	}
++	for (size_t k = 0; k < NSYSVOL; k++) if (dev == sys_volumes[k].mark) return &sysvol_gmounts[k];
++	return is_devfs_host(s) ? &gmounts[1] : &gmounts[0];
++}
+ // getfsstat64(buf, bufsize, flags): sin búfer devuelve el número de montajes; si no, copia los que quepan.
+ static long getfsstat_common(uint64_t buf, uint64_t bufsize) {
+-	if (!buf) return NGMOUNT;
++	TLS_LAZY(struct dmount, dm, 16);
++	int nd = tmpfs_mounts(dm, 16);
++	for (size_t k = 0; k < NSYSVOL && nd < 16; k++) {                   // Data y Preboot, tras la raíz y /dev
++		if (!sysvol_mnt(k)) continue;
++		snprintf(dm[nd].host, sizeof dm[nd].host, "%s%s", tahoe_root, sys_volumes[k].on);
++		dm[nd].m = sysvol_gmounts[k]; nd++;
++	}
++	if (!buf) return (long)NGMOUNT + nd;
+ 	long n = 0;
+-	for (size_t i = 0; i < NGMOUNT && (n + 1) * 2168 <= (long)bufsize; i++) {
++	for (size_t i = 0; i < NGMOUNT + (size_t)nd && (n + 1) * 2168 <= (long)bufsize; i++) {
+ 		struct statfs s;
+-		const char* hp = !strcmp(gmounts[i].on, "/") ? (tahoe_root ? tahoe_root : "/") : gmounts[i].on;
++		const struct gmount* m = i < NGMOUNT ? &gmounts[i] : &dm[i - NGMOUNT].m;
++		const char* hp = i >= NGMOUNT ? dm[i - NGMOUNT].host : !strcmp(m->on, "/") ? (tahoe_root ? tahoe_root : "/") : m->on;
+ 		if (statfs(hp, &s) != 0) memset(&s, 0, sizeof s);
+-		put_statfs(buf + (uint64_t)n * 2168, &s, &gmounts[i]);
++		put_statfs(buf + (uint64_t)n * 2168, &s, m);
+ 		n++;
+ 	}
+ 	return n;
+ }
++// Identificadores (fsid) de todos los montajes, en el mismo orden y con los mismos valores que getfsstat: vfs.generic.vfsidlist
++int vfs_fsids(uint32_t* out, int max) {
++	TLS_LAZY(struct dmount, dm, 16);
++	int nd = tmpfs_mounts(dm, 16);
++	for (size_t k = 0; k < NSYSVOL && nd < 16; k++) {
++		if (!sysvol_mnt(k)) continue;
++		snprintf(dm[nd].host, sizeof dm[nd].host, "%s%s", tahoe_root, sys_volumes[k].on);
++		dm[nd].m = sysvol_gmounts[k]; nd++;
++	}
++	int n = 0;
++	for (size_t i = 0; i < NGMOUNT + (size_t)nd && n < max; i++, n++) {
++		struct statfs s;
++		const struct gmount* m = i < NGMOUNT ? &gmounts[i] : &dm[i - NGMOUNT].m;
++		const char* hp = i >= NGMOUNT ? dm[i - NGMOUNT].host : !strcmp(m->on, "/") ? (tahoe_root ? tahoe_root : "/") : m->on;
++		if (statfs(hp, &s) != 0) memset(&s, 0, sizeof s);
++		fsid_of(&s, m, out + 2 * n);
++	}
++	return n;
++}
+ static long bsd_getfsstat64(struct ctx* c) { return getfsstat_common(c->a[0], c->a[1]); }
+ // __mac_getfsstat(buf, bufsize, mac, macsize, flags): igual, sin etiquetas MAC
+ static long bsd_mac_getfsstat(struct ctx* c) { return getfsstat_common(c->a[0], c->a[1]); }
+@@ -426,14 +809,17 @@ static long bsd_statfs64(struct ctx* c) {
+ 	char p[4096], b[4200];
+ 	struct statfs s;
+ 	if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT;
+-	if (statfs(resolve(p, b, sizeof b), &s) != 0) return err();
+-	put_statfs(c->a[1], &s, gmount_of(&s));
++	const char* hp = resolve(p, b, sizeof b); struct stat st;
++	if (statfs(hp, &s) != 0 || stat(hp, &st) != 0) return err();
++	vol_fix(&st, AT_FDCWD, hp, 0);
++	put_statfs(c->a[1], &s, gmount_of_dev(&s, st.st_dev));
+ 	return 0;
+ }
+ static long bsd_fstatfs64(struct ctx* c) {
+-	struct statfs s;
+-	if (fstatfs((int)c->a[0], &s) != 0) return err();
+-	put_statfs(c->a[1], &s, gmount_of(&s));
++	struct statfs s; struct stat st;
++	if (fstatfs((int)c->a[0], &s) != 0 || fstat((int)c->a[0], &st) != 0) return err();
++	vol_fix(&st, (int)c->a[0], "", AT_EMPTY_PATH);
++	put_statfs(c->a[1], &s, gmount_of_dev(&s, st.st_dev));
+ 	return 0;
+ }
+ 
+@@ -450,6 +836,14 @@ static const struct gmount* gmount_at(const char* p) {
+ static long do_mount(const char* type, const char* path, uint32_t flags) {
+ 	logf_("    mount(\"%s\", \"%s\", 0x%x)\n", type, path, flags);
+ 	const struct gmount* m = gmount_at(path);
++	if (!strcmp(type, "tmpfs") && !(flags & MNT_UPDATE)) {   // tmpfs de verdad en el espacio de montajes del arranque
++		char b[4200]; const char* hp = resolve(path, b, sizeof b);
++		unsigned long lf = ((flags & MNT_RDONLY) ? 1 : 0) | ((flags & MNT_NOSUID) ? 2 : 0) | ((flags & MNT_NODEV) ? 4 : 0);
++		if (syscall(SYS_mount, "tmpfs", hp, "tmpfs", lf, "mode=0755") != 0) return err();
++		if (!strcmp(path, "/System/Volumes/Data")) data_log_storage(hp);   // el /private nuevo, con el almacén de registros
++		vfs_event_signal(0x8);                          // VQ_MOUNT
++		return 0;
++	}
+ 	if (flags & MNT_UPDATE) {
+ 		if (!m) return -D_EINVAL;
+ 		vfs_event_signal(0x100);                        // VQ_UPDATE, como vfs_event_signal tras una actualización en XNU
+@@ -476,6 +870,12 @@ static long bsd_unmount(struct ctx* c) {
+ 	char p[4096];
+ 	if (safe_string(c->a[0], p, sizeof p) != 0) return -D_EFAULT;
+ 	logf_("    unmount(\"%s\", 0x%lx)\n", p, c->a[1]);
++	struct dmount dm[16]; int nd = tmpfs_mounts(dm, 16);
++	for (int i = 0; i < nd; i++) if (!strcmp(dm[i].on, p)) {
++		if (syscall(SYS_umount2, dm[i].host, (c->a[1] & 0x80000) ? 1 /* MNT_FORCE de Linux */ : 0) != 0) return err();
++		vfs_event_signal(0x10);                         // VQ_UNMOUNT
++		return 0;
++	}
+ 	return gmount_at(p) ? -16 : -D_EINVAL;
+ }
+ static long bsd_funmount(struct ctx* c) { (void)c; return -16; }
+@@ -491,6 +891,7 @@ static long bsd_funmount(struct ctx* c) { (void)c; return -16; }
+ #define ATTR_VOL_CAPABILITIES 0x00020000u
+ #define ATTR_VOL_UUID  0x00040000u
+ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t file, uint32_t cmnext, const char* name, const char* fullpath, const struct stat* s, int pack_inval);
++static __thread const char* pe_nofirm;                   // ruta sin firmlinks para ATTR_CMNEXT_NOFIRMLINKPATH (getattrlist)
+ // Copia el resultado de getattrlist como XNU: si no cabe se copia lo que quepa (truncado, sin error), y el primer campo
+ // lleva lo copiado, o lo necesario con FSOPT_REPORT_FULLSIZE (0x4).
+ static long attr_copyout(uint64_t dst, uint64_t size, uint64_t opts, uint8_t* buf, size_t n) {
+@@ -506,27 +907,37 @@ static long bsd_getattrlist(struct ctx* c) {
+ 	struct stat s;
+ 	if (safe_string(c->a[0], p, sizeof p) != 0 || safe_read(c->a[1], al, sizeof al) != sizeof al) return -D_EFAULT;
+ 	uint32_t common = al[1], vol = al[2];
+-	if (trace_all || (diag_target() && diag_all())) logf_("    getattrlist(\"%s\") common=0x%x vol=0x%x dir=0x%x file=0x%x opts=0x%lx\n", p, common, vol, al[3], al[4], (long)c->a[4]);
++	if (trace_all || (diag_target() && diag_all())) logf_("    getattrlist(\"%s\") common=0x%x vol=0x%x dir=0x%x file=0x%x fork=0x%x opts=0x%lx\n", p, common, vol, al[3], al[4], al[5], (long)c->a[4]);
+ 	if (!vol) {                                           // atributos del objeto: empaquetado general
+-		int nofollow = (c->a[4] & 1) != 0;
++		int nofollow = (c->a[4] & (1 | 0x800)) != 0;          // FSOPT_NOFOLLOW / FSOPT_NOFOLLOW_ANY
+ 		struct stat st;
+ 		const char* rpth = resolve(p, b, sizeof b);
++		if (nofollow && host_is_firmlink(rpth)) nofollow = 0;               // un firmlink se ve como directorio
+ 		if ((nofollow ? lstat(rpth, &st) : stat(rpth, &st)) != 0) return err();
++		vol_fix(&st, AT_FDCWD, rpth, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
+ 		char real[4096], gp2[4096];
+ 		const char* rp = realpath(rpth, real) ? real : p;
+ 		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+ 		if (rl && !strncmp(rp, tahoe_root, rl) && (rp[rl] == '/' || rp[rl] == '\0')) rp += rl;
+-		snprintf(gp2, sizeof gp2, "%s", rp[0] ? rp : "/");
++		if (!tahoe_metal_guest(rp, gp2, sizeof gp2)) snprintf(gp2, sizeof gp2, "%s", rp[0] ? rp : "/");
++		char nofirm[4096]; snprintf(nofirm, sizeof nofirm, "%s", gp2);       // ATTR_CMNEXT_NOFIRMLINKPATH: la del volumen de datos
++		fl_canon(gp2, sizeof gp2);
+ 		const char* base = strrchr(gp2, '/');
+ 		base = base && base[1] ? base + 1 : gp2;
++		fid_note(st.st_ino, gp2);
+ 		static uint8_t buf[8192];
++		pe_nofirm = nofirm;
+ 		size_t n = pack_entry(buf, common, al[3], al[4], (c->a[4] & 0x20) ? al[5] : 0, base, gp2, &st, (c->a[4] & 8) != 0);
++		pe_nofirm = NULL;
+ 		return attr_copyout(c->a[2], c->a[3], c->a[4], buf, n);
+ 	}
+ 	// Atributos de volumen (con algunos comunes). Orden de sys/attr.h: longitud, returned_attrs (si se pidió), comunes y de
+ 	// volumen por orden de bit. Las cadenas van al final y se señalan con attrreference_t {desplazamiento desde la propia
+ 	// referencia, longitud con el NUL}. El volumen se presenta como el APFS de arranque montado en "/".
+-	uint32_t known_c = ATTR_CMN_DEVID | ATTR_CMN_FSID | ATTR_CMN_FULLPATH | 0x80000000u /*RETURNED_ATTRS*/;
++	// comunes que se dan junto a los de volumen: CFURL los pide así (DEVID, OBJTYPE, OBJID, PAROBJID, SCRIPT, ACCESSMASK y
++	// FLAGS con la información del volumen) para resolver cada URL de archivo; sin ellos, ENOTSUP y AppKit no abría el nib de
++	// Language Chooser
++	uint32_t known_c = ATTR_CMN_DEVID | ATTR_CMN_FSID | 0x8 | 0x20 | 0x80 | 0x100 | 0x20000 | 0x40000 | ATTR_CMN_FULLPATH | 0x80000000u /*RETURNED_ATTRS*/;
+ 	uint32_t known_v = 0xF0FFFFFFu;                               // ATTR_VOL_VALIDMASK
+ 	if ((common & ~known_c) || (vol & ~known_v) || al[3] || al[4] || al[5]) {
+ 		logf_("    getattrlist(\"%s\"): atributos sin implementar common=0x%x vol=0x%x dir=0x%x file=0x%x fork=0x%x\n", p, common, vol, al[3], al[4], al[5]);
+@@ -534,7 +945,15 @@ static long bsd_getattrlist(struct ctx* c) {
+ 	}
+ 	const char* rpv = resolve(p, b, sizeof b);
+ 	if (stat(rpv, &s) != 0) return err();
++	vol_fix(&s, AT_FDCWD, rpv, 0);
+ 	struct statfs sf; if (statfs(rpv, &sf) != 0) memset(&sf, 0, sizeof sf);
++	// El volumen al que pertenece la ruta (como statfs): la raíz, Data o Preboot de un macOS completo, /dev o un tmpfs.
++	// Punto de montaje, dispositivo, banderas, nombre y UUID son los suyos (los mismos que dan getfsstat e IOKit): con los
++	// de la raíz para todo, diskarbitrationd no encontraba /System/Volumes/Data ni Preboot («Could not find disk»).
++	const struct gmount* vm = gmount_of_dev(&sf, s.st_dev);
++	int vk = -1; for (size_t k = 0; k < NSYSVOL; k++) if (s.st_dev == sys_volumes[k].mark) vk = (int)k;
++	int full = sysvol_mnt(0) && sysvol_mnt(1);
++	const char* vname = vk == 0 ? "Macintosh HD - Data" : vk == 1 ? "Preboot" : !strcmp(vm->on, "/") ? (full ? "Macintosh HD" : "macOS Base System") : vm->type;
+ 	uint8_t out[1024];
+ 	size_t n = 4;                                         // el primer campo es la longitud total
+ 	struct { size_t pos; const char* str; } refs[8]; int nrefs = 0;
+@@ -549,12 +968,23 @@ static long bsd_getattrlist(struct ctx* c) {
+ 	char gpath[4096] = "";
+ 	if (common & ATTR_CMN_DEVID) { uint32_t d = guest_dev(s.st_dev); PUT(&d, 4); }
+ 	if (common & ATTR_CMN_FSID) { uint32_t f2[2] = { guest_dev(s.st_dev), 0x18 }; PUT(f2, 8); }
++	if (common & 0x8) PUTU32(S_ISDIR(s.st_mode) ? 2 : S_ISLNK(s.st_mode) ? 5 : 1);   // OBJTYPE: VDIR / VLNK / VREG
++	if (common & 0x20) { PUTU32((uint32_t)s.st_ino); PUTU32(0); }                    // OBJID {fid_objno, fid_generation}
++	if (common & 0x80) {                                                             // PAROBJID
++		char par[4300]; struct stat ps;
++		snprintf(par, sizeof par, "%s/..", rpv);
++		PUTU32(stat(par, &ps) == 0 ? (uint32_t)ps.st_ino : 1); PUTU32(0);
++	}
++	if (common & 0x100) PUTU32(0);                                                   // SCRIPT: kTextEncodingMacRoman
++	if (common & 0x20000) PUTU32(s.st_mode & 07777);                                 // ACCESSMASK
++	if (common & 0x40000) PUTU32(tahoe_flags_path(rpv));                             // FLAGS
+ 	if (common & ATTR_CMN_FULLPATH) {                     // ruta absoluta tal como la ve macOS (sin la raíz del host)
+ 		char real[4096];
+ 		const char* rp = realpath(rpv, real) ? real : p;
+ 		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+ 		if (rl && !strncmp(rp, tahoe_root, rl) && (rp[rl] == '/' || rp[rl] == '\0')) rp += rl;
+-		snprintf(gpath, sizeof gpath, "%s", rp[0] ? rp : "/");
++		if (!tahoe_metal_guest(rp, gpath, sizeof gpath)) snprintf(gpath, sizeof gpath, "%s", rp[0] ? rp : "/");
++		fl_canon(gpath, sizeof gpath);
+ 		PUTREF(gpath);
+ 	}
+ 	uint64_t bs = sf.f_bsize ? (uint64_t)sf.f_bsize : 4096;
+@@ -570,10 +1000,10 @@ static long bsd_getattrlist(struct ctx* c) {
+ 	if (vol & 0x200) PUTU32(sf.f_files - sf.f_ffree);      // FILECOUNT
+ 	if (vol & 0x400) PUTU32(0);                            // DIRCOUNT
+ 	if (vol & 0x800) PUTU32(sf.f_files);                   // MAXOBJCOUNT
+-	if (vol & 0x1000) PUTREF("/");                         // MOUNTPOINT
+-	if (vol & 0x2000) PUTREF("macOS Base System");         // NAME: el del volumen de la Recovery (AppleAPFSVolume en IOKit)
+-	if (vol & 0x4000) PUTU32(0x1000 | 0x4000);             // MOUNTFLAGS: MNT_LOCAL | MNT_ROOTFS
+-	if (vol & 0x8000) PUTREF("/dev/disk1s1");              // MOUNTEDDEVICE
++	if (vol & 0x1000) PUTREF(vm->on);                      // MOUNTPOINT
++	if (vol & 0x2000) PUTREF(vname);                       // NAME: el del AppleAPFSVolume de IOKit
++	if (vol & 0x4000) PUTU32(vm->flags);                   // MOUNTFLAGS
++	if (vol & 0x8000) PUTREF(vm->from);                    // MOUNTEDDEVICE
+ 	if (vol & 0x10000) PUTU64(0);                          // ENCODINGSUSED
+ 	if (vol & ATTR_VOL_CAPABILITIES) {
+ 		// vol_capabilities_attr_t: capabilities[4] y valid[4] (formato, interfaces, reservados)
+@@ -588,11 +1018,13 @@ static long bsd_getattrlist(struct ctx* c) {
+ 	if (vol & ATTR_VOL_UUID) {
+ 		// el UUID del volumen de arranque (kern.bootuuid y AppleAPFSVolume en IOKit): diskarbitrationd solo toma el nombre del
+ 		// volumen montado si coincide con el del disco
+-		static const uint8_t uuid[16] = { 0xB0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
++		// (Data y Preboot: ...02 y ...03, como sus AppleAPFSVolume)
++		uint8_t uuid[16] = { 0xB0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
++		if (vk >= 0) uuid[15] = (uint8_t)(2 + vk);
+ 		PUT(uuid, 16);
+ 	}
+ 	if (vol & 0x80000) PUTU32(0);                          // MOUNTEXTFLAGS
+-	if (vol & 0x100000) PUTREF("apfs");                    // FSTYPENAME
++	if (vol & 0x100000) PUTREF(vm->type);                 // FSTYPENAME
+ 	if (vol & 0x200000) PUTU32(0);                         // FSSUBTYPE
+ 	if (vol & 0x400000) PUTU32(0);                         // OWNER (root)
+ 	if (vol & 0x800000) PUTU64((sf.f_blocks - sf.f_bfree) * bs);   // SPACEUSED
+@@ -679,6 +1111,11 @@ static long bsd_getdirentries64(struct ctx* c) {
+ 		uint8_t type = lin[pos + 18];
+ 		const char* name = (const char*)lin + pos + 19;
+ 		size_t nl = strlen(name);
++		if (type == DT_LNK) {                                              // firmlink: se ve como directorio
++			char lp[64], hd[4096], hp[4400]; snprintf(lp, sizeof lp, "/proc/self/fd/%d", fd);
++			ssize_t hl = readlink(lp, hd, sizeof hd - 1);
++			if (hl > 0) { hd[hl] = 0; snprintf(hp, sizeof hp, "%s/%s", hd, name); if (host_is_firmlink(hp)) type = DT_DIR; }
++		}
+ 		size_t dr = (21 + nl + 1 + 7) & ~7UL;
+ 		if (used + dr > gsize) { lseek(fd, prev, SEEK_SET); break; }     // no cabe: devolver la entrada al directorio
+ 		uint8_t* e = out + used;
+@@ -791,8 +1228,14 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
+ 	if (common & A_CMN_PARENTID) { P64(0); rc |= A_CMN_PARENTID; }
+ 	if (common & A_CMN_FULLPATH2) { path_ref = n; n += 8; rc |= A_CMN_FULLPATH2; }
+ 	if (common & A_CMN_ADDEDTIME) { PTS(s->st_ctim); rc |= A_CMN_ADDEDTIME; }
+-	if (common & 0x20000000u) { P32(0); rc |= 0x20000000u; }                              // ATTR_CMN_ERROR: sin error
++	// ATTR_CMN_ERROR: como XNU, solo se empaqueta y se marca en returned_attrs cuando hay error. CoreServices
++	// (_InitalizeDirectoryEnumerator) toma la marca por «esta entrada falló»: con ella, todo listado de carpetas con
++	// NSFileManager/CFURLEnumerator acababa en ENOTDIR (init_featureflags no veía las 500 listas de funciones).
+ 	if (common & A_CMN_DPFLAGS) { P32(0); rc |= A_CMN_DPFLAGS; }
++	// Como XNU (vfs_attr_pack): los atributos de directorio solo se empaquetan para directorios y los de archivo solo para
++	// lo demás; sin FSOPT_PACK_INVAL_ATTRS los que no valen no ocupan sitio. Antes un archivo llevaba también los 8 bytes de
++	// DIR_LINKCOUNT|MOUNTSTATUS y quien leía DATALENGTH tomaba 0x100000000: universalaccessd pedía 4 GiB para Defaults.plist.
++	if (!pack_inval) { if (isdir) file = 0; else dir = 0; }
+ 	// directorio: solo valen para directorios
+ 	if (dir) {
+ 		if (dir & A_DIR_LINKCOUNT) { P32(isdir ? s->st_nlink : 0); if (isdir) rd |= A_DIR_LINKCOUNT; }
+@@ -800,6 +1243,14 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
+ 		if (dir & A_DIR_MOUNTSTATUS) {                                                    // DIR_MNTSTATUS_MNTPOINT si es raíz de un montaje
+ 			uint32_t ms = 0;
+ 			for (size_t i = 0; isdir && fullpath && i < NGMOUNT; i++) if (!strcmp(fullpath, gmounts[i].on)) ms = 0x1;
++			// también Data y Preboot de un macOS completo y los tmpfs (como getfsstat): diskutil info <ruta> pregunta esto
++			// para saber si la ruta es un volumen
++			for (size_t k = 0; isdir && fullpath && !ms && k < NSYSVOL; k++) if (sysvol_mnt(k) && !strcmp(fullpath, sysvol_gmounts[k].on)) ms = 0x1;
++			if (isdir && fullpath && !ms && !strncmp(fullpath, "/System/Volumes/", 16)) {
++				TLS_LAZY(struct dmount, dm, 16);
++				int nd = tmpfs_mounts(dm, 16);
++				for (int i = 0; i < nd; i++) if (!strcmp(fullpath, dm[i].on)) ms = 0x1;
++			}
+ 			P32(ms); if (isdir) rd |= A_DIR_MOUNTSTATUS;
+ 		}
+ 	}
+@@ -826,7 +1277,6 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
+ 	if (cmnext & 0x400) { P64(0); rx |= 0x400; }                                         // RECURSIVE_GENCOUNT
+ 	if (cmnext & 0x800) { P64(0); rx |= 0x800; }                                         // ATTRIBUTION_TAG
+ 	if (cmnext & 0x1000) { P32(1); rx |= 0x1000; }                                       // CLONE_REFCNT
+-	(void)pack_inval;
+ 	// cadenas de longitud variable al final, en el orden de sus referencias
+ 	if (common & A_CMN_NAME) {
+ 		size_t nl = strlen(name) + 1;
+@@ -846,7 +1296,7 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
+ 		memcpy(o + n, fullpath, pl);
+ 		n += (pl + 3) & ~3UL;
+ 	}
+-	const char* rel_or_path[2] = { fullpath, fullpath };
++	const char* rel_or_path[2] = { fullpath, pe_nofirm ? pe_nofirm : fullpath };
+ 	size_t refs2[2] = { relpath_ref, nofirm_ref };
+ 	for (int i = 0; i < 2; i++) {
+ 		if (!refs2[i]) continue;
+@@ -869,12 +1319,31 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
+ #undef P64
+ #undef PTS
+ }
+-static uint32_t dir_attrs_g;                              // dirattr de la petición en curso (getattrlistbulk)
++static uint32_t dir_attrs_g, cmnext_g;                    // dirattr y comunes extendidos de la petición en curso (getattrlistbulk)
+ static size_t pack_bulk_entry(uint8_t* o, uint32_t common, uint32_t file, const char* name, const struct stat* s) {
+-	return pack_entry(o, common, dir_attrs_g, file, 0, name, "", s, 1);
++	return pack_entry(o, common, dir_attrs_g, file, cmnext_g, name, "", s, 1);
+ }
+ 
+ // getattrlistbulk(fd, attrlist*, búfer, tamaño, opciones): devuelve cuántas entradas empaquetó (0 = fin).
++// fgetattrlist(fd, attrlist, buf, tamaño, opciones): getattrlist con la ruta del descriptor (la que da F_GETPATH sin
++// firmlinks). Antes el número 228 llevaba a fsetattrlist: quien leía atributos de un archivo abierto no recibía nada (y se
++// intentaba escribir lo que hubiera en su búfer).
++static long bsd_fgetattrlist(struct ctx* c) {
++	char link[64], path[4096];
++	snprintf(link, sizeof link, "/proc/thread-self/fd/%d", (int)c->a[0]);
++	ssize_t n = readlink(link, path, sizeof path - 1);
++	if (n < 0) return err();
++	path[n] = 0;
++	if (path[0] != '/') return -D_EINVAL;                          // tubería, socket...: sin ruta
++	const char* p = path;
++	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
++	if (rl && !strncmp(path, tahoe_root, rl) && (path[rl] == '/' || path[rl] == '\0')) p = path[rl] ? path + rl : "/";
++	static __thread char gp[4400];
++	if (!tahoe_metal_guest(path, gp, sizeof gp)) snprintf(gp, sizeof gp, "%s", p);
++	struct ctx c2 = *c;
++	c2.a[0] = (uint64_t)(uintptr_t)gp;                             // mismos argumentos que getattrlist, con la ruta en a[0]
++	return bsd_getattrlist(&c2);
++}
+ static long bsd_getattrlistbulk(struct ctx* c) {
+ 	int fd = (int)c->a[0];
+ 	uint32_t al[6] = { 0 };
+@@ -884,11 +1353,14 @@ static long bsd_getattrlistbulk(struct ctx* c) {
+ 		A_CMN_CHGTIME | A_CMN_ACCTIME | A_CMN_FNDRINFO | A_CMN_OWNERID | A_CMN_GRPID | A_CMN_ACCESSMASK | A_CMN_FLAGS | A_CMN_GENCOUNT | A_CMN_DOCID |
+ 		A_CMN_USERACCESS | A_CMN_FILEID | A_CMN_PARENTID | A_CMN_ADDEDTIME | 0x20000000u /*ERROR*/ | A_CMN_DPFLAGS | A_CMN_RETURNED;
+ 	uint32_t known_f = A_FILE_LINKCOUNT | A_FILE_TOTALSIZE | A_FILE_ALLOCSIZE | A_FILE_IOBLOCKSIZE | A_FILE_DEVTYPE | A_FILE_DATALENGTH | 0x400u | 0x1000u | 0x2000u;
+-	if ((common & ~known_c) || (file & ~known_f) || (dir & ~7u) || al[2] || al[5]) {
+-		logf_("    getattrlistbulk: atributos sin implementar common=0x%x dir=0x%x file=0x%x\n", common, dir, file);
++	// con FSOPT_ATTR_CMN_EXTENDED (0x20) el campo forkattr lleva comunes extendidos (CFURLEnumerator pide REALDEVID y
++	// EXT_FLAGS); sin esa opción serían atributos de fork, que no hay
++	uint32_t cmnext = (c->a[4] & 0x20) ? al[5] : 0;
++	if ((common & ~known_c) || (file & ~known_f) || (dir & ~7u) || al[2] || (al[5] & ~(cmnext & 0x1ffcu))) {
++		logf_("    getattrlistbulk: atributos sin implementar common=0x%x dir=0x%x file=0x%x fork=0x%x\n", common, dir, file, al[5]);
+ 		return -45;
+ 	}
+-	dir_attrs_g = dir;
++	dir_attrs_g = dir; cmnext_g = cmnext;
+ 	uint64_t gbuf = c->a[2], gsize = c->a[3];
+ 	uint8_t lin[16384];
+ 	uint8_t* out = malloc(gsize);
+@@ -909,6 +1381,12 @@ static long bsd_getattrlistbulk(struct ctx* c) {
+ 			if (!strcmp(name, ".") || !strcmp(name, "..")) { prev = off; pos += reclen; continue; }   // el kernel no las devuelve
+ 			struct stat s;
+ 			if (fstatat(fd, name, &s, AT_SYMLINK_NOFOLLOW) != 0) { prev = off; pos += reclen; continue; }
++			if (S_ISLNK(s.st_mode)) {                                       // firmlink: se ve como directorio
++				char lp[64], hd[4096], hp[4400]; snprintf(lp, sizeof lp, "/proc/self/fd/%d", fd);
++				ssize_t hl = readlink(lp, hd, sizeof hd - 1);
++				if (hl > 0) { hd[hl] = 0; snprintf(hp, sizeof hp, "%s/%s", hd, name); if (host_is_firmlink(hp)) fstatat(fd, name, &s, 0); }
++			}
++			vol_fix(&s, fd, name, AT_SYMLINK_NOFOLLOW);
+ 			uint8_t e[2048];
+ 			size_t en = pack_bulk_entry(e, common, file, name, &s);
+ 			if (used + en > gsize) { lseek(fd, prev, SEEK_SET); full = 1; break; }
+@@ -931,6 +1409,17 @@ static long bsd_getattrlistbulk(struct ctx* c) {
+ // APFS del estado del dispositivo raíz que lanza launchd; devuelve 8 bytes. Se responde sin banderas.
+ static long bsd_fsctl(struct ctx* c) {
+ 	if (c->a[1] == 0x40084a6aUL) { uint64_t z = 0; return safe_write(c->a[2], &z, 8) == 8 ? 0 : -D_EFAULT; }
++	// 'h' 22 (_IOW, u32): umbral de espacio libre que fija KernelEventAgent para avisar de disco lleno; se acepta.
++	// 'h' 18 (_IOR, u32): estado del volumen que consulta después; sin avisos pendientes (0).
++	if (c->a[1] == 0x80046816UL) return 0;
++	// APFSIOC_MARK_PURGEABLE ('J' 68, 8 bytes): marcar un archivo como purgable (cachés de CFNetwork, Spotlight, removefile...).
++	// Aquí no hay purga de espacio: se acepta sin efecto.
++	if (c->a[1] == 0xc0084a44UL) return 0;
++	if (c->a[1] == 0x40046812UL) { uint32_t z = 0; return safe_write(c->a[2], &z, 4) == 4 ? 0 : -D_EFAULT; }
++	// 'J' 11 (16 bytes de salida): datos de bless de un volumen APFS (identificadores de la carpeta y el archivo de
++	// arranque bendecidos), que «bless --info» lee del Preboot. Aquí no hay nada bendecido (el Preboot no tiene la
++	// carpeta de arranque que crea el instalador): ENOENT, que bless entiende como «sin datos» y muestra a cero.
++	if (c->a[1] == 0xc0104a0bUL) return -D_ENOENT;
+ 	logf_("    fsctl: comando 0x%lx sin implementar\n", c->a[1]);
+ 	return -45;
+ }
+@@ -939,16 +1428,17 @@ static long bsd_fsctl(struct ctx* c) {
+ static long bsd_openat(struct ctx* c) {
+ 	char path[4096], full[4200];
+ 	if (safe_string(c->a[1], path, sizeof path) != 0) return -D_EFAULT;
++	tahoe_resolve_strip(path);
+ 	int dfd = (int)c->a[0];
+ 	if (dfd == -2) dfd = AT_FDCWD;
+ 	int flags = darwin_open_flags((int)c->a[2]);
+ 	long fd = -1;
+ 	if (!strcmp(path, "/dev/fsevents")) { int f = fsevents_open(); return f < 0 ? -2 : f; }
+ 	if (tahoe_root && path[0] == '/' && !tahoe_host_passthrough(path)) {
+-		snprintf(full, sizeof full, "%s%s", tahoe_root, path);
+-		fd = syscall(SYS_openat, dfd, full, flags, (int)c->a[3]);
++		if (!tahoe_metal_path(path, full, sizeof full)) snprintf(full, sizeof full, "%s%s", tahoe_root, path);
++		fd = open_symlink(dfd, full, (int)c->a[2], flags, syscall(SYS_openat, dfd, full, flags, (int)c->a[3]));
+ 	}
+-	if (fd < 0 && (!tahoe_root || path[0] != '/' || tahoe_host_passthrough(path))) { char al[64]; fd = syscall(SYS_openat, dfd, tahoe_dev_alias(path, al, sizeof al), flags, (int)c->a[3]); }
++	if (fd < 0 && (!tahoe_root || path[0] != '/' || tahoe_host_passthrough(path))) { char al[64]; const char* q = tahoe_dev_alias(path, al, sizeof al); fd = open_symlink(dfd, q, (int)c->a[2], flags, syscall(SYS_openat, dfd, q, flags, (int)c->a[3])); }
+ 	if (trace_all || fd < 0) logf_("    openat(%d, \"%s\") -> %ld%s%s\n", (int)c->a[0], path, fd, fd < 0 ? " " : "", fd < 0 ? strerror(errno) : "");
+ 	return fd < 0 ? err() : fd;
+ }
+@@ -961,6 +1451,13 @@ static long bsd_fsgetpath(struct ctx* c) {
+ 		if (n > c->a[1]) return -D_ENOMEM;
+ 		return safe_write(c->a[0], cache_guest_path, n) == (ssize_t)n ? (long)n : -D_EFAULT;
+ 	}
++	char gp[4096];
++	if (c->a[3] == 2) snprintf(gp, sizeof gp, "/");          // en APFS el identificador 2 es la raíz del volumen
++	if (c->a[3] == 2 || fid_lookup(c->a[3], gp, sizeof gp)) {
++		size_t n = strlen(gp) + 1;
++		if (n > c->a[1]) return -D_ENOMEM;
++		return safe_write(c->a[0], gp, n) == (ssize_t)n ? (long)n : -D_EFAULT;
++	}
+ 	logf_("    fsgetpath: identificador desconocido (objid=0x%lx)\n", c->a[3]);
+ 	return -D_ENOENT;
+ }
+@@ -1026,18 +1523,25 @@ void populate_data_volume(void) {
+ 	struct stat st;
+ 	if (stat(tmpl_root, &st) != 0) return;
+ 	nftw(tmpl_root, tmpl_copy, 32, FTW_PHYS);
+-	// Almacén de registros de logd. En un BaseSystem, libsystem_trace (_os_trace_basesystem_storage_available) solo da por
++	data_log_storage(tahoe_root);
++}
++// Almacén de registros de logd. En un BaseSystem, libsystem_trace (_os_trace_basesystem_storage_available) solo da por
+ 	// disponible el almacenamiento si /private/var/db/diagnostics es un enlace simbólico (el arranque lo apunta a un volumen
+ 	// escribible) o si los boot-args lo indican; si no, launchd decide que no hay registro completo (HasFullLogging = NO) y
+ 	// no carga logd. Aquí la raíz es una carpeta escribible de Linux: se presenta como lo haría un arranque con almacenamiento.
+-	char p[4400], q[4400];
+-	snprintf(p, sizeof p, "%s/private/var/db/diagnostics", tahoe_root);
++// Se hace sobre el volumen de datos: al arrancar launchd (populate_data_volume) y otra vez cuando la Recovery monta su
++// tmpfs en /System/Volumes/Data (do_mount), que tapa lo anterior; si no, logd queda cargado sin almacén y `log` no conecta.
++void data_log_storage(const char* data_root) {
++	char p[4400], q[4400]; struct stat st;
++	snprintf(p, sizeof p, "%s/private/var/db", data_root);
++	if (stat(p, &st) != 0) { char a[4400]; snprintf(a, sizeof a, "%s/private", data_root); mkdir(a, 0755); snprintf(a, sizeof a, "%s/private/var", data_root); mkdir(a, 0755); mkdir(p, 0755); }
++	snprintf(p, sizeof p, "%s/private/var/db/diagnostics", data_root);
+ 	if (lstat(p, &st) != 0) {
+-		snprintf(q, sizeof q, "%s/private/var/db/diagnostics.storage", tahoe_root);
++		snprintf(q, sizeof q, "%s/private/var/db/diagnostics.storage", data_root);
+ 		mkdir(q, 0755);
+ 		if (symlink("diagnostics.storage", p) != 0) {}
+ 	}
+-	snprintf(p, sizeof p, "%s/private/var/db/uuidtext", tahoe_root);
++	snprintf(p, sizeof p, "%s/private/var/db/uuidtext", data_root);
+ 	if (lstat(p, &st) != 0) mkdir(p, 0755);
+ }
+ 
+@@ -1121,13 +1625,13 @@ void emu_fs_xattr_init(void) {
+ void emu_fs_init(void) {
+ 	reg_bsd(73, bsd_munmap);   reg_bsd(74, bsd_mprotect); reg_bsd(75, bsd_madvise); reg_bsd(197, bsd_mmap);
+ 	reg_bsd(199, bsd_lseek);   reg_bsd(153, bsd_pread);   reg_bsd(154, bsd_pwrite);
+-	reg_bsd(33, bsd_access);   reg_bsd(58, bsd_readlink); reg_bsd(92, bsd_fcntl);
++	reg_bsd(33, bsd_access); reg_bsd(466, bsd_faccessat); reg_bsd(284, bsd_access_extended); reg_bsd(165, bsd_quotactl);   reg_bsd(58, bsd_readlink); reg_bsd(473, bsd_readlinkat); reg_bsd(92, bsd_fcntl);
+ 	reg_bsd(338, bsd_stat64);  reg_bsd(339, bsd_fstat64); reg_bsd(340, bsd_lstat64);
+ 	reg_bsd(24, bsd_getuid);   reg_bsd(25, bsd_geteuid);  reg_bsd(47, bsd_getgid); reg_bsd(43, bsd_getegid);
+ 	reg_bsd(381, bsd_mac_syscall);
+ 	reg_bsd(347, bsd_getfsstat64); reg_bsd(345, bsd_statfs64); reg_bsd(346, bsd_fstatfs64); reg_bsd(426, bsd_mac_getfsstat);
+ 	reg_bsd(167, bsd_mount); reg_bsd(424, bsd_mount); reg_bsd(526, bsd_fmount); reg_bsd(159, bsd_unmount); reg_bsd(164, bsd_funmount);
+-	reg_bsd(242, bsd_fsctl); reg_bsd(220, bsd_getattrlist); reg_bsd(12, bsd_chdir); reg_bsd(13, bsd_fchdir); reg_bsd(344, bsd_getdirentries64); reg_bsd(461, bsd_getattrlistbulk);
++	reg_bsd(242, bsd_fsctl); reg_bsd(220, bsd_getattrlist); reg_bsd(228, bsd_fgetattrlist); reg_bsd(12, bsd_chdir); reg_bsd(13, bsd_fchdir); reg_bsd(344, bsd_getdirentries64); reg_bsd(461, bsd_getattrlistbulk);
+ 	reg_bsd(41, bsd_dup);      reg_bsd(90, bsd_dup2);     reg_bsd(470, bsd_fstatat64);
+ 	reg_bsd(463, bsd_openat); reg_bsd(464, bsd_openat);   /* openat_nocancel */     reg_bsd(427, bsd_fsgetpath);
+ }
+diff --git a/tahoe-run/emu_fs2.c b/tahoe-run/emu_fs2.c
+index 290e511..b4c3e46 100644
+--- a/tahoe-run/emu_fs2.c
++++ b/tahoe-run/emu_fs2.c
+@@ -22,6 +22,8 @@ static long err(void) { return -darwin_errno(errno); }
+ static long rpath(uint64_t addr, char* out, size_t cap) {
+ 	char g[4096];
+ 	if (safe_string(addr, g, sizeof g) != 0) return -D_EFAULT;
++	tahoe_resolve_strip(g);
++	if (tahoe_metal_path(g, out, cap)) return 0;
+ 	if (tahoe_root && g[0] == '/' && !tahoe_host_passthrough(g)) snprintf(out, cap, "%s%s", tahoe_root, g);
+ 	else { char al[64]; snprintf(out, cap, "%s", tahoe_dev_alias(g, al, sizeof al)); }
+ 	return 0;
+@@ -36,7 +38,6 @@ static long bsd_chmod(struct ctx* c)  { PATH1(p, 0); RET(chmod(p, (mode_t)c->a[1
+ // daría EINVAL/EPERM. launchd lo hace con sus sockets y servicios; se acepta sin efecto.
+ static long chown_result(long r) { if (r < 0 && (errno == EINVAL || errno == EPERM)) return 0; return r < 0 ? err() : 0; }
+ static long bsd_chown(struct ctx* c)  { PATH1(p, 0); return chown_result(chown(p, (uid_t)c->a[1], (gid_t)c->a[2])); }
+-static long bsd_ret0(struct ctx* c) { (void)c; return 0; }
+ #include <sys/xattr.h>
+ static long bsd_fchflags(struct ctx* c) { uint32_t v = (uint32_t)c->a[1]; fsetxattr((int)c->a[0], "user.tahoe.flags", &v, 4, 0); return 0; }   // sin soporte de xattr: se acepta igual
+ static long bsd_chflags(struct ctx* c) { PATH1(p, 0); uint32_t v = (uint32_t)c->a[1]; lsetxattr(p, "user.tahoe.flags", &v, 4, 0); return 0; }
+@@ -56,11 +57,18 @@ static long bsd_truncate(struct ctx* c) { PATH1(p, 0); RET(truncate(p, (off_t)c-
+ static long bsd_mkfifo(struct ctx* c) { PATH1(p, 0); RET(mkfifo(p, (mode_t)c->a[1])); }
+ static long bsd_rename(struct ctx* c) { PATH1(a, 0); PATH1(b, 1); RET(rename(a, b)); }
+ static long bsd_link(struct ctx* c)   { PATH1(a, 0); PATH1(b, 1); RET(link(a, b)); }
+-static long bsd_symlink(struct ctx* c) {      // el destino del enlace se guarda tal cual; solo la ruta del enlace va a la raíz
+-	char tgt[4096];
++// Destino de un enlace simbólico nuevo: el kernel de Linux lo sigue por su cuenta, así que un destino absoluto de macOS
++// (/tmp, /usr/lib/...) se guarda dentro de la raíz; readlink lo devuelve sin ese prefijo (emu_fs.c, guest_link_target).
++static void host_link_target(const char* t, char* out, size_t cap) {
++	if (tahoe_root && t[0] == '/' && !tahoe_host_passthrough(t)) snprintf(out, cap, "%s%s", tahoe_root, t);
++	else snprintf(out, cap, "%s", t);
++}
++static long bsd_symlink(struct ctx* c) {
++	char tgt[4096], ht[4400];
+ 	if (safe_string(c->a[0], tgt, sizeof tgt) != 0) return -D_EFAULT;
+ 	PATH1(l, 1);
+-	RET(symlink(tgt, l));
++	host_link_target(tgt, ht, sizeof ht);
++	RET(symlink(ht, l));
+ }
+ static long bsd_fchmod(struct ctx* c) { RET(fchmod((int)c->a[0], (mode_t)c->a[1])); }
+ static long bsd_fchown(struct ctx* c) { return chown_result(fchown((int)c->a[0], (uid_t)c->a[1], (gid_t)c->a[2])); }
+@@ -76,7 +84,21 @@ static long bsd_flock(struct ctx* c) {        // LOCK_SH 1, LOCK_EX 2, LOCK_NB 4
+ }
+ static long bsd_getdtablesize(struct ctx* c) { (void)c; return 10240; }
+ static long bsd_readv(struct ctx* c)  { RET(readv((int)c->a[0], (const struct iovec*)c->a[1], (int)c->a[2])); }
+-static long bsd_writev(struct ctx* c) { RET(writev((int)c->a[0], (const struct iovec*)c->a[1], (int)c->a[2])); }
++// writev; en un proceso de STACKS, lo que escribe en su salida de errores también va al registro (NSLog y los mensajes de
++// AppKit antes de salir van ahí, y el proceso que lo lanzó suele tenerla en /dev/null).
++static long bsd_writev(struct ctx* c) {
++	if ((int)c->a[0] == 2 && diag_target()) {
++		const struct iovec* v = (const struct iovec*)c->a[1];
++		char t[1024]; size_t k = 0;
++		for (int i = 0; i < (int)c->a[2] && i < 8 && k < sizeof t - 1; i++) {
++			size_t n = v[i].iov_len < sizeof t - 1 - k ? v[i].iov_len : sizeof t - 1 - k;
++			if (safe_read((uint64_t)v[i].iov_base, t + k, n) == (ssize_t)n) k += n;
++		}
++		t[k] = 0;
++		logf_("    stderr <%d>: %s%s", (int)getpid(), t, k && t[k - 1] == '\n' ? "" : "\n");
++	}
++	RET(writev((int)c->a[0], (const struct iovec*)c->a[1], (int)c->a[2]));
++}
+ static long bsd_utimes(struct ctx* c) {       // struct timeval de Darwin: {i64 segundos, i32 microsegundos, pad}
+ 	PATH1(p, 0);
+ 	struct timespec ts[2];
+@@ -102,8 +124,16 @@ static long bsd_getgroups(struct ctx* c) {
+ 	return r;
+ }
+ static long bsd_ok(struct ctx* c) { (void)c; return 0; }                // setgroups/setuid/setgid...: ya somos el usuario efectivo
+-// select(nfds, readfds, writefds, exceptfds, timeval*)
+-static long bsd_select(struct ctx* c) {
++// select(nfds, readfds, writefds, exceptfds, timeval*) y pselect(..., timespec*, sigmask*): el fd_set de Darwin es el mismo
++// mapa de bits (int32 por palabra) que el de Linux. pselect se diferencia en el plazo (timespec) y en la máscara de señales
++// durante la espera, que aquí se lee y se ignora: tahoe-run aún no entrega señales al invitado (ver bsd_pthread_sigmask).
++static long do_select(struct ctx* c, int ts);
++static long bsd_select(struct ctx* c) { return do_select(c, 0); }
++static long bsd_pselect(struct ctx* c) {
++	if (c->a[5]) { uint32_t m; if (safe_read(c->a[5], &m, 4) != 4) return -D_EFAULT; }
++	return do_select(c, 1);
++}
++static long do_select(struct ctx* c, int ts) {
+ 	int n = (int)c->a[0];
+ 	if (n < 0 || n > 1024) return -D_EINVAL;
+ 	size_t bytes = ((size_t)n + 7) / 8;
+@@ -118,9 +148,10 @@ static long bsd_select(struct ctx* c) {
+ 	if (c->a[4]) {
+ 		uint8_t t[16];
+ 		if (safe_read(c->a[4], t, 16) != 16) return -D_EFAULT;
+-		int64_t s; int32_t us;
+-		memcpy(&s, t, 8); memcpy(&us, t + 8, 4);
+-		tv.tv_sec = s; tv.tv_usec = us; tp = &tv;
++		int64_t s; int32_t us; int64_t ns;
++		memcpy(&s, t, 8); memcpy(&us, t + 8, 4); memcpy(&ns, t + 8, 8);
++		tv.tv_sec = s; tv.tv_usec = ts ? (suseconds_t)(ns / 1000) : us; tp = &tv;   // timespec: {i64 s, i64 ns}
++		if (ts && ns % 1000 && tv.tv_usec < 999999) tv.tv_usec++;                  // no esperar menos de lo pedido
+ 	}
+ 	int r = select(n, have[0] ? &sets[0] : NULL, have[1] ? &sets[1] : NULL, have[2] ? &sets[2] : NULL, tp);
+ 	if (r < 0) return err();
+@@ -131,10 +162,81 @@ static long bsd_select(struct ctx* c) {
+ 
+ // ---- variantes *at: el descriptor de directorio AT_FDCWD de Darwin es -2
+ static int dfd(uint64_t v) { return (int)v == -2 ? AT_FDCWD : (int)v; }
++static long apath(uint64_t addr, char* out, size_t cap);
++
++// setattrlist(ruta, attrlist*, búfer, tamaño, opciones) / fsetattrlist(fd, ...) / setattrlistat(dirfd, ruta, ..., opciones):
++// atributos comunes que se pueden cambiar (ditto los usa al copiar). El búfer va sin longitud, en orden de bit, alineado a 4.
++// Fechas: modificación y acceso con utimensat; creación, cambio, copia y alta no existen en Linux (se aceptan sin efecto).
++// FinderInfo como el atributo extendido com.apple.FinderInfo; banderas como chflags; propietario como chown (sin efecto si el
++// uid no existe aquí); permisos como chmod. Volumen, directorio, archivo y fork no se pueden cambiar: EINVAL, como XNU.
++static long setattr_common(const char* hp, int nofollow, uint64_t alp, uint64_t buf, uint64_t size) {
++	uint32_t al[6];
++	if (safe_read(alp, al, sizeof al) != (ssize_t)sizeof al) return -D_EFAULT;
++	uint32_t common = al[1];
++	// también EXTENDED_SECURITY (ACL), UUID, GRPUUID y DATA_PROTECT_FLAGS (clase de protección): se aceptan sin efecto (en
++	// Linux no hay ACL de macOS ni cifrado por archivo). lsd los fija al guardar su base de datos; con EINVAL no la guardaba
++	// y volvía a registrar todas las apps en cada arranque.
++	const uint32_t known = 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x10000 | 0x20000 | 0x40000 |
++	                       0x400000 | 0x800000 | 0x1000000 | 0x10000000 | 0x40000000;
++	if (al[2] || al[3] || al[4] || al[5] || (common & ~known)) {
++		logf_("    setattrlist: atributos no modificables common=0x%x vol=0x%x dir=0x%x file=0x%x fork=0x%x\n", common, al[2], al[3], al[4], al[5]);
++		return -D_EINVAL;
++	}
++	uint8_t b[512]; size_t n = size < sizeof b ? (size_t)size : sizeof b, o = 0;
++	if (n && safe_read(buf, b, n) != (ssize_t)n) return -D_EFAULT;
++	struct timespec ts[2] = { { 0, UTIME_OMIT }, { 0, UTIME_OMIT } };
++	uint32_t uid = (uint32_t)-1, gid = (uint32_t)-1, mode = 0, flags = 0; const uint8_t* fi = NULL;
++#define NEED(k) do { if (o + (k) > n) return -D_EINVAL; } while (0)
++#define TS(t) do { int64_t s_, ns_; memcpy(&s_, b + o, 8); memcpy(&ns_, b + o + 8, 8); (t).tv_sec = s_; (t).tv_nsec = ns_; } while (0)
++	if (common & 0x100) { NEED(4); o += 4; }                            // SCRIPT
++	if (common & 0x200) { NEED(16); o += 16; }                          // CRTIME
++	if (common & 0x400) { NEED(16); TS(ts[1]); o += 16; }               // MODTIME
++	if (common & 0x800) { NEED(16); o += 16; }                          // CHGTIME
++	if (common & 0x1000) { NEED(16); TS(ts[0]); o += 16; }              // ACCTIME
++	if (common & 0x2000) { NEED(16); o += 16; }                         // BKUPTIME
++	if (common & 0x4000) { NEED(32); fi = b + o; o += 32; }             // FNDRINFO
++	if (common & 0x8000) { NEED(4); memcpy(&uid, b + o, 4); o += 4; }   // OWNERID
++	if (common & 0x10000) { NEED(4); memcpy(&gid, b + o, 4); o += 4; }  // GRPID
++	if (common & 0x20000) { NEED(4); memcpy(&mode, b + o, 4); o += 4; } // ACCESSMASK
++	if (common & 0x40000) { NEED(4); memcpy(&flags, b + o, 4); o += 4; }// FLAGS
++	if (common & 0x400000) { NEED(8); o += 8; }                         // EXTENDED_SECURITY (attrreference_t)
++	if (common & 0x800000) { NEED(16); o += 16; }                       // UUID
++	if (common & 0x1000000) { NEED(16); o += 16; }                      // GRPUUID
++	if (common & 0x10000000) { NEED(16); o += 16; }                     // ADDEDTIME
++	if (common & 0x40000000) { NEED(4); o += 4; }                       // DATA_PROTECT_FLAGS
++#undef NEED
++#undef TS
++	struct stat st;
++	if ((nofollow ? lstat(hp, &st) : stat(hp, &st)) != 0) return err();
++	int link = S_ISLNK(st.st_mode);
++	if (common & (0x8000 | 0x10000)) { long r = chown_result(nofollow ? lchown(hp, uid, gid) : chown(hp, uid, gid)); if (r) return r; }
++	if ((common & 0x20000) && !link && chmod(hp, mode & 07777) != 0) return err();
++	if (common & 0x40000) lsetxattr(hp, "user.tahoe.flags", &flags, 4, 0);
++	if (fi) {
++		static const uint8_t zero[32];
++		if (memcmp(fi, zero, 32)) lsetxattr(hp, "user.com.apple.FinderInfo", fi, 32, 0);
++		else lremovexattr(hp, "user.com.apple.FinderInfo");             // FinderInfo a cero: XNU borra el atributo
++	}
++	if ((common & (0x400 | 0x1000)) && utimensat(AT_FDCWD, hp, ts, nofollow ? AT_SYMLINK_NOFOLLOW : 0) != 0) return err();
++	return 0;
++}
++static long bsd_setattrlist(struct ctx* c) { PATH1(p, 0); return setattr_common(p, (c->a[4] & (1 | 0x800)) != 0, c->a[1], c->a[2], c->a[3]); }
++static long bsd_fsetattrlist(struct ctx* c) {
++	char p[64]; snprintf(p, sizeof p, "/proc/self/fd/%d", (int)c->a[0]);
++	return setattr_common(p, 0, c->a[1], c->a[2], c->a[3]);
++}
++static long bsd_setattrlistat(struct ctx* c) {
++	char g[4400], p[4500]; long e = apath(c->a[1], g, sizeof g); if (e) return e;
++	int d = dfd(c->a[0]);
++	if (g[0] != '/' && d != AT_FDCWD) snprintf(p, sizeof p, "/proc/self/fd/%d/%s", d, g); else snprintf(p, sizeof p, "%s", g);
++	return setattr_common(p, (c->a[5] & (1 | 0x800)) != 0, c->a[2], c->a[3], c->a[4]);
++}
+ // Ruta relativa al dirfd o absoluta -> bajo la raíz si es absoluta
+ static long apath(uint64_t addr, char* out, size_t cap) {
+ 	char g[4096];
+ 	if (safe_string(addr, g, sizeof g) != 0) return -D_EFAULT;
++	tahoe_resolve_strip(g);
++	if (tahoe_metal_path(g, out, cap)) return 0;
+ 	if (tahoe_root && g[0] == '/' && !tahoe_host_passthrough(g)) snprintf(out, cap, "%s%s", tahoe_root, g);
+ 	else { char al[64]; snprintf(out, cap, "%s", tahoe_dev_alias(g, al, sizeof al)); }
+ 	return 0;
+@@ -150,13 +252,14 @@ static long bsd_renameatx(struct ctx* c) {      // flags de Darwin: RENAME_SWAP
+ static long bsd_unlinkat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(unlinkat(dfd(c->a[0]), p, (c->a[2] & 0x180) ? AT_REMOVEDIR : 0)); }   // AT_REMOVEDIR = 0x80, AT_REMOVEDIR_DATALESS = 0x100 (rm -r)
+ static long bsd_mkdirat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(mkdirat(dfd(c->a[0]), p, (mode_t)c->a[2])); }
+ static long bsd_symlinkat(struct ctx* c) {
+-	char tgt[4096], l[4400];
++	char tgt[4096], ht[4400], l[4400];
+ 	if (safe_string(c->a[0], tgt, sizeof tgt) != 0) return -D_EFAULT;
+ 	long e = apath(c->a[2], l, sizeof l); if (e) return e;
+-	RET(symlinkat(tgt, dfd(c->a[1]), l));
++	host_link_target(tgt, ht, sizeof ht);
++	RET(symlinkat(ht, dfd(c->a[1]), l));
+ }
+ static long bsd_fchmodat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(fchmodat(dfd(c->a[0]), p, (mode_t)c->a[2], 0)); }
+-static long bsd_fchownat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; return chown_result(fchownat(dfd(c->a[0]), p, (uid_t)c->a[2], (gid_t)c->a[3], (c->a[4] & 0x20) ? AT_SYMLINK_NOFOLLOW : 0)); }
++static long bsd_fchownat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; return chown_result(fchownat(dfd(c->a[0]), p, (uid_t)c->a[2], (gid_t)c->a[3], (c->a[4] & (0x20 | 0x800)) ? AT_SYMLINK_NOFOLLOW : 0)); }
+ static long bsd_linkat(struct ctx* c) { char a[4400], b[4400]; long e; if ((e = apath(c->a[1], a, sizeof a)) || (e = apath(c->a[3], b, sizeof b))) return e; RET(linkat(dfd(c->a[0]), a, dfd(c->a[2]), b, 0)); }
+ 
+ // poll(fds, n, ms): struct pollfd igual que en Linux; cambian POLLWRNORM (Darwin 0x4 = POLLOUT, Linux 0x100) y POLLWRBAND
+@@ -185,14 +288,16 @@ static long bsd_poll(struct ctx* c) {
+ void emu_fs2_init(void) {
+ 	reg_bsd(230, bsd_poll); reg_bsd(417, bsd_poll);   // poll / poll_nocancel
+ 	reg_bsd(465, bsd_renameat); reg_bsd(488, bsd_renameatx); reg_bsd(472, bsd_unlinkat); reg_bsd(475, bsd_mkdirat);
++	reg_bsd(221, bsd_setattrlist); reg_bsd(229, bsd_fsetattrlist); reg_bsd(524, bsd_setattrlistat);
+ 	reg_bsd(474, bsd_symlinkat); reg_bsd(467, bsd_fchmodat); reg_bsd(468, bsd_fchownat); reg_bsd(471, bsd_linkat);
+ 	reg_bsd(136, bsd_mkdir); reg_bsd(137, bsd_rmdir); reg_bsd(10, bsd_unlink); reg_bsd(15, bsd_chmod);
+-	reg_bsd(364, bsd_lchown); reg_bsd(34, bsd_chflags); reg_bsd(35, bsd_fchflags); reg_bsd(351, bsd_ret0);   // lchown; chflags/fchflags/auditon sin efecto
++	reg_bsd(364, bsd_lchown); reg_bsd(34, bsd_chflags); reg_bsd(35, bsd_fchflags);   // lchown; chflags/fchflags (auditon está en emu_cred.c)
+ 	reg_bsd(234, bsd_no_xattr); reg_bsd(142, bsd_gethostuuid);
+ 	reg_bsd(16, bsd_chown); reg_bsd(254, bsd_lchown); reg_bsd(200, bsd_truncate); reg_bsd(132, bsd_mkfifo);
+ 	reg_bsd(128, bsd_rename); reg_bsd(9, bsd_link); reg_bsd(57, bsd_symlink);
+ 	reg_bsd(124, bsd_fchmod); reg_bsd(123, bsd_fchown); reg_bsd(201, bsd_ftruncate); reg_bsd(95, bsd_fsync);
+ 	reg_bsd(131, bsd_flock); reg_bsd(89, bsd_getdtablesize); reg_bsd(120, bsd_readv); reg_bsd(121, bsd_writev);
+-	reg_bsd(138, bsd_utimes); reg_bsd(286, bsd_gettid); reg_bsd(79, bsd_getgroups); reg_bsd(93, bsd_select);
++	reg_bsd(138, bsd_utimes); reg_bsd(286, bsd_gettid); reg_bsd(79, bsd_getgroups); reg_bsd(93, bsd_select); reg_bsd(394, bsd_pselect);
++	reg_bsd(203, bsd_ok); reg_bsd(204, bsd_ok);                 // mlock/munlock: sin intercambio a disco, no hay que fijar nada
+ 	reg_bsd(80, bsd_ok); reg_bsd(23, bsd_ok); reg_bsd(181, bsd_ok); reg_bsd(182, bsd_ok); reg_bsd(183, bsd_ok);
+ }

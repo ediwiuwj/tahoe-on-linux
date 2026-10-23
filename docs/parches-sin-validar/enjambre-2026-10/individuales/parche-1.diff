@@ -1,0 +1,424 @@
+diff --git i/tahoe-run/emu_mach.c w/tahoe-run/emu_mach.c
+index 10560d8..c039669 100644
+--- i/tahoe-run/emu_mach.c
++++ w/tahoe-run/emu_mach.c
+@@ -290,6 +290,211 @@ static size_t mig_mach_vm_remap(const struct hdr* req, const uint8_t* m, uint8_t
+ 	return n + 16;
+ }
+ 
++// ---------------------------------------------------------------- mach_vm_region (id 4816)
++// Sabores de vm_region (osfmk/mach/vm_region.h) y tamaño de sus estructuras (en natural_t, como las cuenta XNU).
++#define VR_BASIC_INFO_64        9        // VM_REGION_BASIC_INFO_64
++#define VR_BASIC_INFO          10        // VM_REGION_BASIC_INFO (el viejo de 32 bits: XNU lo convierte al de 64)
++#define VR_EXTENDED_INFO       13        // VM_REGION_EXTENDED_INFO
++#define VR_BASIC_COUNT_64      10        // VM_REGION_BASIC_INFO_COUNT_64  (40 bytes / 4: la estructura tiene 8 bytes de «offset» y 4 de relleno)
++#define VR_EXTENDED_COUNT       9        // VM_REGION_EXTENDED_INFO_COUNT  (36 bytes / 4)
++
++// Una región del mapa de la tarea. Las de Linux: el invitado comparte el espacio de direcciones con el emulador, así que
++// /proc/<pid>/maps es el mapa de la tarea (lo que en XNU es su vm_map).
++struct vregion { uint64_t start, end, off; int prot, shared; };
++
++// Región que contiene la dirección; si no hay ninguna, la siguiente por encima (como XNU: «si la dirección indicada no
++// está asignada, se describe el siguiente intervalo de direcciones más alto», osfmk/mach/mach_vm.defs). Devuelve 0 si no
++// hay ninguna por encima (entonces XNU responde KERN_NO_SPACE).
++static int vm_region_of(int32_t pid, uint64_t addr, struct vregion* out) {
++	char path[64];
++	snprintf(path, sizeof path, "/proc/%d/maps", (int)pid);
++	FILE* f = fopen(path, "r");
++	if (!f) return 0;
++	char ln[512];
++	int found = 0;
++	uint64_t ns = 0, ne = 0, no = 0; int np = 0, nsh = 0, hay = 0;
++	while (fgets(ln, sizeof ln, f)) {
++		unsigned long lo, hi; char pr[8]; unsigned long long o;
++		if (sscanf(ln, "%lx-%lx %7s %llx", &lo, &hi, pr, &o) < 4) continue;
++		uint64_t s = (uint64_t)lo, e = (uint64_t)hi;
++		int p = (pr[0] == 'r' ? 1 : 0) | (pr[1] == 'w' ? 2 : 0) | (pr[2] == 'x' ? 4 : 0);
++		int sh = pr[3] == 's';                            // 's' = mapa compartido, 'p' = privado (como el «shared» de XNU)
++		if (s <= addr && addr < e) {                       // la región que contiene la dirección
++			out->start = s; out->end = e; out->off = (uint64_t)o; out->prot = p; out->shared = sh;
++			found = 1;
++			break;
++		}
++		if (s > addr) {                                    // la siguiente por encima (el mapa va ordenado)
++			ns = s; ne = e; no = (uint64_t)o; np = p; nsh = sh; hay = 1;
++			break;
++		}
++	}
++	fclose(f);
++	if (!found && hay) { out->start = ns; out->end = ne; out->off = no; out->prot = np; out->shared = nsh; found = 1; }
++	return found;
++}
++
++// mach_vm_region (id 4816): información de una región del espacio de direcciones de una tarea.
++// La petición es simple (sin descriptores): cabecera (24) + NDR (8) + argumentos, y los argumentos van en el orden de
++// mach_vm.defs: address (inout, 8), size (out, 8), flavor (4), count (4, el CountInOut de `info`). La tarea es el puerto
++// remoto del mensaje: las rutinas del subsistema mach_vm son «_external» en XNU (el sufijo lo añade KERNEL_SERVER,
++// osfmk/mach/mach_vm.defs:90), o sea que el objetivo es el puerto de destino y no un argumento del cuerpo.
++// O sea: cabecera (24) + NDR (24..31) + address (32..39) + flavor (40..43) + count (44..47) = 48 bytes. Lo comprobó el
++// cliente de macOS 26 (libsystem_kernel, `_mach_vm_region` de la caché de dyld): escribe el NDR en +24, la dirección en
++// +32, el sabor en +40 y min(cuenta,10) en +44, y el mensaje mide 48 bytes.
++// La respuesta es compleja: `object_name` es un puerto de salida -> cabecera (24) + nº de descriptores (4) + descriptor de
++// puerto (12) + NDR (8) + address (8) + size (8) + count (4) + info[count]. El mismo cliente comprueba ese reparto: la
++// respuesta debe medir 68 + 4*count bytes, el descriptor de puerto va en +28 (con la disposición en +38) y el contador en
++// +64; sin el bit «complejo» (0x80000000) en msgh_bits, el cliente toma la respuesta por un error.
++static size_t mig_mach_vm_region(const struct hdr* req, const uint8_t* m, uint8_t* r) {
++	uint64_t addr = 0;
++	int32_t flavor = 0, count = 0;
++	if (req->size < 48) return reply_begin(r, req, KERN_INVALID_ARG);   // petición corta: faltan los argumentos
++	memcpy(&addr, m + 32, 8);                          // address (in/out)
++	memcpy(&flavor, m + 40, 4);                        // flavor
++	memcpy(&count, m + 44, 4);                         // count (CountInOut de info)
++	if (flavor == VR_BASIC_INFO) flavor = VR_BASIC_INFO_64;   // como XNU (osfmk/vm/vm_user.c:1452)
++	uint32_t need = 0;
++	if (flavor == VR_BASIC_INFO_64) need = VR_BASIC_COUNT_64;
++	else if (flavor == VR_EXTENDED_INFO) need = VR_EXTENDED_COUNT;
++	else return reply_begin(r, req, KERN_INVALID_ARG);        // sabor desconocido: como XNU (vm_map.c: «default»)
++	// XNU solo comprueba que la cuenta quepa (osfmk/vm/vm_map.c: «if (*count < VM_REGION_BASIC_INFO_COUNT_64)»): si no,
++	// KERN_INVALID_ARGUMENT. Si sobra, devuelve la cuenta que necesita y el cliente se queda con lo que pidió.
++	if (count < (int32_t)need) return reply_begin(r, req, KERN_INVALID_ARG);
++	int32_t pid = (int32_t)getpid();
++	int kt;
++	if (req->remote != 0x103 && !(kobj_lookup(req->remote, &kt, &pid) && (kt == KO_TASK || kt == KO_TASK_NAME)))
++		pid = (int32_t)getpid();
++	struct vregion vm;
++	if (!vm_region_of(pid, addr, &vm)) return reply_begin(r, req, KERN_NO_SPACE_);   // no hay nada por encima
++	uint32_t info[VR_BASIC_COUNT_64] = { 0 };
++	if (flavor == VR_BASIC_INFO_64) {
++		// struct vm_region_basic_info_64 (osfmk/mach/vm_region.h:88), con su reparto real: protection (0),
++		// max_protection (4), inheritance (8), shared (12), reserved (16), 4 bytes de relleno (20), offset (24, 8 bytes),
++		// behavior (32), user_wired_count (36) y 2 de relleno (38). XNU escribe la estructura tal cual en el búfer del
++		// cliente (vm_map.c: «basic = (vm_region_basic_info_64_t) info»), así que el relleno también cuenta.
++		info[0] = (uint32_t)vm.prot;              // protección actual (los bits de Linux son los de vm_prot_t)
++		info[1] = (uint32_t)vm.prot;              // protección máxima: en Linux no hay más que la actual
++		info[2] = 1;                              // VM_INHERIT_COPY (Linux no tiene atributo de herencia)
++		info[3] = (uint32_t)vm.shared;            // shared: el mapa es compartido (MAP_SHARED) si el Kernel lo dice
++		info[4] = 0;                              // reserved (is_sub_map)
++		memcpy(info + 6, &vm.off, 8);             // offset dentro del objeto (el desplazamiento del archivo)
++		info[8] = 0;                              // VM_BEHAVIOR_DEFAULT
++		info[9] = 0;                              // user_wired_count
++	} else {
++		// struct vm_region_extended_info (osfmk/mach/vm_region.h:186): protección, etiqueta y páginas.
++		info[0] = (uint32_t)vm.prot;              // protection
++		info[1] = 0;                              // user_tag
++		info[2] = 0;                              // pages_resident (XNU también lo deja a cero sin objeto de memoria)
++		info[3] = 0;                              // pages_shared_now_private
++		info[4] = 0;                              // pages_swapped_out
++		info[5] = 0;                              // pages_dirtied
++		info[6] = 0;                              // ref_count
++		info[7] = 0;                              // shadow_depth, external_pager y share_mode
++		info[8] = 0;                              // pages_reusable
++	}
++	if (mach_trace()) logf_("    MT pid=%d vm_region 0x%lx sabor %d cuenta %d -> 0x%lx+0x%lx prot=%d\n",
++		(int)getpid(), (unsigned long)addr, flavor, count, (unsigned long)vm.start, (unsigned long)(vm.end - vm.start), vm.prot);
++	// Respuesta compleja: el puerto de salida `object_name` va en un descriptor (aquí nulo: no hay objetos de memoria).
++	struct hdr nh = { .bits = 0x80000000u, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = req->id + 100 };
++	memcpy(r, &nh, sizeof nh);
++	uint32_t one = 1; memcpy(r + 24, &one, 4);
++	uint8_t desc[12] = { 0 };
++	desc[10] = 17;                                  // MACH_MSG_TYPE_COPY_SEND: el derecho de envío que se devuelve
++	desc[11] = 0;                                   // MACH_MSG_PORT_DESCRIPTOR
++	memcpy(r + 28, desc, 12);
++	memcpy(r + 40, NDR_LE, 8);
++	size_t n = 48;
++	uint64_t start = vm.start, size = vm.end - vm.start;
++	memcpy(r + n, &start, 8); n += 8;
++	memcpy(r + n, &size, 8); n += 8;
++	int32_t c32 = (int32_t)need; memcpy(r + n, &c32, 4); n += 4;
++	memcpy(r + n, info, need * 4); n += need * 4;
++	return n;
++}
++
++// mach_vm_region_recurse (id 4815): como mach_vm_region, pero además de la profundidad de anidamiento (los «submap» de
++// XNU). Aquí no hay submaps, así que la profundidad no cambia y la región es la misma.
++// La petición: cabecera (24) + NDR (8) + address (8, inout) + nesting_depth (4, inout) + count (4) = 48 bytes; lo comprobó
++// el cliente de macOS 26 (`_mach_vm_region_recurse` en la caché de dyld): NDR en +24, dirección en +32, profundidad en +40
++// y min(cuenta,19) en +44, y el mensaje mide 48 bytes.
++// La respuesta: cabecera (24) + NDR (8) + retcode (4) + address (8) + size (8) + nesting_depth (4) + count (4) +
++// info[count]: el tamaño es 60 + 4*count y el cliente lee la dirección en +36, el tamaño en +44, la profundidad en +52 y
++// el contador en +56.
++#define VR_RECURSE_SHORT_COUNT  13        // VM_REGION_SUBMAP_SHORT_INFO_COUNT_64
++#define VR_RECURSE_V0_COUNT     17        // VM_REGION_SUBMAP_INFO_V0_COUNT_64
++#define VR_RECURSE_V1_COUNT     18        // VM_REGION_SUBMAP_INFO_V1_COUNT_64
++#define VR_RECURSE_MAX_COUNT    19        // el arreglo del cliente: type vm_region_recurse_info_t = array[*:19] (mach_types.defs:573)
++static size_t mig_mach_vm_region_recurse(const struct hdr* req, const uint8_t* m, uint8_t* r) {
++	uint64_t addr = 0;
++	int32_t depth = 0, count = 0;
++	if (req->size < 48) return reply_begin(r, req, KERN_INVALID_ARG);
++	memcpy(&addr, m + 32, 8);                          // address (in/out)
++	memcpy(&depth, m + 40, 4);                         // nesting_depth (in/out)
++	memcpy(&count, m + 44, 4);                         // count (CountInOut de info)
++	// Como XNU (osfmk/vm/vm_map.c: vm_map_region_recurse_64): si el búfer no cabe ni la versión corta, KERN_INVALID_ARGUMENT;
++	// si sobra, se devuelve la versión que cabe (V0, V1 o V2 según lo que pidiera).
++	if (count < VR_RECURSE_SHORT_COUNT) return reply_begin(r, req, KERN_INVALID_ARG);
++	uint32_t need = VR_RECURSE_V0_COUNT;
++	if (count >= VR_RECURSE_V1_COUNT) need = VR_RECURSE_V1_COUNT;
++	if (need > VR_RECURSE_MAX_COUNT) need = VR_RECURSE_MAX_COUNT;    // el arreglo del cliente no da para más
++	int32_t pid = (int32_t)getpid();
++	int kt;
++	if (req->remote != 0x103 && !(kobj_lookup(req->remote, &kt, &pid) && (kt == KO_TASK || kt == KO_TASK_NAME)))
++		pid = (int32_t)getpid();
++	struct vregion vm;
++	if (!vm_region_of(pid, addr, &vm)) return reply_begin(r, req, KERN_NO_SPACE_);
++	// struct vm_region_submap_info_64 (osfmk/mach/vm_region.h:271), con su reparto real (los huecos también cuentan,
++	// porque XNU escribe la estructura tal cual en el búfer del cliente):
++	// protection (0), max_protection (4), inheritance (8), relleno (12), offset (16, 8 bytes), user_tag (24),
++	// pages_resident (28), pages_shared_now_private (32), pages_swapped_out (36), pages_dirtied (40), ref_count (44),
++	// shadow_depth (48), external_pager (50), share_mode (51), is_submap (52), behavior (56), object_id (60),
++	// user_wired_count (64), flags (66), pages_reusable (68).
++	uint32_t info[VR_RECURSE_V1_COUNT] = { 0 };
++	info[0] = (uint32_t)vm.prot;               // protection (0)
++	info[1] = (uint32_t)vm.prot;               // max_protection (4)
++	info[2] = 1;                               // inheritance: VM_INHERIT_COPY (8)
++	memcpy(info + 4, &vm.off, 8);              // offset (16): el desplazamiento del archivo
++	info[11] = 0;                              // ref_count (44)
++	info[12] = (uint32_t)(vm.shared ? 4 : 2) << 24;   // share_mode (51): SM_SHARED o SM_PRIVATE
++	info[13] = 0;                              // is_submap (52): aquí no hay submaps
++	info[16] = 0;                              // user_wired_count (64) y flags (66)
++	info[17] = 0;                              // pages_reusable (68)
++	if (mach_trace()) logf_("    MT pid=%d vm_region_recurse 0x%lx profundidad %d cuenta %d -> 0x%lx+0x%lx prot=%d\n",
++		(int)getpid(), (unsigned long)addr, depth, count, (unsigned long)vm.start, (unsigned long)(vm.end - vm.start), vm.prot);
++	size_t n = reply_begin(r, req, KERN_SUCCESS_);
++	uint64_t start = vm.start, size = vm.end - vm.start;
++	memcpy(r + n, &start, 8); n += 8;
++	memcpy(r + n, &size, 8); n += 8;
++	memcpy(r + n, &depth, 4); n += 4;
++	int32_t c32 = (int32_t)need; memcpy(r + n, &c32, 4); n += 4;
++	memcpy(r + n, info, need * 4); n += need * 4;
++	return n;
++}
++
++// mach_port_space_basic_info (id 3235): información básica del espacio IPC de una tarea.
++// La petición es simple: cabecera (24) + NDR (8) + argumentos; la tarea es el puerto remoto del mensaje (como en las
++// demás rutinas del subsistema mach_port: en mach_port_get_attributes, id 3217, el nombre del puerto está en +32, o sea
++// que la tarea no se repite en el cuerpo).
++// La respuesta es simple: cabecera (24) + NDR (8) + código de retorno (4) + ipc_info_space_basic_t (6 natural_t).
++static size_t mig_mach_port_space_basic_info(const struct hdr* req, const uint8_t* m, uint8_t* r) {
++	(void)m;
++	int32_t pid = (int32_t)getpid();
++	int kt;
++	if (req->remote != 0x103 && !(kobj_lookup(req->remote, &kt, &pid) && (kt == KO_TASK || kt == KO_TASK_NAME)))
++		pid = (int32_t)getpid();
++	uint32_t inuse = 0, tsize = 0;
++	port_space_counts(pid, &inuse, &tsize);
++	uint32_t info[6] = { 0 };
++	info[0] = 0xff;                 // iisb_genno_mask = MACH_PORT_NGEN(MACH_PORT_DEAD) (osfmk/ipc/port.h:72)
++	info[1] = tsize;                 // iisb_table_size
++	info[2] = 0;                     // iisb_table_next (sin uso en XNU)
++	info[3] = inuse;                 // iisb_table_inuse
++	size_t n = reply_begin(r, req, KERN_SUCCESS_);
++	memcpy(r + n, info, sizeof info);
++	return n + sizeof info;
++}
++
+ // host_statistics (216) y host_statistics64 (219): NDR, sabor, capacidad (en enteros de 32 bits). Datos de Linux:
+ //   HOST_LOAD_INFO (1):      avenrun[3] (carga × 1000, LOAD_SCALE) y mach_factor[3], de /proc/loadavg.
+ //   HOST_VM_INFO (2):        vm_statistics (15 natural_t), solo en host_statistics.
+@@ -456,6 +661,53 @@ static size_t reply_ool(uint8_t* r, const struct hdr* req, const uint32_t* names
+ 	return n + 4;
+ }
+ 
++// task_policy_get (id 3421): la política de una tarea (el papel, el nivel de QoS, la supresión o el estado de importancia).
++// La petición: cabecera (24) + NDR (8) + flavor (4) + count (4) + get_default (4) = 44 bytes; la respuesta: cabecera (24) +
++// NDR (8) + retcode (4) + count (4) + info[count] + get_default (4) = 44 + 4*count bytes. (Lo comprobó el cliente de macOS 26:
++// `_task_policy_get` en la caché de dyld, que pide min(cuenta,16) y lee el get_default al final, en +40+4*count.)
++// En XNU (osfmk/kern/task_policy.c:575) hay cuatro sabores: TASK_CATEGORY_POLICY (1), TASK_SUPPRESSION_POLICY (3),
++// TASK_POLICY_STATE (4, que solo puede leer root), TASK_BASE_QOS_POLICY (8) y TASK_OVERRIDE_QOS_POLICY (9). Aquí las tareas no
++// tienen papel, QoS ni supresión: se devuelven los valores «sin especificar», que son los mismos que da XNU con get_default.
++#define TP_CATEGORY_POLICY      1        // TASK_CATEGORY_POLICY
++#define TP_SUPPRESSION_POLICY   3        // TASK_SUPPRESSION_POLICY
++#define TP_POLICY_STATE         4        // TASK_POLICY_STATE
++#define TP_BASE_QOS_POLICY      8        // TASK_BASE_QOS_POLICY
++#define TP_OVERRIDE_QOS_POLICY  9        // TASK_OVERRIDE_QOS_POLICY
++static size_t mig_task_policy_get(const struct hdr* req, const uint8_t* m, uint8_t* r) {
++	int32_t flavor = 0, count = 0, gd = 0;
++	if (req->size < 44) return reply_begin(r, req, KERN_INVALID_ARG);
++	memcpy(&flavor, m + 32, 4);                       // flavor
++	memcpy(&count, m + 36, 4);                        // count (CountInOut de info)
++	memcpy(&gd, m + 40, 4);                           // get_default (entrada y salida)
++	uint32_t info[16] = { 0 };
++	uint32_t need = 0;                                   // palabras que ocupa la estructura del sabor
++	if (flavor == TP_CATEGORY_POLICY) {
++		need = 1;
++		if (count < (int32_t)need) return reply_begin(r, req, KERN_INVALID_ARG);
++		info[0] = 0;                                  // role: TASK_UNSPECIFIED (task_policy.h:120)
++	} else if (flavor == TP_BASE_QOS_POLICY || flavor == TP_OVERRIDE_QOS_POLICY) {
++		need = 2;
++		if (count < (int32_t)need) return reply_begin(r, req, KERN_INVALID_ARG);
++		info[0] = 0;                                  // task_latency_qos_tier: LATENCY_QOS_TIER_UNSPECIFIED
++		info[1] = 0;                                  // task_throughput_qos_tier: THROUGHPUT_QOS_TIER_UNSPECIFIED
++	} else if (flavor == TP_SUPPRESSION_POLICY) {
++		need = 16;                                   // nada suprimido (task_policy_private.h:118)
++		if (count < (int32_t)need) return reply_begin(r, req, KERN_INVALID_ARG);
++	} else if (flavor == TP_POLICY_STATE) {
++		need = 16;                                   // requested, effective, pending... (task_policy_private.h:133)
++		if (count < (int32_t)need) return reply_begin(r, req, KERN_INVALID_ARG);
++		if (cred_euid() != 0) return reply_begin(r, req, 2 /* KERN_PROTECTION_FAILURE: solo root */);
++	} else return reply_begin(r, req, KERN_INVALID_ARG);   // sabor desconocido: como XNU
++	// XNU no cambia la cuenta (solo la comprueba): la respuesta lleva los mismos números que la petición (el cliente los
++	// limita a 16), y XNU escribe la estructura al principio del búfer. Aquí, lo mismo: los valores al principio y el resto a cero.
++	uint32_t out = (count > 16 ? 16 : (uint32_t)count);
++	size_t n = reply_begin(r, req, KERN_SUCCESS_);
++	memcpy(r + n, &out, 4); n += 4;
++	memcpy(r + n, info, out * 4); n += out * 4;
++	memcpy(r + n, &gd, 4); n += 4;                     // get_default: XNU no lo cambia, se devuelve el que pidió
++	return n;
++}
++
+ // Conjuntos de procesadores (top, ps): uno solo, como en un Mac. host_processor_sets (419) da su nombre, y
+ // host_processor_set_priv (420) el puerto con privilegios, con el que processor_set_tasks (4005) da un puerto de tarea por
+ // cada proceso de macOS vivo (los pid del espacio de nombres son los de macOS).
+@@ -1089,6 +1341,7 @@ static long mach_msg2(struct ctx* c) {
+ 		n = reply_begin(rep, &h, port_set_attributes(nm, (int)fl, in, cnt));
+ 		break;
+ 	}
++	case 3235: n = mig_mach_port_space_basic_info(&h, req, rep); break;   // estado del espacio IPC de la tarea (top)
+ 	case 3228: {                                                  // mach_port_get_context(task, name) -> context
+ 		uint32_t nm; memcpy(&nm, req + 32, 4);
+ 		n = reply_begin(rep, &h, port_exists(nm) ? KERN_SUCCESS_ : 15 /* KERN_INVALID_NAME */);
+@@ -1144,6 +1397,8 @@ static long mach_msg2(struct ctx* c) {
+ 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;
+ 	case 4817: n = mig_make_memory_entry(&h, req, rep); break;
+ 	case 4813: n = mig_mach_vm_remap(&h, req, rep); break;
++	case 4816: n = mig_mach_vm_region(&h, req, rep); break;   // las regiones del mapa de la tarea (top, vmmap)
++	case 4815: n = mig_mach_vm_region_recurse(&h, req, rep); break;   // lo mismo, con la profundidad de anidamiento (top)
+ 	case 4807: {                                                  // mach_vm_copy(task, src, size, dst): el destino ya está asignado
+ 		uint64_t src, size, dst; memcpy(&src, req + 32, 8); memcpy(&size, req + 40, 8); memcpy(&dst, req + 48, 8);
+ 		// Las dos direcciones son del invitado: sin comprobarlas, un rango inválido mataba el proceso emulado
+@@ -1207,6 +1462,7 @@ static long mach_msg2(struct ctx* c) {
+ 	case 3409: n = mig_task_get_special_port(&h, req, rep); break;
+ 	case 3410: n = mig_task_set_special_port(&h, req, rep); break;
+ 	case 3405: n = mig_task_info(&h, req, rep); break;
++	case 3421: n = mig_task_policy_get(&h, req, rep); break;   // la política de la tarea (rol, QoS) (top)
+ 	default:
+ 		if (h.id >= 2800 && h.id < 2900) {                          // IOKit (device.defs): sin registro de E/S todavía -> kIOReturnNotFound
+ 			{ int hd; size_t r2 = mig_iokit(&h, req, rep, &hd); if (hd) { n = r2; break; } }
+diff --git i/tahoe-run/emu_net.c w/tahoe-run/emu_net.c
+index 50681c3..4ffc63e 100644
+--- i/tahoe-run/emu_net.c
++++ w/tahoe-run/emu_net.c
+@@ -576,6 +576,37 @@ static long pc_value(int name) {
+ }
+ static long net_pathconf(struct ctx* c) { long v = pc_value((int)c->a[1]); return v < 0 ? -D_EINVAL : v; }
+ 
++// Indicadores de necp_open (bsd/net/necp.h:614).
++#define NECP_OPEN_FLAG_OBSERVER       0x01
++#define NECP_OPEN_FLAG_BACKGROUND     0x02
++#define NECP_OPEN_FLAG_PUSH_OBSERVER  0x04
++
++// Los descriptores de cliente NECP. En XNU sus operaciones de archivo no hacen nada (bsd/net/necp_client.c:413,
++// necp_fd_ops: fo_read = fo_no_read → ENXIO, fo_write = fo_no_write → ENXIO, fo_ioctl = fo_no_ioctl → ENOTTY;
++// fo_no_read y fo_no_write devuelven ENXIO en bsd/kern/kern_descrip.c:6268 y 6296, y fo_no_ioctl, ENOTTY, en 6337).
++// Aquí no hay políticas NECP (ni de filtros ni de proveedores de datos), así que el descriptor solo existe: se abre el de
++// /dev/null (para que se pueda cerrar como cualquier otro) y las llamadas de archivo se responden con esos errores.
++#define NECP_FDS 64
++static int necp_fds[NECP_FDS];
++int net_necp_fd(int fd) { for (int i = 0; i < NECP_FDS; i++) if (necp_fds[i] == fd) return 1; return 0; }
++void net_necp_fd_closed(int fd) { for (int i = 0; i < NECP_FDS; i++) if (necp_fds[i] == fd) necp_fds[i] = 0; }
++static void net_necp_fd_new(int fd) { for (int i = 0; i < NECP_FDS; i++) if (!necp_fds[i]) { necp_fds[i] = fd; return; } }
++
++// necp_open (syscall 501): en XNU (bsd/net/necp_client.c:8098, necp_open) abre un descriptor de cliente NECP con los
++// indicadores dados. Los indicadores de observador exigen el privilegio de estadísticas de red
++// (PRIV_NET_PRIVILEGED_NETWORK_STATISTICS) o el de skywalk: sin ellos, EACCES, como en XNU. Aquí el privilegio se
++// aproxima con «root» (uid 0), que es quien lo tiene en un Mac.
++static long net_necp_open(struct ctx* c) {
++	int flags = (int)c->a[0];
++	if (flags & (NECP_OPEN_FLAG_OBSERVER | NECP_OPEN_FLAG_PUSH_OBSERVER))
++		if (cred_euid() != 0) return -D_EACCES;
++	int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);   // como en XNU, el descriptor se crea con FP_CLOEXEC
++	if (fd < 0) return err();
++	net_necp_fd_new(fd);
++	if (trace_all) logf_("    necp_open(0x%x) -> %d\n", flags, fd);
++	return fd;
++}
++
+ // coalition(op, id*, tipo, flags): solo se emula la creación (id sintético) y la consulta
+ static long net_coalition(struct ctx* c) {
+ 	static uint64_t next = 100;
+@@ -592,4 +623,5 @@ void emu_net_init(void) {
+ 	reg_bsd(28, net_sendmsg); reg_bsd(402, net_sendmsg); reg_bsd(27, net_recvmsg); reg_bsd(401, net_recvmsg);
+ 	reg_bsd(191, net_pathconf); reg_bsd(192, net_pathconf);
+ 	reg_bsd(458, net_coalition); reg_bsd(459, net_coalition); reg_bsd(532, net_coalition);   // coalition, coalition_info, coalition_ledger
++	reg_bsd(501, net_necp_open);                                                       // necp_open: descriptor de cliente NECP
+ }
+diff --git i/tahoe-run/emu_port.c w/tahoe-run/emu_port.c
+index 7e19be7..347c4a7 100644
+--- i/tahoe-run/emu_port.c
++++ w/tahoe-run/emu_port.c
+@@ -1161,6 +1161,24 @@ int port_list_owned(uint32_t* names, uint32_t* types, int max) {
+ 	return n;
+ }
+ int port_rpid(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p ? p->rpid : -1; unlock(); return r; }
++// Estado del espacio IPC de un proceso: cuántas entradas (nombres de puerto) usa y de qué tamaño es la tabla.
++// En XNU cada tarea tiene su propia tabla de nombres (osfmk/ipc/ipc_space.c) y mach_port_space_basic_info
++// (osfmk/ipc/mach_debug.c:357) informa de su tamaño y de las entradas en uso. Una entrada es un nombre del espacio: un
++// derecho de recepción o un derecho de envío que el proceso tiene (los urefs no cuentan: en XNU es un nombre por entrada).
++// Aquí la tabla de puertos es única para todo el sistema: el «tamaño» es la marca más alta usada (los huecos se
++// reutilizan, como en XNU la tabla nunca encoge) y las «entradas en uso» son las del proceso: sus puertos y los derechos
++// de envío que tiene sobre los de otros.
++void port_space_counts(int32_t pid, uint32_t* inuse, uint32_t* tsize) {
++	uint32_t n = 0;
++	lock();
++	for (int i = 0; i < (int)shm->hiwater; i++)
++		if (shm->ports[i].used && shm->ports[i].owner == pid) n++;
++	for (int i = 0; i < (int)shm->sh_hw; i++)
++		if (shm->sh[i].port && shm->sh[i].holder == pid) n++;      // derechos de envío que tiene (uno por nombre)
++	*tsize = (uint32_t)shm->hiwater;
++	*inuse = n;
++	unlock();
++}
+ static int owns(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p && p->owner == (int32_t)getpid(); unlock(); return r; }
+ // Diagnóstico: una destrucción que se ignora porque el puerto consta de otro dueño (las primeras 20 por proceso).
+ static void no_es_mio(const char* que, uint32_t name) {
+diff --git i/tahoe-run/tahoe.h w/tahoe-run/tahoe.h
+index d30b47b..57ddae4 100644
+--- i/tahoe-run/tahoe.h
++++ w/tahoe-run/tahoe.h
+@@ -97,6 +97,7 @@ int trace_file_on(const char* file);
+ static inline int wl_trace_on(void) { static int v = -1; if (v < 0) v = mach_trace() || trace_file_on("/dev/shm/tahoe-wl-trace"); return v; }
+ int port_rpid(uint32_t name);
+ int port_list_owned(uint32_t* names, uint32_t* types, int max);
++void port_space_counts(int32_t pid, uint32_t* inuse, uint32_t* tsize);   // estado del espacio IPC de un proceso (mach_port_space_basic_info)
+ uint64_t port_get_context(uint32_t name);
+ int port_set_context(uint32_t name, uint64_t v);   // kern_return_t
+ int port_guard(uint32_t name, uint64_t guard, int strict);
+@@ -111,6 +112,8 @@ int trace_file_on(const char* file);
+ void diag_dump_threads(void);
+ void diag_breakpoints(void);
+ uint32_t cred_euid(void);
++int net_necp_fd(int fd);              // emu_net.c: 1 si el descriptor es de cliente NECP (lectura y escritura: ENXIO)
++void net_necp_fd_closed(int fd);      // emu_net.c: se olvida al cerrar el descriptor
+ uint32_t cred_egid(void);
+ uint32_t cred_auid(void);           // emu_cred.c: sesión de auditoría del proceso (auid, asid)
+ uint32_t cred_asid(void);
+@@ -213,4 +216,4 @@ void special_port_set(int which, uint32_t name);
+ void reenable_dispatch(void);   // el kernel no hereda la interceptación de syscalls en el hijo de un fork
+ 
+ // Códigos de error de Darwin
+-enum { D_EPERM = 1, D_ENOENT = 2, D_ESRCH = 3, D_EBADF = 9, D_ENOMEM = 12, D_EFAULT = 14, D_EINVAL = 22, D_ENOSYS = 78, D_ERANGE = 34 };
++enum { D_EPERM = 1, D_ENOENT = 2, D_ESRCH = 3, D_EBADF = 9, D_ENOMEM = 12, D_EACCES = 13, D_EFAULT = 14, D_EINVAL = 22, D_ENOSYS = 78, D_ERANGE = 34 };
+diff --git i/tahoe-run/tahoe_run.c w/tahoe-run/tahoe_run.c
+index 4b42e85..b0b2e94 100644
+--- i/tahoe-run/tahoe_run.c
++++ w/tahoe-run/tahoe_run.c
+@@ -559,10 +559,12 @@ static long bsd_write(struct ctx* c) {
+ 		struct stat st;
+ 		if (fstat((int)fd, &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == makedev(1, 3)) fd = (unsigned long)logfd;
+ 	}
++	if (net_necp_fd((int)fd)) return -6;               // ENXIO: como fo_no_write del descriptor NECP (XNU)
+ 	long r = syscall(SYS_write, fd, c->a[1], c->a[2]);
+ 	return r < 0 ? -darwin_errno(errno) : r;
+ }
+ static long bsd_read(struct ctx* c) {
++	if (net_necp_fd((int)c->a[0])) return -6;           // ENXIO: como fo_no_read del descriptor NECP (XNU)
+ 	long r = syscall(SYS_read, c->a[0], c->a[1], c->a[2]);
+ 	return r < 0 ? -darwin_errno(errno) : r;
+ }
+@@ -571,6 +573,7 @@ static long bsd_close(struct ctx* c) {
+ 	int fd = (int)c->a[0];
+ 	if (fd >= FD_INTERNAL_BASE) return -9;                 // EBADF: descriptores del emulador (ver fd_hi)
+ 	kq_close(fd);                                           // si era una kqueue, se sueltan sus knotes antes de cerrar
++	net_necp_fd_closed(fd);                                 // si era un descriptor de cliente NECP, se olvida
+ 	long r = syscall(SYS_close, fd);
+ 	return r < 0 ? -darwin_errno(errno) : r;
+ }
