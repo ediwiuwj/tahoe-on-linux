@@ -1,0 +1,893 @@
+From c4a76be1def1a12f54da2d2e9b055c8281922cad Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 21:48:23 -0600
+Subject: [PATCH 18/57] =?UTF-8?q?Metal:=2021=20m=C3=A9todos=20del=20protoc?=
+ =?UTF-8?q?olo=20MTLDevice=20implementados=20de=20verdad?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fase 0 (los triviales que usan clientes reales):
+- newCommandBuffer: crea una cola por defecto y devuelve su command buffer.
+- getDefaultSamplePositions:count: las posiciones estándar de MSAA (1, 2, 4, 8, 16).
+- heapBufferSizeAndAlignWithLength:options: y heapTextureSizeAndAlignWithDescriptor:
+  (size, 256); MPS los llama 7 veces.
+- maxArgumentBufferSamplerCount: 0, como argumentBuffersSupport.
+
+Fase 1:
+- newHeapWithDescriptor: con TahoeMTLHeap (cuenta lo ocupado); QuartzCore lo pide en
+  update_surface_heap y MPS en sus cachés.
+- newFence y newResidencySetWithDescriptor:error: con sus clases.
+- newBufferWithBytesNoCopy:length:options:deallocator: (copia los bytes: el
+  servidor no puede importar memoria del cliente).
+
+Variantes de los pipelines (el bloque de completado se llama de seguida):
+- newComputePipelineStateWithDescriptor:options:reflection:error:
+- newComputePipelineStateWithFunction:options:reflection:error:
+- newComputePipelineStateWithFunction:completionHandler:
+- newComputePipelineStateWithFunction:options:completionHandler:
+- newComputePipelineStateWithDescriptor:options:completionHandler:
+- newRenderPipelineStateWithDescriptor:completionHandler:
+- newRenderPipelineStateWithDescriptor:options:completionHandler:
+
+Eventos y manejadores: newEvent, newSharedEvent, newSharedEventWithHandle:,
+functionHandleWithFunction: y functionHandleWithBinaryFunction:.
+
+La batería crece con cada lote: 26/26 comprobaciones (era 11/11) y los stubs
+vivos del protocolo pasan de 68 a 47.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-metal/src/bin/metalsuite.rs | 260 ++++++++++++++++++++++++++++++
+ tahoe-metal/src/clases.rs         |  87 ++++++++++
+ tahoe-metal/src/lib.rs            | 139 ++++++++++++++++
+ tahoe-metal/src/render.rs         | 222 ++++++++++++++++++++++++-
+ 4 files changed, 706 insertions(+), 2 deletions(-)
+
+diff --git a/tahoe-metal/src/bin/metalsuite.rs b/tahoe-metal/src/bin/metalsuite.rs
+index b5e1230..89e2698 100644
+--- a/tahoe-metal/src/bin/metalsuite.rs
++++ b/tahoe-metal/src/bin/metalsuite.rs
+@@ -48,6 +48,76 @@ fn chequear(inf: &mut Informe, nombre: &str, f: impl FnOnce() -> Result<(), Stri
+     }
+ }
+ 
++/// Un mensaje con cuatro argumentos (los que no cubre el módulo de Objective-C).
++unsafe fn m4<A, B, C, D, R>(obj: Id, s: &str, a: A, b: B, c: C, d: D) -> R {
++    let f: unsafe extern "C" fn(Id, objc::Sel, A, B, C, D) -> R = std::mem::transmute(objc::objc_msgSend as *const ());
++    f(obj, objc::sel(s), a, b, c, d)
++}
++
++/// Cuántos bloques de completado se han llamado.
++static BLOQUES_LLAMADOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++extern "C" fn bloque_invocado(_bloque: Id, _a: Id, _b: Id) {
++    BLOQUES_LLAMADOS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++}
++
++/// Un bloque de Objective-C de mentira: el driver solo usa la función de invocación (está en el desplazamiento 16
++/// del literal), así que basta con un bloque con esa forma.
++#[repr(C)]
++struct BloqueFalso {
++    isa: *const c_void,
++    flags: i32,
++    reserved: i32,
++    invoke: extern "C" fn(Id, Id, Id),
++    descriptor: *const c_void,
++}
++
++fn bloque_falso() -> Id {
++    let b = Box::into_raw(Box::new(BloqueFalso {
++        isa: std::ptr::null(),
++        flags: 0,
++        reserved: 0,
++        invoke: bloque_invocado,
++        descriptor: std::ptr::null(),
++    }));
++    b as Id
++}
++
++/// La función de cómputo de la biblioteca de CoreRE3D (la misma que usa metalprobe).
++fn funcion_de_computo(d: Id) -> Option<Id> {
++    unsafe {
++        let mut err: Id = std::ptr::null_mut();
++        let ruta = "/System/Library/PrivateFrameworks/CoreRE3DGSFoundation.framework/Versions/A/Resources/default.metallib";
++        let lib = objc::m2::<Id, *mut Id, Id>(d, "newLibraryWithFile:error:", objc::nsstring(ruta), &mut err as *mut Id);
++        if lib.is_null() {
++            return None;
++        }
++        let f = objc::m1::<Id, Id>(lib, "newFunctionWithName:", objc::nsstring("SetValueFloat"));
++        if f.is_null() {
++            return None;
++        }
++        Some(f)
++    }
++}
++
++/// MTLSizeAndAlign: el tamaño y la alineación de un recurso en un heap.
++#[repr(C)]
++#[derive(Clone, Copy)]
++struct TamanoAlineacion {
++    tamano: u64,
++    alineacion: u64,
++}
++
++/// Una comprobación que solo aplica si el marco de Apple tiene esa clase: si no, se cuenta como saltada.
++fn chequear_si(inf: &mut Informe, nombre: &str, aplica: bool, f: impl FnOnce() -> Result<(), String>) {
++    if !aplica {
++        inf.saltados += 1;
++        println!("  (n/d)   {nombre}: Apple no tiene esa clase");
++        return;
++    }
++    chequear(inf, nombre, f)
++}
++
+ /// Una comprobación que depende de que exista un selector en el marco de Apple: si no existe, no es un fallo del
+ /// driver, se cuenta como saltada.
+ fn comprobar(inf: &mut Informe, nombre: &str, selector: Option<&str>, f: impl FnOnce() -> Result<(), String>) {
+@@ -269,6 +339,196 @@ fn main() {
+             }
+             Ok(())
+         });
++        chequear(&mut inf, "command buffer del dispositivo", || {
++            let cb: Id = objc::m0(d, "newCommandBuffer");
++            if cb.is_null() {
++                return Err("nil".into());
++            }
++            if !objc::responde_instancia(cb, "commit") {
++                return Err("no responde a commit".into());
++            }
++            Ok(())
++        });
++        chequear(&mut inf, "tamaño y alineación de buffer en heap", || {
++            let r = objc::m2::<u64, u64, TamanoAlineacion>(d, "heapBufferSizeAndAlignWithLength:options:", 1024, 0);
++            if r.tamano < 1024 {
++                return Err(format!("tamaño {} menor que 1024", r.tamano));
++            }
++            if r.alineacion != 256 {
++                return Err(format!("alineación {} en vez de 256", r.alineacion));
++            }
++            Ok(())
++        });
++        chequear(&mut inf, "tamaño y alineación de textura en heap", || {
++            let td = descriptor_textura2d(252, 64, 64, false);
++            let r = objc::m1::<Id, TamanoAlineacion>(d, "heapTextureSizeAndAlignWithDescriptor:", td);
++            if r.tamano < 64 * 64 * 4 {
++                return Err(format!("tamaño {} menor que 16384", r.tamano));
++            }
++            if r.alineacion != 256 {
++                return Err(format!("alineación {} en vez de 256", r.alineacion));
++            }
++            Ok(())
++        });
++        chequear(&mut inf, "posiciones de muestreo", || {
++            let mut posiciones = [[0.0f32; 2]; 4];
++            objc::m2::<*mut [f32; 2], u64, ()>(d, "getDefaultSamplePositions:count:", posiciones.as_mut_ptr(), 4);
++            if posiciones[0] != [0.375, 0.375] {
++                return Err(format!("primera posición {:?} en vez de [0.375, 0.375]", posiciones[0]));
++            }
++            Ok(())
++        });
++        chequear(&mut inf, "máximo de samplers en argument buffer", || {
++            let n = objc::m0::<u64>(d, "maxArgumentBufferSamplerCount");
++            if n != 0 {
++                return Err(format!("{n} en vez de 0"));
++            }
++            Ok(())
++        });
++        let hay_heap = !objc::clase("MTLHeapDescriptor").is_null();
++        let hay_computo = funcion_de_computo(d).is_some();
++        chequear_si(&mut inf, "heap de memoria", hay_heap, || {
++            let hd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLHeapDescriptor"), "alloc"), "init");
++            if hd.is_null() {
++                return Err("descriptor nil".into());
++            }
++            objc::m1::<u64, ()>(hd, "setSize:", 1024 * 1024);
++            objc::m1::<u64, ()>(hd, "setStorageMode:", 0);
++            let h: Id = objc::m1(d, "newHeapWithDescriptor:", hd);
++            if h.is_null() {
++                return Err("nil".into());
++            }
++            let tam = objc::m0::<u64>(h, "size");
++            if tam != 1024 * 1024 {
++                return Err(format!("tamaño {tam} en vez de 1048576"));
++            }
++            let b: Id = objc::m2::<u64, u64, Id>(h, "newBufferWithLength:options:", 4096, 0);
++            if b.is_null() {
++                return Err("buffer del heap nil".into());
++            }
++            Ok(())
++        });
++        chequear(&mut inf, "fence", || {
++            let f: Id = objc::m0(d, "newFence");
++            if f.is_null() {
++                return Err("nil".into());
++            }
++            Ok(())
++        });
++        let hay_residencia = !objc::clase("MTLResidencySetDescriptor").is_null();
++        chequear_si(&mut inf, "conjunto de residencia", hay_residencia, || {
++            let rd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLResidencySetDescriptor"), "alloc"), "init");
++            if rd.is_null() {
++                return Err("descriptor nil".into());
++            }
++            let mut err: Id = std::ptr::null_mut();
++            let r: Id = objc::m2::<Id, *mut Id, Id>(d, "newResidencySetWithDescriptor:error:", rd, &mut err as *mut Id);
++            if r.is_null() {
++                return Err("nil".into());
++            }
++            let buf: Id = objc::m2::<u64, u64, Id>(d, "newBufferWithLength:options:", 256, 0);
++            // NSMutableArray: +array devuelve un NSArray inmutable y addObject: sobre él lanza excepción.
++            let arr: Id = objc::m0(objc::clase("NSMutableArray"), "array");
++            objc::m1::<Id, ()>(arr, "addObject:", buf);
++            objc::m1::<Id, ()>(r, "addAllObjects:", arr);
++            Ok(())
++        });
++        chequear(&mut inf, "buffer sin copia", || {
++            let datos: [u8; 4] = [1, 2, 3, 4];
++            let enviar4: unsafe extern "C" fn(Id, objc::Sel, *const u8, u64, u64, Id) -> Id =
++                std::mem::transmute(objc::objc_msgSend as *const ());
++            let b: Id = enviar4(d, objc::sel("newBufferWithBytesNoCopy:length:options:deallocator:"), datos.as_ptr(), 4, 0, std::ptr::null_mut());
++            if b.is_null() {
++                return Err("nil".into());
++            }
++            let len = objc::m0::<u64>(b, "length");
++            if len != 4 {
++                return Err(format!("longitud {len} en vez de 4"));
++            }
++            Ok(())
++        });
++        // Eventos y manejadores.
++        chequear(&mut inf, "evento compartido", || {
++            let e: Id = objc::m0(d, "newSharedEvent");
++            if e.is_null() {
++                return Err("nil".into());
++            }
++            objc::m1::<u64, ()>(e, "setSignaledValue:", 42);
++            let v = objc::m0::<u64>(e, "signaledValue");
++            if v != 42 {
++                return Err(format!("valor {v} en vez de 42"));
++            }
++            Ok(())
++        });
++        chequear(&mut inf, "evento con mango", || {
++            let e: Id = objc::m1(d, "newSharedEventWithHandle:", objc::nsstring("mango-de-prueba"));
++            if e.is_null() {
++                return Err("nil".into());
++            }
++            Ok(())
++        });
++        chequear(&mut inf, "manejador de función", || {
++            let b: Id = objc::m2::<u64, u64, Id>(d, "newBufferWithLength:options:", 64, 0);
++            let h: Id = objc::m1(d, "functionHandleWithFunction:", b);
++            if h.is_null() {
++                return Err("nil".into());
++            }
++            Ok(())
++        });
++        // Los pipelines de cómputo y de render, con sus variantes.
++        chequear_si(&mut inf, "pipeline de cómputo por función con opciones", hay_computo, || {
++            let f = funcion_de_computo(d).ok_or("no hay función de cómputo")?;
++            let mut reflexion: Id = std::ptr::null_mut();
++            let mut err: Id = std::ptr::null_mut();
++            let p = unsafe {
++                m4::<Id, u64, *mut Id, *mut Id, Id>(
++                    d,
++                    "newComputePipelineStateWithFunction:options:reflection:error:",
++                    f,
++                    0,
++                    &mut reflexion as *mut Id,
++                    &mut err as *mut Id,
++                )
++            };
++            if p.is_null() {
++                return Err(format!("nil: {}", objc::texto(err)));
++            }
++            Ok(())
++        });
++        chequear_si(&mut inf, "pipeline de cómputo por descriptor", hay_computo, || {
++            let f = funcion_de_computo(d).ok_or("no hay función de cómputo")?;
++            let pd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLComputePipelineDescriptor"), "alloc"), "init");
++            if pd.is_null() {
++                return Err("descriptor nil".into());
++            }
++            objc::m1::<Id, ()>(pd, "setComputeFunction:", f);
++            let mut reflexion: Id = std::ptr::null_mut();
++            let mut err: Id = std::ptr::null_mut();
++            let p = unsafe {
++                m4::<Id, u64, *mut Id, *mut Id, Id>(
++                    d,
++                    "newComputePipelineStateWithDescriptor:options:reflection:error:",
++                    pd,
++                    0,
++                    &mut reflexion as *mut Id,
++                    &mut err as *mut Id,
++                )
++            };
++            if p.is_null() {
++                return Err(format!("nil: {}", objc::texto(err)));
++            }
++            Ok(())
++        });
++        chequear_si(&mut inf, "pipeline de cómputo con bloque de completado", hay_computo, || {
++            let f = funcion_de_computo(d).ok_or("no hay función de cómputo")?;
++            let antes = BLOQUES_LLAMADOS.load(std::sync::atomic::Ordering::SeqCst);
++            objc::m2::<Id, Id, ()>(d, "newComputePipelineStateWithFunction:completionHandler:", f, bloque_falso());
++            let despues = BLOQUES_LLAMADOS.load(std::sync::atomic::Ordering::SeqCst);
++            if despues != antes + 1 {
++                return Err(format!("el bloque se llamó {despues} veces, se esperaba {antes}+1"));
++            }
++            Ok(())
++        });
+         chequear(&mut inf, "estado de muestreo", || {
+             let sd: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLSamplerDescriptor"), "alloc"), "init");
+             if sd.is_null() {
+diff --git a/tahoe-metal/src/clases.rs b/tahoe-metal/src/clases.rs
+index 9f3a463..f34ea96 100644
+--- a/tahoe-metal/src/clases.rs
++++ b/tahoe-metal/src/clases.rs
+@@ -58,6 +58,8 @@ unsafe impl Sync for Clase {}
+ 
+ pub struct Clases {
+     pub cola: Clase,
++    pub evento: Clase,
++    pub manejador: Clase,
+     pub buffer: Clase,
+     pub biblioteca: Clase,
+     pub funcion: Clase,
+@@ -268,6 +270,80 @@ pub fn nueva_cola() -> Id {
+     crear(&clases().cola, Cola { etiqueta: std::ptr::null_mut() })
+ }
+ 
++// ------------------------------------------------------------------ evento y manejador de función
++
++/// Un evento (MTLEvent / MTLSharedEvent): aquí solo lleva el valor de señal; no hay sincronización entre
++/// procesos, así que un evento compartido no lo es realmente.
++pub struct Evento {
++    valor: u64,
++    etiqueta: Id,
++}
++etiqueta_de!(Evento);
++
++impl Drop for Evento {
++    fn drop(&mut self) {
++        soltar(self.etiqueta);
++    }
++}
++
++/// El manejador de una función (MTLFunctionHandle): la referencia a la función para llamarla desde el shader.
++pub struct Manejador {
++    funcion: Id,
++    etiqueta: Id,
++}
++etiqueta_de!(Manejador);
++
++impl Drop for Manejador {
++    fn drop(&mut self) {
++        soltar(self.funcion);
++        soltar(self.etiqueta);
++    }
++}
++
++/// Un evento nuevo (MTLEvent / MTLSharedEvent).
++pub fn nuevo_evento() -> Id {
++    crear(&clases().evento, Evento { valor: 0, etiqueta: std::ptr::null_mut() })
++}
++
++/// Un manejador de función nuevo (MTLFunctionHandle).
++pub fn nuevo_manejador(funcion: Id) -> Id {
++    crear(&clases().manejador, Manejador { funcion: retener(funcion), etiqueta: std::ptr::null_mut() })
++}
++
++extern "C-unwind" fn evento_valor(this: Id, _cmd: Sel) -> u64 {
++    estado::<Evento>(this).map(|e| e.valor).unwrap_or(0)
++}
++
++extern "C-unwind" fn evento_valor_poner(this: Id, _cmd: Sel, v: u64) {
++    if let Some(e) = estado::<Evento>(this) {
++        e.valor = v;
++    }
++}
++
++extern "C-unwind" fn manejador_funcion(this: Id, _cmd: Sel) -> Id {
++    estado::<Manejador>(this).map(|m| m.funcion).unwrap_or(std::ptr::null_mut())
++}
++
++/// Llama a un bloque de Objective-C con dos argumentos. El literal de un bloque tiene la función de invocación en
++/// el desplazamiento 16 (isa, flags, reserved, invoke).
++pub fn llamar_bloque_2(bloque: Id, a: Id, b: Id) {
++    if bloque.is_null() {
++        return;
++    }
++    // SAFETY: bloque de Objective-C.
++    unsafe {
++        let p = bloque.cast::<*const c_void>();
++        let invocar: extern "C" fn(Id, Id, Id) = std::mem::transmute(p.offset(2).read());
++        invocar(bloque, a, b);
++    }
++}
++
++/// El command buffer de una cola. Lo usa también `-[MTLDevice newCommandBuffer]`, que da un command buffer sin
++/// que el cliente tenga que crear una cola.
++pub fn command_buffer_de(cola: Id) -> Id {
++    cola_command_buffer(cola, objc::sel("commandBuffer"))
++}
++
+ /// getGPUPriority / getBackgroundGPUPriority (MTLGPUPriority): aquí no hay planificador de citas; el servidor de GPU
+ /// ejecuta lo que llega en orden. Se contesta la prioridad sin especificar (0), que es lo neutro.
+ extern "C-unwind" fn cola_gpu_prioridad(_this: Id, _cmd: Sel) -> u64 {
+@@ -724,6 +800,15 @@ pub fn registrar() {
+             $v.push(("setLabel:", poner_etiqueta::<$t> as Imp, "v@:@"));
+         };
+     }
++    let mut evento: Vec<Metodo> = vec![
++        ("signaledValue", evento_valor as Imp, "Q@:"),
++        ("setSignaledValue:", evento_valor_poner as Imp, "v@:Q"),
++    ];
++    comunes(&mut evento);
++    etiquetas!(evento, Evento);
++    let mut manejador: Vec<Metodo> = vec![("function", manejador_funcion as Imp, "@@:")];
++    comunes(&mut manejador);
++    etiquetas!(manejador, Manejador);
+     let mut cola: Vec<Metodo> = vec![
+         ("commandBuffer", cola_command_buffer as Imp, "@@:"),
+         ("commandBufferWithUnretainedReferences", cola_command_buffer as Imp, "@@:"),
+@@ -810,6 +895,8 @@ pub fn registrar() {
+     etiquetas!(blit, Encoder);
+     let c = Clases {
+         cola: nueva_clase("TahoeMTLCommandQueue", &["MTLCommandQueue"], &cola),
++        evento: nueva_clase("TahoeMTLEvent", &["MTLEvent", "MTLSharedEvent"], &evento),
++        manejador: nueva_clase("TahoeMTLFunctionHandle", &["MTLFunctionHandle"], &manejador),
+         buffer: nueva_clase("TahoeMTLBuffer", &["MTLBuffer"], &buffer),
+         biblioteca: nueva_clase("TahoeMTLLibrary", &["MTLLibrary"], &biblioteca),
+         funcion: nueva_clase("TahoeMTLFunction", &["MTLFunction"], &funcion),
+diff --git a/tahoe-metal/src/lib.rs b/tahoe-metal/src/lib.rs
+index dc245af..0c4b2b5 100644
+--- a/tahoe-metal/src/lib.rs
++++ b/tahoe-metal/src/lib.rs
+@@ -79,6 +79,55 @@ extern "C-unwind" fn nueva_cola(_this: Id, _cmd: Sel) -> Id {
+ extern "C-unwind" fn nueva_cola_max(_this: Id, _cmd: Sel, _n: u64) -> Id {
+     clases::nueva_cola()
+ }
++
++/// newCommandBuffer (MTLDevice): un command buffer sin cola propia. En macOS 26 ningún framework del sistema lo
++/// llama, pero está en el protocolo del runtime: como stub devolvía nil.
++extern "C-unwind" fn nuevo_command_buffer(_this: Id, _cmd: Sel) -> Id {
++    let cola = clases::nueva_cola();
++    if cola.is_null() {
++        return std::ptr::null_mut();
++    }
++    clases::command_buffer_de(cola)
++}
++
++/// Las posiciones de muestreo estándar de MSAA. La extensión Swift de Metal (libswiftMetal) las copia tal cual;
++/// el compositor no usa MSAA.
++const POSICIONES_1: [[f32; 2]; 1] = [[0.5, 0.5]];
++const POSICIONES_2: [[f32; 2]; 2] = [[0.75, 0.75], [0.25, 0.25]];
++const POSICIONES_4: [[f32; 2]; 4] = [[0.375, 0.375], [0.875, 0.875], [0.125, 0.125], [0.625, 0.625]];
++const POSICIONES_8: [[f32; 2]; 8] = [
++    [0.5625, 0.3125], [0.4375, 0.6875], [0.8125, 0.5625], [0.3125, 0.1875],
++    [0.1875, 0.8125], [0.0625, 0.4375], [0.6875, 0.9375], [0.9375, 0.0625],
++];
++const POSICIONES_16: [[f32; 2]; 16] = [
++    [0.5625, 0.3125], [0.4375, 0.5625], [0.5625, 0.8125], [0.1875, 0.3750],
++    [0.7500, 0.4375], [0.9375, 0.6875], [0.3125, 0.1250], [0.6875, 0.9375],
++    [0.0625, 0.5625], [0.4375, 0.9375], [0.0625, 0.3125], [0.8125, 0.4375],
++    [0.8125, 0.8125], [0.1875, 0.6875], [0.1875, 0.0625], [0.5625, 0.0625],
++];
++
++/// getDefaultSamplePositions:count: (MTLDevice): rellena el vector con las posiciones estándar del número de
++/// muestras pedido. Para un número que no sea 1, 2, 4, 8 o 16 se deja el centro.
++extern "C-unwind" fn posiciones_muestreo(_this: Id, _cmd: Sel, destino: *mut [f32; 2], cuenta: u64) {
++    if destino.is_null() {
++        return;
++    }
++    let patron: &[[f32; 2]] = match cuenta {
++        1 => &POSICIONES_1,
++        2 => &POSICIONES_2,
++        4 => &POSICIONES_4,
++        8 => &POSICIONES_8,
++        16 => &POSICIONES_16,
++        _ => &[],
++    };
++    // SAFETY: el cliente reserva `cuenta` posiciones.
++    unsafe {
++        for i in 0..cuenta as usize {
++            let p = patron.get(i).copied().unwrap_or([0.5, 0.5]);
++            *destino.add(i) = p;
++        }
++    }
++}
+ extern "C-unwind" fn nuevo_buffer(_this: Id, _cmd: Sel, len: u64, opciones: u64) -> Id {
+     clases::nuevo_buffer(len as usize, opciones, None).unwrap_or_else(|e| {
+         registro(&format!("newBufferWithLength:{len}: {e}"));
+@@ -122,6 +171,88 @@ extern "C-unwind" fn pipeline_funcion(_this: Id, _cmd: Sel, f: Id, error: *mut I
+     clases::nuevo_pipeline(f, error)
+ }
+ 
++// ------------------------------------------------------------------ variantes de los pipelines
++//
++// Todas hacen lo mismo que la versión simple: la diferencia es cómo se avisa del resultado (reflexión o bloque de
++// completado) y si el trabajo se hace en segundo plano. Aquí el pipeline se crea en el momento y el bloque de
++// completado se llama de seguida, con el pipeline (o nil) y el error.
++
++/// newComputePipelineStateWithDescriptor:options:reflection:error:
++extern "C-unwind" fn pipeline_computo_descripcion(_this: Id, _cmd: Sel, d: Id, _opciones: u64, reflexion: *mut Id, error: *mut Id) -> Id {
++    if !reflexion.is_null() {
++        // SAFETY: parámetro de salida.
++        unsafe { *reflexion = std::ptr::null_mut() };
++    }
++    let f: Id = render::campo(d, "computeFunction", std::ptr::null_mut());
++    if f.is_null() {
++        clases::poner_error(error, "el descriptor no tiene computeFunction");
++        return std::ptr::null_mut();
++    }
++    clases::nuevo_pipeline(f, error)
++}
++
++/// newComputePipelineStateWithFunction:options:reflection:error:
++extern "C-unwind" fn pipeline_computo_funcion_reflexion(_this: Id, _cmd: Sel, f: Id, _opciones: u64, reflexion: *mut Id, error: *mut Id) -> Id {
++    if !reflexion.is_null() {
++        // SAFETY: parámetro de salida.
++        unsafe { *reflexion = std::ptr::null_mut() };
++    }
++    clases::nuevo_pipeline(f, error)
++}
++
++/// Los tres que avisan con un bloque de completado.
++extern "C-unwind" fn pipeline_computo_funcion_completado(_this: Id, _cmd: Sel, f: Id, manejador: Id) {
++    let mut error: Id = std::ptr::null_mut();
++    let p = clases::nuevo_pipeline(f, &mut error as *mut Id);
++    clases::llamar_bloque_2(manejador, p, error);
++}
++
++extern "C-unwind" fn pipeline_computo_funcion_opciones_completado(_this: Id, _cmd: Sel, f: Id, _opciones: u64, manejador: Id) {
++    pipeline_computo_funcion_completado(_this, _cmd, f, manejador)
++}
++
++extern "C-unwind" fn pipeline_computo_descripcion_completado(_this: Id, _cmd: Sel, d: Id, _opciones: u64, manejador: Id) {
++    let f: Id = render::campo(d, "computeFunction", std::ptr::null_mut());
++    if f.is_null() {
++        clases::llamar_bloque_2(manejador, std::ptr::null_mut(), std::ptr::null_mut());
++        return;
++    }
++    pipeline_computo_funcion_completado(_this, _cmd, f, manejador)
++}
++
++/// newRenderPipelineStateWithDescriptor:completionHandler: y su variante con opciones.
++pub(crate) extern "C-unwind" fn pipeline_render_completado(_this: Id, _cmd: Sel, d: Id, manejador: Id) {
++    let mut error: Id = std::ptr::null_mut();
++    let p = render::nuevo_pipeline_render(d, &mut error as *mut Id);
++    clases::llamar_bloque_2(manejador, p, error);
++}
++
++pub(crate) extern "C-unwind" fn pipeline_render_opciones_completado(_this: Id, _cmd: Sel, d: Id, _opciones: u64, manejador: Id) {
++    pipeline_render_completado(_this, _cmd, d, manejador)
++}
++
++// ------------------------------------------------------------------ eventos y manejadores de función
++
++/// newEvent / newSharedEvent: el objeto con su valor de señal. Aquí no hay sincronización entre procesos, así que
++/// un «evento compartido» no lo es: solo carries el valor.
++pub(crate) extern "C-unwind" fn dev_evento(_this: Id, _cmd: Sel) -> Id {
++    crear_evento()
++}
++
++fn crear_evento() -> Id {
++    clases::nuevo_evento()
++}
++
++/// newSharedEventWithHandle: el mango no se comparte con nadie: se crea un evento nuevo.
++pub(crate) extern "C-unwind" fn dev_evento_manejador(_this: Id, _cmd: Sel, _mango: Id) -> Id {
++    crear_evento()
++}
++
++/// functionHandleWithFunction: y functionHandleWithBinaryFunction:: el manejador de una función.
++pub(crate) extern "C-unwind" fn dev_manejador_funcion(_this: Id, _cmd: Sel, f: Id) -> Id {
++    clases::nuevo_manejador(f)
++}
++
+ #[repr(C)]
+ struct MTLSize {
+     w: u64,
+@@ -322,6 +453,9 @@ extern "C" fn registrar() {
+         objc::metodo(cls, "featureProfile", perfil as *const c_void, "Q@:");
+         for (n, imp, t) in [
+             ("newCommandQueue", nueva_cola as *const c_void, "@@:"),
++            ("newCommandBuffer", nuevo_command_buffer as *const c_void, "@16@0:8"),
++            ("getDefaultSamplePositions:count:", posiciones_muestreo as *const c_void, "v32@0:8^{?=ff}16Q24"),
++            ("maxArgumentBufferSamplerCount", cero_u64 as *const c_void, "Q16@0:8"),
+             ("newCommandQueueWithMaxCommandBufferCount:", nueva_cola_max as *const c_void, "@@:Q"),
+             ("newBufferWithLength:options:", nuevo_buffer as *const c_void, "@@:QQ"),
+             ("newBufferWithBytes:length:options:", nuevo_buffer_datos as *const c_void, "@@:^vQQ"),
+@@ -329,6 +463,11 @@ extern "C" fn registrar() {
+             ("newLibraryWithFile:error:", biblioteca_archivo as *const c_void, "@@:@^@"),
+             ("newLibraryWithURL:error:", biblioteca_url as *const c_void, "@@:@^@"),
+             ("newComputePipelineStateWithFunction:error:", pipeline_funcion as *const c_void, "@@:@^@"),
++            ("newComputePipelineStateWithDescriptor:options:reflection:error:", pipeline_computo_descripcion as *const c_void, "@48@0:8@16Q24^@32^@40"),
++            ("newComputePipelineStateWithFunction:options:reflection:error:", pipeline_computo_funcion_reflexion as *const c_void, "@48@0:8@16Q24^@32^@40"),
++            ("newComputePipelineStateWithFunction:completionHandler:", pipeline_computo_funcion_completado as *const c_void, "v32@0:8@16@?24"),
++            ("newComputePipelineStateWithFunction:options:completionHandler:", pipeline_computo_funcion_opciones_completado as *const c_void, "v40@0:8@16Q24@?32"),
++            ("newComputePipelineStateWithDescriptor:options:completionHandler:", pipeline_computo_descripcion_completado as *const c_void, "v40@0:8@16Q24@?32"),
+             ("maxThreadsPerThreadgroup", max_hilos as *const c_void, "{MTLSize=QQQ}@:"),
+             ("maxThreadgroupMemoryLength", memoria_grupo as *const c_void, "Q@:"),
+             ("recommendedMaxWorkingSetSize", trabajo_recomendado as *const c_void, "Q@:"),
+diff --git a/tahoe-metal/src/render.rs b/tahoe-metal/src/render.rs
+index 2059052..0ea7732 100644
+--- a/tahoe-metal/src/render.rs
++++ b/tahoe-metal/src/render.rs
+@@ -60,6 +60,9 @@ pub struct MTLScissorRect {
+ }
+ 
+ pub struct ClasesRender {
++    pub heap: Clase,
++    pub fence: Clase,
++    pub residencia: Clase,
+     pub textura: Clase,
+     pub sampler: Clase,
+     pub pipeline: Clase,
+@@ -176,6 +179,11 @@ fn nueva_textura(desc: Id, superficie: Id, plano: u64) -> Id {
+ extern "C-unwind" fn dev_textura(_this: Id, _cmd: Sel, desc: Id) -> Id {
+     nueva_textura(desc, std::ptr::null_mut(), 0)
+ }
++
++/// Una textura a partir de su descriptor (la usan el dispositivo y los heaps).
++pub fn textura_de_descriptor(desc: Id) -> Id {
++    nueva_textura(desc, std::ptr::null_mut(), 0)
++}
+ extern "C-unwind" fn dev_textura_superficie(_this: Id, _cmd: Sel, desc: Id, sup: Id, plano: u64) -> Id {
+     nueva_textura(desc, sup, plano)
+ }
+@@ -301,7 +309,7 @@ extern "C-unwind" fn tex_obtener_capa(this: Id, _cmd: Sel, p: *mut u8, bpr: u64,
+ /// `MTLStencilDescriptor`). Preguntar por una propiedad inexistente lanza `NSException` y desde Rust eso aborta
+ /// el proceso («Rust cannot catch foreign exceptions»): no se puede capturar. Por eso toda lectura de descriptor
+ /// pasa por aquí y usa el valor por defecto cuando el selector no existe.
+-fn campo<T: Copy>(o: Id, nombre: &str, por_defecto: T) -> T {
++pub fn campo<T: Copy>(o: Id, nombre: &str, por_defecto: T) -> T {
+     if o.is_null() || !objc::responde_instancia(o, nombre) {
+         return por_defecto;
+     }
+@@ -632,7 +640,7 @@ fn funcion(f: Id, e: &mut Escritor) {
+     }
+ }
+ 
+-fn nuevo_pipeline_render(d: Id, error: *mut Id) -> Id {
++pub fn nuevo_pipeline_render(d: Id, error: *mut Id) -> Id {
+     let id = nuevo_id();
+     let mut e = Escritor::default();
+     e.u32(id);
+@@ -873,6 +881,185 @@ extern "C-unwind" fn ren_color(_this: Id, _cmd: Sel, _r: f32, _g: f32, _b: f32,
+ 
+ // ------------------------------------------------------------------ registro
+ 
++/// Tamaño y alineación de un recurso dentro de un heap (MTLSizeAndAlign): vuelve en rax:rdx.
++#[repr(C)]
++#[derive(Clone, Copy)]
++pub struct TamanoAlineacion {
++    pub tamano: u64,
++    pub alineacion: u64,
++}
++
++/// La alineación que se supone a los recursos de un heap: 256 bytes, como en los heaps de Apple.
++const ALINEACION_HEAP: u64 = 256;
++
++/// heapBufferSizeAndAlignWithLength:options: (MTLDevice): MPS lo llama 7 veces (MPSAutoCache, MPSAutoBuffer,
++/// GetResourceSize) y usa el valor para trocear memoria. No hace falta tocar el servidor de GPU: se devuelve el
++/// tamaño redondeado a la alineación y la alineación.
++extern "C-unwind" fn tamano_buffer_heap(_this: Id, _cmd: Sel, len: u64, _opciones: u64) -> TamanoAlineacion {
++    TamanoAlineacion { tamano: len.div_ceil(ALINEACION_HEAP) * ALINEACION_HEAP, alineacion: ALINEACION_HEAP }
++}
++
++/// heapTextureSizeAndAlignWithDescriptor: (MTLDevice): lo usa MPSDevice_MacOS::SupportsPlugin. El tamaño es el
++/// de la textura entera (todos los niveles) y la alineación, 256.
++extern "C-unwind" fn tamano_textura_heap(_this: Id, _cmd: Sel, d: Id) -> TamanoAlineacion {
++    let (ancho, alto, prof, capas, niveles, formato) = (
++        campo(d, "width", 0u64),
++        campo(d, "height", 0u64),
++        campo(d, "depth", 0u64),
++        campo(d, "arrayLength", 0u64),
++        campo(d, "mipmapLevelCount", 0u64),
++        campo(d, "pixelFormat", 0u64),
++    );
++    let bpp = bytes_por_pixel(formato);
++    let mut total = 0u64;
++    for nivel in 0..niveles.max(1) {
++        let w = (ancho >> nivel).max(1);
++        let h = (alto >> nivel).max(1);
++        let p = (prof >> nivel).max(1);
++        total += w * h * p * bpp;
++    }
++    total *= capas.max(1);
++    TamanoAlineacion { tamano: total.div_ceil(ALINEACION_HEAP) * ALINEACION_HEAP, alineacion: ALINEACION_HEAP }
++}
++
++// ------------------------------------------------------------------ heap, fence y conjunto de residencia
++
++/// Un heap (MTLHeap): la memoria reservada de la que salen buffers y texturas. Aquí solo se lleva la cuenta de lo
++/// ocupado: cada recurso se crea en el servidor de GPU como los del dispositivo.
++pub struct Heap {
++    tamano: u64,
++    modo: u64,
++    ocupado: u64,
++    etiqueta: Id,
++}
++con_etiqueta!(Heap);
++
++impl Drop for Heap {
++    fn drop(&mut self) {
++        soltar(self.etiqueta);
++    }
++}
++
++/// Un fence (MTLFence): aquí no hay planificador de citas, así que no sincroniza nada; existe para que el cliente
++/// tenga el objeto que espera.
++pub struct Fence {
++    etiqueta: Id,
++}
++con_etiqueta!(Fence);
++
++impl Drop for Fence {
++    fn drop(&mut self) {
++        soltar(self.etiqueta);
++    }
++}
++
++/// Un conjunto de residencia (MTLResidencySet): los recursos que se mantienen vivos mientras esté puesto.
++pub struct Residencia {
++    objetos: Vec<Id>,
++    etiqueta: Id,
++}
++con_etiqueta!(Residencia);
++
++impl Drop for Residencia {
++    fn drop(&mut self) {
++        for o in self.objetos.drain(..) {
++            soltar(o);
++        }
++        soltar(self.etiqueta);
++    }
++}
++
++extern "C-unwind" fn heap_tamano(this: Id, _cmd: Sel) -> u64 {
++    estado::<Heap>(this).map(|h| h.tamano).unwrap_or(0)
++}
++extern "C-unwind" fn heap_modo(this: Id, _cmd: Sel) -> u64 {
++    estado::<Heap>(this).map(|h| h.modo).unwrap_or(0)
++}
++extern "C-unwind" fn heap_ocupado(this: Id, _cmd: Sel) -> u64 {
++    estado::<Heap>(this).map(|h| h.ocupado).unwrap_or(0)
++}
++extern "C-unwind" fn heap_nuevo_buffer(this: Id, _cmd: Sel, len: u64, opciones: u64) -> Id {
++    let b = match clases::nuevo_buffer(len as usize, opciones, None) {
++        Ok(b) => b,
++        Err(e) => {
++            registro(&format!("heap: newBufferWithLength:{len}: {e}"));
++            return std::ptr::null_mut();
++        }
++    };
++    if let Some(h) = estado::<Heap>(this) {
++        h.ocupado += len.next_multiple_of(256);
++    }
++    b
++}
++extern "C-unwind" fn heap_nueva_textura(this: Id, _cmd: Sel, desc: Id) -> Id {
++    let t = textura_de_descriptor(desc);
++    if t.is_null() {
++        return t;
++    }
++    let bytes = estado::<Textura>(t).map(|x| x.ancho * x.alto * x.prof.max(1) * bytes_por_pixel(x.formato)).unwrap_or(0);
++    if let Some(h) = estado::<Heap>(this) {
++        h.ocupado += bytes.next_multiple_of(256);
++    }
++    t
++}
++extern "C-unwind" fn residencia_anadir(this: Id, _cmd: Sel, objetos: Id) {
++    let Some(r) = estado::<Residencia>(this) else { return };
++    if objetos.is_null() {
++        return;
++    }
++    let n = unsafe { objc::m0::<u64>(objetos, "count") };
++    for i in 0..n {
++        let o = unsafe { objc::m1::<u64, Id>(objetos, "objectAtIndexedSubscript:", i) };
++        if !o.is_null() {
++            r.objetos.push(retener(o));
++        }
++    }
++}
++extern "C-unwind" fn residencia_quitar_todo(this: Id, _cmd: Sel) {
++    if let Some(r) = estado::<Residencia>(this) {
++        for o in r.objetos.drain(..) {
++            soltar(o);
++        }
++    }
++}
++
++/// newHeapWithDescriptor: (MTLDevice): QuartzCore lo pide en `update_surface_heap` y MPS en sus cachés.
++extern "C-unwind" fn dev_heap(_this: Id, _cmd: Sel, desc: Id) -> Id {
++    let tamano = campo(desc, "size", 0u64);
++    let modo = campo(desc, "storageMode", 0u64);
++    registro(&format!("heap: {tamano} bytes, modo {modo}"));
++    crear(&clases_render().heap, Heap { tamano, modo, ocupado: 0, etiqueta: std::ptr::null_mut() })
++}
++
++/// newFence (MTLDevice): el objeto en sí; no sincroniza nada.
++extern "C-unwind" fn dev_fence(_this: Id, _cmd: Sel) -> Id {
++    crear(&clases_render().fence, Fence { etiqueta: std::ptr::null_mut() })
++}
++
++/// newResidencySetWithDescriptor:error: (MTLDevice): guarda los recursos que le metan.
++extern "C-unwind" fn dev_residencia(_this: Id, _cmd: Sel, desc: Id, error: *mut Id) -> Id {
++    if !error.is_null() {
++        // SAFETY: parámetro de salida.
++        unsafe { *error = std::ptr::null_mut() };
++    }
++    let _ = desc;
++    crear(&clases_render().residencia, Residencia { objetos: Vec::new(), etiqueta: std::ptr::null_mut() })
++}
++
++/// newBufferWithBytesNoCopy:length:options:deallocator: (MTLDevice): el cliente da memoria ya paginada y espera que
++/// Metal no la copie. Aquí sí se copia al buffer del servidor (el servidor no puede importar memoria del cliente) y
++/// el bloque de liberador no se llama: la memoria sigue siendo del cliente.
++extern "C-unwind" fn dev_buffer_nocopia(_this: Id, _cmd: Sel, p: *const u8, len: u64, opciones: u64, _liberador: Id) -> Id {
++    let datos = if p.is_null() { None } else { Some(unsafe { std::slice::from_raw_parts(p, len as usize) }) };
++    match clases::nuevo_buffer(len as usize, opciones, datos) {
++        Ok(b) => b,
++        Err(e) => {
++            registro(&format!("newBufferWithBytesNoCopy:{len}: {e}"));
++            std::ptr::null_mut()
++        }
++    }
++}
++
+ pub fn registrar(dispositivo: Class) {
+     if CLASES.get().is_some() {
+         return;
+@@ -956,7 +1143,25 @@ pub fn registrar(dispositivo: Class) {
+         ("insertDebugSignpost:", ren_nada_o as Imp, "v@:@"),
+     ];
+     etq(&mut encoder, clases::etiqueta::<Encoder> as Imp, clases::poner_etiqueta::<Encoder> as Imp);
++    let mut heap: Vec<Metodo> = vec![
++        ("size", heap_tamano as Imp, "Q@:"),
++        ("storageMode", heap_modo as Imp, "Q@:"),
++        ("currentAllocatedSize", heap_ocupado as Imp, "Q@:"),
++        ("newBufferWithLength:options:", heap_nuevo_buffer as Imp, "@@:QQ"),
++        ("newTextureWithDescriptor:", heap_nueva_textura as Imp, "@@:@"),
++    ];
++    etq(&mut heap, clases::etiqueta::<Heap> as Imp, clases::poner_etiqueta::<Heap> as Imp);
++    let mut fence: Vec<Metodo> = vec![];
++    etq(&mut fence, clases::etiqueta::<Fence> as Imp, clases::poner_etiqueta::<Fence> as Imp);
++    let mut residencia: Vec<Metodo> = vec![
++        ("addAllObjects:", residencia_anadir as Imp, "v@:@"),
++        ("removeAllObjects", residencia_quitar_todo as Imp, "v@:"),
++    ];
++    etq(&mut residencia, clases::etiqueta::<Residencia> as Imp, clases::poner_etiqueta::<Residencia> as Imp);
+     let c = ClasesRender {
++        heap: nueva_clase("TahoeMTLHeap", &["MTLHeap"], &heap),
++        fence: nueva_clase("TahoeMTLFence", &["MTLFence"], &fence),
++        residencia: nueva_clase("TahoeMTLResidencySet", &["MTLResidencySet"], &residencia),
+         textura: nueva_clase("TahoeMTLTexture", &["MTLTexture"], &textura),
+         sampler: nueva_clase("TahoeMTLSamplerState", &["MTLSamplerState"], &sampler),
+         pipeline: nueva_clase("TahoeMTLRenderPipelineState", &["MTLRenderPipelineState"], &pipeline),
+@@ -969,9 +1174,22 @@ pub fn registrar(dispositivo: Class) {
+         ("newTextureWithDescriptor:", dev_textura as Imp, "@@:@"),
+         ("newTextureWithDescriptor:iosurface:plane:", dev_textura_superficie as Imp, "@@:@^vQ"),
+         ("newSamplerStateWithDescriptor:", dev_sampler as Imp, "@@:@"),
++        ("heapBufferSizeAndAlignWithLength:options:", tamano_buffer_heap as Imp, "{?=QQ}32@0:8Q16Q24"),
++        ("heapTextureSizeAndAlignWithDescriptor:", tamano_textura_heap as Imp, "{?=QQ}24@0:8@16"),
++        ("newHeapWithDescriptor:", dev_heap as Imp, "@@:@"),
++        ("newFence", dev_fence as Imp, "@16@0:8"),
++        ("newResidencySetWithDescriptor:error:", dev_residencia as Imp, "@@:@^@"),
++        ("newBufferWithBytesNoCopy:length:options:deallocator:", dev_buffer_nocopia as Imp, "@@:^vQQ@"),
+         ("newDepthStencilStateWithDescriptor:", dev_profundidad as Imp, "@@:@"),
+         ("newRenderPipelineStateWithDescriptor:error:", dev_pipeline_render as Imp, "@@:@^@"),
+         ("newRenderPipelineStateWithDescriptor:options:reflection:error:", dev_pipeline_render_opciones as Imp, "@@:@Q^@^@"),
++        ("newRenderPipelineStateWithDescriptor:completionHandler:", crate::pipeline_render_completado as Imp, "v32@0:8@16@?24"),
++        ("newRenderPipelineStateWithDescriptor:options:completionHandler:", crate::pipeline_render_opciones_completado as Imp, "v40@0:8@16Q24@?32"),
++        ("newEvent", crate::dev_evento as Imp, "@16@0:8"),
++        ("newSharedEvent", crate::dev_evento as Imp, "@16@0:8"),
++        ("newSharedEventWithHandle:", crate::dev_evento_manejador as Imp, "@24@0:8@16"),
++        ("functionHandleWithFunction:", crate::dev_manejador_funcion as Imp, "@24@0:8@16"),
++        ("functionHandleWithBinaryFunction:", crate::dev_manejador_funcion as Imp, "@24@0:8@16"),
+     ] {
+         objc::metodo(dispositivo, n, imp, t);
+     }

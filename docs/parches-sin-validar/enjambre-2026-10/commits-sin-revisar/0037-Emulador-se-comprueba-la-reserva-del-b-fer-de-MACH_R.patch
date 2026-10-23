@@ -1,0 +1,34 @@
+From 259f89d32837e0138cb8a25689e3f09cbf8680c7 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:59:26 -0600
+Subject: [PATCH 37/57] =?UTF-8?q?Emulador:=20se=20comprueba=20la=20reserva?=
+ =?UTF-8?q?=20del=20b=C3=BAfer=20de=20MACH=5FRCV=5FLARGE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_port.c: al recibir un mensaje mayor que el búfer, la copia del
+  mensaje se reservaba sin comprobar. Si la reserva fallaba, el
+  memcpy escribía sobre el puntero nulo y moría el proceso tahoe-run
+  entero, porque el invitado comparte el espacio de direcciones con el
+  emulador. Ahora se avisa con MACH_RCV_INVALID_DATA_.
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_port.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/tahoe-run/emu_port.c b/tahoe-run/emu_port.c
+index b87e27c..d1fd10b 100644
+--- a/tahoe-run/emu_port.c
++++ b/tahoe-run/emu_port.c
+@@ -860,6 +860,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
+ 			// se pudiera recibir con RCV_LARGE (el receptor ampliaba el búfer y el total seguía cabiendo: bucle).
+ 			if (large && limit && q->size > limit) {                        // MACH_RCV_LARGE: no se consume; se informa del tamaño necesario
+ 				uint8_t* h = malloc(q->size ? q->size : 1);
++				if (!h) { unlock(); return MACH_RCV_INVALID_DATA_; }        // sin memoria: se avisa, sin copiar a NULL
+ 				memcpy(h, q->data, q->size);
+ 				*size = q->size; *out = h;
+ 				unlock();

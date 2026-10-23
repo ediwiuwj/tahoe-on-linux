@@ -1,0 +1,939 @@
+From e5aa473a831d8dffa7cea7a8918beeb62a1eccd9 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:08:10 -0600
+Subject: [PATCH 39/57] Metal y traductor: las function constants llegan al
+ shader y tres huecos del AIR
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+El compositor pone sus function constants (por ejemplo _shader_state, un uint4) y
+no llegaban al shader. La causa: Metal copia los valores a un objeto interno
+suyo al ponerlos en el descriptor, y esa copia no pasa por los métodos
+interceptados; ahora los valores interceptados se copian al objeto del
+descriptor. En el servidor, el nombre del cliente («_shader_state») se
+compara también con el nombre cualificado del AIR
+(«RB::Shader::Constant::_shader_state»), que antes no coincidía y dejaba la
+constante sin valor. Una constante vectorial llega del cliente como varios
+escalares consecutivos (setConstantValues:type:withRange:) y ahora se reunen.
+
+Traductor (tahoe-gpu/src/air):
+- extract_bits.u.i32 y popcount.i32, con la semántica real (OpBitCount, que no
+  está en GLSL.std.450).
+- El índice de extractelement se convierte a u32 cuando es un i1: si no, el
+  SPIR-V no valida.
+- Un fragment shader que escribe air.depth declara el modo de ejecución
+  DepthReplacing, que Vulkan exige (VUID-FragDepth-FragDepth-04216).
+- escribir_salidas comprueba los índices: antes un desajuste daba un panic y
+  tumbaba el servidor de GPU.
+
+driver:
+- El bloque de liberación de newBufferWithBytesNoCopy:… recibe la memoria del
+  cliente (es void (^)(const void *)) y se llama cuando el buffer muere.
+- signalEvent:value: y waitForEvent:value: en el command buffer.
+- El conjunto de residencia usa addAllocation: (el selector del protocolo) y
+  commit; los encoders tienen updateFence: y waitForFence:.
+- newCommandBuffer reutiliza la cola del dispositivo.
+- heapTextureSizeAndAlign… multiplica por el muestreo y alinea la fila.
+- La batería crece con 10 comprobaciones nuevas (heap, fence, residencia,
+  eventos, variantes de pipeline) y metalprobe tiene el modo «constante».
+
+Medido: 241 de 280 shaders de Apple traducen y validan (antes 239).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-gpu/src/air/fc.rs           |  28 ++++-
+ tahoe-gpu/src/air/spirv.rs        |   2 +
+ tahoe-gpu/src/air/spirv_inst.rs   |  22 +++-
+ tahoe-gpu/src/air/spirv_ops.rs    |  34 +++++-
+ tahoe-gpu/src/servir.rs           |   6 +-
+ tahoe-metal/src/bin/metalprobe.rs |  38 ++++++-
+ tahoe-metal/src/bin/metalsuite.rs | 172 +++++++++++++++++++++++++++++-
+ tahoe-metal/src/clases.rs         |  47 ++++++--
+ tahoe-metal/src/lib.rs            |  11 +-
+ tahoe-metal/src/render.rs         | 161 ++++++++++++++++++++++++++--
+ 10 files changed, 488 insertions(+), 33 deletions(-)
+
+diff --git a/tahoe-gpu/src/air/fc.rs b/tahoe-gpu/src/air/fc.rs
+index 4dedf5e..461d525 100644
+--- a/tahoe-gpu/src/air/fc.rs
++++ b/tahoe-gpu/src/air/fc.rs
+@@ -66,6 +66,16 @@ pub struct Especializacion {
+ 
+ /// Especializa con `valores` (índice de la function constant → valor). Las que no se den quedan sin definir
+ /// (air.is_function_constant_defined da falso).
++/// Cuántos componentes tiene una constante de tipo vectorial («uint4» → 4, «float3» → 3).
++fn componentes(tipo: &str) -> Option<usize> {
++    let n = tipo.chars().last()?.to_digit(10)? as usize;
++    if (1..=4).contains(&n) && tipo.len() > 1 {
++        Some(n)
++    } else {
++        None
++    }
++}
++
+ pub fn especializar(m: &Module, valores: &HashMap<u32, V>) -> Res<Especializacion> {
+     let mut mem = Memoria::nueva(m);
+     let mut definidas = Vec::new();
+@@ -73,10 +83,26 @@ pub fn especializar(m: &Module, valores: &HashMap<u32, V>) -> Res<Especializacio
+         if let Some(v) = valores.get(&fc.indice) {
+             let ty = m.globals[fc.global].ty;
+             // un bool de Metal es un i8 en memoria
+-            let v = match (&m.types[ty], v) {
++            let mut v = match (&m.types[ty], v) {
+                 (Type::Int(8), V::Int(1, x)) => V::Int(8, *x),
+                 (_, v) => v.clone(),
+             };
++            // Una constante vectorial (uint4, float4...) llega del cliente como varios escalares consecutivos:
++            // el cliente los pone con setConstantValues:type:withRange:, y aquí se reunen.
++            if !matches!(v, V::Vec(_)) {
++                if let Some(n) = componentes(&fc.tipo) {
++                    if n > 1 {
++                        let mut vs = Vec::with_capacity(n);
++                        for k in 0..n {
++                            match valores.get(&(fc.indice + k as u32)) {
++                                Some(x) => vs.push(x.clone()),
++                                None => return Err(format!("constante {}: faltan componentes", fc.nombre)),
++                            }
++                        }
++                        v = V::Vec(vs);
++                    }
++                }
++            }
+             mem.guardar(m, &V::Ptr(Mem::Global(fc.global), 0), ty, &v).map_err(|e| format!("constante {}: {e}", fc.nombre))?;
+             definidas.push(fc.global);
+         }
+diff --git a/tahoe-gpu/src/air/spirv.rs b/tahoe-gpu/src/air/spirv.rs
+index 27998eb..509fd08 100644
+--- a/tahoe-gpu/src/air/spirv.rs
++++ b/tahoe-gpu/src/air/spirv.rs
+@@ -170,6 +170,8 @@ struct Tr<'a> {
+     grid: Option<Word>,
+     usa_demote: bool,
+     usa_subgrupos: bool,
++    /// El shader escribe la profundidad (air.depth): necesita el modo de ejecución DepthReplacing.
++    escribe_profundidad: bool,
+     /// Capacidades que piden los recursos usados (Sampled1D, SampledCubeArray...).
+     capacidades: Vec<Capability>,
+     /// descriptor set de los recursos (Opciones::set)
+diff --git a/tahoe-gpu/src/air/spirv_inst.rs b/tahoe-gpu/src/air/spirv_inst.rs
+index 5bb2831..c6c80f4 100644
+--- a/tahoe-gpu/src/air/spirv_inst.rs
++++ b/tahoe-gpu/src/air/spirv_inst.rs
+@@ -81,6 +81,7 @@ fn traducir_modo(m: &Module, e: &Entrada, op: &Opciones, estructurado: bool) ->
+         grid: None,
+         usa_demote: false,
+         usa_subgrupos: false,
++        escribe_profundidad: false,
+         capacidades: Vec::new(),
+         set: op.set,
+         bases: HashMap::new(),
+@@ -212,7 +213,13 @@ impl Tr<'_> {
+         self.b.entry_point(modelo, fun, nombre, interfaz);
+         match self.ent.etapa {
+             Etapa::Kernel => {}
+-            Etapa::Fragment => self.b.execution_mode(fun, ExecutionMode::OriginUpperLeft, []),
++            Etapa::Fragment => {
++                self.b.execution_mode(fun, ExecutionMode::OriginUpperLeft, []);
++                if self.escribe_profundidad {
++                    // Sin este modo, el SPIR-V con OpStore %gl_FragDepth no valida (VUID-FragDepth-04216).
++                    self.b.execution_mode(fun, ExecutionMode::DepthReplacing, []);
++                }
++            }
+             Etapa::Vertex => {}
+         }
+         Ok(())
+@@ -478,7 +485,10 @@ impl Tr<'_> {
+                     self.b.decorate(var, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::Position)]);
+                 }
+                 "air.point_size" => self.b.decorate(var, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::PointSize)]),
+-                "air.depth" => self.b.decorate(var, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::FragDepth)]),
++                "air.depth" => {
++                    self.b.decorate(var, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::FragDepth)]);
++                    self.escribe_profundidad = true;
++                }
+                 "air.vertex_output" => {
+                     let nombre = d.propios().first().and_then(|x| match x { super::super::Dato::Txt(s) => Some(s.clone()), _ => None }).unwrap_or_default();
+                     let loc = self.varyings_out.len() as u32;
+@@ -915,9 +925,13 @@ impl Tr<'_> {
+                 continue;
+             }
+             let (tc, val) = if struct_ret {
+-                let tc = match &self.m.types[t] { Type::Struct { elems, .. } => elems[k], _ => unreachable!() };
++                let tc = match &self.m.types[t] {
++                    Type::Struct { elems, .. } if k < elems.len() => elems[k],
++                    _ => return Err(format!("salida {k} sin campo en la struct de retorno")),
++                };
+                 let id = match &x {
+-                    TV::C(V::Agg(es)) => self.constante(tc, &es[k])?,
++                    TV::C(V::Agg(es)) if k < es.len() => self.constante(tc, &es[k])?,
++                    TV::C(V::Agg(_)) => return Err(format!("salida {k} sin valor en la constante")),
+                     TV::C(V::Undef) => {
+                         let st = self.ty(tc)?;
+                         self.b.constant_null(st)
+diff --git a/tahoe-gpu/src/air/spirv_ops.rs b/tahoe-gpu/src/air/spirv_ops.rs
+index 2b69485..bdab8c0 100644
+--- a/tahoe-gpu/src/air/spirv_ops.rs
++++ b/tahoe-gpu/src/air/spirv_ops.rs
+@@ -247,7 +247,15 @@ impl Tr<'_> {
+                 match self.tv(*i)? {
+                     TV::C(V::Int(_, k)) => TV::Id(self.b.composite_extract(st, None, x, [k as u32]).unwrap()),
+                     _ => {
+-                        let k = self.id(*i)?;
++                        let mut k = self.id(*i)?;
++                        // El índice debe ser un entero escalar: si es un i1 (como en uber_fragment) se
++                        // convierte a u32, o el SPIR-V no valida («Expected Index to be int scalar»).
++                        let tidx = self.f.values[*i].ty;
++                        if bits(self.m, tidx) == 1 {
++                            // Un booleano de SPIR-V vale 0 o 1: se convierte con un select (no hay OpZeroExtend).
++                            let (uno, cero) = (self.cu(1), self.cu(0));
++                            k = self.b.select(self.t_u32, None, k, uno, cero).unwrap();
++                        }
+                         TV::Id(self.b.vector_extract_dynamic(st, None, x, k).unwrap())
+                     }
+                 }
+@@ -746,6 +754,30 @@ impl Tr<'_> {
+                 };
+                 self.ext(st, op, &[x])
+             }
++            // extract_bits.u.i32(valor, desplazamiento, cuenta): saca «cuenta» bits a partir de
++            // «desplazamiento» (la cuenta es el número de bits, no un valor de máscara).
++            "extract_bits" => {
++                let val = self.id(a[0])?;
++                let off = self.id(a[1])?;
++                let cnt = self.id(a[2])?;
++                let uno = self.cu(1);
++                let der = self.b.shift_right_logical(self.t_u32, None, val, off).unwrap();
++                let r = if cnt == 32 {
++                    der
++                } else {
++                    // máscara de «cuenta» bits: (1 << cuenta) - 1
++                    let shl = self.b.shift_left_logical(self.t_u32, None, uno, cnt).unwrap();
++                    let masca = self.b.i_sub(self.t_u32, None, shl, uno).unwrap();
++                    self.b.bitwise_and(self.t_u32, None, der, masca).unwrap()
++                };
++                return Ok(Some(TV::Id(r)));
++            }
++            // popcount.i32(x): OpBitCount (no existe en GLSL.std.450).
++            "popcount" => {
++                let x = self.id(a[0])?;
++                let r = self.b.bit_count(self.t_u32, None, x).unwrap();
++                return Ok(Some(TV::Id(r)));
++            }
+             "get_null_texture_2d" | "get_null_texture_3d" | "get_null_texture_cube" => return Ok(Some(TV::Ptr(Base::Nula, Off::C(0)))),
+             "get_read_sampler" => return Ok(Some(TV::Smp(Smp::Lectura))),
+             "get_simdgroup_size" => {
+diff --git a/tahoe-gpu/src/servir.rs b/tahoe-gpu/src/servir.rs
+index cbc2f64..8d79902 100644
+--- a/tahoe-gpu/src/servir.rs
++++ b/tahoe-gpu/src/servir.rs
+@@ -373,7 +373,11 @@ impl Cliente {
+                     // las constantes por nombre, a su índice en esta función
+                     let mut op2 = spirv::Opciones { constantes: op.constantes.clone(), varyings: op.varyings.clone(), set: op.set };
+                     for fc in air::fc::constantes(&m) {
+-                        if let Some((_, v)) = por_nombre.iter().find(|(n, _)| *n == fc.nombre) {
++                        // El cliente pone el nombre tal como se escribe en el código («_shader_state»); en el
++                        // AIR el nombre viene cualificado («RB::Shader::Constant::_shader_state»): se comparan
++                        // los dos, o la constante del cliente no llegaría nunca al shader.
++                        let corto = fc.nombre.rsplit("::").next().unwrap_or(&fc.nombre);
++                        if let Some((_, v)) = por_nombre.iter().find(|(n, _)| *n == fc.nombre || *n == corto) {
+                             op2.constantes.insert(fc.indice, v.clone());
+                         }
+                     }
+diff --git a/tahoe-metal/src/bin/metalprobe.rs b/tahoe-metal/src/bin/metalprobe.rs
+index df87dc7..d111217 100644
+--- a/tahoe-metal/src/bin/metalprobe.rs
++++ b/tahoe-metal/src/bin/metalprobe.rs
+@@ -62,6 +62,9 @@ fn main() {
+         if std::env::args().nth(1).as_deref() == Some("plano") {
+             std::process::exit(plano(d));
+         }
++        if std::env::args().nth(1).as_deref() == Some("constante") {
++            std::process::exit(plano_con(d, true));
++        }
+         if std::env::args().nth(1).as_deref() == Some("cadena") {
+             std::process::exit(cadena(d));
+         }
+@@ -182,7 +185,14 @@ fn cadena(d: Id) -> i32 {
+ /// El vertex shader hace pos = x*g0 + y*g1 + g2 (las esquinas del quad salen del vertex_id) y el fragment shader
+ /// escribe el color que viene en los globals (28 bytes del plano + 8 del color) en el primer attachment y la
+ /// cobertura en el segundo.
++///
++/// Con `constante` se pone además la function constant `_shader_state` (un uint4) como pone el compositor: con el
++/// bit 0x80000 del componente 2, el shader fuerza el alfa a 1 en vez de usar el del buffer.
+ fn plano(d: Id) -> i32 {
++    plano_con(d, false)
++}
++
++fn plano_con(d: Id, constante: bool) -> i32 {
+     const RUTA: &str = "/System/Library/PrivateFrameworks/RenderBox.framework/Versions/A/Resources/default.metallib";
+     const COLOR: u64 = 80;    // MTLPixelFormatBGRA8Unorm
+     const COVERAGE: u64 = 65; // MTLPixelFormatRG16Float (el shader escribe half2 en el segundo attachment)
+@@ -193,10 +203,27 @@ fn plano(d: Id) -> i32 {
+             println!("biblioteca: nil");
+             return 3;
+         }
++        // Los valores de la constante: un uint4 con el bit 0x80000 en el componente 2.
++        let mut valores: Id = std::ptr::null_mut();
++        if constante {
++            valores = objc::m0(objc::clase("MTLFunctionConstantValues"), "alloc");
++            if valores.is_null() {
++                println!("MTLFunctionConstantValues: nil");
++                return 8;
++            }
++            valores = objc::m0(valores, "init");
++            let mut v = [0u32; 4];
++            v[2] = 0x80000;
++            // MTLDataType: 32 = cuatro enteros de 32 bits (16 bytes).
++            objc::m3::<*const u32, u64, Id, ()>(valores, "setConstantValue:type:withName:", v.as_ptr(), 32, objc::nsstring("_shader_state"));
++        }
+         // La función, por descriptor (como hace el compositor).
+         let por_descriptor = |lib: Id, nombre: &str| -> Id {
+             let desc: Id = objc::m0(objc::clase("MTLFunctionDescriptor"), "alloc");
+             objc::m1::<Id, ()>(desc, "setName:", objc::nsstring(nombre));
++            if !valores.is_null() {
++                objc::m1::<Id, ()>(desc, "setConstantValues:", valores);
++            }
+             objc::m2(lib, "newFunctionWithDescriptor:error:", desc, std::ptr::null_mut::<Id>())
+         };
+         let vf = por_descriptor(lib, "plane__vertex");
+@@ -227,7 +254,8 @@ fn plano(d: Id) -> i32 {
+         for (o, v) in [(0usize, 2.0f32), (4, 0.0), (8, 0.0), (12, 2.0), (16, -1.0), (20, -1.0), (24, 0.0)] {
+             g[o..o + 4].copy_from_slice(&v.to_le_bytes());
+         }
+-        for (o, v) in [(28usize, 0x3c00u16), (30, 0x3800), (32, 0x3400), (34, 0x3c00)] {
++        // El color: (1.0, 0.5, 0.25) con alfa 0.5 (así se ve el efecto de la constante).
++        for (o, v) in [(28usize, 0x3c00u16), (30, 0x3800), (32, 0x3400), (34, 0x3800)] {
+             g[o..o + 2].copy_from_slice(&v.to_le_bytes());
+         }
+         let gb: Id = objc::m3(d, "newBufferWithBytes:length:options:", g.as_ptr(), 36u64, 0u64);
+@@ -273,9 +301,11 @@ fn plano(d: Id) -> i32 {
+         }
+         let punto = |x: usize, y: usize| -> [u8; 4] { px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].try_into().unwrap() };
+         println!("command buffer: estado {st}; centro BGRA {:?}; esquina {:?}", punto(32, 32), punto(0, 0));
+-        // El color de los globals es (1.0, 0.5, 0.25, 1.0): en BGRA8 son B=64, G=128, R=255, A=255.
+-        let bien = punto(32, 32) == [64u8, 128, 255, 255] && punto(0, 0) == [64u8, 128, 255, 255];
+-        println!("plano: {}", if bien { "CORRECTO" } else { "MAL" });
++        // El color de los globals es (1.0, 0.5, 0.25, 0.5): en BGRA8 son B=64, G=128, R=255, A=128.
++        // Con la constante puesta, el shader fuerza el alfa a 1 (A=255).
++        let esperado: [u8; 4] = if constante { [64, 128, 255, 255] } else { [64, 128, 255, 128] };
++        let bien = punto(32, 32) == esperado && punto(0, 0) == esperado;
++        println!("plano{}: {}", if constante { " con constante" } else { "" }, if bien { "CORRECTO" } else { "MAL" });
+         if bien { 0 } else { 7 }
+     }
+ }
+diff --git a/tahoe-metal/src/bin/metalsuite.rs b/tahoe-metal/src/bin/metalsuite.rs
+index 89e2698..5dfbe1f 100644
+--- a/tahoe-metal/src/bin/metalsuite.rs
++++ b/tahoe-metal/src/bin/metalsuite.rs
+@@ -83,6 +83,75 @@ fn bloque_falso() -> Id {
+     b as Id
+ }
+ 
++/// Cuántas veces se ha llamado al bloque liberador de un buffer «no copia» y con qué puntero.
++static LIBERADOR_LLAMADAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static LIBERADOR_PUNTERO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++
++/// El liberador `void (^)(const void *)` de un buffer «no copia»: apunta el puntero que recibe y que se ha llamado.
++extern "C" fn bloque_liberador(_bloque: *mut c_void, p: *const u8) {
++    LIBERADOR_PUNTERO.store(p as usize, std::sync::atomic::Ordering::SeqCst);
++    LIBERADOR_LLAMADAS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++}
++
++/// La firma del bloque liberador (`void (^)(const void *)`).
++static FIRMA_LIBERADOR: &[u8] = b"v@^v\0";
++
++/// El descriptor de un literal de bloque: el runtime de bloques (libclosure) lo lee para saber el tamaño del bloque
++/// (el segundo campo) y su firma (el tercero).
++#[repr(C)]
++struct DescriptorBloque {
++    reservado: u64,
++    tamano: u64,
++    firma: *const c_char,
++}
++
++/// Un literal de bloque de Objective-C: `isa`, `flags`, `reserved`, la función de invocación (en el desplazamiento 16)
++/// y el descriptor.
++#[repr(C)]
++struct LiteralBloque {
++    isa: *const c_void,
++    flags: i32,
++    reserved: i32,
++    invoke: extern "C" fn(*mut c_void, *const u8),
++    descriptor: *const DescriptorBloque,
++}
++
++/// Un bloque liberador de verdad (`void (^)(const void *)`), para el buffer «no copia».
++///
++/// A diferencia del bloque de mentira de arriba, este lo copia el driver con `_Block_copy`, así que tiene que ser un
++/// bloque de verdad: la clase de los bloques de pila (`_NSConcreteStackBlock`, que exporta libSystem), la función de
++/// invocación en el desplazamiento 16 y un descriptor con el tamaño del literal y su firma. `None` si el proceso no
++/// trae ese símbolo (entonces no se puede comprobar el contrato).
++fn nuevo_bloque_liberador() -> Option<Id> {
++    // RTLD_DEFAULT: el ámbito global de símbolos (así se busca uno sin saber en qué biblioteca está).
++    let mut isa = unsafe { dlsym((-2isize) as *mut c_void, c"_NSConcreteStackBlock".as_ptr()) };
++    if isa.is_null() {
++        // Por si el ámbito global no llega al símbolo: se busca en libSystem, que es quien lo exporta.
++        let h = unsafe { dlopen(c"/usr/lib/libSystem.B.dylib".as_ptr(), 2) };
++        if !h.is_null() {
++            isa = unsafe { dlsym(h, c"_NSConcreteStackBlock".as_ptr()) };
++        }
++    }
++    if isa.is_null() {
++        return None;
++    }
++    // El literal y su descriptor se quedan vivos a propósito (el runtime los lee al copiar el bloque, y el descriptor
++    // lo consulta al soltarlo).
++    let descriptor = Box::into_raw(Box::new(DescriptorBloque {
++        reservado: 0,
++        tamano: std::mem::size_of::<LiteralBloque>() as u64,
++        firma: FIRMA_LIBERADOR.as_ptr().cast(),
++    }));
++    let b = Box::into_raw(Box::new(LiteralBloque {
++        isa: isa.cast(),
++        flags: 1 << 30, // BLOCK_HAS_SIGNATURE
++        reserved: 0,
++        invoke: bloque_liberador,
++        descriptor: descriptor.cast(),
++    }));
++    Some(b.cast())
++}
++
+ /// La función de cómputo de la biblioteca de CoreRE3D (la misma que usa metalprobe).
+ fn funcion_de_computo(d: Id) -> Option<Id> {
+     unsafe {
+@@ -118,6 +187,18 @@ fn chequear_si(inf: &mut Informe, nombre: &str, aplica: bool, f: impl FnOnce() -
+     chequear(inf, nombre, f)
+ }
+ 
++/// Una comprobación que puede no aplicar por el entorno (no por el driver): si no, se cuenta como saltada y se dice
++/// por qué.
++fn chequear_si_falta(inf: &mut Informe, nombre: &str, falta: Option<&str>, f: impl FnOnce() -> Result<(), String>) {
++    match falta {
++        Some(motivo) => {
++            inf.saltados += 1;
++            println!("  (n/d)   {nombre}: {motivo}");
++        }
++        None => chequear(inf, nombre, f),
++    }
++}
++
+ /// Una comprobación que depende de que exista un selector en el marco de Apple: si no existe, no es un fallo del
+ /// driver, se cuenta como saltada.
+ fn comprobar(inf: &mut Informe, nombre: &str, selector: Option<&str>, f: impl FnOnce() -> Result<(), String>) {
+@@ -427,10 +508,16 @@ fn main() {
+                 return Err("nil".into());
+             }
+             let buf: Id = objc::m2::<u64, u64, Id>(d, "newBufferWithLength:options:", 256, 0);
+-            // NSMutableArray: +array devuelve un NSArray inmutable y addObject: sobre él lanza excepción.
+-            let arr: Id = objc::m0(objc::clase("NSMutableArray"), "array");
++            // El array tiene que ser mutable: addObject: sobre un NSArray inmutable lanza excepción, así que se
++            // reserva con alloc/init en vez de con +array.
++            let arr: Id = objc::m0(objc::m0::<Id>(objc::clase("NSMutableArray"), "alloc"), "init");
+             objc::m1::<Id, ()>(arr, "addObject:", buf);
+             objc::m1::<Id, ()>(r, "addAllObjects:", arr);
++            // Y el conjunto tiene que haberse quedado con el recurso.
++            let n = objc::m0::<u64>(r, "allocationCount");
++            if n != 1 {
++                return Err(format!("el conjunto tiene {n} recursos en vez de 1"));
++            }
+             Ok(())
+         });
+         chequear(&mut inf, "buffer sin copia", || {
+@@ -447,6 +534,50 @@ fn main() {
+             }
+             Ok(())
+         });
++        // El liberador es `void (^)(const void *)`: el driver lo guarda y lo llama cuando el buffer muere, y tiene que
++        // recibir el mismo puntero que dio el cliente (no el del buffer del servidor).
++        let liberador = nuevo_bloque_liberador();
++        let falta = if liberador.is_none() {
++            Some("el proceso no exporta _NSConcreteStackBlock (libclosure)")
++        } else {
++            None
++        };
++        chequear_si_falta(&mut inf, "bloque liberador del buffer sin copia", falta, || {
++            let bloque = liberador.ok_or("no se pudo construir el bloque")?;
++            let datos: [u8; 4] = [9, 8, 7, 6];
++            let p_datos = datos.as_ptr();
++            LIBERADOR_LLAMADAS.store(0, std::sync::atomic::Ordering::SeqCst);
++            LIBERADOR_PUNTERO.store(0, std::sync::atomic::Ordering::SeqCst);
++            let enviar4: unsafe extern "C" fn(Id, objc::Sel, *const u8, u64, u64, Id) -> Id =
++                std::mem::transmute(objc::objc_msgSend as *const ());
++            let b: Id = enviar4(d, objc::sel("newBufferWithBytesNoCopy:length:options:deallocator:"), p_datos, 4, 0, bloque);
++            if b.is_null() {
++                return Err("nil".into());
++            }
++            // El contenido es el que dio el cliente.
++            let p = objc::m0::<*const u8>(b, "contents");
++            if p.is_null() {
++                return Err("contents nil".into());
++            }
++            if std::slice::from_raw_parts(p, 4) != datos {
++                return Err("el contenido no es el esperado".into());
++            }
++            // Al soltar el buffer tiene que morir el bloque liberador, una sola vez y con el puntero del cliente.
++            if objc::responde_instancia(b, "release") {
++                objc::m0::<()>(b, "release");
++            } else {
++                objc::m0::<()>(b, "dealloc");
++            }
++            let n = LIBERADOR_LLAMADAS.load(std::sync::atomic::Ordering::SeqCst);
++            if n != 1 {
++                return Err(format!("el bloque se llamó {n} veces, se esperaba 1 (el buffer se soltó con release)"));
++            }
++            let ptr = LIBERADOR_PUNTERO.load(std::sync::atomic::Ordering::SeqCst);
++            if ptr != p_datos as usize {
++                return Err(format!("el bloque recibió {ptr:#x} en vez de {:#x}", p_datos as usize));
++            }
++            Ok(())
++        });
+         // Eventos y manejadores.
+         chequear(&mut inf, "evento compartido", || {
+             let e: Id = objc::m0(d, "newSharedEvent");
+@@ -461,10 +592,47 @@ fn main() {
+             Ok(())
+         });
+         chequear(&mut inf, "evento con mango", || {
++            // El «mango» (MTLSharedEventHandle) es en macOS 26 un puerto Mach, y compartirlo entre procesos es otra
++            // ruta (la ruta B). Así que el driver devuelve nil a propósito: un nil honesto es mejor que un objeto
++            // mentiroso, porque QuartzCore (CA::shared_event_submit) tiene ruta de error para el nil, mientras que con
++            // un evento de mentira esperaría una señal que nadie va a dar. (El mango de verdad es un objeto con un
++            // puerto Mach detrás; aquí se le pasa otro objeto cualquiera, que el driver no usa.)
+             let e: Id = objc::m1(d, "newSharedEventWithHandle:", objc::nsstring("mango-de-prueba"));
++            if !e.is_null() {
++                return Err(format!("el driver devolvió un evento ({e:?}) en vez de nil"));
++            }
++            // Y la llamada no rompe nada: el dispositivo sigue dando eventos.
++            let otro: Id = objc::m0(d, "newSharedEvent");
++            if otro.is_null() {
++                return Err("el dispositivo dejó de dar eventos".into());
++            }
++            Ok(())
++        });
++        chequear(&mut inf, "señalización del evento compartido", || {
++            let e: Id = objc::m0(d, "newSharedEvent");
+             if e.is_null() {
+                 return Err("nil".into());
+             }
++            // Un evento nuevo empieza sin señalizar.
++            let v0 = objc::m0::<u64>(e, "signaledValue");
++            if v0 != 0 {
++                return Err(format!("el valor inicial es {v0} en vez de 0"));
++            }
++            let cb: Id = objc::m0(d, "newCommandBuffer");
++            if cb.is_null() {
++                return Err("command buffer nil".into());
++            }
++            // La señal se da desde el command buffer.
++            objc::m2::<Id, u64, ()>(cb, "signalEvent:value:", e, 5);
++            let v = objc::m0::<u64>(e, "signaledValue");
++            if v != 5 {
++                return Err(format!("el valor es {v} en vez de 5"));
++            }
++            // Esperar por ese valor no rompe nada: el commit es síncrono, así que el evento ya está señalado (si no
++            // lo estuviera, el driver solo dejaría traza).
++            objc::m2::<Id, u64, ()>(cb, "waitForEvent:value:", e, 5);
++            objc::m0::<()>(cb, "commit");
++            objc::m0::<()>(cb, "waitUntilCompleted");
+             Ok(())
+         });
+         chequear(&mut inf, "manejador de función", || {
+diff --git a/tahoe-metal/src/clases.rs b/tahoe-metal/src/clases.rs
+index ce05225..73faf23 100644
+--- a/tahoe-metal/src/clases.rs
++++ b/tahoe-metal/src/clases.rs
+@@ -377,6 +377,9 @@ pub struct Buffer {
+     /// El bloque que el cliente da para liberar su memoria cuando el buffer muera
+     /// (newBufferWithBytesNoCopy:length:options:deallocator:). Se copia para que sobreviva a la llamada.
+     liberador: Option<*mut c_void>,
++    /// La memoria que dio el cliente (newBufferWithBytesNoCopy…): es el puntero que recibe el bloque liberador
++    /// (`void (^)(const void *)`). Nulo si el buffer no es del cliente.
++    origen: *const u8,
+     etiqueta: Id,
+ }
+ etiqueta_de!(Buffer);
+@@ -387,11 +390,8 @@ impl Drop for Buffer {
+         // SAFETY: proyección hecha en nuevo_buffer.
+         unsafe { munmap(self.ptr.cast(), self.proyectado) };
+         if let Some(b) = self.liberador {
+-            // SAFETY: bloque copiado con _Block_copy; el liberador no toma argumentos.
+-            unsafe {
+-                llamar_bloque(b, std::ptr::null_mut());
+-                _Block_release(b);
+-            }
++            // SAFETY: bloque copiado con _Block_copy; el liberador toma la memoria del cliente.
++            unsafe { liberar_con_bloque(b, self.origen) };
+         }
+         soltar(self.etiqueta);
+     }
+@@ -399,15 +399,19 @@ impl Drop for Buffer {
+ 
+ /// MTLBuffer: memoria compartida con el servidor de GPU (archivo en /dev/shm, que se borra en cuanto él lo abre).
+ pub fn nuevo_buffer(len: usize, opciones: u64, datos: Option<&[u8]>) -> Result<Id, String> {
+-    nuevo_buffer_con_liberador(len, opciones, datos, None)
++    nuevo_buffer_con_liberador(len, opciones, datos, None, std::ptr::null())
+ }
+ 
+ /// Un buffer con el bloque que libera la memoria del cliente (newBufferWithBytesNoCopy…).
++///
++/// `origen` es la memoria que dio el cliente: es el puntero que recibe el bloque liberador, que es de tipo
++/// `void (^)(const void *)`. Nulo si el buffer no es del cliente.
+ pub fn nuevo_buffer_con_liberador(
+     len: usize,
+     opciones: u64,
+     datos: Option<&[u8]>,
+     liberador: Option<*mut c_void>,
++    origen: *const u8,
+ ) -> Result<Id, String> {
+     let id = nuevo_id();
+     let proyectado = len.next_multiple_of(4096).max(4096);
+@@ -420,6 +424,11 @@ pub fn nuevo_buffer_con_liberador(
+     drop(f);
+     if p.is_null() || p as isize == -1 {
+         let _ = std::fs::remove_file(&ruta);
++        if let Some(b) = liberador {
++            // El buffer no llegó a existir: la memoria sigue siendo del cliente, así que el bloque no se llama.
++            // SAFETY: bloque copiado con _Block_copy.
++            unsafe { _Block_release(b) };
++        }
+         return Err("mmap del buffer".into());
+     }
+     let ptr = p.cast::<u8>();
+@@ -434,9 +443,15 @@ pub fn nuevo_buffer_con_liberador(
+     if let Err(er) = r {
+         // SAFETY: proyección de arriba.
+         unsafe { munmap(p, proyectado) };
++        if let Some(b) = liberador {
++            // El buffer no llegó a existir: la memoria sigue siendo del cliente (que la suelta él), así que el
++            // bloque no se llama, solo se suelta la copia.
++            // SAFETY: bloque copiado con _Block_copy.
++            unsafe { _Block_release(b) };
++        }
+         return Err(er);
+     }
+-    Ok(crear(&clases().buffer, Buffer { id, ptr, len, proyectado, opciones, liberador, etiqueta: std::ptr::null_mut() }))
++    Ok(crear(&clases().buffer, Buffer { id, ptr, len, proyectado, opciones, liberador, origen, etiqueta: std::ptr::null_mut() }))
+ }
+ 
+ extern "C-unwind" fn buffer_contents(this: Id, _cmd: Sel) -> *mut u8 {
+@@ -657,6 +672,24 @@ unsafe fn llamar_bloque(b: *mut c_void, arg: Id) {
+     invoke(b, arg);
+ }
+ 
++/// Llama a un bloque liberador `void (^)(const void *)` con el puntero a la memoria del cliente.
++///
++/// # Safety
++/// `b` debe ser un bloque con esa firma.
++unsafe fn llamar_bloque_con_puntero(b: *mut c_void, p: *const u8) {
++    let invoke: extern "C-unwind" fn(*mut c_void, *const u8) = std::mem::transmute(*(b.cast::<u8>().add(16) as *const *const c_void));
++    invoke(b, p);
++}
++
++/// Llama al bloque liberador con la memoria del cliente y suelta la copia del bloque: el bloque se llama una sola vez.
++///
++/// # Safety
++/// `b` debe ser un bloque `void (^)(const void *)` copiado con `_Block_copy`.
++unsafe fn liberar_con_bloque(b: *mut c_void, origen: *const u8) {
++    llamar_bloque_con_puntero(b, origen);
++    _Block_release(b);
++}
++
+ /// signalEvent:value: (MTLCommandBuffer): señala el evento compartido con el valor dado.
+ extern "C-unwind" fn cb_signal_event(_this: Id, _cmd: Sel, evento: Id, valor: u64) {
+     if let Some(e) = estado::<Evento>(evento) {
+diff --git a/tahoe-metal/src/lib.rs b/tahoe-metal/src/lib.rs
+index 6a04475..940c5b7 100644
+--- a/tahoe-metal/src/lib.rs
++++ b/tahoe-metal/src/lib.rs
+@@ -258,9 +258,14 @@ fn crear_evento() -> Id {
+     clases::nuevo_evento()
+ }
+ 
+-/// newSharedEventWithHandle: el mango no se comparte con nadie: se crea un evento nuevo.
+-pub(crate) extern "C-unwind" fn dev_evento_manejador(_this: Id, _cmd: Sel, _mango: Id) -> Id {
+-    crear_evento()
++/// newSharedEventWithHandle: el «mango» (MTLSharedEventHandle) es en macOS 26 un puerto Mach, y compartirlo entre
++/// procesos es trabajo de otra ruta (la ruta B). Mientras el mango no se pueda compartir no se puede honrar lo que el
++/// cliente pide, así que se devuelve nil: el cliente (QuartzCore, en CA::shared_event_submit) tiene una ruta de error
++/// para el nil, mientras que un evento nuevo (falso) lo llevaría por la ruta «con evento», esperando una señal de un
++/// evento que nadie va a señalar.
++pub(crate) extern "C-unwind" fn dev_evento_manejador(_this: Id, _cmd: Sel, mango: Id) -> Id {
++    registro(&format!("newSharedEventWithHandle: mango {mango:?} no compartido; se devuelve nil"));
++    std::ptr::null_mut()
+ }
+ 
+ /// functionHandleWithFunction: y functionHandleWithBinaryFunction:: el manejador de una función.
+diff --git a/tahoe-metal/src/render.rs b/tahoe-metal/src/render.rs
+index 5eabced..c339ba7 100644
+--- a/tahoe-metal/src/render.rs
++++ b/tahoe-metal/src/render.rs
+@@ -242,9 +242,8 @@ fn bytes_por_pixel(formato: u64) -> u64 {
+     }
+ }
+ 
+-/// allocatedSize: los bytes que ocupa la textura, con todos sus niveles.
+-fn tex_allocado(this: Id, _cmd: Sel) -> u64 {
+-    let Some(t) = estado::<Textura>(this) else { return 0 };
++/// Los bytes que ocupa una textura, con todos sus niveles.
++fn tamano_de_textura(t: &Textura) -> u64 {
+     let bpp = bytes_por_pixel(t.formato);
+     let mut total = 0u64;
+     for nivel in 0..t.niveles.max(1) {
+@@ -256,6 +255,23 @@ fn tex_allocado(this: Id, _cmd: Sel) -> u64 {
+     total * t.capas.max(1)
+ }
+ 
++/// allocatedSize: los bytes que ocupa la textura, con todos sus niveles.
++fn tex_allocado(this: Id, _cmd: Sel) -> u64 {
++    let Some(t) = estado::<Textura>(this) else { return 0 };
++    tamano_de_textura(t)
++}
++
++/// Los bytes que ocupa un recurso (buffer o textura) de un conjunto de residencia.
++fn tamano_de_recurso(o: Id) -> u64 {
++    if let Some(b) = estado::<clases::Buffer>(o) {
++        return b.len as u64;
++    }
++    if let Some(t) = estado::<Textura>(o) {
++        return tamano_de_textura(t);
++    }
++    0
++}
++
+ /// setPurgeableState: (MTLPurgeableState): la memoria la tiene el servidor de GPU; se acepta y sigue ahí.
+ extern "C-unwind" fn tex_purgeable(_this: Id, _cmd: Sel, _estado: u64) -> Bool {
+     1
+@@ -465,7 +481,7 @@ extern "C-unwind" fn dev_sampler(_this: Id, _cmd: Sel, d: Id) -> Id {
+ /// MTLDataType y bytes.
+ type Constantes = Vec<(u32, String, u32, Vec<u8>)>;
+ static CONSTANTES: Mutex<Option<HashMap<usize, Constantes>>> = Mutex::new(None);
+-static ORIGINALES: OnceLock<[usize; 3]> = OnceLock::new();
++static ORIGINALES: OnceLock<[usize; 4]> = OnceLock::new();
+ 
+ /// Bytes de un valor de MTLDataType.
+ fn tam_tipo(t: u64) -> usize {
+@@ -483,6 +499,7 @@ fn tam_tipo(t: u64) -> usize {
+ fn apuntar(obj: Id, indice: u32, nombre: String, tipo_d: u64, p: *const u8) {
+     // SAFETY: Metal pasa un valor de ese tipo en p.
+     let b = unsafe { std::slice::from_raw_parts(p, tam_tipo(tipo_d)) }.to_vec();
++    registro(&format!("constante: índice {indice} nombre «{nombre}» tipo {tipo_d} bytes {}", b.len()));
+     if let Ok(mut g) = CONSTANTES.lock() {
+         let v = g.get_or_insert_with(HashMap::new).entry(obj as usize).or_default();
+         v.retain(|x| !(x.0 == indice && x.1 == nombre));
+@@ -506,6 +523,29 @@ extern "C-unwind" fn fc_nombre(this: Id, cmd: Sel, p: *const u8, t: u64, n: Id)
+         f(this, cmd, p, t, n)
+     }
+ }
++/// setConstantValues: (MTLFunctionDescriptor): Metal copia los valores a un objeto interno; los nuestros se copian
++/// al objeto copiado, que es el que luego lee el driver al crear la función.
++extern "C-unwind" fn fd_constantes(this: Id, cmd: Sel, valores: Id) {
++    // SAFETY: el método original de Metal con la misma firma.
++    unsafe {
++        let f: extern "C-unwind" fn(Id, Sel, Id) = std::mem::transmute(ORIGINALES.get().unwrap()[3]);
++        f(this, cmd, valores);
++    }
++    // SAFETY: el descriptor es un MTLFunctionDescriptor.
++    let destino: Id = unsafe { objc::m0(this, "constantValues") };
++    if destino.is_null() || valores.is_null() {
++        return;
++    }
++    let v = CONSTANTES.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&(valores as usize)).cloned()));
++    if let Some(v) = v {
++        let n = v.len();
++        if let Ok(mut g) = CONSTANTES.lock() {
++            g.get_or_insert_with(HashMap::new).insert(destino as usize, v);
++        }
++        registro(&format!("constantes: {n} valores copiados al objeto del descriptor"));
++    }
++}
++
+ extern "C-unwind" fn fc_rango(this: Id, cmd: Sel, p: *const u8, t: u64, r: clases::NSRange) {
+     let paso = tam_tipo(t);
+     for k in 0..r.len {
+@@ -533,16 +573,37 @@ fn interceptar_constantes() {
+             registro("MTLFunctionConstantValuesInternal sin los métodos esperados");
+             return;
+         }
+-        let _ = ORIGINALES.set([objc::method_getImplementation(a) as usize, objc::method_getImplementation(b) as usize, objc::method_getImplementation(c) as usize]);
++        let _ = ORIGINALES.set([
++            objc::method_getImplementation(a) as usize,
++            objc::method_getImplementation(b) as usize,
++            objc::method_getImplementation(c) as usize,
++            0,
++        ]);
+         objc::method_setImplementation(a, fc_indice as Imp);
+         objc::method_setImplementation(b, fc_nombre as Imp);
+         objc::method_setImplementation(c, fc_rango as Imp);
++        // También el descriptor: al poner los valores, Metal los copia a un objeto interno suyo, y esa copia no
++        // pasa por los métodos interceptados. Se copia lo nuestro al objeto copiado.
++        let d = objc::clase("MTLFunctionDescriptor");
++        if !d.is_null() {
++            let m = objc::class_getInstanceMethod(d, objc::sel("setConstantValues:"));
++            if !m.is_null() {
++                let _ = ORIGINALES.set([
++                    objc::method_getImplementation(a) as usize,
++                    objc::method_getImplementation(b) as usize,
++                    objc::method_getImplementation(c) as usize,
++                    objc::method_getImplementation(m) as usize,
++                ]);
++                objc::method_setImplementation(m, fd_constantes as Imp);
++            }
++        }
+     }
+ }
+ 
+ /// Las constantes de un MTLFunctionConstantValues, serializadas como las pide el protocolo.
+ fn serializar_constantes(valores: Id) -> Vec<u8> {
+     let v = CONSTANTES.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&(valores as usize)).cloned())).unwrap_or_default();
++    registro(&format!("constantes: {} valores para {:p}", v.len(), valores));
+     let mut e = Escritor::default();
+     e.u32(v.len() as u32);
+     for (i, n, t, b) in v {
+@@ -988,6 +1049,15 @@ extern "C-unwind" fn heap_modo(this: Id, _cmd: Sel) -> u64 {
+ extern "C-unwind" fn heap_ocupado(this: Id, _cmd: Sel) -> u64 {
+     estado::<Heap>(this).map(|h| h.ocupado).unwrap_or(0)
+ }
++/// cpuCacheMode, hazardTrackingMode, resourceOptions, type y gpuAddress (MTLHeap): el heap no tiene memoria propia
++/// (los recursos viven en el servidor de GPU), así que se contestan los valores neutros.
++extern "C-unwind" fn heap_cero(_this: Id, _cmd: Sel) -> u64 {
++    0
++}
++/// memoryPoolId (MTLHeap): este heap no sale de ningún conjunto de memoria.
++extern "C-unwind" fn heap_nil(_this: Id, _cmd: Sel) -> Id {
++    std::ptr::null_mut()
++}
+ extern "C-unwind" fn heap_nuevo_buffer(this: Id, _cmd: Sel, len: u64, opciones: u64) -> Id {
+     let b = match clases::nuevo_buffer(len as usize, opciones, None) {
+         Ok(b) => b,
+@@ -1001,6 +1071,12 @@ extern "C-unwind" fn heap_nuevo_buffer(this: Id, _cmd: Sel, len: u64, opciones:
+     }
+     b
+ }
++/// newBufferWithLength:options:offset: (MTLHeap): el desplazamiento dentro del heap no se puede honorar (aquí los
++/// recursos no se colocan en el heap, sino en el servidor de GPU), así que se crea el buffer como el otro y se anota.
++extern "C-unwind" fn heap_nuevo_buffer_offset(this: Id, cmd: Sel, len: u64, opciones: u64, offset: u64) -> Id {
++    registro(&format!("heap: newBufferWithLength:options:offset: {len} bytes en {offset}: el desplazamiento se ignora"));
++    heap_nuevo_buffer(this, cmd, len, opciones)
++}
+ extern "C-unwind" fn heap_nueva_textura(this: Id, _cmd: Sel, desc: Id) -> Id {
+     let t = textura_de_descriptor(desc);
+     if t.is_null() {
+@@ -1012,6 +1088,11 @@ extern "C-unwind" fn heap_nueva_textura(this: Id, _cmd: Sel, desc: Id) -> Id {
+     }
+     t
+ }
++/// newTextureWithDescriptor:offset: (MTLHeap): como el otro, el desplazamiento dentro del heap se ignora.
++extern "C-unwind" fn heap_nueva_textura_offset(this: Id, cmd: Sel, desc: Id, offset: u64) -> Id {
++    registro(&format!("heap: newTextureWithDescriptor:offset: en {offset}: el desplazamiento se ignora"));
++    heap_nueva_textura(this, cmd, desc)
++}
+ /// addAllocation: (MTLResidencySet): añade un recurso (buffer o textura) al conjunto.
+ extern "C-unwind" fn residencia_anadir(this: Id, _cmd: Sel, recurso: Id) {
+     let Some(r) = estado::<Residencia>(this) else { return };
+@@ -1020,9 +1101,52 @@ extern "C-unwind" fn residencia_anadir(this: Id, _cmd: Sel, recurso: Id) {
+     }
+     r.objetos.push(retener(recurso));
+ }
++/// removeAllocation: (MTLResidencySet): quita un recurso del conjunto.
++extern "C-unwind" fn residencia_quitar(this: Id, _cmd: Sel, recurso: Id) {
++    let Some(r) = estado::<Residencia>(this) else { return };
++    if let Some(p) = r.objetos.iter().position(|o| *o == recurso) {
++        let o = r.objetos.remove(p);
++        soltar(o);
++    }
++}
++/// allAllocations (MTLResidencySet): los recursos que tiene el conjunto ahora mismo.
++extern "C-unwind" fn residencia_todos(this: Id, _cmd: Sel) -> Id {
++    let v: Vec<Id> = estado::<Residencia>(this).map(|r| r.objetos.clone()).unwrap_or_default();
++    // SAFETY: NSArray de Foundation.
++    unsafe { objc::m2(objc::clase("NSArray"), "arrayWithObjects:count:", v.as_ptr(), v.len() as u64) }
++}
++/// allocatedSize (MTLResidencySet): los bytes que ocupan los recursos del conjunto.
++extern "C-unwind" fn residencia_tamano(this: Id, _cmd: Sel) -> u64 {
++    let Some(r) = estado::<Residencia>(this) else { return 0 };
++    r.objetos.iter().map(|o| tamano_de_recurso(*o)).sum()
++}
++/// allocationCount (MTLResidencySet): cuántos recursos tiene el conjunto.
++extern "C-unwind" fn residencia_cuenta(this: Id, _cmd: Sel) -> u64 {
++    estado::<Residencia>(this).map(|r| r.objetos.len() as u64).unwrap_or(0)
++}
++/// addAllObjects: (no es del protocolo MTLResidencySet, pero algunos clientes lo usan): añade todos los objetos de
++/// un NSArray al conjunto.
++extern "C-unwind" fn residencia_anadir_todos(this: Id, _cmd: Sel, objetos: Id) {
++    if objetos.is_null() {
++        return;
++    }
++    // SAFETY: objetos es un NSArray.
++    let n = unsafe { objc::m0::<u64>(objetos, "count") };
++    for i in 0..n {
++        // SAFETY: el NSArray tiene n objetos.
++        let o = unsafe { objc::m1::<u64, Id>(objetos, "objectAtIndexedSubscript:", i) };
++        if !o.is_null() {
++            residencia_anadir(this, _cmd, o);
++        }
++    }
++}
+ 
+ /// commit (MTLResidencySet): no hay planificador de citas; el conjunto solo retiene los recursos.
+ extern "C-unwind" fn residencia_commit(_this: Id, _cmd: Sel) {}
++/// requestResidency (MTLResidencySet): no hay planificador de citas; el conjunto ya retiene los recursos.
++extern "C-unwind" fn residencia_pedir(_this: Id, _cmd: Sel) {}
++/// endResidency (MTLResidencySet): lo mismo que pedir residencia; aquí no hace nada.
++extern "C-unwind" fn residencia_terminar(_this: Id, _cmd: Sel) {}
+ extern "C-unwind" fn residencia_quitar_todo(this: Id, _cmd: Sel) {
+     if let Some(r) = estado::<Residencia>(this) {
+         for o in r.objetos.drain(..) {
+@@ -1056,11 +1180,13 @@ extern "C-unwind" fn dev_residencia(_this: Id, _cmd: Sel, desc: Id, error: *mut
+ 
+ /// newBufferWithBytesNoCopy:length:options:deallocator: (MTLDevice): el cliente da memoria ya paginada y espera que
+ /// Metal no la copie. Aquí sí se copia al buffer del servidor (el servidor no puede importar memoria del cliente),
+-/// pero el bloque de liberación se guarda y se llama cuando el buffer muere, como manda el contrato.
++/// pero el bloque de liberación se guarda y se llama cuando el buffer muere con el puntero que dio el cliente, como
++/// manda el contrato (`void (^)(const void *)`).
+ extern "C-unwind" fn dev_buffer_nocopia(_this: Id, _cmd: Sel, p: *const u8, len: u64, opciones: u64, liberador: Id) -> Id {
+     let datos = if p.is_null() { None } else { Some(unsafe { std::slice::from_raw_parts(p, len as usize) }) };
+-    let bloq = clases::copiar_bloque(liberador);
+-    match clases::nuevo_buffer_con_liberador(len as usize, opciones, datos, bloq) {
++    // Sin memoria del cliente no hay nada que liberar: el bloque ni se copia (quedaría sin llamar).
++    let bloq = if p.is_null() { None } else { clases::copiar_bloque(liberador) };
++    match clases::nuevo_buffer_con_liberador(len as usize, opciones, datos, bloq, p) {
+         Ok(b) => b,
+         Err(e) => {
+             registro(&format!("newBufferWithBytesNoCopy:{len}: {e}"));
+@@ -1156,18 +1282,33 @@ pub fn registrar(dispositivo: Class) {
+     etq(&mut encoder, clases::etiqueta::<Encoder> as Imp, clases::poner_etiqueta::<Encoder> as Imp);
+     let mut heap: Vec<Metodo> = vec![
+         ("size", heap_tamano as Imp, "Q@:"),
++        ("allocatedSize", heap_ocupado as Imp, "Q@:"),
+         ("storageMode", heap_modo as Imp, "Q@:"),
+-        ("currentAllocatedSize", heap_ocupado as Imp, "Q@:"),
++        ("cpuCacheMode", heap_cero as Imp, "Q@:"),
++        ("hazardTrackingMode", heap_cero as Imp, "Q@:"),
++        ("resourceOptions", heap_cero as Imp, "Q@:"),
++        ("type", heap_cero as Imp, "Q@:"),
++        ("gpuAddress", heap_cero as Imp, "Q@:"),
++        ("memoryPoolId", heap_nil as Imp, "@@:"),
+         ("newBufferWithLength:options:", heap_nuevo_buffer as Imp, "@@:QQ"),
++        ("newBufferWithLength:options:offset:", heap_nuevo_buffer_offset as Imp, "@@:QQQ"),
+         ("newTextureWithDescriptor:", heap_nueva_textura as Imp, "@@:@"),
++        ("newTextureWithDescriptor:offset:", heap_nueva_textura_offset as Imp, "@@:@Q"),
+     ];
+     etq(&mut heap, clases::etiqueta::<Heap> as Imp, clases::poner_etiqueta::<Heap> as Imp);
+     let mut fence: Vec<Metodo> = vec![];
+     etq(&mut fence, clases::etiqueta::<Fence> as Imp, clases::poner_etiqueta::<Fence> as Imp);
+     let mut residencia: Vec<Metodo> = vec![
+         ("addAllocation:", residencia_anadir as Imp, "v@:@"),
+-        ("removeAllObjects", residencia_quitar_todo as Imp, "v@:"),
++        ("removeAllocation:", residencia_quitar as Imp, "v@:@"),
++        ("allAllocations", residencia_todos as Imp, "@@:"),
++        ("allocatedSize", residencia_tamano as Imp, "Q@:"),
++        ("allocationCount", residencia_cuenta as Imp, "Q@:"),
+         ("commit", residencia_commit as Imp, "v@:"),
++        ("requestResidency", residencia_pedir as Imp, "v@:"),
++        ("endResidency", residencia_terminar as Imp, "v@:"),
++        ("addAllObjects:", residencia_anadir_todos as Imp, "v@:@"),
++        ("removeAllObjects", residencia_quitar_todo as Imp, "v@:"),
+     ];
+     etq(&mut residencia, clases::etiqueta::<Residencia> as Imp, clases::poner_etiqueta::<Residencia> as Imp);
+     let c = ClasesRender {

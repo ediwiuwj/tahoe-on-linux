@@ -1,0 +1,44 @@
+From c39b96ad510bc25b779e7bd22b491477dbfa0e1b Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:32:18 -0600
+Subject: [PATCH 27/57] Emulador: el estado de un hijo continuado se traduce al
+ de Darwin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_proc.c: wait4 con WCONTINUED devuelve ahora el estado de "continuado"
+  como en XNU, que copia W_STOPCODE(SIGCONT) = 0x137f (kern_exit.c:3209).
+  Linux lo devuelve como __WCONTINUED (0xffff), que no encaja en
+  ninguna de sus macros de estado y salía en crudo: en Darwin, 0xffff es
+  "muerto por la señal 255", así que el invitado veía una muerte que no
+  había ocurrido. Este camino lo abrió el commit 6467ba0, que habilitó
+  WCONTINUED sin cerrar la traducción del estado.
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_proc.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/tahoe-run/emu_proc.c b/tahoe-run/emu_proc.c
+index 29cb583..1e83c3e 100644
+--- a/tahoe-run/emu_proc.c
++++ b/tahoe-run/emu_proc.c
+@@ -657,11 +657,14 @@ static int linux_to_darwin_sig(int s) {
+ 	for (int d = 1; d < 32; d++) if (darwin_to_linux_sig(d) == s) return d;
+ 	return s;
+ }
+-// Estado de wait4: salida normal = código << 8; terminado por señal = nº de señal de Darwin (+0x80 si volcó core).
++// Estado de wait4: salida normal = código << 8; terminado por señal = nº de señal de Darwin (+0x80 si volcó core);
++// parado = 0x7f | (señal << 8); continuado = W_STOPCODE(SIGCONT) = 0x137f (como en XNU, kern_exit.c:3209).
+ static int darwin_wait_status(int st) {
+ 	if (WIFEXITED(st)) return WEXITSTATUS(st) << 8;
+ 	if (WIFSIGNALED(st)) return linux_to_darwin_sig(WTERMSIG(st)) | (WCOREDUMP(st) ? 0x80 : 0);
+ 	if (WIFSTOPPED(st)) return 0x7f | (linux_to_darwin_sig(WSTOPSIG(st)) << 8);
++	if (st == 0xFFFF) return 0x137f;                // Linux: __WCONTINUED (el hijo se paró y siguió). En Darwin, WIFSIGNALED
++	                                                // de 0xffff sería "muerto por la señal 255", así que hay que traducirlo.
+ 	return st;
+ }
+ 

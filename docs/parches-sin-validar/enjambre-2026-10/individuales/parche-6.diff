@@ -1,0 +1,74 @@
+diff --git i/tahoe-run/emu_fs.c w/tahoe-run/emu_fs.c
+index 6512f85..279dba3 100644
+--- i/tahoe-run/emu_fs.c
++++ w/tahoe-run/emu_fs.c
+@@ -659,8 +659,69 @@ static long bsd_fcntl(struct ctx* c) {
+ 	case 74: case 63: case 77: return 0;                    // F_GETNOSIGPIPE, F_GETPROTECTIONCLASS, F_GETPROTECTIONLEVEL: 0
+ 	case 64: return 0;                                      // F_SETPROTECTIONCLASS: sin clases de protección
+ 	case 85: RET(fdatasync(fd));                            // F_BARRIERFSYNC
++	case 42: {                                              // F_PREALLOCATE: reservar espacio (fstore_t de bsd/sys/fcntl.h)
++		// XNU bsd/kern/kern_descrip.c: EBADF si el archivo no está abierto para escritura; EINVAL si el
++		// posmode no es F_PEOFPOSMODE (3, offset 0) ni F_VOLPOSMODE (4, offset > 0), y esa comprobación
++		// va antes del VFS (sin copiar la estructura de vuelta); con VFS, la estructura se devuelve
++		// siempre. VNOP_ALLOCATE (bsd/sys/vnode_if.h) reserva espacio "sin usarlo": al crecer, el
++		// tamaño lógico no cambia. En hfs_vnop_allocate (hfs_readwrite.c) el PEOF son los bloques
++		// asignados, fst_length se le añade (PEOFPOSMODE) o es el total deseado (VOLPOSMODE, que no
++		// puede encoger), y bytesalloc informa de lo añadido. Traducción: fallocate(2) con
++		// FALLOC_FL_KEEP_SIZE, que tampoco toca el tamaño.
++		uint8_t raw[32];                                   // fst_flags, fst_posmode, fst_offset, fst_length, fst_bytesalloc
++		int32_t posmode; int64_t offset, length, alloc = 0;
++		int fl = fcntl(fd, F_GETFL);
++		if (fl < 0) return err();                          // EBADF
++		if ((fl & O_ACCMODE) == O_RDONLY) return -D_EBADF; // XNU: hace falta FWRITE
++		if (safe_read(c->a[2], raw, 32) != 32) return -D_EFAULT;
++		memcpy(&posmode, raw + 4, 4); memcpy(&offset, raw + 8, 8); memcpy(&length, raw + 16, 8);
++		if (posmode == 3) { if (offset != 0) return -D_EINVAL; }            // F_PEOFPOSMODE: desde el final físico
++		else if (posmode == 4) { if (offset <= 0) return -D_EINVAL; }       // F_VOLPOSMODE: desde el inicio del volumen
++		else return -D_EINVAL;
++		struct stat st;
++		if (fstat(fd, &st) != 0) return err();
++		off_t peof = (off_t)st.st_blocks * 512;           // bloques asignados, como ff_blocks de HFS+; con huecos
++		if (peof < st.st_size) peof = st.st_size;         // (imposibles allí) se toma el tamaño, que es lo que falta
++		off_t base = 0, len = 0;
++		long e = 0;
++		if (length < 0) e = -D_EINVAL;                    // hfs_vnop_allocate: length negativo
++		else if (posmode == 3) { base = peof; len = length; }
++		else if (length < peof) e = -D_EINVAL;            // VOLPOSMODE por debajo de lo ya asignado (hfs)
++		else { base = peof; len = length - peof; }
++		if (!e && len > 0) {
++			// F_ALLOCATEALL: fallocate ya es "todo o nada" (con ENOSPC no reserva nada), como hfs con
++			// kEFAllMask. F_ALLOCATECONTIG no se puede prometer en Linux: se reserva igual, quizá no
++			// contiguo. F_ALLOCATEPERSIST: lo reservado no se libera al cerrar (HFS+ libera lo no
++			// escrito; aquí queda como bloques asignados). El offset de F_VOLPOSMODE es solo una pista
++			// de colocación de bloques en HFS+: se ignora.
++			if (fallocate(fd, FALLOC_FL_KEEP_SIZE, base, len) != 0)
++				e = errno == EOPNOTSUPP ? -45 /* ENOTSUP: err_allocate de XNU */ : err();
++			else alloc = len;
++		}
++		memcpy(raw + 24, &alloc, 8);                       // fst_bytesalloc: lo pedido (hfs lo redondea al bloque;
++		                                                   // nunca se informa de menos de lo pedido)
++		if (safe_write(c->a[2], raw, 32) != 32 && !e) e = -D_EFAULT;   // kern_descrip.c: copyout siempre
++		return e;
++	}
++	case 43: {                                              // F_SETSIZE: truncar (equivalente a truncate(2))
++		// XNU kern_descrip.c: EBADF si no hay FWRITE; EACCES si no es root ("growing a file without zero
++		// filling the data is a security hole"); con root, vnode_setsize. La uid es la emulada
++		// (cred_euid), la que cada demonio cree tener; el SF_APPEND de XNU (EPERM) no se aplica porque
++		// las banderas BSD solo se guardan como atributo extendido, no se hacen cumplir.
++		int fl = fcntl(fd, F_GETFL);
++		if (fl < 0) return err();                          // EBADF
++		if ((fl & O_ACCMODE) == O_RDONLY) return -D_EBADF;
++		int64_t size;
++		if (safe_read(c->a[2], &size, 8) != 8) return -D_EFAULT;
++		if (cred_euid() != 0) return -13;                 // EACCES: solo root
++		RET(ftruncate(fd, (off_t)size));
++	}
+ 	case 99: {                                              // F_PUNCHHOLE(fpunchhole_t: flags, reservado, offset, length)
++		// XNU kern_descrip.c: sin FWRITE, EPERM (antes de leer la estructura)
+ 		uint64_t ph[3]; uint8_t raw[24];
++		int fl = fcntl(fd, F_GETFL);
++		if (fl < 0) return err();                          // EBADF
++		if ((fl & O_ACCMODE) == O_RDONLY) return -D_EPERM;
+ 		if (safe_read(c->a[2], raw, 24) != 24) return -D_EFAULT;
+ 		memcpy(&ph[1], raw + 8, 8); memcpy(&ph[2], raw + 16, 8);
+ 		RET(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)ph[1], (off_t)ph[2]));

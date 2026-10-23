@@ -1,0 +1,1577 @@
+From ffbef8789b1f018c323f5f17a0d82dfec1d6ce58 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:39:27 -0600
+Subject: [PATCH 09/57] =?UTF-8?q?Diagn=C3=B3stico:=20mensajes=20Mach,=20IO?=
+ =?UTF-8?q?Kit,=20discos,=20memoria=20y=20la=20bater=C3=ADa?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Herramientas para seguir lo que hace el macOS emulado:
+
+- mensajes.py: quién habla con quién, qué peticiones no recibieron respuesta
+  y qué mensajes quedaron sin responder (con decodificación de XPC).
+- iokit.py: las peticiones de IOKit de cada proceso, con sus respuestas.
+- discos.sh, da_log.py: diskutil y el registro de diskarbitrationd.
+- memoria.sh, memoria.py: el muestreo de la memoria de un proceso y la
+  comparación de dos fotos de smaps (qué región crece).
+- caidas.py, dsmos.py, stub.py, stub de los símbolos: las caídas simbolizadas
+  y el descifrado del __TEXT protegido de los binarios de Apple.
+- captura.py, pantalla.sh, entrada.py: la pantalla del macOS y el teclado y
+  el ratón del visor.
+- inventario.py, inventario_total.sh: el inventario de los 1167 programas.
+- llaveros.sh, dk_calmo.sh, arranque.sh, ab_recorrido.sh, cola.sh.
+- bateria.sh: la batería fija que se pasa antes de dar por bueno un cambio
+  (diskutil, el inventario corto dos veces, la memoria de WindowServer y
+  cargo test --lib), con la comparación A/B contra el binario anterior.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tools/diag/ab_recorrido.sh |  14 +++
+ tools/diag/arranque.sh     |  26 +++++
+ tools/diag/bateria.sh      |  23 ++++
+ tools/diag/caidas.py       |  39 +++++++
+ tools/diag/captura.py      |  34 ++++++
+ tools/diag/clean.sh        |   4 +-
+ tools/diag/cola.sh         |  16 +++
+ tools/diag/da_log.py       |  77 +++++++++++++
+ tools/diag/dis.py          |   7 +-
+ tools/diag/discos.sh       |  70 ++++++++++++
+ tools/diag/dk_calmo.sh     |  13 +++
+ tools/diag/dsmos.py        | 124 +++++++++++++++++++++
+ tools/diag/entrada.py      |  40 +++++++
+ tools/diag/hang.sh         |  76 ++++++++++---
+ tools/diag/inventario.py   |  97 ++++++++++++++++
+ tools/diag/iokit.py        |  95 ++++++++++++++++
+ tools/diag/llamadas.py     |  58 ++++++++++
+ tools/diag/llaveros.sh     |  15 +++
+ tools/diag/memoria.py      |  68 +++++++++++
+ tools/diag/memoria.sh      |  55 +++++++++
+ tools/diag/mensajes.py     | 223 +++++++++++++++++++++++++++++++++++++
+ tools/diag/msh.sh          |  19 +++-
+ tools/diag/pantalla.sh     |  29 +++++
+ tools/diag/stub.py         |  57 ++++++++++
+ tools/diag/sym.py          |  12 +-
+ 25 files changed, 1268 insertions(+), 23 deletions(-)
+ create mode 100755 tools/diag/ab_recorrido.sh
+ create mode 100755 tools/diag/arranque.sh
+ create mode 100755 tools/diag/bateria.sh
+ create mode 100755 tools/diag/caidas.py
+ create mode 100755 tools/diag/captura.py
+ create mode 100755 tools/diag/cola.sh
+ create mode 100755 tools/diag/da_log.py
+ create mode 100755 tools/diag/discos.sh
+ create mode 100755 tools/diag/dk_calmo.sh
+ create mode 100755 tools/diag/dsmos.py
+ create mode 100644 tools/diag/entrada.py
+ create mode 100755 tools/diag/inventario.py
+ create mode 100755 tools/diag/iokit.py
+ create mode 100755 tools/diag/llamadas.py
+ create mode 100755 tools/diag/llaveros.sh
+ create mode 100755 tools/diag/memoria.py
+ create mode 100755 tools/diag/memoria.sh
+ create mode 100755 tools/diag/mensajes.py
+ create mode 100755 tools/diag/pantalla.sh
+ create mode 100755 tools/diag/stub.py
+
+diff --git a/tools/diag/ab_recorrido.sh b/tools/diag/ab_recorrido.sh
+new file mode 100755
+index 0000000..02946f1
+--- /dev/null
++++ b/tools/diag/ab_recorrido.sh
+@@ -0,0 +1,14 @@
++#!/bin/bash
++# ab_recorrido.sh <binario_A> [veces]: compara dos tahoe-run con el inventario corto (shell_survey.sh) en el macOS
++# completo, alternando A (el binario dado: la versión anterior) y B (el del repo), 2 veces por omisión. El arranque varía
++# mucho de una vez a otra (54–62 de 79 con el mismo binario): solo cuenta una diferencia que se repita.
++DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; REPO="$(cd "$DIAG/../.." && pwd)"
++A="${1:?indica el binario anterior de tahoe-run}"; N="${2:-2}"
++D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; O="$D/ab_recorrido"; rm -rf "$O"; mkdir -p "$O"
++COMPLETO="${TAHOE_COMPLETO:-$HOME/macos26/completo/macOS}"
++cd "$REPO" || exit 1
++for i in $(seq "$N"); do
++	TAHOE_RUN="$A" TAHOE_ROOT="$COMPLETO" DEPURAR=1 tools/shell_survey.sh > "$O/A$i.txt" 2>&1; "$DIAG/clean.sh" > /dev/null 2>&1; sleep 5
++	TAHOE_ROOT="$COMPLETO" DEPURAR=1 tools/shell_survey.sh > "$O/B$i.txt" 2>&1; "$DIAG/clean.sh" > /dev/null 2>&1; sleep 5
++done
++for f in "$O"/A*.txt "$O"/B*.txt; do echo "$(basename "$f" .txt): OK=$(grep -c '^OK' "$f") COLGADA=$(grep -c '^COLGADA' "$f") ERR=$(grep -c '^ERR' "$f")"; done
+diff --git a/tools/diag/arranque.sh b/tools/diag/arranque.sh
+new file mode 100755
+index 0000000..b059c64
+--- /dev/null
++++ b/tools/diag/arranque.sh
+@@ -0,0 +1,26 @@
++#!/bin/bash
++# arranque.sh [segundos]: arranca el macOS completo sin trazas durante esos segundos (240) y dice cuántos programas se
++# cargan por cada 10 s y cuáles se cargan más veces (los servicios que se relanzan en bucle salen arriba).
++# Necesita el registro con hora: aplicar antes docs/parches-sin-validar/log-con-hora.patch. Siempre limpia.
++DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; REPO="$(cd "$DIAG/../.." && pwd)"
++D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; O="$D/arranque"; rm -rf "$O"; mkdir -p "$O"
++cd "$REPO" || exit 1
++touch /dev/shm/tahoe-log-time
++TAHOE_ROOT="${TAHOE_ROOT:-$HOME/macos26/completo/macOS}" TAHOE_BOOT_WAIT=10 timeout 600 tools/macos-shell.sh --launchd -c "sleep ${1:-240}" > "$O/out" 2>&1
++rm -f /dev/shm/tahoe-log-time
++L=/tmp/tahoe-shell-$USER.log; n=$(grep -a -n "cargado launchd" "$L" | tail -1 | cut -d: -f1); tail -n +"$n" "$L" > "$O/boot.log"
++"$DIAG/clean.sh" > /dev/null 2>&1
++python3 - "$O/boot.log" <<'PY'
++import re, sys, collections
++t0 = None; h = collections.Counter(); progs = collections.defaultdict(list)
++for ln in open(sys.argv[1], errors="replace"):
++    m = re.match(r"\[([0-9.]+)\] tahoe-run: <(\d+)> cargado (\S+)", ln)
++    if not m: continue
++    t = float(m.group(1)); t0 = t0 or t; p = m.group(3)
++    if p in ("dyld", "xpcproxy"): continue
++    h[int((t - t0) // 10)] += 1; progs[p].append(round(t - t0))
++if not h: sys.exit("el registro no tiene hora: aplicar docs/parches-sin-validar/log-con-hora.patch")
++print("programas cargados por cada 10 s:", " ".join("%d:%d" % (k * 10, h[k]) for k in sorted(h)))
++print("total", sum(h.values()), "distintos", len(progs))
++for p, v in sorted(progs.items(), key=lambda x: -len(x[1]))[:15]: print("%4d  %-30s %s" % (len(v), p, v[:12]))
++PY
+diff --git a/tools/diag/bateria.sh b/tools/diag/bateria.sh
+new file mode 100755
+index 0000000..e8ac82b
+--- /dev/null
++++ b/tools/diag/bateria.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++# bateria.sh [binario_anterior]: la batería fija que se pasa antes de dar por bueno un cambio. Con binario_anterior, antes
++# hace la comparación A/B del inventario corto (ab_recorrido.sh). Luego, con el tahoe-run del repo:
++#   1. diskutil list en la Recovery (discos.sh): debe decir «VEREDICTO: correcto» (cuelga a veces también sin cambios);
++#   2. el inventario corto (shell_survey.sh, 79 órdenes) en el macOS completo, dos veces: el arranque varía mucho;
++#   3. la memoria de WindowServer (memoria.sh, ~76 MB estable);
++#   4. cargo test --lib en tahoe-run/nucleo.
++# Salida en $TAHOE_DIAG_DIR/bateria (por omisión ~/.cache/tahoe-diag/bateria) y un resumen al final. Siempre limpia.
++DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; REPO="$(cd "$DIAG/../.." && pwd)"
++D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; O="$D/bateria"; rm -rf "$O"; mkdir -p "$O"
++COMPLETO="${TAHOE_COMPLETO:-$HOME/macos26/completo/macOS}"
++cd "$REPO" || exit 1
++[ -n "$1" ] && "$DIAG/ab_recorrido.sh" "$1" > "$O/ab.txt" 2>&1
++DEPURAR=1 "$DIAG/discos.sh" > "$O/discos.txt" 2>&1; "$DIAG/clean.sh" > /dev/null 2>&1
++for i in 1 2; do TAHOE_ROOT="$COMPLETO" DEPURAR=1 tools/shell_survey.sh > "$O/recorrido$i.txt" 2>&1; "$DIAG/clean.sh" > /dev/null 2>&1; done
++TAHOE_ROOT="$COMPLETO" DEPURAR=1 "$DIAG/memoria.sh" WindowServer 60 120 > "$O/memoria.txt" 2>&1; "$DIAG/clean.sh" > /dev/null 2>&1
++(cd tahoe-run/nucleo && cargo test --lib 2>&1 | grep "test result") > "$O/cargo.txt"
++[ -s "$O/ab.txt" ] && cat "$O/ab.txt"
++grep -a -m1 "VEREDICTO\|COLGADA" "$O/discos.txt"
++for i in 1 2; do echo "recorrido $i: OK=$(grep -c '^OK' "$O/recorrido$i.txt") COLGADA=$(grep -c '^COLGADA' "$O/recorrido$i.txt") ERR=$(grep -c '^ERR' "$O/recorrido$i.txt")"; done
++grep "t=1[01][05]" "$O/memoria.txt" | tail -2
++cat "$O/cargo.txt"
++echo "procesos tahoe-run vivos al final: $(pgrep -c -x tahoe-run)"
+diff --git a/tools/diag/caidas.py b/tools/diag/caidas.py
+new file mode 100755
+index 0000000..953e6c5
+--- /dev/null
++++ b/tools/diag/caidas.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++# caidas.py [registro]: resumen de las caídas de un arranque (por omisión ~/.cache/tahoe-diag/msh.log).
++# Cuenta, por programa de macOS, los mensajes de aborto (abort <pid>: [librería] "motivo"), los motivos de los
++# informes de caída, las señales (SIGSEGV, SIGBUS, SIGILL) y las salidas con estado distinto de 0. Los volcados de "espera" y "traza" (STACKS) no son caídas.
++import collections, os, re, sys
++
++log = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/.cache/tahoe-diag/msh.log")
++name = {}
++msgs = collections.Counter()
++sigs = collections.Counter()
++exits = collections.Counter()
++for l in open(log, errors="replace"):
++    m = re.match(r"tahoe-run: <(\d+)> cargado (\S+)", l)
++    if m and m.group(2) != "dyld":
++        name[m.group(1)] = m.group(2)        # el último programa cargado por ese pid
++        continue
++    m = re.search(r'abort <(\d+)>: \[([^\]]+)\] "(.*)"', l)
++    if m and m.group(3) != "abort() called":
++        msgs[(name.get(m.group(1), "?"), m.group(3)[:110])] += 1
++        continue
++    m = re.search(r'=== motivo: "(.*)"', l)
++    if m:
++        msgs[("?", m.group(1)[:110])] += 1
++    m = re.search(r"fin <(\d+)> \[([^\]]*)\] exit\((-?\d+)\)", l)
++    if m:
++        if m.group(3) != "0":
++            exits[(m.group(2), f"exit({m.group(3)})")] += 1
++        continue
++    m = re.search(r"(SIGSEGV|SIGBUS|SIGILL) <(\d+)>", l)
++    if m:
++        sigs[(name.get(m.group(2), "?"), m.group(1))] += 1
++for (n, msg), c in msgs.most_common(40):
++    print(f"{c:3} {n:28} {msg}")
++for (n, sig), c in sigs.most_common(20):
++    print(f"{c:3} {n:28} {sig}")
++for (n, st), c in exits.most_common(20):
++    print(f"{c:3} {n:28} {st}")
++if not msgs and not sigs and not exits:
++    print("sin caídas")
+diff --git a/tools/diag/captura.py b/tools/diag/captura.py
+new file mode 100755
+index 0000000..59f8ef5
+--- /dev/null
++++ b/tools/diag/captura.py
+@@ -0,0 +1,34 @@
++#!/usr/bin/env python3
++# captura.py [salida.png] [archivo]: guarda en PNG la pantalla emulada de macOS (la memoria de vídeo en la que dibuja
++# WindowServer: /dev/shm/tahoe-fb-<id>, por omisión la más reciente). Lee la cabecera "TFB1" de la última página del
++# archivo (ancho, alto, bytes por fila, formato 0 = B, G, R, X) como tools/tahoe-view. Sin dependencias (zlib).
++import glob, os, struct, sys, zlib
++
++out = sys.argv[1] if len(sys.argv) > 1 else "pantalla.png"
++files = [sys.argv[2]] if len(sys.argv) > 2 else sorted(glob.glob("/dev/shm/tahoe-fb-*"), key=os.path.getmtime)
++if not files:
++    sys.exit("no hay memoria de vídeo (/dev/shm/tahoe-fb-*): ¿está WindowServer en marcha?")
++with open(files[-1], "rb") as f:
++    data = f.read()
++magic, w, h, bpr, fmt = struct.unpack_from("<4sIIII", data, len(data) - 4096)
++if magic != b"TFB1" or fmt != 0:
++    sys.exit("cabecera desconocida en " + files[-1])
++rows = bytearray()
++used = 0
++for y in range(h):
++    line = data[y * bpr: y * bpr + w * 4]
++    rows.append(0)                                            # filtro PNG: ninguno
++    px = bytearray(w * 3)
++    px[0::3], px[1::3], px[2::3] = line[2::4], line[1::4], line[0::4]   # BGRX -> RGB
++    used += any(line)
++    rows += px
++
++
++def chunk(t, d):
++    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
++
++
++png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + \
++      chunk(b"IDAT", zlib.compress(bytes(rows), 6)) + chunk(b"IEND", b"")
++open(out, "wb").write(png)
++print(f"{out}: {w}x{h}, {used} de {h} filas con algo dibujado ({files[-1]})")
+diff --git a/tools/diag/clean.sh b/tools/diag/clean.sh
+index 3429e2b..f9032c3 100755
+--- a/tools/diag/clean.sh
++++ b/tools/diag/clean.sh
+@@ -2,6 +2,8 @@
+ # clean.sh: termina todos los procesos de tahoe-run, para el guardián de memoria y borra los archivos de /dev/shm de tahoe-run
+ # (regiones de puertos, semáforos, banderas de diagnóstico). Imprime lo que queda vivo y la RAM disponible.
+ pkill -9 -x tahoe-run; pkill -9 -x unshare; touch /dev/shm/tahoe-guard-stop; sleep 1.5
+-rm -f /dev/shm/tahoe-guard-stop /dev/shm/tahoe-me-* /dev/shm/tahoe.* /dev/shm/tahoe-ports-* /dev/shm/tahoe-hid-* /dev/shm/sem.tahoe-* \
++# los que estaban esperando al disco (estado D) tardan en irse: hasta 15 s más antes de contar
++for _ in $(seq 30); do pgrep -x tahoe-run > /dev/null || break; pkill -9 -x tahoe-run; sleep 0.5; done
++rm -f /dev/shm/tahoe-guard-stop /dev/shm/tahoe-msg-trace /dev/shm/tahoe-me-* /dev/shm/tahoe.* /dev/shm/tahoe-ports-* /dev/shm/tahoe-hid-* /dev/shm/tahoe-fb-* /dev/shm/tahoe-fbcursor-* /dev/shm/tahoe-surf-* /dev/shm/tahoe-surfaces-* /dev/shm/sem.tahoe-* \
+ 	/dev/shm/tahoe-stacks /dev/shm/tahoe-stacks-all /dev/shm/tahoe-mach-trace /dev/shm/tahoe-iokit-trace /dev/shm/tahoe-break /dev/shm/tahoe-peek
+ echo "limpio: tahoe-run vivos=$(pgrep -c -x tahoe-run) disponible=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)MB"
+diff --git a/tools/diag/cola.sh b/tools/diag/cola.sh
+new file mode 100755
+index 0000000..f542de4
+--- /dev/null
++++ b/tools/diag/cola.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++# cola.sh <salida> <herramienta de tools/diag> [argumentos...]: espera a que no quede ningún arranque de tahoe-run ni otra
++# herramienta de diagnóstico en marcha y lanza la indicada en segundo plano, con su salida en <salida>. Dos arranques a la
++# vez se pisan (región de puertos, memoria de la PC), así que los diagnósticos se encolan con esto, uno detrás de otro.
++# Las variables de entorno (STACKS, IOK, ESPERA, TAHOE_ROOT...) pasan tal cual.
++#   tools/diag/cola.sh /tmp/ws.out hang.sh true 'WindowServer hidd' 40
++DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
++if [ "$1" != --ya ]; then                                   # desligado de la terminal (o de ssh): sobrevive al cerrarla
++	[ -x "$DIAG/$2" ] || { echo "no existe tools/diag/$2" >&2; exit 1; }
++	setsid -f "$0" --ya "$@" > "$1" 2>&1 < /dev/null
++	echo "encolado: $2 (salida en $1)"; exit 0
++fi
++shift; tool=$2; shift 2
++# el patrón con [h] no se encuentra a sí mismo en la línea de órdenes de este bucle
++while pgrep -x tahoe-run >/dev/null || pgrep -f "tools/diag/(msh|hang)\.s[h] " >/dev/null; do sleep 3; done
++cd "$DIAG/../.." && exec "$DIAG/$tool" "$@"
+diff --git a/tools/diag/da_log.py b/tools/diag/da_log.py
+new file mode 100755
+index 0000000..528c972
+--- /dev/null
++++ b/tools/diag/da_log.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++# da_log.py [registro]: resume el registro de depuración de diskarbitrationd (/var/log/diskarbitrationd.log, que solo
++# se escribe si diskarbitrationd corre con -d y el archivo ya existe; tools/diag/discos.sh lo prepara). Sin argumento
++# lee la entrada estándar. Si el registro tiene varios arranques ("server has been started"), resume el último.
++#
++# Qué dice:
++#   - cada disco: creado, sondeado (con qué sistema de archivos y resultado) y si se anunció a algún cliente ("disk
++#     appeared"). Un disco creado que nunca se anuncia está atascado en las etapas de diskarbitrationd.
++#   - cada cliente (diskutil, storagekitd...): las retrollamadas "idle" que registró y si se le enviaron. storagekitd
++#     espera la suya con un semáforo sin plazo (DARegisterIdleCallback): si no llega, diskutil se queda colgado.
++#   - un veredicto de una línea.
++#
++# Referencia (Recovery que funcionaba): los cuatro discos (disk0, disk0s1, disk1, disk1s1) se anuncian; solo disk1s1
++# se sondea (apfs, success, con «fsck status 65»): los otros no tienen sistema de archivos y se anuncian sin sondeo.
++import re, sys
++
++lines = (open(sys.argv[1], errors="replace") if len(sys.argv) > 1 else sys.stdin).read().splitlines()
++start = max([i for i, l in enumerate(lines) if "server has been started" in l] or [0])
++lines = lines[start:]
++
++disks = {}                  # disco -> {"creado", "sondeo": [..], "anunciado": set(clientes)}
++def disk(d): return disks.setdefault(d, {"creado": False, "sondeo": [], "anunciado": set()})
++cb = {}                     # (sesión, id) -> tipo
++idle = {}                   # sesión -> {"pedidas": n, "enviadas": n}
++sesiones = []               # en orden de aparición
++cur = None                  # sesión de la cabecera actual ("cliente -> diskarbitrationd" o al revés)
++hora_fin = ""
++
++for l in lines:
++    m = re.match(r"(\d\d:\d\d:\d\d) ", l)
++    if m: hora_fin = m.group(1)
++    m = re.search(r"(\S+ \[\d+\]:\d+) -> diskarbitrationd", l) or re.search(r"diskarbitrationd \[\d+\] -> (\S+ \[\d+\]:\d+)", l)
++    if m:
++        cur = m.group(1)
++        if cur not in sesiones: sesiones.append(cur)
++        continue
++    m = re.search(r"created disk, id = (\S+)\.$", l)
++    if m: disk(m.group(1))["creado"] = True; continue
++    m = re.search(r"probed disk, id = (\S+), with (\S+), (\S+)\.$", l)
++    if m: disk(m.group(1))["sondeo"].append(f"{m.group(2)}:{m.group(3)}"); continue
++    m = re.search(r"registered callback, id = (\S+), kind = ([^.]+)\.", l)
++    if m and "unregistered" not in l:
++        cb[(cur, m.group(1))] = m.group(2)
++        if m.group(2) == "idle": idle.setdefault(cur, {"pedidas": 0, "enviadas": 0})["pedidas"] += 1
++        continue
++    m = re.search(r"dispatched callback, id = (\S+), kind = ([^,.]+)(?:, disk = (\S+?))?\.$", l)
++    if m:
++        if m.group(2) == "disk appeared" and m.group(3): disk(m.group(3))["anunciado"].add(cur.split(" ")[0])
++        if m.group(2) == "idle": idle.setdefault(cur, {"pedidas": 0, "enviadas": 0})["enviadas"] += 1
++
++if not disks and not sesiones:
++    sys.exit("registro vacío o sin el formato de diskarbitrationd -d")
++
++print(f"== discos ({len(disks)}), registro hasta las {hora_fin}")
++atascados = []
++for d in sorted(disks):
++    v = disks[d]
++    an = ", ".join(sorted(v["anunciado"])) or "-"
++    print(f"   {d:<14} creado={'sí' if v['creado'] else 'no'}  sondeo={' '.join(v['sondeo']) or '-':<26} anunciado a: {an}")
++    if v["creado"] and not v["anunciado"] and any(k == "disk appeared" for k in cb.values()): atascados.append(d)
++print("== avisos «idle» por sesión")
++pend = []
++for s in sesiones:
++    if s in idle:
++        i = idle[s]; ok = i["enviadas"] >= 1
++        print(f"   {s:<32} pedidas={i['pedidas']} enviadas={i['enviadas']}{'' if ok else '   <- SIN RESPUESTA'}")
++        if not ok: pend.append(s.split(" ")[0])
++if not idle: print("   (ningún cliente pidió el aviso idle)")
++
++if not any(k == "disk appeared" for k in cb.values()) and not idle:
++    print("VEREDICTO: sin datos: en este arranque ningún cliente pidió discos ni el aviso idle (¿se lanzó diskutil?)")
++elif atascados or pend:
++    print("VEREDICTO: diskarbitrationd no llega a «idle»: " +
++          (f"discos sin anunciar {', '.join(atascados)}" if atascados else "todos los discos anunciados") +
++          (f"; esperan el aviso: {', '.join(sorted(set(pend)))}" if pend else ""))
++else:
++    print("VEREDICTO: correcto (discos anunciados y avisos idle enviados)")
+diff --git a/tools/diag/dis.py b/tools/diag/dis.py
+index 2e25c49..7956e8f 100755
+--- a/tools/diag/dis.py
++++ b/tools/diag/dis.py
+@@ -4,10 +4,13 @@
+ # TAHOE_ROOT: sistema de macOS extraído (por omisión ~/macos26/base/macOS Base System).
+ import glob, os, struct, subprocess, sys, tempfile
+ ROOT = os.environ.get("TAHOE_ROOT", os.path.expanduser("~/macos26/base/macOS Base System"))
+-B = os.path.join(ROOT, "System/Library/dyld/dyld_shared_cache_x86_64")
++B = next((os.path.join(ROOT, c) for c in ("System/Library/dyld/dyld_shared_cache_x86_64",       # Recovery
++          "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h",    # macOS completo
++          "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64")
++          if os.path.exists(os.path.join(ROOT, c))), None) or sys.exit("no encuentro la caché de dyld en " + ROOT)
+ va = int(sys.argv[1], 16); n = int(sys.argv[2]) if len(sys.argv) > 2 else 200
+ for fn in [B] + sorted(glob.glob(B + ".[0-9]*")):
+-    if fn.endswith(".map") or fn.endswith("symbols"): continue
++    if fn.endswith((".map", "symbols", ".atlas")): continue
+     f = open(fn, 'rb'); h = f.read(0x200)
+     mo, mc = struct.unpack_from('<II', h, 0x10)                  # mappingOffset, mappingCount
+     f.seek(mo)
+diff --git a/tools/diag/discos.sh b/tools/diag/discos.sh
+new file mode 100755
+index 0000000..7956b8b
+--- /dev/null
++++ b/tools/diag/discos.sh
+@@ -0,0 +1,70 @@
++#!/bin/bash
++# discos.sh ['orden de diskutil']: diagnóstico de diskutil en un arranque (por omisión «diskutil list»).
++#   1. arranca launchd (tools/macos-shell.sh --launchd) y relanza diskarbitrationd con -d y su registro creado
++#      (/var/log/diskarbitrationd.log: sin -d no escribe y sin el archivo no lo crea);
++#   2. lanza la orden con un plazo (PLAZO s, 40) y anota si terminó y su salida;
++#   3. muestra los procesos de discos vivos (diskutil, storagekitd, diskarbitrationd, fskitd, diskmanagementd) y el
++#      resumen del registro con da_log.py: qué discos se anunciaron y qué avisos «idle» quedaron sin enviar.
++# TAHOE_ROOT: sistema de macOS (por omisión la Recovery). ESPERA: segundos de arranque antes de empezar (15).
++# PREP: órdenes de macOS que se ejecutan antes de relanzar diskarbitrationd (para pruebas A/B: restaurar estado de
++# arranques antiguos, relanzar otro servicio...). Ejemplo, con una copia de /private/var del volumen de datos en disco
++# hecha en la raíz como /.datos-viejos:
++#   PREP='cp -Rp /.datos-viejos/folders/. /var/folders/; launchctl kickstart -k system/com.apple.fskitd' discos.sh
++# MSGS: programas cuyos mensajes Mach se trazan (/dev/shm/tahoe-msg-trace); al final, mensajes.py dice qué envíos no
++# llegaron y qué peticiones se quedaron sin respuesta. Ejemplo:
++#   MSGS='diskutil storagekitd diskarbitrationd fskitd extensionkitservice' discos.sh
++# IOKS: programas cuya actividad IOKit se traza (/dev/shm/tahoe-iokit-trace: peticiones, respuestas y avisos de
++# notificación); al final, iokit.py la resume por proceso. Ejemplo: IOKS=diskarbitrationd SIN_REINICIO=1 discos.sh
++# DEPURAR=1: arranque en modo depuración (macos-shell.sh --depurar): recoveryosd no reinicia al fallar. Siempre se
++# muestra el final de /var/log/recoveryos.log y si recoveryosd terminó.
++# SIN_REINICIO=1: no relanza diskarbitrationd (se queda el del arranque, sin su registro -d; relanzarlo cambia el
++# escenario). PAUSA: segundos entre relanzarlo y lanzar la orden (8).
++# El registro de este arranque queda en ~/.cache/tahoe-diag/discos.log.
++# Todo queda en ~/.cache/tahoe-diag/discos.out (la salida entera de macOS) y siempre se limpia el arranque.
++DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
++D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
++ORDEN="${1:-diskutil list}"; PLAZO="${PLAZO:-40}"; E="${ESPERA:-15}"; PAUSA="${PAUSA:-8}"
++export TAHOE_ROOT="${TAHOE_ROOT:-$HOME/macos26/base/macOS Base System}"
++DA=system/com.apple.diskarbitrationd
++# Dentro de macOS: la orden va en segundo plano y su código de salida se apunta al terminar; si sigue viva al vencer
++# el plazo se dice («COLGADA»). Las secciones van marcadas con @@ para separarlas aquí.
++SCRIPT="${PREP:+$PREP
++}${SIN_REINICIO:+: }touch /var/log/diskarbitrationd.log
++${SIN_REINICIO:+: }launchctl debug $DA -- /usr/libexec/diskarbitrationd -d >/dev/null 2>&1
++${SIN_REINICIO:+: }launchctl kickstart -k $DA >/dev/null 2>&1
++sleep $PAUSA
++( $ORDEN > /tmp/.discos.out 2>&1; echo \"@@salida \$?\" >> /tmp/.discos.out ) &
++i=0; while [ \$i -lt $PLAZO ] && ! grep -q '^@@salida' /tmp/.discos.out 2>/dev/null; do sleep 1; i=\$((i+1)); done
++grep -q '^@@salida' /tmp/.discos.out || echo '@@salida COLGADA' >> /tmp/.discos.out
++echo @@procesos; ps axo pid,stat,command | grep -E 'diskutil|storagekitd|diskarbitrationd|fskitd|diskmanagementd' | grep -v grep
++echo @@orden; cat /tmp/.discos.out
++echo @@recovery; tail -12 /var/log/recoveryos.log
++echo @@registro; cat /var/log/diskarbitrationd.log"
++LOG="${TAHOE_LOGFILE:-/tmp/tahoe-shell-$USER.log}"
++# como macos-shell.sh: si el registro pasa de TAHOE_LOG_MAX_MB se vacía ya (si lo vaciara él, «desde» quedaría fuera)
++if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt $(( ${TAHOE_LOG_MAX_MB:-300} * 1024 * 1024 )) ]; then : > "$LOG"; fi
++desde=$(( $( [ -f "$LOG" ] && wc -l < "$LOG" || echo 0) + 1 ))      # el registro es común: se toma solo lo de este arranque
++if [ -n "$MSGS" ]; then echo "$MSGS" > /dev/shm/tahoe-msg-trace; else rm -f /dev/shm/tahoe-msg-trace; fi
++if [ -n "$IOKS" ]; then echo "$IOKS" > /dev/shm/tahoe-iokit-trace; else rm -f /dev/shm/tahoe-iokit-trace; fi
++TAHOE_BOOT_WAIT=$E timeout $(( E + PLAZO + 90 )) "$DIAG/../macos-shell.sh" ${DEPURAR:+--depurar} --launchd -c "$SCRIPT" > "$D/discos.out" 2>&1
++r=$?
++rm -f /dev/shm/tahoe-msg-trace /dev/shm/tahoe-iokit-trace
++tail -n +"$desde" "$LOG" > "$D/discos.log" 2>/dev/null
++"$DIAG/clean.sh" > /dev/null 2>&1
++sec() { awk -v s="@@$1" '$0 == s {on=1; next} /^@@(procesos|orden|recovery|registro)$/ {on=0} on' "$D/discos.out"; }
++if ! grep -q '^@@registro$' "$D/discos.out"; then
++	echo "el arranque no llegó a la orden (código $r):"; tail -5 "$D/discos.out"; exit 1
++fi
++[ -n "$PREP" ] && echo "== preparación: $PREP"
++echo "== $ORDEN: $(grep -o '^@@salida .*' "$D/discos.out" | sed 's/@@salida /salida /')"
++sec orden | grep -v '^@@salida' | head -15 | sed 's/^/   /'
++echo "== recoveryosd: $(grep -ao 'fin <[0-9]*> \[recoveryosd\] [^ ]*' "$D/discos.log" | tail -1 || true)"
++sec recovery | sed 's/^/   /'
++echo "== procesos de discos vivos al final"
++sec procesos | sed 's/^/   /'
++if [ -n "$SIN_REINICIO" ]; then echo "== (SIN_REINICIO: diskarbitrationd sin registro -d)"
++elif [ -z "$(sec registro)" ]; then echo "== el registro -d de diskarbitrationd salió vacío (¿no llegó a relanzarse?)"
++else sec registro | python3 "$DIAG/da_log.py"; fi
++[ -n "$MSGS" ] && python3 "$DIAG/mensajes.py" "$D/discos.log"
++[ -n "$IOKS" ] && python3 "$DIAG/iokit.py" "$D/discos.log"
++echo "(salida completa: $D/discos.out; registro: $D/discos.log)"
+diff --git a/tools/diag/dk_calmo.sh b/tools/diag/dk_calmo.sh
+new file mode 100755
+index 0000000..fcaf873
+--- /dev/null
++++ b/tools/diag/dk_calmo.sh
+@@ -0,0 +1,13 @@
++#!/bin/bash
++# dk_calmo.sh [espera]: diskutil con el sistema ya asentado (no en pleno arranque, que tarda 2–3 min en calmarse).
++# Arranca el macOS completo, espera a que launchd responda y luego «espera» segundos más (150), y cronometra órdenes de
++# disco (repetidas) con su código de salida, tiempo y número de líneas. Siempre limpia.
++DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; REPO="$(cd "$DIAG/../.." && pwd)"
++D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; O="$D/dk_calmo"; rm -rf "$O"; mkdir -p "$O"
++cd "$REPO" || exit 1
++C="w=0; while ! perl -e \"alarm 8; exec @ARGV\" launchctl print system >/dev/null 2>&1 && [ \$w -lt 180 ]; do sleep 3; w=\$((w+3)); done; echo listo \$w; sleep ${1:-150}
++for o in \"diskutil list\" \"diskutil list\" \"diskutil info /\" \"diskutil info /System/Volumes/Data\" \"diskutil apfs list\" \"diskutil info disk1s3\" \"diskutil list\" \"bless --info\" \"bless --info --getBoot\"; do s=\$(perl -MTime::HiRes=time -e \"printf q(%.1f), time\"); perl -e \"alarm 90; exec @ARGV\" sh -c \"\$o\" > /tmp/o.txt 2>&1; r=\$?; e=\$(perl -MTime::HiRes=time -e \"printf q(%.1f), time\"); echo \"rc=\$r t=\$(echo \"\$e - \$s\" | bc) lineas=\$(wc -l < /tmp/o.txt) \$o | \$(grep -m1 -i error /tmp/o.txt)\"; done"
++TAHOE_ROOT="${TAHOE_ROOT:-$HOME/macos26/completo/macOS}" TAHOE_BOOT_WAIT=10 timeout 900 tools/macos-shell.sh --depurar --launchd -c "$C" > "$O/out" 2>&1
++L=/tmp/tahoe-shell-$USER.log; n=$(grep -a -n "cargado launchd" "$L" | tail -1 | cut -d: -f1); tail -n +"$n" "$L" > "$O/boot.log"
++"$DIAG/clean.sh" > /dev/null 2>&1
++grep -a "^rc=\|^listo" "$O/out"
+diff --git a/tools/diag/dsmos.py b/tools/diag/dsmos.py
+new file mode 100755
+index 0000000..7a31ea0
+--- /dev/null
++++ b/tools/diag/dsmos.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python3
++"""dsmos.py <macho> <salida>: copia de un ejecutable de macOS con el __TEXT protegido («Apple Protect»: loginwindow,
++Finder, Dock...) ya descifrado, para poder desensamblarlo (llvm-objdump). El mismo esquema que emu_dsmos.c: Blowfish en
++modo CBC por páginas de 4 KiB, vector inicial cero, salvo las 3 primeras páginas del archivo, con la clave OSK de 64 bytes
++de TAHOE_OSK_FILE o ~/.config/tahoe-run/osk. Si el archivo es universal, se queda con la parte x86_64.
++La copia descifrada es un binario de Apple: no se sube al repositorio (déjala en /tmp).
++"""
++import os
++import re
++import struct
++import sys
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++UNPROTECTED = 0x3000
++MAGIC = 0x2e69cf40
++SG_PROTECTED_VERSION_1 = 0x8
++
++
++def bf_pi():
++    src = open(os.path.join(HERE, "..", "..", "tahoe-run", "bf_pi.h")).read()
++    return [int(x, 16) for x in re.findall(r"0x([0-9a-f]{8})", src)]
++
++
++class Blowfish:
++    def __init__(self, key):
++        pi = bf_pi()
++        self.p = pi[:18]
++        self.s = [pi[18 + 256 * i: 18 + 256 * (i + 1)] for i in range(4)]
++        j = 0
++        for i in range(18):
++            d = 0
++            for _ in range(4):
++                d = (d << 8) | key[j]
++                j = (j + 1) % len(key)
++            self.p[i] ^= d
++        l = r = 0
++        for i in range(0, 18, 2):
++            l, r = self.enc(l, r)
++            self.p[i], self.p[i + 1] = l, r
++        for s in range(4):
++            for i in range(0, 256, 2):
++                l, r = self.enc(l, r)
++                self.s[s][i], self.s[s][i + 1] = l, r
++
++    def f(self, x):
++        s = self.s
++        return (((s[0][x >> 24] + s[1][(x >> 16) & 0xff]) & 0xffffffff) ^ s[2][(x >> 8) & 0xff]) + s[3][x & 0xff] & 0xffffffff
++
++    def enc(self, a, b):
++        for i in range(16):
++            a ^= self.p[i]
++            b ^= self.f(a)
++            a, b = b, a
++        a, b = b, a
++        return a ^ self.p[17], b ^ self.p[16]
++
++    def dec(self, a, b):
++        for i in range(17, 1, -1):
++            a ^= self.p[i]
++            b ^= self.f(a)
++            a, b = b, a
++        a, b = b, a
++        return a ^ self.p[0], b ^ self.p[1]
++
++
++def dec_page(bf, pg):
++    out = bytearray(len(pg))
++    iv = b"\0" * 8
++    for o in range(0, len(pg) - 7, 8):
++        c = pg[o:o + 8]
++        l, r = struct.unpack(">II", c)
++        l, r = bf.dec(l, r)
++        p = struct.pack(">II", l, r)
++        out[o:o + 8] = bytes(x ^ y for x, y in zip(p, iv))
++        iv = c
++    out[len(pg) - len(pg) % 8:] = pg[len(pg) - len(pg) % 8:]
++    return bytes(out)
++
++
++def thin_x86(d):
++    if struct.unpack(">I", d[:4])[0] in (0xcafebabe,):
++        n = struct.unpack(">I", d[4:8])[0]
++        for i in range(n):
++            ct, _, off, sz, _ = struct.unpack(">IIIII", d[8 + i * 20:28 + i * 20])
++            if ct == 0x01000007:
++                return d[off:off + sz]
++        sys.exit("no hay parte x86_64")
++    return d
++
++
++def main():
++    src, dst = sys.argv[1], sys.argv[2]
++    kf = os.environ.get("TAHOE_OSK_FILE", os.path.expanduser("~/.config/tahoe-run/osk"))
++    key = open(kf, "rb").read(64)
++    if len(key) != 64:
++        sys.exit("clave OSK incompleta")
++    d = bytearray(thin_x86(open(src, "rb").read()))
++    ncmds = struct.unpack("<I", d[16:20])[0]
++    off = 32
++    bf = Blowfish(key)
++    for _ in range(ncmds):
++        cmd, sz = struct.unpack("<II", d[off:off + 8])
++        if cmd == 0x19:                                           # LC_SEGMENT_64
++            name = d[off + 8:off + 24].rstrip(b"\0").decode()
++            fileoff, filesize = struct.unpack("<QQ", d[off + 40:off + 56])
++            flags = struct.unpack("<I", d[off + 68:off + 72])[0]
++            if flags & SG_PROTECTED_VERSION_1:
++                start = 0 if fileoff >= UNPROTECTED else UNPROTECTED - fileoff
++                magic = struct.unpack("<I", d[fileoff + start:fileoff + start + 4])[0]
++                if magic != MAGIC:
++                    sys.exit(f"{name}: marca 0x{magic:08x} desconocida")
++                for o in range(start, filesize, 4096):
++                    a = fileoff + o
++                    b = fileoff + min(o + 4096, filesize)
++                    d[a:b] = dec_page(bf, bytes(d[a:b]))
++                flags &= ~SG_PROTECTED_VERSION_1
++                d[off + 68:off + 72] = struct.pack("<I", flags)
++                print(f"{name}: descifradas {(filesize - start + 4095) // 4096} páginas")
++        off += sz
++    open(dst, "wb").write(d)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/diag/entrada.py b/tools/diag/entrada.py
+new file mode 100644
+index 0000000..d255e7c
+--- /dev/null
++++ b/tools/diag/entrada.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python3
++# entrada.py <orden>...: manda teclado y ratón al macOS que corre (el mismo socket que usa tahoe-view, ver
++# tools/tahoe-view/src/entrada.rs). Para probar sin la ventana. Órdenes:
++#   tecla <uso hex>      pulsa y suelta esa tecla (uso HID de la página 7: 0x28 Intro, 0x2c espacio, 0x04 «a»...)
++#   texto <letras>       letras a-z, cifras y espacios (distribución estadounidense, sin mayúsculas)
++#   mueve <x> <y>        el puntero a ese píxel de la pantalla de macOS
++#   clic <x> <y>         mueve y hace clic con el botón izquierdo
++#   rueda <dy>           líneas de rueda (positivo hacia arriba)
++#   espera <s>           pausa
++# El socket es /dev/shm/tahoe-input-<id> del arranque más reciente (o TAHOE_INPUT).
++import glob, os, socket, struct, sys, time
++
++def ruta():
++    if os.environ.get("TAHOE_INPUT"): return os.environ["TAHOE_INPUT"]
++    s = sorted(glob.glob("/dev/shm/tahoe-input-*"), key=os.path.getmtime)
++    if not s: sys.exit("entrada.py: no hay /dev/shm/tahoe-input-* (¿WindowServer arrancado?)")
++    return s[-1]
++
++S = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); R = ruta()
++def manda(t, a, b, c): S.sendto(struct.pack("<Iiii", t, a, b, c), R)
++def tecla(u): manda(1, 7, u, 1); time.sleep(0.03); manda(1, 7, u, 0); time.sleep(0.03)
++def uso(ch):
++    if "a" <= ch <= "z": return 4 + ord(ch) - ord("a")
++    if "1" <= ch <= "9": return 0x1e + ord(ch) - ord("1")
++    return {"0": 0x27, " ": 0x2c, "\n": 0x28}.get(ch)
++
++a = sys.argv[1:]
++while a:
++    o = a.pop(0)
++    if o == "tecla": tecla(int(a.pop(0), 16))
++    elif o == "texto":
++        for ch in a.pop(0):
++            u = uso(ch)
++            if u is None: sys.exit(f"entrada.py: «{ch}» no está en la tabla")
++            tecla(u)
++    elif o == "mueve": x, y = int(a.pop(0)), int(a.pop(0)); manda(2, x, y, 0)
++    elif o == "clic": x, y = int(a.pop(0)), int(a.pop(0)); manda(2, x, y, 0); time.sleep(0.05); manda(2, x, y, 1); time.sleep(0.08); manda(2, x, y, 0)
++    elif o == "rueda": manda(3, 0, int(a.pop(0)), 0)
++    elif o == "espera": time.sleep(float(a.pop(0)))
++    else: sys.exit(f"entrada.py: orden desconocida «{o}»")
+diff --git a/tools/diag/hang.sh b/tools/diag/hang.sh
+index a0c7470..3c21129 100755
+--- a/tools/diag/hang.sh
++++ b/tools/diag/hang.sh
+@@ -1,39 +1,85 @@
+ #!/bin/bash
+-# hang.sh '<orden de macOS>' <proceso> [segundos]: lanza la orden con msh.sh y, pasados los segundos (20) tras el arranque,
+-# vuelca cada hilo del proceso de macOS llamado <proceso> (estado, llamada de Linux en curso, wchan y la instrucción,
+-# simbolizada con sym.py si está en la caché de macOS o con addr2line si es código de tahoe-run). Siempre limpia.
++# hang.sh '<orden de macOS>' '<proceso> [proceso...]' [segundos]: lanza la orden con msh.sh y, pasados los segundos (20)
++# tras el arranque, vuelca cada hilo de los procesos de macOS con esos nombres (estado, llamada de Linux en curso, wchan y
++# la instrucción, simbolizada con sym.py si está en la caché de macOS o con addr2line si es código de tahoe-run). Los
++# procesos se buscan por el programa de macOS que cargaron (el registro dice "<pid de macOS> cargado <programa>"; el pid
++# de Linux se encuentra por NSpid), no por la línea de órdenes, que puede ser la del xpcproxy que lo lanzó. Si alguno no
++# está vivo, dice qué se sabe de él por el registro (si llegó a cargarse, sus mensajes de aborto). Siempre limpia.
+ # Admite las variables de diagnóstico de msh.sh (el registro queda en msh.log). Con STACKS=<proceso> (el mismo), además
+-# las pilas de macOS de cada hilo, simbolizadas.
++# las pilas de macOS de cada hilo, simbolizadas. ESPERA: segundos de arranque antes de la orden (12; el macOS completo
++# necesita más, p. ej. 60).
+ DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
+ RUN="${TAHOE_RUN:-$DIAG/../../tahoe-run/tahoe-run}"
+-( "$DIAG/msh.sh" "$1" 12 $(( ${3:-20} + 40 )) > "$D/hang.out" 2>&1 & )
+-sleep $(( 12 + 4 + ${3:-20} ))
++E=${ESPERA:-12}
++# msh.sh apaga el arranque en cuanto acaba la orden: se alarga con un sleep para que siga vivo cuando llegue el volcado.
++( "$DIAG/msh.sh" "$1; sleep $(( ${3:-20} + 30 ))" $E $(( E + ${3:-20} + 60 )) > "$D/hang.out" 2>&1 & )
++sleep $(( E + 4 + ${3:-20} ))
+ # Línea de órdenes desde un hilo vivo: si el hilo principal terminó, /proc/<pid>/cmdline sale vacío
+ # (y no vale [ -s ]: los archivos de /proc dicen tener tamaño 0).
+ cmdl() { local t c; for t in /proc/$1/task/*; do c=$(tr '\0' ' ' < $t/cmdline 2>/dev/null); [ -n "$c" ] && { echo "$c"; return; }; done; }
+-for P in $(pgrep -x tahoe-run); do
+-	cmdl $P 2>/dev/null | sed 's/.*dyld //' | LC_ALL=C grep -q -E "/$2( |$)" || continue
+-	echo "== pid $P (en macOS $(awk '/^NSpid/{print $NF}' /proc/$P/status)): $(cmdl $P | sed 's/.*dyld //' | cut -c1-100)"
++# Pid de macOS -> programa que tiene cargado ahora (el último ejecutable, tipo=2, que cargó ese pid).
++progs() { LC_ALL=C grep -ao "<[0-9]*> cargado [^ ]* .* tipo=2" "$D/msh.log" | awk '{gsub(/[<>]/,"",$1); p[$1]=$3} END{for (k in p) print k, p[k]}'; }
++# Procesos (pid de Linux) cuyo programa de macOS es $1: se buscan por su pid de macOS (último campo de NSpid, en un
++# espacio de PID hijo: el del arranque) y no por el nombre de Linux, que no siempre es tahoe-run.
++NS=; for p in $(pgrep -x tahoe-run); do NS=$(readlink /proc/$p/ns/pid 2>/dev/null) && [ -n "$NS" ] && break; done
++pids_of() {
++	local s n
++	for s in /proc/[0-9]*/status; do
++		[ "$(readlink ${s%/status}/ns/pid 2>/dev/null)" = "$NS" ] || continue
++		# solo procesos, no hilos sueltos: el número de hilo de un proceso puede coincidir con el pid de macOS de otro, y la
++		# señal de volcado (RTMIN+5) mata a un proceso que no la espera (pasó con WindowServer)
++		[ "$(awk '/^Tgid/{print $2}' "$s" 2>/dev/null)" = "$(awk '/^Pid/{print $2}' "$s" 2>/dev/null)" ] || continue
++		n=$(awk '/^NSpid/{if (NF > 2) print $NF}' "$s" 2>/dev/null)
++		[ -n "$n" ] && [ "$(echo "$PROGS" | awk -v n="$n" '$1==n{print $2}')" = "$1" ] && { s=${s#/proc/}; echo "${s%/status}"; }
++	done
++}
++# Lo que dice el registro de un proceso que no está vivo.
++gone() {
++	local n=$1 m
++	m=$(LC_ALL=C grep -ao "<[0-9]*> cargado $n " "$D/msh.log" | grep -o "[0-9]*" | sort -un | paste -sd' ')
++	if [ -z "$m" ]; then echo "== $n: no llegó a cargarse"; return; fi
++	echo "== $n: no está vivo (pid de macOS $m)"
++	for p in $m; do
++		LC_ALL=C grep -a "abort <$p>: \[\|fin <$p> \|SIG[A-Z]* <$p>\|recolector: pid $p " "$D/msh.log" | sort -u | head -5 | sed 's/^ */   /'
++		LC_ALL=C grep -a "<$p>" "$D/msh.log" | grep -av "IOKIT" | tail -3 | cut -c1-200 | sed 's/^ */   último: /'
++	done
++}
++PROGS=$(progs)
++for NAME in $2; do
++	PIDS=$(pids_of "$NAME")
++	[ -z "$PIDS" ] && { gone "$NAME"; continue; }
++	for P in $PIDS; do
++	echo "== $NAME: pid $P, \"$(cat /proc/$P/comm 2>/dev/null)\" en Linux (en macOS $(for t in /proc/$P/task/*; do awk '/^NSpid/{print $NF; exit}' "$t/status" 2>/dev/null; done | head -1)): $(cmdl $P | sed 's/.*dyld //' | cut -c1-100)"
++	# Hilos iguales (mismo estado, llamada y sitio: p. ej. los de reserva de las colas, parados en poll) en una sola línea.
+ 	for t in /proc/$P/task/*; do
+ 		s=$(cat $t/syscall 2>/dev/null); pc=$(echo "$s" | awk '{print $NF}'); nr=$(echo "$s" | awk '{print $1}')
+-		w=$(cat $t/wchan 2>/dev/null); st=$(awk '{print $3}' $t/stat)
+-		case "$pc" in 0x7ff8*|0x7ff9*) where=$(python3 "$DIAG/sym.py" ${pc#0x} 2>/dev/null | cut -d' ' -f2-);;
++		[ -r $t/stat ] || continue                              # el hilo terminó mientras se miraba
++		w=$(cat $t/wchan 2>/dev/null); st=$(awk '{print $3}' $t/stat 2>/dev/null)
++		case "$pc" in 0x7ff8*|0x7ff9*|0x7ffa*|0x7ffb*|0x7ffc*|0x7ffd*|0x7ffe*) where=$(python3 "$DIAG/sym.py" ${pc#0x} 2>/dev/null | cut -d' ' -f2-);;
+ 			0x*) where=$(addr2line -f -s -e "$RUN" "$pc" 2>/dev/null | paste -sd' ');; *) where=;; esac
+-		echo "   $(basename $t) $st nr=$nr wchan=$w pc=$pc $where"
+-	done
++		echo "$(basename $t) $st nr=$nr wchan=$w pc=$pc $where"
++	done | awk '{t=$1; $1=""; if (!($0 in n)) o[++k]=$0; n[$0]++; f[$0]=f[$0] ? f[$0] : t}
++		END{for (i=1; i<=k; i++) { h=(n[o[i]] > 1) ? n[o[i]] " hilos (" f[o[i]] "...):" : f[o[i]]; printf "   %s%s\n", h, o[i] }}' 
+ 	# Pilas de macOS de cada hilo: si el proceso es el de STACKS, SIGRTMIN+5 hace que cada hilo escriba en el registro sus
+ 	# marcos (rbp) y la llamada en curso (on_dump_all, emu_proc.c); se simbolizan con sym.py.
+ 	if [ -n "$STACKS" ]; then
+-		N=$(awk '/^NSpid/{print $NF}' /proc/$P/status)
++		# el pid de macOS se lee de un hilo vivo: si el principal ya terminó (zombi), /proc/<pid>/status puede no estar
++		N=$(for t in /proc/$P/task/*; do awk '/^NSpid/{print $NF; exit}' "$t/status" 2>/dev/null; done | head -1)
+ 		kill -s RTMIN+5 "$P" 2>/dev/null; sleep 1
+-		LC_ALL=C grep -a "HILO <$N:" "$D/msh.log" | sort -s -t: -k2,2n | tail -n 120 | while read -r l; do
++		# los hilos que ejecutan código de tahoe-run sin llamada en curso (en reposo) se cuentan, no se listan
++		LC_ALL=C grep -a "HILO <$N:" "$D/msh.log" | sort -s -t: -k2,2n | tail -n 400 > "$D/hilos.tmp"
++		idle=$(LC_ALL=C grep -c "ejecutando rip=0x[0-9a-f]\{1,8\}$" "$D/hilos.tmp")
++		LC_ALL=C grep -v "ejecutando rip=0x[0-9a-f]\{1,8\}$" "$D/hilos.tmp" | tail -n 150 | while read -r l; do
+ 			case "$l" in
+ 				*"marcos (rbp):"*) python3 "$DIAG/sym.py" ${l#*marcos (rbp):} 2>/dev/null | sed 's/^/        /';;
+ 				*) echo "   ${l:0:200}";;
+ 			esac
+ 		done
++		[ "${idle:-0}" -gt 0 ] && echo "   (+ $idle hilos en reposo dentro de tahoe-run)"
++		rm -f "$D/hilos.tmp"
+ 	fi
++	done
+ done
+ sleep 2; while pgrep -f "diag/msh.sh" > /dev/null; do sleep 1; done
+ echo "--- salida de la orden:"; tail -8 "$D/hang.out"
+diff --git a/tools/diag/inventario.py b/tools/diag/inventario.py
+new file mode 100755
+index 0000000..4dfe5d2
+--- /dev/null
++++ b/tools/diag/inventario.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""inventario.py <inventario.txt> [registro]: clasifica el resultado de tools/inventario_total.sh.
++
++Cada línea del inventario: «n|programa|pid|código|segundos|primera línea de la salida». Con el registro de tahoe-run del
++mismo arranque se añade, por pid, lo que el emulador anotó: llamadas sin implementar ([FALTA]), abortos y señales.
++Categorías:
++  funciona            sale con 0
++  pide argumentos     sale con error mostrando su uso («usage», «illegal option»...): el programa arranca y responde
++  error del emulador  el mensaje o el registro apuntan a tahoe-run (llamada sin implementar, función no implementada,
++                      dirección inválida, librería o símbolo que falta...)
++  se cae              muere por una señal
++  cuelga              no termina en el plazo
++  otro error          el resto (necesita permisos, hardware, configuración...)
++  saltada             no se ejecutó (acaba el arranque o es un servicio de launchd)
++"""
++import re
++import sys
++from collections import Counter, defaultdict
++
++USO = re.compile(r"usage|uso:|illegal option|unknown option|invalid option|requires? (an )?argument|missing|expected|"
++                 r"not enough|too few|no (input|file|command|operand)|specify|options?:|syntax|help|must|need",
++                 re.I)
++EMU = re.compile(r"not implemented|function not implemented|library not loaded|symbol not found|bad system call|"
++                 r"invalid address|init failed|\(os/kern\)|kern_return|mach_|failed to get|unable to (obtain|get|connect)|"
++                 r"connection (to .*)?(failed|invalid|interrupted)|xpc|operation not supported", re.I)
++SEÑALES = {4: "SIGILL", 5: "SIGTRAP", 6: "SIGABRT", 7: "SIGBUS", 8: "SIGFPE", 9: "SIGKILL", 10: "SIGBUS", 11: "SIGSEGV",
++           12: "SIGSYS", 13: "SIGPIPE", 15: "SIGTERM"}
++
++
++def registro(path):
++    falta = defaultdict(set)
++    causa = {}
++    if not path:
++        return falta, causa
++    for l in open(path, errors="replace"):
++        m = re.search(r"\[FALTA\] <(\d+):\d+> (\w+ \d+ \w+)", l)
++        if m:
++            falta[m.group(1)].add(m.group(2))
++            continue
++        m = re.search(r"abort <(\d+)>: (\[[^\]]+\] .*)", l)
++        if m and m.group(1) not in causa:
++            causa[m.group(1)] = m.group(2)[:120]
++            continue
++        m = re.search(r"(SIG[A-Z]+) <(\d+)> .*rip=(0x[0-9a-f]+)", l)
++        if m and m.group(2) not in causa:
++            causa[m.group(2)] = f"{m.group(1)} en {m.group(3)}"
++    return falta, causa
++
++
++def main():
++    falta, causa = registro(sys.argv[2] if len(sys.argv) > 2 else None)
++    cats = defaultdict(list)
++    por_falta = Counter()
++    for l in open(sys.argv[1], errors="replace"):
++        p = l.rstrip("\n").split("|", 5)
++        if len(p) < 6:
++            continue
++        n, prog, pid, rc, seg, out = p
++        f = falta.get(pid, set())
++        for x in f:
++            por_falta[x] += 1
++        if rc == "saltada":
++            cat = "saltada"
++        elif rc == "COLGADA":
++            cat = "cuelga"
++        elif rc == "0":
++            cat = "funciona"
++        elif rc.isdigit() and 128 < int(rc) <= 128 + 31:          # 128 + señal (255 es exit(-1), no una señal)
++            cat = "se cae"
++            out = f"{SEÑALES.get(int(rc) - 128, 'señal %d' % (int(rc) - 128))}: {causa.get(pid, out)}"
++        elif EMU.search(out) or f:
++            cat = "error del emulador"
++            if f and not EMU.search(out):
++                out = f"{out}  [FALTA: {', '.join(sorted(f))[:80]}]"
++        elif USO.search(out):
++            cat = "pide argumentos"
++        else:
++            cat = "otro error"
++        cats[cat].append((prog, rc, out))
++    total = sum(len(v) for v in cats.values())
++    orden = ["funciona", "pide argumentos", "otro error", "error del emulador", "se cae", "cuelga", "saltada"]
++    print(f"== {total} programas")
++    for c in orden:
++        print(f"   {c:20s} {len(cats[c]):5d}")
++    if por_falta:
++        print("== llamadas sin implementar ([FALTA]) y a cuántos programas afectan")
++        for x, k in por_falta.most_common(20):
++            print(f"   {k:4d}  {x}")
++    for c in ["se cae", "cuelga", "error del emulador", "otro error"]:
++        if cats[c]:
++            print(f"== {c} ({len(cats[c])})")
++            for prog, rc, out in cats[c]:
++                print(f"   {prog:42s} {rc:8s} {out[:110]}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/diag/iokit.py b/tools/diag/iokit.py
+new file mode 100755
+index 0000000..496e172
+--- /dev/null
++++ b/tools/diag/iokit.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++# iokit.py [-t] [-p pid|programa] [registro]: resumen de la traza de IOKit de tahoe-run (líneas «IOKIT»). La traza se
++# activa con /dev/shm/tahoe-iokit-trace: vacío, todos los procesos; con nombres de programas, solo esos
++# (tools/diag/discos.sh lo hace con IOKS='diskarbitrationd ...'). Por omisión lee ~/.cache/tahoe-diag/discos.log.
++#
++# Por proceso:
++#   - peticiones agrupadas (llamada, objeto, argumentos) con cuántas veces y qué respondieron (puerto y objeto, o kr);
++#   - errores devueltos (kr distinto de 0);
++#   - notificaciones registradas (add_notification: tipo y diccionario; add_interest_notification) y los avisos que se le
++#     enviaron. Un registro sin ningún aviso es sospechoso cuando el cliente espera a que aparezca algo.
++#   -t           además, todas las peticiones en orden, con su respuesta
++#   -p pid|prog  solo ese proceso (puede repetirse)
++import os, re, sys
++from collections import OrderedDict, defaultdict
++
++args = sys.argv[1:]
++full = "-t" in args
++follow, rest = set(), []
++i = 0
++while i < len(args):
++    if args[i] == "-t": pass
++    elif args[i] == "-p" and i + 1 < len(args): follow.add(args[i + 1]); i += 1
++    else: rest.append(args[i])
++    i += 1
++path = rest[0] if rest else os.path.expanduser(os.environ.get("TAHOE_DIAG_DIR", "~/.cache/tahoe-diag") + "/discos.log")
++
++req_re = re.compile(r"IOKIT <(\d+)> (\S+)\((\d+)\)(?: \[([^\]]*)\])?(.*)$")
++rep_re = re.compile(r"IOKIT <(\d+)>   -> (\S+): (.*)$")
++avi_re = re.compile(r"IOKIT <(\d+)> aviso tipo=(\d+) al puerto (0x[0-9a-f]+) \(notificación (0x[0-9a-f]+)\) -> (-?\d+)")
++prog_re = re.compile(r"<(\d+)> cargado (\S+) .*tipo=2")
++
++progs, reqs, avisos = {}, defaultdict(list), defaultdict(list)
++pending = defaultdict(list)                   # (pid, llamada) -> peticiones aún sin respuesta (varios hilos se entremezclan)
++with open(path, "rb") as f:
++    for n, raw in enumerate(f, 1):
++        l = raw.decode("utf-8", "replace").rstrip("\n")
++        m = prog_re.search(l)
++        if m and m.group(2) != "dyld": progs[m.group(1)] = m.group(2)
++        m = rep_re.search(l)
++        if m:
++            k = (m.group(1), m.group(2))
++            if pending[k]: pending[k].pop(0)["rep"] = m.group(3)
++            continue
++        m = avi_re.search(l)
++        if m:
++            pid, ty, wake, notif, r = m.groups()
++            avisos[notif].append(dict(n=n, pid=pid, tipo=int(ty), r=int(r)))
++            continue
++        m = req_re.search(l)
++        if m:
++            pid, call, cid, obj, arg = m.groups()
++            q = dict(n=n, pid=pid, call=call, id=int(cid), obj=obj or "", arg=arg.strip(), rep=None)
++            reqs[pid].append(q); pending[(pid, call)].append(q)
++
++if not reqs:
++    sys.exit(f"sin líneas IOKIT en {path} (¿se activó /dev/shm/tahoe-iokit-trace?)")
++
++def name(pid): return f"{progs.get(pid, '?')}[{pid}]"
++def short(s, k=150): s = re.sub(r"\s+", " ", s); return s if len(s) <= k else s[:k] + "…"
++def notif_port(rep):
++    m = re.search(r"puerto (0x[0-9a-f]+)", rep or ""); return m.group(1) if m else None
++
++pids = [p for p in reqs if not follow or p in follow or progs.get(p) in follow]
++for pid in pids:
++    rs = reqs[pid]
++    print(f"== {name(pid)}: {len(rs)} peticiones")
++    if full:
++        for q in rs:
++            print(f"   {q['n']:>7} {q['call']}" + (f" [{q['obj']}]" if q["obj"] else "") + (f" {short(q['arg'], 110)}" if q["arg"] else "")
++                  + f"  -> {q['rep'] or '(sin respuesta anotada)'}")
++    grp = OrderedDict()
++    for q in rs:
++        k = (q["call"], q["obj"], re.sub(r"0x[0-9a-f]{5,}", "N", q["arg"]))
++        g = grp.setdefault(k, dict(c=0, reps=OrderedDict()))
++        g["c"] += 1
++        r = re.sub(r"puerto 0x[0-9a-f]+ ", "", q["rep"] or "?"); g["reps"][r] = g["reps"].get(r, 0) + 1
++    print("   -- peticiones (veces, llamada, objeto, argumentos -> respuestas)")
++    for (call, obj, arg), g in list(grp.items())[:60]:
++        reps = ", ".join(f"{r}" + (f" ×{c}" if c > 1 else "") for r, c in list(g["reps"].items())[:4])
++        print(f"   {g['c']:>4} {call}" + (f" [{obj}]" if obj else "") + (f" {short(arg, 100)}" if arg else "") + f"  -> {short(reps, 120)}")
++    errs = [q for q in rs if q["rep"] and re.search(r"kr=0x(?!0 )[0-9a-f]+", q["rep"]) and "kr=0x0 " not in q["rep"] + " "]
++    if errs:
++        print("   -- errores devueltos")
++        for q in errs[:20]:
++            print(f"   {q['n']:>7} {q['call']}" + (f" [{q['obj']}]" if q["obj"] else "") + f" {short(q['arg'], 90)} -> {q['rep']}")
++    notifs = [q for q in rs if q["call"] in ("service_add_notification", "service_add_notification_ool",
++                                             "service_add_notification_bin", "service_add_interest_notification")
++              or q["id"] in (2868, 2870, 2884, 2869)]
++    if notifs:
++        print("   -- notificaciones registradas (avisos enviados)")
++        for q in notifs:
++            p = notif_port(q["rep"]); av = avisos.get(p, []) if p else []
++            tipos = ", ".join(sorted({str(a["tipo"]) for a in av})) or "-"
++            print(f"   {q['n']:>7} {q['call']}" + (f" [{q['obj']}]" if q["obj"] else "") + f" {short(q['arg'], 100)}"
++                  + f"\n            -> notificación {p or '?'}: {len(av)} avisos (tipos {tipos})" + ("   <- NINGÚN AVISO" if not av else ""))
+diff --git a/tools/diag/llamadas.py b/tools/diag/llamadas.py
+new file mode 100755
+index 0000000..b3fc8f9
+--- /dev/null
++++ b/tools/diag/llamadas.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++# llamadas.py <dir_inicio_hex> <bytes> [función...]: lista las llamadas de un trozo de la caché de dyld (normalmente el
++# código de un framework) a las funciones indicadas (por omisión, las de los user clients de IOKit: IOConnectCallMethod,
++# IOConnectCallAsyncMethod, IOConnectCallStructMethod, IOConnectCallScalarMethod e IOConnectTrap0..6), con el selector o
++# índice de trampa (lo que se carga en esi antes de la llamada) y la función de macOS que la contiene. Sirve para deducir
++# la interfaz de un user client sin su código fuente:
++#   tools/diag/llamadas.py 7ff80f445000 81000          (IOSurface.framework)
++# Usa dis.py (desensamblar), stub.py (destino de cada stub) y sym.py (símbolos). TAHOE_ROOT como en ellos.
++import os, re, subprocess, sys
++
++DIAG = os.path.dirname(os.path.abspath(__file__))
++WANT = sys.argv[3:] or ["IOConnectCallMethod", "IOConnectCallAsyncMethod", "IOConnectCallStructMethod",
++                        "IOConnectCallScalarMethod"] + [f"IOConnectTrap{i}" for i in range(7)]
++
++
++def run(*a):
++    return subprocess.run([sys.executable, *a], capture_output=True, text=True).stdout
++
++
++asm = run(os.path.join(DIAG, "dis.py"), sys.argv[1], sys.argv[2]).splitlines()
++calls = []                      # (dirección, destino, carga de esi más reciente)
++esi = "?"
++for l in asm:
++    m = re.match(r"\s*([0-9a-f]+):\s+(?:[0-9a-f]{2} )+\s*(.*)", l)
++    if not m:
++        continue
++    ins = m.group(2)
++    if re.match(r"mov\s+esi,", ins):
++        esi = ins.split(",", 1)[1].strip()
++    elif re.match(r"xor\s+esi,esi", ins):
++        esi = "0x0"
++    elif ins.startswith("call"):
++        t = re.search(r"0x([0-9a-f]+)", ins)
++        if t:
++            calls.append((m.group(1), t.group(1), esi))
++        esi = "?"                # una llamada estropea esi: el selector se carga justo antes de la suya
++    elif re.match(r"(jmp|ret)", ins):
++        esi = "?"
++
++# Destinos: cada stub distinto se resuelve una vez.
++targets = sorted({t for _, t, _ in calls})
++dest = {}
++out = run(os.path.join(DIAG, "stub.py"), *targets) if targets else ""
++for l in out.splitlines():
++    m = re.match(r"([0-9a-f]+) -> 0x[0-9a-f]+ \S+ _?(\S+?)\+0x0", l)
++    if m:
++        dest[m.group(1)] = m.group(2)
++hits = [(a, dest[t], s) for a, t, s in calls if dest.get(t) in WANT]
++if not hits:
++    sys.exit("ninguna llamada a " + ", ".join(WANT))
++names = {}
++for l in run(os.path.join(DIAG, "sym.py"), *("0x" + a for a, _, _ in hits)).splitlines():
++    p = l.split(None, 2)
++    if len(p) == 3:
++        names[p[0][2:]] = p[2]
++rows = sorted(hits, key=lambda h: (h[1], int(h[2], 16) if h[2].startswith("0x") else 1 << 40))
++for a, f, s in rows:
++    print(f"{f:28} {s:>6}  {names.get(a, '?')}  (0x{a})")
+diff --git a/tools/diag/llaveros.sh b/tools/diag/llaveros.sh
+new file mode 100755
+index 0000000..6ed1458
+--- /dev/null
++++ b/tools/diag/llaveros.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++# llaveros.sh: prueba de los llaveros en el macOS completo. Crea un llavero de usuario y guarda y lee una contraseña
++# (funciona desde el 14 de octubre de 2026), y prueba el llavero del sistema: «systemkeychain -t» (desbloqueo con
++# /var/db/SystemKey, todavía «System unlock is NOT working») y show-keychain-info. Siempre limpia.
++DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; REPO="$(cd "$DIAG/../.." && pwd)"
++D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; O="$D/llaveros"; rm -rf "$O"; mkdir -p "$O"
++cd "$REPO" || exit 1
++TAHOE_ROOT="${TAHOE_ROOT:-$HOME/macos26/completo/macOS}" TAHOE_BOOT_WAIT=10 timeout 400 tools/macos-shell.sh --launchd -c "sleep 60; rm -f /tmp/t.keychain*; \
++ security create-keychain -p x /tmp/t.keychain; echo create rc=\$?; \
++ security add-generic-password -a a -s s -w w /tmp/t.keychain; echo add rc=\$?; \
++ security find-generic-password -s s /tmp/t.keychain > /dev/null; echo find rc=\$?; \
++ /usr/sbin/systemkeychain -v -t; echo systemkeychain rc=\$?; \
++ security show-keychain-info /Library/Keychains/System.keychain; echo info rc=\$?" > "$O/out" 2>&1
++"$DIAG/clean.sh" > /dev/null 2>&1
++grep -av "^launchd\|Alarm" "$O/out"
+diff --git a/tools/diag/memoria.py b/tools/diag/memoria.py
+new file mode 100755
+index 0000000..365d8ff
+--- /dev/null
++++ b/tools/diag/memoria.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++"""memoria.py <smaps.1> <smaps.2>: qué memoria anónima creció entre dos fotos de /proc/<pid>/smaps del mismo proceso.
++
++Dice el total de Anonymous en cada foto y luego:
++  - regiones nuevas (no estaban en la primera), agrupadas por tamaño, permisos y nombre: muchas iguales indican
++    reservas que no se liberan (mmap / mach_vm_allocate / datos fuera de línea de mensajes);
++  - regiones que ya estaban y crecieron (el malloc del programa, una pila...), las que más.
++Las direcciones van en hexadecimal para buscarlas en el registro o con vmmap/sym.py.
++"""
++import re
++import sys
++from collections import defaultdict
++
++CAB = re.compile(r'^([0-9a-f]+)-([0-9a-f]+) (\S+) \S+ \S+ \S+\s*(.*)$')
++
++
++def leer(ruta):
++    reg = {}
++    cur = None
++    for linea in open(ruta, errors='replace'):
++        m = CAB.match(linea)
++        if m:
++            ini, fin = int(m.group(1), 16), int(m.group(2), 16)
++            cur = {'ini': ini, 'tam': fin - ini, 'perm': m.group(3), 'nombre': m.group(4) or '[anónima]', 'anon': 0}
++            reg[ini] = cur
++        elif cur and linea.startswith('Anonymous:'):
++            cur['anon'] = int(linea.split()[1])
++    return reg
++
++
++def mb(kb):
++    return f'{kb / 1024:.1f} MB'
++
++
++def main():
++    a, b = leer(sys.argv[1]), leer(sys.argv[2])
++    ta, tb = sum(r['anon'] for r in a.values()), sum(r['anon'] for r in b.values())
++    print(f'Anonymous: {mb(ta)} -> {mb(tb)} ({mb(tb - ta)} más), regiones {len(a)} -> {len(b)}')
++
++    nuevas = [r for k, r in b.items() if k not in a]
++    grupos = defaultdict(lambda: [0, 0, []])
++    for r in nuevas:
++        g = grupos[(r['tam'], r['perm'], r['nombre'])]
++        g[0] += 1
++        g[1] += r['anon']
++        g[2].append(r['ini'])
++    print(f'\nregiones nuevas: {len(nuevas)}, con {mb(sum(r["anon"] for r in nuevas))} anónimos')
++    for (tam, perm, nombre), (n, anon, dirs) in sorted(grupos.items(), key=lambda x: -x[1][1])[:15]:
++        ej = ' '.join(hex(d) for d in sorted(dirs)[:3])
++        print(f'  {n:5d} × {tam // 1024:8d} KB {perm} {nombre[:40]:40s} anon={mb(anon):>9s}  p. ej. {ej}')
++
++    crecen = []
++    for k, r in b.items():
++        if k in a and r['anon'] > a[k]['anon']:
++            crecen.append((r['anon'] - a[k]['anon'], r, a[k]))
++    crecen.sort(key=lambda x: -x[0])
++    print(f'\nregiones que crecieron: {len(crecen)}, con {mb(sum(c[0] for c in crecen))} más')
++    for d, r, ra in crecen[:15]:
++        cambio = f' (tamaño {ra["tam"] // 1024} -> {r["tam"] // 1024} KB)' if ra['tam'] != r['tam'] else ''
++        print(f'  +{mb(d):>9s} {hex(r["ini"])} {r["tam"] // 1024:8d} KB {r["perm"]} {r["nombre"][:40]}{cambio}')
++
++    idas = [r for k, r in a.items() if k not in b]
++    if idas:
++        print(f'\nregiones liberadas: {len(idas)}, con {mb(sum(r["anon"] for r in idas))} anónimos')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/diag/memoria.sh b/tools/diag/memoria.sh
+new file mode 100755
+index 0000000..99b46cc
+--- /dev/null
++++ b/tools/diag/memoria.sh
+@@ -0,0 +1,55 @@
++#!/bin/bash
++# memoria.sh <programa> [t1] [t2]: ¿qué memoria crece en un proceso de macOS? Arranca launchd (tools/macos-shell.sh
++# --launchd), busca el proceso por el programa de macOS que cargó (como hang.sh) y cada 5 s anota su RssAnon; en t1 y t2
++# (30 y 60 s desde el arranque) guarda /proc/<pid>/smaps y al final memoria.py dice qué regiones son nuevas o crecieron.
++# Siempre limpia. Variables:
++#   TAHOE_ROOT  sistema de macOS (por omisión la Recovery); TAHOE_RUN otro binario (A/B); DEPURAR=1 modo depuración
++#   MSGS/IOKS   programas cuyos mensajes Mach / actividad IOKit se trazan (como en discos.sh); al final se resumen
++#               con mensajes.py e iokit.py
++# Salida en ~/.cache/tahoe-diag: memoria.txt (muestreo), smaps.1, smaps.2, memoria.log (registro de este arranque).
++DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
++D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
++PROG="${1:?indica el programa de macOS (p. ej. WindowServer)}"; T1="${2:-30}"; T2="${3:-60}"
++export TAHOE_ROOT="${TAHOE_ROOT:-$HOME/macos26/base/macOS Base System}"
++LOG="${TAHOE_LOGFILE:-/tmp/tahoe-shell-$USER.log}"
++# como macos-shell.sh: si el registro pasa de TAHOE_LOG_MAX_MB se vacía ya (si lo vaciara él, «desde» quedaría fuera)
++if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt $(( ${TAHOE_LOG_MAX_MB:-300} * 1024 * 1024 )) ]; then : > "$LOG"; fi
++desde=$(( $( [ -f "$LOG" ] && wc -l < "$LOG" || echo 0) + 1 ))
++if [ -n "$MSGS" ]; then echo "$MSGS" > /dev/shm/tahoe-msg-trace; else rm -f /dev/shm/tahoe-msg-trace; fi
++if [ -n "$IOKS" ]; then echo "$IOKS" > /dev/shm/tahoe-iokit-trace; else rm -f /dev/shm/tahoe-iokit-trace; fi
++rm -f "$D/smaps.1" "$D/smaps.2"; : > "$D/memoria.txt"
++( TAHOE_BOOT_WAIT=5 timeout $(( T2 + 60 )) "$DIAG/../macos-shell.sh" ${DEPURAR:+--depurar} --launchd -c "sleep $(( T2 + 30 ))" \
++	> "$D/memoria.out" 2>&1 & )
++# Pid de Linux del proceso cuyo programa de macOS (el último ejecutable que cargó, tipo=2) es $PROG.
++pid_de() {
++	local ns s n p
++	for p in $(pgrep -x tahoe-run); do ns=$(readlink /proc/$p/ns/pid 2>/dev/null) && [ -n "$ns" ] && break; done
++	[ -z "$ns" ] && return
++	local progs; progs=$(tail -n +"$desde" "$LOG" 2>/dev/null | LC_ALL=C grep -ao "<[0-9]*> cargado [^ ]* .* tipo=2" |
++		awk '{gsub(/[<>]/,"",$1); p[$1]=$3} END{for (k in p) print k, p[k]}')
++	for s in /proc/[0-9]*/status; do
++		[ "$(readlink ${s%/status}/ns/pid 2>/dev/null)" = "$ns" ] || continue
++		n=$(awk '/^NSpid/{if (NF > 2) print $NF}' "$s" 2>/dev/null)
++		[ -n "$n" ] && [ "$(echo "$progs" | awk -v n="$n" '$1==n{print $2}')" = "$PROG" ] && { s=${s#/proc/}; echo "${s%/status} $n"; return; }
++	done
++}
++t=0
++while [ $t -lt $T2 ]; do
++	sleep 5; t=$((t + 5))
++	read -r P N < <(pid_de)
++	if [ -z "$P" ]; then echo "t=$t $PROG no está vivo" >> "$D/memoria.txt"; continue; fi
++	echo "t=$t pid=$P (macOS $N) $(awk '/^RssAnon|^RssShmem|^VmSize/{printf "%s %d MB  ", $1, $2/1024}' /proc/$P/status 2>/dev/null)" >> "$D/memoria.txt"
++	[ $t -ge "$T1" ] && [ ! -f "$D/smaps.1" ] && cp /proc/$P/smaps "$D/smaps.1" 2>/dev/null && echo "$N" > "$D/smaps.pid"
++done
++[ -n "$P" ] && cp /proc/$P/smaps "$D/smaps.2" 2>/dev/null
++[ -n "$P" ] && [ "$N" != "$(cat "$D/smaps.pid" 2>/dev/null)" ] && echo "(aviso: el pid cambió entre las fotos: $PROG se relanzó)" >> "$D/memoria.txt"
++"$DIAG/clean.sh" > /dev/null 2>&1
++rm -f /dev/shm/tahoe-msg-trace /dev/shm/tahoe-iokit-trace
++tail -n +"$desde" "$LOG" > "$D/memoria.log" 2>/dev/null
++echo "== muestreo de $PROG"; cat "$D/memoria.txt"
++grep -a "guardián" "$D/memoria.out" | head -2
++if [ -f "$D/smaps.1" ] && [ -f "$D/smaps.2" ]; then echo "== smaps entre t=$T1 y t=$T2"; python3 "$DIAG/memoria.py" "$D/smaps.1" "$D/smaps.2"
++else echo "== no hay dos fotos de smaps"; fi
++[ -n "$MSGS" ] && python3 "$DIAG/mensajes.py" "$D/memoria.log" | head -60
++[ -n "$IOKS" ] && python3 "$DIAG/iokit.py" "$D/memoria.log" | head -60
++echo "(muestreo: $D/memoria.txt; fotos: $D/smaps.1 $D/smaps.2; registro: $D/memoria.log)"
+diff --git a/tools/diag/mensajes.py b/tools/diag/mensajes.py
+new file mode 100755
+index 0000000..16c1177
+--- /dev/null
++++ b/tools/diag/mensajes.py
+@@ -0,0 +1,223 @@
++#!/usr/bin/env python3
++# mensajes.py [-t] [-s programa] [registro]: conversación de mensajes Mach a partir de la traza «MSG» de tahoe-run
++# (procesos nombrados en /dev/shm/tahoe-msg-trace; tools/diag/discos.sh la activa con MSGS='prog1 prog2...').
++# Por omisión lee ~/.cache/tahoe-diag/discos.log.
++#
++# Para cada envío dice si llegó a su destino (hay una recepción de ese remitente con el mismo puerto e id) y, si pedía
++# respuesta (puerto de respuesta), si alguien la envió a ese puerto. Al final, el resumen por pareja de programas y la
++# lista de lo que se quedó a medias: envíos que nadie recibió y peticiones sin respuesta, que es donde se cuelga una
++# cadena (diskutil -> storagekitd -> diskarbitrationd -> fskitd...).
++#   -t           además, la conversación completa en orden (una línea por mensaje)
++#   -s prog      solo los mensajes en los que participa ese programa (puede repetirse)
++#   -x           con -t o -p, el contenido de los mensajes XPC descodificado ({clave: valor, ...}) si la traza guardó el
++#                cuerpo (líneas «MSG cuerpo», mensajes de hasta 1 KB)
++#   -p pid|prog  sigue un proceso: todos sus envíos y recepciones en orden (con un nombre, todos los pid con ese programa,
++#                p. ej. el diskarbitrationd de arranque y el relanzado)
++# Un destino sin traza (no está en la lista) sale como «(sin traza)»: se sabe que se envió, no si llegó.
++import os, re, sys
++from collections import Counter, defaultdict
++
++args = sys.argv[1:]
++full = "-t" in args
++xpc = "-x" in args
++solo = set()
++follow = set()
++rest = []
++i = 0
++while i < len(args):
++    if args[i] in ("-t", "-x"): pass
++    elif args[i] == "-s" and i + 1 < len(args): solo.add(args[i + 1]); i += 1
++    elif args[i] == "-p" and i + 1 < len(args): follow.add(args[i + 1]); i += 1
++    else: rest.append(args[i])
++    i += 1
++path = rest[0] if rest else os.path.expanduser(os.environ.get("TAHOE_DIAG_DIR", "~/.cache/tahoe-diag") + "/discos.log")
++
++snd_re = re.compile(r"MSG <(\d+)\.(\d+)> envía dest=(0x[0-9a-f]+)\(->(-?\d+)\) resp=(0x[0-9a-f]+) id=(-?\d+) tam=(\d+) bits=(0x[0-9a-f]+)( y espera)?(?: \| (.*))?")
++rcv_re = re.compile(r"MSG <(\d+)\.(\d+)> recibe en=(0x[0-9a-f]+) dest=(0x[0-9a-f]+) resp=(0x[0-9a-f]+) id=(-?\d+) tam=(\d+) de=(-?\d+) -> (0x[0-9a-f]+)")
++fail_re = re.compile(r"MSG <(\d+)\.(\d+)> envío a (0x[0-9a-f]+) id=(-?\d+) falló (0x[0-9a-f]+)")
++body_re = re.compile(r"MSG cuerpo <(\d+)\.(\d+)>: ([0-9a-f]+)")
++rbody_re = re.compile(r"MSG recibido <(\d+)\.(\d+)>: ([0-9a-f]+)")
++prog_re = re.compile(r"<(\d+)> cargado (\S+) .*tipo=2")
++
++progs = {}
++sends, recvs = [], []
++traced = set()
++with open(path, "rb") as f:
++    for n, raw in enumerate(f, 1):
++        l = raw.decode("utf-8", "replace")
++        m = prog_re.search(l)
++        if m and m.group(2) != "dyld": progs[m.group(1)] = m.group(2)
++        m = snd_re.search(l)
++        if m:
++            pid, tid, dest, to, resp, mid, size, bits, wait, txt = m.groups()
++            traced.add(pid)
++            sends.append(dict(n=n, pid=pid, tid=tid, dest=dest, to=to, resp=resp, id=int(mid), size=int(size),
++                              bits=bits, wait=bool(wait), txt=(txt or "")[:90], prog=progs.get(pid, "?"), recv=None, reply=None))
++            continue
++        m = body_re.search(l)
++        if m:                             # cuerpo del envío anterior de ese hilo
++            for x in reversed(sends[-50:]):
++                if x["pid"] == m.group(1) and x["tid"] == m.group(2): x["body"] = bytes.fromhex(m.group(3)[:len(m.group(3)) // 2 * 2]); break
++            continue
++        m = rbody_re.search(l)
++        if m:                             # cuerpo de la recepción anterior de ese hilo
++            for r in reversed(recvs[-50:]):
++                if r["pid"] == m.group(1) and r["tid"] == m.group(2): r["body"] = bytes.fromhex(m.group(3)[:len(m.group(3)) // 2 * 2]); break
++            continue
++        m = fail_re.search(l)
++        if m:                             # el envío anterior de ese hilo no entró en la cola (llena con plazo 0, destino muerto)
++            pid, tid, dest, mid, kr = m.groups()
++            for x in reversed(sends[-50:]):
++                if x["pid"] == pid and x["tid"] == tid and x["dest"] == dest and x["id"] == int(mid): x["fail"] = kr; break
++            continue
++        m = rcv_re.search(l)
++        if m:
++            pid, tid, en, dest, resp, mid, size, de, res = m.groups()
++            traced.add(pid)
++            recvs.append(dict(n=n, pid=pid, tid=tid, dest=dest, resp=resp, id=int(mid), size=int(size), de=de, res=res, used=False))
++
++if not sends and not recvs:
++    sys.exit(f"sin líneas MSG en {path} (¿se activó /dev/shm/tahoe-msg-trace con los nombres?)")
++
++# Formato de libxpc en el cable: «CPX@» (0x40585043), versión, y el objeto raíz (normalmente un diccionario). Cada objeto: tipo (u32)
++# y su contenido; los puertos van en descriptores aparte («puerto»). La traza guarda como mucho 400 bytes: lo que no
++# quepa sale como «(no descodificable ...)».
++def xpc_decode(b):
++    import struct
++    k = b.find(b"CPX@")                                     # número mágico 0x40585043 en little endian
++    if k < 0 or k + 8 > len(b): return None
++    pos = [k + 8]
++    def u32():
++        v = struct.unpack_from("<I", b, pos[0])[0]; pos[0] += 4; return v
++    def cstr():
++        e = b.index(b"\0", pos[0]); t = b[pos[0]:e].decode("utf-8", "replace"); pos[0] = (e + 4) & ~3; return t
++    def obj(depth=0):
++        t = u32()
++        if t == 0x1000: return "null"
++        if t == 0x2000: return "true" if u32() else "false"
++        if t in (0x3000, 0x4000, 0x7000):
++            v = struct.unpack_from("<q" if t == 0x3000 else "<Q", b, pos[0])[0]; pos[0] += 8
++            return str(v) if t != 0x4000 or v < 4096 else hex(v)
++        if t == 0x5000: v = struct.unpack_from("<d", b, pos[0])[0]; pos[0] += 8; return str(v)
++        if t in (0x8000, 0x9000):
++            n = u32(); raw = b[pos[0]:pos[0] + n]; pos[0] += (n + 3) & ~3
++            return repr(raw.rstrip(b"\0").decode("utf-8", "replace")) if t == 0x9000 else f"datos[{n}]"
++        if t == 0xa000: v = b[pos[0]:pos[0] + 16].hex(); pos[0] += 16; return "uuid:" + v
++        if t in (0xd000, 0x15000, 0xb000, 0xc000, 0x11000, 0x12000, 0x14000): return {0xd000: "puerto", 0x15000: "puerto-recv",
++            0xb000: "fd", 0xc000: "shmem", 0x11000: "conexión", 0x12000: "endpoint", 0x14000: "tubería"}[t]
++        if t in (0xe000, 0xf000):
++            u32(); n = u32()
++            if depth > 4: return "…"
++            if t == 0xe000: return "[" + ", ".join(obj(depth + 1) for _ in range(n)) + "]"
++            items = []
++            for _ in range(n):
++                key = cstr(); items.append(f"{key}: {obj(depth + 1)}")
++            return "{" + ", ".join(items) + "}"
++        raise ValueError(hex(t))
++    try: return obj()
++    except Exception as e: return f"(no descodificable: {e})"
++
++def name(pid): return f"{progs.get(pid, '?')}[{pid}]"
++
++# llegada: la primera recepción posterior, del mismo remitente, al mismo puerto y con el mismo id
++by_key = defaultdict(list)
++for r in recvs: by_key[(r["de"], r["dest"], r["id"])].append(r)
++for s in sends:
++    if s.get("fail"): continue
++    for r in by_key.get((s["pid"], s["dest"], s["id"]), []):
++        if not r["used"] and r["n"] > s["n"]: r["used"] = True; s["recv"] = r; break
++# respuesta: un envío posterior cuyo destino es el puerto de respuesta de la petición
++by_dest = defaultdict(list)
++for s in sends: by_dest[s["dest"]].append(s)
++# o, aunque quien responde no tenga traza, una recepción posterior del que preguntó en ese puerto de respuesta
++rx_by_port = defaultdict(list)
++for r in recvs: rx_by_port[(r["pid"], r["dest"])].append(r)
++for s in sends:
++    if s["resp"] != "0x0":
++        s["reply"] = next((x for x in by_dest.get(s["resp"], []) if x["n"] > s["n"]), None) or \
++                     next((r for r in rx_by_port.get((s["pid"], s["resp"]), []) if r["n"] > s["n"] and r["res"] == "0x0"), None)
++
++# Subsistemas MIG que aparecen en estas trazas (id = base del subsistema + número de rutina).
++MIG = {1000: "notifyd", 11600: "logd", 20000: "configd", 400: "bootstrap", 3200: "mach_port", 3400: "host_priv",
++       200: "host", 3800: "thread_act", 4800: "mach_vm", 2400: "clock", 6100: "DiskArbitration"}
++
++def kind(mid):
++    if mid in (64, 65, 66, 69, 70, 71, 72):
++        return {64: "aviso", 65: "aviso PORT_DELETED", 66: "aviso", 69: "aviso PORT_DESTROYED", 70: "aviso NO_SENDERS",
++                71: "aviso SEND_ONCE", 72: "aviso DEAD_NAME"}[mid]
++    if mid & 0x10000000 or mid & 0x40000000: return "XPC"
++    for base in sorted(MIG, reverse=True):
++        if base <= mid < base + 100: return f"MIG {MIG[base]}#{mid - base}"
++    return f"MIG {mid}" if mid >= 100 else f"id {mid}"
++
++# 0x10000004 MACH_SEND_TIMED_OUT: cola llena con plazo (en los puertos de despertar de CFRunLoop/dispatch, de cola 1,
++# es lo normal: ya hay un despertar pendiente). 0x10000003 INVALID_DEST: el destino ya no existe.
++FALLOS = {"0x10000004": "cola llena (plazo agotado)", "0x10000003": "destino inválido"}
++
++def state(s):
++    if s.get("fail"): return "no enviado: " + FALLOS.get(s["fail"], s["fail"])
++    if s["to"] not in traced: llegada = "(sin traza)"
++    elif s["recv"]: llegada = "recibido" if s["recv"]["res"] == "0x0" else f"recibido con error {s['recv']['res']}"
++    else: llegada = "NO RECIBIDO"
++    if s["resp"] == "0x0": return llegada
++    return llegada + (", respondido" if s["reply"] else ", SIN RESPUESTA")
++
++# Petición que espera respuesta: el puerto de respuesta va como derecho de envío único (MAKE/MOVE_SEND_ONCE, 21/18),
++# o el remitente se queda esperando en la misma llamada. Los avisos que se registran (puerto de respuesta con derecho de
++# envío normal) no cuentan: se contestan cuando pasa algo, si pasa.
++def espera_respuesta(s):
++    return s["resp"] != "0x0" and (s["wait"] or ((int(s["bits"], 16) >> 8) & 0x1f) in (18, 21))
++
++def interesa(s): return not solo or progs.get(s["pid"]) in solo or progs.get(s["to"]) in solo
++
++print(f"== procesos con traza: {', '.join(sorted({name(p) for p in traced}))}")
++if full:
++    print("== conversación")
++    for s in sends:
++        if interesa(s):
++            print(f"   {s['n']:>7} {name(s['pid']):>26} -> {name(s['to']):<26} {kind(s['id']):<16} {state(s)}"
++                  + (f"   «{s['txt']}»" if s["txt"] else ""))
++            if xpc and s.get("body"):
++                d = xpc_decode(s["body"])
++                if d: print(f"              {d[:600]}")
++
++if follow:
++    pids = {p for p in traced if p in follow or progs.get(p) in follow}
++    print(f"== seguimiento de {', '.join(sorted(name(p) for p in pids)) or '(nadie con traza)'}")
++    ev = [("->", x) for x in sends if x["pid"] in pids] + [("<-", r) for r in recvs if r["pid"] in pids]
++    for d, x in sorted(ev, key=lambda e: e[1]["n"]):
++        if d == "->":
++            print(f"   {x['n']:>7} {name(x['pid'])}.{x['tid']} envía a {name(x['to'])} {kind(x['id'])} tam={x['size']}: {state(x)}"
++                  + (f"   «{x['txt']}»" if x["txt"] and not (xpc and x.get("body")) else ""))
++            if xpc and x.get("body"):
++                d = xpc_decode(x["body"])
++                if d: print(f"              {d[:600]}")
++            rp = x.get("reply")
++            if xpc and rp and rp.get("body"):                 # la respuesta, si quien responde también tiene traza
++                d = xpc_decode(rp["body"])
++                if d: print(f"              respuesta (línea {rp['n']}): {d[:600]}")
++        else:
++            err = "" if x["res"] == "0x0" else f" ERROR {x['res']}"
++            print(f"   {x['n']:>7} {name(x['pid'])}.{x['tid']} recibe de {name(x['de'])} {kind(x['id'])} tam={x['size']} en {x['dest']}{err}")
++            if xpc and x.get("body"):
++                d = xpc_decode(x["body"])
++                if d: print(f"              {d[:600]}")
++
++print("== por pareja (mensajes, sin recibir, sin respuesta)")
++pairs = Counter(); lost = Counter(); unans = Counter()
++for s in sends:
++    if not interesa(s): continue
++    k = (name(s["pid"]), name(s["to"]))
++    pairs[k] += 1
++    if s["to"] in traced and not s["recv"] and not s.get("fail"): lost[k] += 1
++    if s["resp"] != "0x0" and not s["reply"]: unans[k] += 1
++for k, v in pairs.most_common(30):
++    print(f"   {k[0]:>26} -> {k[1]:<26} {v:>5} {lost[k]:>5} {unans[k]:>5}")
++
++print("== a medias (lo que puede colgar una cadena)")
++malos = [s for s in sends if interesa(s) and s["pid"] != s["to"] and
++         not s.get("fail") and ((s["to"] in traced and not s["recv"]) or (espera_respuesta(s) and not s["reply"]))]
++for s in malos[-40:]:
++    print(f"   línea {s['n']}: {name(s['pid'])} -> {name(s['to'])} {kind(s['id'])} (id {s['id']}): {state(s)}"
++          + (f"   «{s['txt']}»" if s["txt"] else ""))
++if not malos: print("   nada: todo lo enviado llegó y las peticiones que esperaban tuvieron respuesta")
+diff --git a/tools/diag/msh.sh b/tools/diag/msh.sh
+index ed131ec..65c1632 100755
+--- a/tools/diag/msh.sh
++++ b/tools/diag/msh.sh
+@@ -8,25 +8,38 @@
+ #   STACKS=<proceso>  errores de sus syscalls con ruta, pilas al bloquearse o caer
+ #   ALL=1             con STACKS: todas sus syscalls y trampas Mach
+ #   MACH=1            traza de mensajes Mach, workloops e hilos de las colas (MT, WL, THR)
++#   WL=1              solo la de workloops (WL, WLQ, THR): para carreras que la traza Mach completa tapa; WL='<proc>...'
++#                     solo en esos procesos
+ #   IOK=1             traza de IOKit
++#   NS=1              cada aviso MACH_NOTIFY_NO_SENDERS: puerto, quién lo recibe y quién soltó el último derecho
++#   SR='<proc>...'    en esos procesos, cada cambio en la cuenta de derechos de envío (SR: puerto, quién, ±n, total)
+ #   CONSOLA=1         lo que se escribe en /dev/console (launchd anota ahí sus errores) se imprime al final
+ #   BRK='dir dir...'  int3 en esas direcciones (hex) del proceso de STACKS: registra los registros al pasar (BRK)
+-#   PEEK='expr...'    con BRK: lee 8 bytes en cada dirección o registro+desplazamiento (p. ej. rdi+0x50)
++#   BRKP='<proc>...'  los BRK en esos procesos en vez de en el de STACKS (sin el resto del diagnóstico, que ralentiza)
++#   PEEK='expr...'    con BRK: lee 8 bytes en cada dirección o registro+desplazamiento (p. ej. rdi+0x50); con * delante
++#                     (*rcx+0x10) muestra además el texto al que apunta ese valor (cadenas C, CFString constantes)
+ #   TAHOE_RUN=<bin>   otro binario de tahoe-run (comparar versiones)
+ #   TAHOE_DEPURAR=0   arranque normal; por omisión se usa el modo depuración (macos-shell.sh --depurar), en el que
+ #                     recoveryosd no reinicia si falla, para poder seguir mirando)
+ DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; mkdir -p "$D"
+-rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stacks /dev/shm/tahoe-stacks-all /dev/shm/tahoe-mach-trace /dev/shm/tahoe-iokit-trace /dev/shm/tahoe-console
++rm -f "$D/msh.log" /dev/shm/tahoe-break /dev/shm/tahoe-peek /dev/shm/tahoe-stacks /dev/shm/tahoe-stacks-all /dev/shm/tahoe-mach-trace /dev/shm/tahoe-wl-trace /dev/shm/tahoe-iokit-trace /dev/shm/tahoe-console /dev/shm/tahoe-ns-trace /dev/shm/tahoe-sr-trace /dev/shm/tahoe-brk-who
+ [ -n "$STACKS" ] && echo "$STACKS" > /dev/shm/tahoe-stacks
+ [ -n "$ALL" ] && touch /dev/shm/tahoe-stacks-all
+ [ -n "$MACH" ] && touch /dev/shm/tahoe-mach-trace
++[ -n "$WL" ] && { if [ "$WL" = 1 ]; then touch /dev/shm/tahoe-wl-trace; else echo "$WL" > /dev/shm/tahoe-wl-trace; fi; }
+ [ -n "$IOK" ] && touch /dev/shm/tahoe-iokit-trace
++[ -n "$NS" ] && touch /dev/shm/tahoe-ns-trace
++[ -n "$SR" ] && echo "$SR" > /dev/shm/tahoe-sr-trace
+ [ -n "$CONSOLA" ] && : > /dev/shm/tahoe-console
+ [ -n "$BRK" ] && printf "%s\n" $BRK > /dev/shm/tahoe-break
++[ -n "$BRKP" ] && echo "$BRKP" > /dev/shm/tahoe-brk-who
+ [ -n "$PEEK" ] && printf "%s\n" $PEEK > /dev/shm/tahoe-peek
+-TAHOE_RUN="${TAHOE_RUN:-}" TAHOE_LOGFILE="$D/msh.log" TAHOE_BOOT_WAIT="${2:-12}" timeout -s TERM -k 5 "${3:-60}" nice -n 10 \
++G="${TMPDIR:-/tmp}/tahoe-guard.log"; g0=$(wc -l < "$G" 2>/dev/null || echo 0)
++TAHOE_RUN="${TAHOE_RUN:-}" TAHOE_LOGFILE="$D/msh.log" TAHOE_BOOT_WAIT="${2:-12}" timeout -s TERM -k 5 "${3:-60}" \
+ 	"$DIAG/../macos-shell.sh" --launchd $([ "${TAHOE_DEPURAR:-1}" = 0 ] || echo --depurar) -c "$1" < /dev/null 2>&1
+ echo "[salida=$?]"
++# si el guardián de memoria cortó el arranque, decirlo (si no, parece que los procesos desaparecen sin más)
++tail -n +$((g0 + 1)) "$G" 2>/dev/null | sed 's/^/*** /'
+ [ -n "$CONSOLA" ] && { echo "--- consola ---"; cat /dev/shm/tahoe-console; cp /dev/shm/tahoe-console "$D/consola.log"; rm -f /dev/shm/tahoe-console; }
+ "$DIAG/clean.sh"
+diff --git a/tools/diag/pantalla.sh b/tools/diag/pantalla.sh
+new file mode 100755
+index 0000000..ddb1daa
+--- /dev/null
++++ b/tools/diag/pantalla.sh
+@@ -0,0 +1,29 @@
++#!/bin/bash
++# pantalla.sh [segundos] [cada]: arranca el macOS completo (launchd, sin orden) durante <segundos> (300) y cada <cada> s
++# (30) guarda la pantalla emulada en PNG (captura.py) y anota qué procesos gráficos están vivos (WindowServer,
++# loginwindow, Dock, Finder, SystemUIServer...). Sirve para ver hasta dónde llega el escritorio sin abrir el visor.
++#   TAHOE_ROOT: el macOS (por omisión el completo); TAHOE_RUN: otro binario; DEPURAR=1: modo depuración.
++# Salida en $TAHOE_DIAG_DIR/pantalla (por omisión ~/.cache/tahoe-diag/pantalla): t<seg>.png, pantalla.txt y el registro
++# de este arranque (pantalla.log). Siempre limpia.
++DIAG="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
++D="${TAHOE_DIAG_DIR:-$HOME/.cache/tahoe-diag}"; O="$D/pantalla"; rm -rf "$O"; mkdir -p "$O"
++export TAHOE_ROOT="${TAHOE_ROOT:-$HOME/macos26/completo/macOS}"
++T="${1:-300}"; C="${2:-30}"
++LOG="${TAHOE_LOGFILE:-/tmp/tahoe-shell-$USER.log}"
++if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt $(( ${TAHOE_LOG_MAX_MB:-300} * 1024 * 1024 )) ]; then : > "$LOG"; fi
++desde=$(( $( [ -f "$LOG" ] && wc -l < "$LOG" || echo 0) + 1 ))
++( TAHOE_BOOT_WAIT=5 timeout $(( T + 60 )) "$DIAG/../macos-shell.sh" ${DEPURAR:+--depurar} --launchd -c "sleep $(( T + 30 ))" \
++	> "$O/arranque.out" 2>&1 & )
++GRAF="WindowServer|loginwindow|Dock|Finder|SystemUIServer|ControlCenter|WindowManager|NotificationCenter|Language Chooser|Setup Assistant|universalaccessd"
++for (( t = C; t <= T; t += C )); do
++	sleep "$C"
++	# programas gráficos cargados en este arranque y si siguen vivos (el registro dice «cargado» y «fin <pid>»)
++	vivos=$(tail -n +"$desde" "$LOG" 2>/dev/null | LC_ALL=C grep -aoE "<[0-9]+> cargado ($GRAF) |fin <[0-9]+>" |
++		awk '/cargado/ {gsub(/[<>]/,"",$1); p[$1]=$3} /^fin/ {gsub(/[<>]/,"",$2); delete p[$2]} END {for (k in p) printf "%s(%s) ", p[k], k}')
++	cap=$(python3 "$DIAG/captura.py" "$O/t$t.png" 2>&1 | sed 's/ (.*//')
++	echo "t=$t: $cap | vivos: ${vivos:-ninguno}" | tee -a "$O/pantalla.txt"
++	pgrep -x tahoe-run > /dev/null || { echo "t=$t: el arranque terminó" | tee -a "$O/pantalla.txt"; break; }
++done
++tail -n +"$desde" "$LOG" > "$O/pantalla.log" 2>/dev/null
++"$DIAG/clean.sh" > /dev/null 2>&1
++grep -a "guardián" "$O/arranque.out" | head -1
+diff --git a/tools/diag/stub.py b/tools/diag/stub.py
+new file mode 100755
+index 0000000..814b07f
+--- /dev/null
++++ b/tools/diag/stub.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++# stub.py <dir_hex>...: destino de cada stub de la caché compartida de dyld ("jmp [rip+d32]", ff 25): lee el puntero de
++# su entrada de la GOT en la caché y lo decodifica (puntero encadenado v5: base de la caché + 34 bits bajos), y da su
++# imagen y símbolo con sym.py. Ejemplo de salida:
++#   7ff80f458ef2 -> 0x7ff806c53924 IOKit _IOConnectCallMethod+0x0
++# TAHOE_ROOT: sistema de macOS extraído (por omisión ~/macos26/base/macOS Base System).
++import glob, os, struct, subprocess, sys
++ROOT = os.environ.get("TAHOE_ROOT", os.path.expanduser("~/macos26/base/macOS Base System"))
++B = next((os.path.join(ROOT, c) for c in ("System/Library/dyld/dyld_shared_cache_x86_64",       # Recovery
++          "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h",    # macOS completo
++          "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64")
++          if os.path.exists(os.path.join(ROOT, c))), None) or sys.exit("no encuentro la caché de dyld en " + ROOT)
++BASE = 0x7ff800000000                                            # dirección de la caché (sin slide)
++maps = []                                                        # (dirección, tamaño, archivo, desplazamiento)
++for fn in [B] + sorted(glob.glob(B + ".[0-9]*")):
++    if fn.endswith((".map", "symbols", ".atlas")): continue
++    with open(fn, "rb") as f:
++        h = f.read(0x200)
++        mo, mc = struct.unpack_from("<II", h, 0x10)               # mappingOffset, mappingCount
++        f.seek(mo)
++        for _ in range(mc):
++            a, s, o = struct.unpack_from("<QQQ", f.read(32))
++            maps.append((a, s, fn, o))
++
++
++def read(va, n):
++    for a, s, fn, o in maps:
++        if a <= va < a + s:
++            with open(fn, "rb") as f:
++                f.seek(o + va - a)
++                return f.read(n)
++    return None
++
++
++out = []
++for arg in sys.argv[1:]:
++    va = int(arg, 16)
++    ins = read(va, 6)
++    if not ins or ins[:2] != b"\xff\x25":
++        out.append((arg, None, "no es un stub jmp [rip+d32]")); continue
++    got = va + 6 + struct.unpack_from("<i", ins, 2)[0]
++    raw = read(got, 8)
++    if not raw:
++        out.append((arg, None, "GOT fuera de la caché")); continue
++    v = struct.unpack("<Q", raw)[0]
++    t = v if BASE <= v < BASE + (1 << 34) else BASE + (v & 0x3ffffffff)   # ya resuelto, o encadenado (v5)
++    out.append((arg, t, None))
++names = {}
++targets = ["%#x" % t for _, t, _ in out if t]
++if targets:
++    r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sym.py"), *targets],
++                       capture_output=True, text=True).stdout
++    for l in r.splitlines():
++        p = l.split(None, 1)
++        if len(p) == 2: names[int(p[0], 16)] = p[1]
++for a, t, err in out:
++    print(f"{a} -> {err}" if err else f"{a} -> {t:#x} {names.get(t, '?')}")
+diff --git a/tools/diag/sym.py b/tools/diag/sym.py
+index 60cb8da..5d02cee 100755
+--- a/tools/diag/sym.py
++++ b/tools/diag/sym.py
+@@ -5,8 +5,16 @@
+ # TAHOE_ROOT: sistema de macOS extraído (por omisión ~/macos26/base/macOS Base System).
+ import bisect, os, re, struct, subprocess, sys
+ ROOT = os.environ.get("TAHOE_ROOT", os.path.expanduser("~/macos26/base/macOS Base System"))
+-C = os.path.join(ROOT, "System/Library/dyld/dyld_shared_cache_x86_64")
+-D = os.path.expanduser("~/.cache/tahoe-syms"); os.makedirs(D, exist_ok=True)
++def find_cache(root):
++    # la de la Recovery está en el sistema; la de un macOS completo, en el cryptex de Preboot (x86_64h en Haswell o posterior)
++    for c in ("System/Library/dyld/dyld_shared_cache_x86_64",
++              "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h",
++              "System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64"):
++        if os.path.exists(os.path.join(root, c)): return os.path.join(root, c)
++    sys.exit("no encuentro la caché de dyld en " + root)
++C = find_cache(ROOT)
++# símbolos guardados por caché (la Recovery y el sistema completo son versiones distintas)
++D = os.path.expanduser("~/.cache/tahoe-syms/%s-%x" % (os.path.basename(C), os.path.getsize(C))); os.makedirs(D, exist_ok=True)
+ f = open(C, 'rb'); io, ic = struct.unpack_from('<II', f.read(0x1c8), 0x1c0)   # imagesOffset, imagesCount
+ f.seek(io); t = f.read(ic * 32); im = []
+ for i in range(ic):

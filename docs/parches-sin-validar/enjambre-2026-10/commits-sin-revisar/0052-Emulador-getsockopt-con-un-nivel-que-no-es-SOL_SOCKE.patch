@@ -1,0 +1,37 @@
+From c1465c5a05e987faeebcef4f061a145ca32b698f Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:39:05 -0600
+Subject: [PATCH 52/57] Emulador: getsockopt con un nivel que no es SOL_SOCKET
+ da ENOPROTOOPT
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_net.c: con un nivel distinto de SOL_SOCKET, getsockopt devolvía
+  un búfer de ceros sin avisar de nada. En XNU, sogetoptlock devuelve
+  ENOPROTOOPT (bsd/kern/uipc_socket.c:5879). setsockopt ya lo hacía.
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_net.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/tahoe-run/emu_net.c b/tahoe-run/emu_net.c
+index 6d458cd..50681c3 100644
+--- a/tahoe-run/emu_net.c
++++ b/tahoe-run/emu_net.c
+@@ -443,7 +443,11 @@ static long net_getsockopt(struct ctx* c) {
+ 			int on = sock_nosigpipe_get(fd);
+ 			memcpy(v, &on, 4); l = 4;
+ 		} else if (lo < 0 || getsockopt(fd, SOL_SOCKET, lo, v, &l) < 0) { if (lo >= 0) return err(); memset(v, 0, 4); l = 4; }
+-	} else { memset(v, 0, 4); l = 4; }
++	} else {
++		// Un nivel que no sea SOL_SOCKET: en XNU, sogetoptlock devuelve ENOPROTOOPT (uipc_socket.c:5879) en vez de
++		// dejar el búfer a cero sin avisar. El nivel de SOL_SOCKET en Darwin es 0xffff.
++		return -D_ENOPROTOOPT;
++	}
+ 	uint32_t n = l < cap ? l : cap;
+ 	if (n && safe_write(c->a[3], v, n) < 0) return -D_EFAULT;
+ 	safe_write(c->a[4], &n, 4);

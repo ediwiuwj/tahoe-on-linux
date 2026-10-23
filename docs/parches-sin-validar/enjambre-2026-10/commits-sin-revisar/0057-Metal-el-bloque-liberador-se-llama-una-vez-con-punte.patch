@@ -1,0 +1,175 @@
+From ed41eb3ed6452d8b449b53044926270edfb50a68 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 01:34:22 -0600
+Subject: [PATCH 57/57] Metal: el bloque liberador se llama una vez con
+ (puntero, longitud) y ya tras la copia
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+La firma real del bloque en macOS 26 es void (^)(const void *bytes, NSUInteger length),
+no void (^)(const void *): hasta ahora se invocaba con un solo argumento.
+
+Se avisa al cliente justo después de copiar sus bytes, no cuando muere el buffer: el
+driver devuelve los objetos con +1 y sin autorelease, así que un cliente que siga la
+convención de Metal nunca los suelta y el bloque no se llamaría nunca (CoreImage se
+quedaría esperando su aviso). Si el buffer no llega a existir, el bloque no se llama
+(la memoria sigue siendo del cliente) pero su copia sí se suelta.
+
+Evidencia de quién pasa qué: SkyLight y MPSNeuralNetwork pasan NULL; CoreImage y
+MetalKit pasan un bloque real. Ninguno escribe en la memoria después de la llamada.
+
+De paso se quitan dos funciones muertas de la suite.
+---
+ tahoe-metal/src/bin/metalsuite.rs | 32 -----------------------
+ tahoe-metal/src/clases.rs         | 42 ++++++++++++++++++++++++-------
+ tahoe-metal/src/render.rs         | 23 ++++++++++++++---
+ 3 files changed, 53 insertions(+), 44 deletions(-)
+
+diff --git a/tahoe-metal/src/bin/metalsuite.rs b/tahoe-metal/src/bin/metalsuite.rs
+index 5dfbe1f..1c267fc 100644
+--- a/tahoe-metal/src/bin/metalsuite.rs
++++ b/tahoe-metal/src/bin/metalsuite.rs
+@@ -199,38 +199,6 @@ fn chequear_si_falta(inf: &mut Informe, nombre: &str, falta: Option<&str>, f: im
+     }
+ }
+ 
+-/// Una comprobación que depende de que exista un selector en el marco de Apple: si no existe, no es un fallo del
+-/// driver, se cuenta como saltada.
+-fn comprobar(inf: &mut Informe, nombre: &str, selector: Option<&str>, f: impl FnOnce() -> Result<(), String>) {
+-    match selector {
+-        Some(s) if !existe(s) => {
+-            inf.saltados += 1;
+-            println!("  (n/d)   {nombre}: Apple no tiene «{s}»");
+-        }
+-        _ => chequear(inf, nombre, f),
+-    }
+-}
+-
+-/// Si el marco de Apple (Metal) tiene ese selector de clase.
+-fn existe(selector: &str) -> bool {
+-    unsafe {
+-        // Se busca en cualquier clase de Metal registrada: el runtime lo resuelve por nombre de selector.
+-        let h = dlopen(c"/System/Library/Frameworks/Metal.framework/Metal".as_ptr(), 2);
+-        if h.is_null() {
+-            return false;
+-        }
+-        // metal: usa el runtime de Objective-C: se mira si alguna clase Metal implementa el selector.
+-        let clases = [
+-            "MTLTextureDescriptor", "MTLSamplerStateDescriptor", "MTLRenderPipelineDescriptor", "MTLHeapDescriptor",
+-            "MTLArgumentBufferDescriptor", "MTLIndirectCommandBufferDescriptor", "MTLResidencySetDescriptor",
+-        ];
+-        clases.iter().any(|c| {
+-            let clase = objc::clase(c);
+-            !clase.is_null() && objc::responde_clase(clase, selector)
+-        })
+-    }
+-}
+-
+ /// Métodos del protocolo que el driver no implementa: se comparan las implementaciones de la clase del driver con las
+ /// de la clase madre de Apple (_MTLDevice). Si son la misma, es que el driver no lo implementa.
+ fn sin_implementar(d: Id) -> Vec<(String, String)> {
+diff --git a/tahoe-metal/src/clases.rs b/tahoe-metal/src/clases.rs
+index 169a89c..9ef7a82 100644
+--- a/tahoe-metal/src/clases.rs
++++ b/tahoe-metal/src/clases.rs
+@@ -435,8 +435,8 @@ impl Drop for Buffer {
+         // SAFETY: proyección hecha en nuevo_buffer.
+         unsafe { munmap(self.ptr.cast(), self.proyectado) };
+         if let Some(b) = self.liberador {
+-            // SAFETY: bloque copiado con _Block_copy; el liberador toma la memoria del cliente.
+-            unsafe { liberar_con_bloque(b, self.origen) };
++            // SAFETY: bloque copiado con _Block_copy; el liberador toma la memoria del cliente y su longitud.
++            unsafe { liberar_con_bloque(b, self.origen, self.len as u64) };
+         }
+         soltar(self.etiqueta);
+     }
+@@ -740,21 +740,45 @@ unsafe fn llamar_bloque(b: *mut c_void, arg: Id) {
+     invoke(b, arg);
+ }
+ 
+-/// Llama a un bloque liberador `void (^)(const void *)` con el puntero a la memoria del cliente.
++/// Llama a un bloque liberador con el puntero a la memoria del cliente y su longitud.
++///
++/// En macOS 26 la firma del bloque es `void (^)(const void *bytes, NSUInteger length)` (cadena `v24@?0^v8Q16` en el
++/// descriptor del literal de bloque de la caché de macOS 26), no `void (^)(const void *)`: el bloque de CoreImage y
++/// el de MetalKit son de ese tipo, así que hay que pasar los dos argumentos.
+ ///
+ /// # Safety
+ /// `b` debe ser un bloque con esa firma.
+-unsafe fn llamar_bloque_con_puntero(b: *mut c_void, p: *const u8) {
+-    let invoke: extern "C-unwind" fn(*mut c_void, *const u8) = std::mem::transmute(*(b.cast::<u8>().add(16) as *const *const c_void));
+-    invoke(b, p);
++unsafe fn llamar_bloque_con_puntero(b: *mut c_void, p: *const u8, len: u64) {
++    let invoke: extern "C-unwind" fn(*mut c_void, *const u8, u64) =
++        std::mem::transmute(*(b.cast::<u8>().add(16) as *const *const c_void));
++    invoke(b, p, len);
+ }
+ 
+ /// Llama al bloque liberador con la memoria del cliente y suelta la copia del bloque: el bloque se llama una sola vez.
+ ///
+ /// # Safety
+-/// `b` debe ser un bloque `void (^)(const void *)` copiado con `_Block_copy`.
+-unsafe fn liberar_con_bloque(b: *mut c_void, origen: *const u8) {
+-    llamar_bloque_con_puntero(b, origen);
++/// `b` debe ser un bloque `void (^)(const void *, NSUInteger)` copiado con `_Block_copy`.
++unsafe fn liberar_con_bloque(b: *mut c_void, origen: *const u8, len: u64) {
++    llamar_bloque_con_puntero(b, origen, len);
++    _Block_release(b);
++}
++
++/// Llama al bloque liberador del cliente (con su puntero y su longitud) y suelta la copia: se llama **una sola vez**.
++///
++/// Es `pub` porque el llamador puede querer avisar en el momento en que los bytes ya están copiados, sin esperar a
++/// que el buffer muera.
++///
++/// # Safety
++/// `b` debe ser un bloque `void (^)(const void *, NSUInteger)` copiado con `_Block_copy`.
++pub unsafe fn liberar_bloque_del_cliente(b: *mut c_void, origen: *const u8, len: u64) {
++    liberar_con_bloque(b, origen, len);
++}
++
++/// Suelta la copia de un bloque sin llamarlo (el buffer no llegó a existir: la memoria sigue siendo del cliente).
++///
++/// # Safety
++/// `b` debe ser un bloque copiado con `_Block_copy`.
++pub unsafe fn soltar_bloque(b: *mut c_void) {
+     _Block_release(b);
+ }
+ 
+diff --git a/tahoe-metal/src/render.rs b/tahoe-metal/src/render.rs
+index 8d6c83e..a82a12f 100644
+--- a/tahoe-metal/src/render.rs
++++ b/tahoe-metal/src/render.rs
+@@ -1271,11 +1271,28 @@ extern "C-unwind" fn dev_residencia(_this: Id, _cmd: Sel, desc: Id, error: *mut
+ extern "C-unwind" fn dev_buffer_nocopia(_this: Id, _cmd: Sel, p: *const u8, len: u64, opciones: u64, liberador: Id) -> Id {
+     // SAFETY: el cliente garantiza que hay len bytes en p (si no hay memoria, p es nulo y no se lee nada).
+     let datos = if p.is_null() { None } else { Some(unsafe { std::slice::from_raw_parts(p, len as usize) }) };
+-    // El bloque se copia siempre que no sea nulo: si no hay memoria del cliente, se llamará con NULL al morir el buffer.
++    // El bloque se copia siempre que no sea nulo: si no hay memoria del cliente, se llamará con NULL.
+     let bloq = clases::copiar_bloque(liberador);
+-    match clases::nuevo_buffer_con_liberador(len as usize, opciones, datos, bloq, p) {
+-        Ok(b) => b,
++    match clases::nuevo_buffer_con_liberador(len as usize, opciones, datos, None, p) {
++        Ok(b) => {
++            // Los bytes ya están copiados al fichero del servidor: la memoria del cliente ya no la necesita Metal
++            // para nada, así que se avisa AHORA, exactamente una vez y con su puntero y su longitud. Si se esperase
++            // a que el buffer muera, el bloque no se llamaría nunca en un cliente que no suelta el objeto (Metal
++            // devuelve los objetos autoreleados) y ese cliente se quedaría esperando su aviso: es el caso de
++            // CoreImage, cuyo bloque recupera el contexto de la conversión.
++            if let Some(bloque) = bloq {
++                // SAFETY: bloque copiado con _Block_copy, con la firma void (^)(const void *, NSUInteger).
++                unsafe { clases::liberar_bloque_del_cliente(bloque, p, len) };
++            }
++            b
++        }
+         Err(e) => {
++            // El buffer no llegó a existir: la memoria sigue siendo del cliente, así que el bloque NO se llama;
++            // solo se suelta la copia.
++            if let Some(bloque) = bloq {
++                // SAFETY: bloque copiado con _Block_copy.
++                unsafe { clases::soltar_bloque(bloque) };
++            }
+             registro(&format!("newBufferWithBytesNoCopy:{len}: {e}"));
+             std::ptr::null_mut()
+         }

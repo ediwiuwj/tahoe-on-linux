@@ -1,0 +1,301 @@
+From 9ccbe6b35826e901dcb65170fdd3d166072c5ab3 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:52:54 -0600
+Subject: [PATCH 53/57] Traductor: pruebas de las function constants y el
+ nombre del cliente
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Las function constants llegan al shader por dos caminos que se prueban ahora:
+- El cliente pone el nombre tal como aparece en el código («_shader_state») y en
+  el AIR el nombre viene cualificado («RB::Shader::Constant::_shader_state»):
+  `coincide()` acepta los dos, y el servidor lo usa.
+- Una constante vectorial (uint4) llega del cliente como cuatro escalares
+  consecutivos (setConstantValues:type:withRange:) y `valor_de()` los reúne.
+
+Tres pruebas unitarias: el nombre, los componentes de un tipo vectorial y la
+reunión de los escalares.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-gpu/src/air/fc.rs           | 95 ++++++++++++++++++++++++-------
+ tahoe-gpu/src/air/spirv_inst.rs   |  1 -
+ tahoe-gpu/src/servir.rs           |  3 +-
+ tahoe-metal/src/bin/metalprobe.rs | 65 ++++++++++++++-------
+ tahoe-metal/src/lib.rs            | 16 +++++-
+ 5 files changed, 133 insertions(+), 47 deletions(-)
+
+diff --git a/tahoe-gpu/src/air/fc.rs b/tahoe-gpu/src/air/fc.rs
+index 461d525..7f7154d 100644
+--- a/tahoe-gpu/src/air/fc.rs
++++ b/tahoe-gpu/src/air/fc.rs
+@@ -66,6 +66,17 @@ pub struct Especializacion {
+ 
+ /// Especializa con `valores` (índice de la function constant → valor). Las que no se den quedan sin definir
+ /// (air.is_function_constant_defined da falso).
++/// Si el nombre que pone el cliente («_shader_state») es el de la constante del AIR
++/// («RB::Shader::Constant::_shader_state»).
++pub fn coincide(nombre_air: &str, nombre_cliente: &str) -> bool {
++    if nombre_air == nombre_cliente {
++        return true;
++    }
++    // El cliente escribe el nombre tal como aparece en el código; en el AIR viene cualificado.
++    let corto = nombre_air.rsplit("::").next().unwrap_or(nombre_air);
++    corto == nombre_cliente
++}
++
+ /// Cuántos componentes tiene una constante de tipo vectorial («uint4» → 4, «float3» → 3).
+ fn componentes(tipo: &str) -> Option<usize> {
+     let n = tipo.chars().last()?.to_digit(10)? as usize;
+@@ -76,33 +87,38 @@ fn componentes(tipo: &str) -> Option<usize> {
+     }
+ }
+ 
++/// El valor de una constante, tal y como lo da el cliente. Una constante vectorial (uint4, float4...) llega
++/// como varios escalares consecutivos (el cliente los pone con setConstantValues:type:withRange:) y aquí se reunen.
++fn valor_de(fc: &FuncConst, valores: &HashMap<u32, V>) -> Res<Option<V>> {
++    let Some(v) = valores.get(&fc.indice) else { return Ok(None) };
++    if matches!(v, V::Vec(_)) {
++        return Ok(Some(v.clone()));
++    }
++    let Some(n) = componentes(&fc.tipo) else { return Ok(Some(v.clone())) };
++    if n <= 1 {
++        return Ok(Some(v.clone()));
++    }
++    let mut vs = Vec::with_capacity(n);
++    for k in 0..n {
++        match valores.get(&(fc.indice + k as u32)) {
++            Some(x) => vs.push(x.clone()),
++            None => return Err(format!("constante {}: faltan componentes", fc.nombre)),
++        }
++    }
++    Ok(Some(V::Vec(vs)))
++}
++
+ pub fn especializar(m: &Module, valores: &HashMap<u32, V>) -> Res<Especializacion> {
+     let mut mem = Memoria::nueva(m);
+     let mut definidas = Vec::new();
+     for fc in constantes(m) {
+-        if let Some(v) = valores.get(&fc.indice) {
++        if let Some(v) = valor_de(&fc, valores)? {
+             let ty = m.globals[fc.global].ty;
+             // un bool de Metal es un i8 en memoria
+-            let mut v = match (&m.types[ty], v) {
+-                (Type::Int(8), V::Int(1, x)) => V::Int(8, *x),
+-                (_, v) => v.clone(),
++            let v = match (&m.types[ty], v) {
++                (Type::Int(8), V::Int(1, x)) => V::Int(8, x),
++                (_, v) => v,
+             };
+-            // Una constante vectorial (uint4, float4...) llega del cliente como varios escalares consecutivos:
+-            // el cliente los pone con setConstantValues:type:withRange:, y aquí se reunen.
+-            if !matches!(v, V::Vec(_)) {
+-                if let Some(n) = componentes(&fc.tipo) {
+-                    if n > 1 {
+-                        let mut vs = Vec::with_capacity(n);
+-                        for k in 0..n {
+-                            match valores.get(&(fc.indice + k as u32)) {
+-                                Some(x) => vs.push(x.clone()),
+-                                None => return Err(format!("constante {}: faltan componentes", fc.nombre)),
+-                            }
+-                        }
+-                        v = V::Vec(vs);
+-                    }
+-                }
+-            }
+             mem.guardar(m, &V::Ptr(Mem::Global(fc.global), 0), ty, &v).map_err(|e| format!("constante {}: {e}", fc.nombre))?;
+             definidas.push(fc.global);
+         }
+@@ -150,3 +166,42 @@ pub fn especializar(m: &Module, valores: &HashMap<u32, V>) -> Res<Especializacio
+     }
+     Ok(Especializacion { memoria: mem, definidas })
+ }
++
++#[cfg(test)]
++mod pruebas {
++    use super::*;
++
++    #[test]
++    fn el_nombre_del_cliente_coincide_con_el_del_air() {
++        assert!(coincide("RB::Shader::Constant::_shader_state", "_shader_state"));
++        assert!(coincide("_shader_state", "_shader_state"));
++        assert!(!coincide("RB::Shader::Constant::_shader_state", "otra_cosa"));
++    }
++
++    #[test]
++    fn los_componentes_de_un_tipo_vectorial() {
++        assert_eq!(componentes("uint4"), Some(4));
++        assert_eq!(componentes("float3"), Some(3));
++        assert_eq!(componentes("half2"), Some(2));
++        assert_eq!(componentes("uint"), None);
++    }
++
++    #[test]
++    fn una_constante_vectorial_se_reune_de_esc() {
++        // El cliente pone cuatro escalares en los índices 0..3; la constante del AIR es un uint4 en el índice 0.
++        let fc = FuncConst { global: 0, tipo: "uint4".into(), nombre: "_shader_state".into(), indice: 0 };
++        let mut v = HashMap::new();
++        v.insert(0u32, V::Int(32, 0));
++        v.insert(1u32, V::Int(32, 0));
++        v.insert(2u32, V::Int(32, 0x80000));
++        v.insert(3u32, V::Int(32, 0));
++        let valor = valor_de(&fc, &v).unwrap().unwrap();
++        match valor {
++            V::Vec(es) => {
++                assert_eq!(es.len(), 4);
++                assert!(matches!(es[2], V::Int(32, 0x80000)));
++            }
++            o => panic!("se esperaba un vector, se obtuvo {o:?}"),
++        }
++    }
++}
+diff --git a/tahoe-gpu/src/air/spirv_inst.rs b/tahoe-gpu/src/air/spirv_inst.rs
+index 2fafbba..fb224d1 100644
+--- a/tahoe-gpu/src/air/spirv_inst.rs
++++ b/tahoe-gpu/src/air/spirv_inst.rs
+@@ -493,7 +493,6 @@ impl Tr<'_> {
+             // La capa y el viewport (multiview) no tienen built-in en Vulkan (Layer solo existe en geometría y
+             // el índice de capa exige la extensión VK_EXT_shader_viewport_index_layer): salen como un location
+             // más, que es lo que hizo el prototipo de AIR.
+-            let multiview = matches!(d.clase.as_str(), "air.render_target_array_index" | "air.viewport_array_index");
+             let pt = self.ptr_t(StorageClass::Output, st);
+             let var = self.var_global(pt, StorageClass::Output, None);
+             match d.clase.as_str() {
+diff --git a/tahoe-gpu/src/servir.rs b/tahoe-gpu/src/servir.rs
+index 8d79902..1ab4370 100644
+--- a/tahoe-gpu/src/servir.rs
++++ b/tahoe-gpu/src/servir.rs
+@@ -376,8 +376,7 @@ impl Cliente {
+                         // El cliente pone el nombre tal como se escribe en el código («_shader_state»); en el
+                         // AIR el nombre viene cualificado («RB::Shader::Constant::_shader_state»): se comparan
+                         // los dos, o la constante del cliente no llegaría nunca al shader.
+-                        let corto = fc.nombre.rsplit("::").next().unwrap_or(&fc.nombre);
+-                        if let Some((_, v)) = por_nombre.iter().find(|(n, _)| *n == fc.nombre || *n == corto) {
++                        if let Some((_, v)) = por_nombre.iter().find(|(n, _)| air::fc::coincide(&fc.nombre, n)) {
+                             op2.constantes.insert(fc.indice, v.clone());
+                         }
+                     }
+diff --git a/tahoe-metal/src/bin/metalprobe.rs b/tahoe-metal/src/bin/metalprobe.rs
+index d111217..cae2535 100644
+--- a/tahoe-metal/src/bin/metalprobe.rs
++++ b/tahoe-metal/src/bin/metalprobe.rs
+@@ -9,6 +9,22 @@ mod objc;
+ 
+ use objc::Id;
+ 
++/// Anota una línea en un fichero: si el proceso aborta, lo que iba por stdout se pierde.
++fn nota(texto: &str) {
++    use std::io::Write;
++    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/private/var/tmp/nota.txt") {
++        let _ = writeln!(f, "{texto}");
++    }
++}
++
++/// Un NSRange (de Foundation): dos enteros de 64 bits.
++#[repr(C)]
++#[derive(Clone, Copy)]
++struct Rango {
++    loc: u64,
++    len: u64,
++}
++
+ extern "C" {
+     fn dlopen(p: *const c_char, modo: c_int) -> *mut c_void;
+     fn dlsym(h: *mut c_void, s: *const c_char) -> *mut c_void;
+@@ -110,7 +126,10 @@ fn cadena(d: Id) -> i32 {
+         let por_descriptor = |lib: Id, nombre: &str| -> Id {
+             let desc: Id = objc::m0(objc::clase("MTLFunctionDescriptor"), "alloc");
+             objc::m1::<Id, ()>(desc, "setName:", objc::nsstring(nombre));
+-            objc::m2(lib, "newFunctionWithDescriptor:error:", desc, std::ptr::null_mut::<Id>())
++            nota("creando la función por descriptor");
++            let f: Id = objc::m2(lib, "newFunctionWithDescriptor:error:", desc, std::ptr::null_mut::<Id>());
++            nota(&format!("función: {}", if f.is_null() { "nil" } else { "ok" }));
++            f
+         };
+         let vf = por_descriptor(lib, &vn);
+         let ff = por_descriptor(lib, &fnn);
+@@ -203,31 +222,33 @@ fn plano_con(d: Id, constante: bool) -> i32 {
+             println!("biblioteca: nil");
+             return 3;
+         }
+-        // Los valores de la constante: un uint4 con el bit 0x80000 en el componente 2.
+-        let mut valores: Id = std::ptr::null_mut();
+-        if constante {
+-            valores = objc::m0(objc::clase("MTLFunctionConstantValues"), "alloc");
+-            if valores.is_null() {
+-                println!("MTLFunctionConstantValues: nil");
+-                return 8;
+-            }
+-            valores = objc::m0(valores, "init");
+-            let mut v = [0u32; 4];
+-            v[2] = 0x80000;
+-            // MTLDataType: 32 = cuatro enteros de 32 bits (16 bytes).
+-            objc::m3::<*const u32, u64, Id, ()>(valores, "setConstantValue:type:withName:", v.as_ptr(), 32, objc::nsstring("_shader_state"));
+-        }
+-        // La función, por descriptor (como hace el compositor).
+-        let por_descriptor = |lib: Id, nombre: &str| -> Id {
+-            let desc: Id = objc::m0(objc::clase("MTLFunctionDescriptor"), "alloc");
++        // La función, por descriptor (como hace el compositor). Los valores de la constante se ponen en el
++        // objeto que da el propio descriptor: en macOS 26, MTLFunctionConstantValues es una fachada y el objeto
++        // de verdad es un MTLFunctionConstantValuesInternal, que es el único que acepta los valores.
++        let por_descriptor = |lib: Id, nombre: &str, con_constante: bool| -> Id {
++            let desc: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLFunctionDescriptor"), "alloc"), "init");
+             objc::m1::<Id, ()>(desc, "setName:", objc::nsstring(nombre));
+-            if !valores.is_null() {
+-                objc::m1::<Id, ()>(desc, "setConstantValues:", valores);
++            if con_constante {
++                // Los valores: un uint4 con el bit 0x80000 en el componente 2 (el shader fuerza el alfa a 1).
++                let valores: Id = objc::m0(objc::m0::<Id>(objc::clase("MTLFunctionConstantValues"), "alloc"), "init");
++                nota(&format!("valores: {}", objc::nombre_clase(objc::object_getClass(valores))));
++                let mut v = [0u32; 4];
++                v[2] = 0x80000;
++                // Una constante vectorial se pone con el rango: cuatro escalares (MTLDataType 29 = un entero
++                // de 32 bits) en los índices 0..3.
++                let r = Rango { loc: 0, len: 4 };
++                nota("poniendo la constante por rango");
++                objc::m3::<*const u32, u64, Rango, ()>(valores, "setConstantValues:type:withRange:", v.as_ptr(), 29, r);
++                nota("constante puesta");
++                // Con los valores, la función se pide por nombre (la vía que usa el driver).
++                let f: Id = objc::m3::<Id, Id, *mut Id, Id>(lib, "newFunctionWithName:constantValues:error:", objc::nsstring(nombre), valores, std::ptr::null_mut::<Id>());
++                nota(&format!("función con constantes: {}", if f.is_null() { "nil" } else { "ok" }));
++                return f;
+             }
+             objc::m2(lib, "newFunctionWithDescriptor:error:", desc, std::ptr::null_mut::<Id>())
+         };
+-        let vf = por_descriptor(lib, "plane__vertex");
+-        let ff = por_descriptor(lib, "plane_color_fragment");
++        let vf = por_descriptor(lib, "plane__vertex", false);
++        let ff = por_descriptor(lib, "plane_color_fragment", constante);
+         if vf.is_null() || ff.is_null() {
+             println!("shaders: vertex={} fragment={}", if vf.is_null() { "nil" } else { "ok" }, if ff.is_null() { "nil" } else { "ok" });
+             return 4;
+diff --git a/tahoe-metal/src/lib.rs b/tahoe-metal/src/lib.rs
+index 940c5b7..2c1689a 100644
+--- a/tahoe-metal/src/lib.rs
++++ b/tahoe-metal/src/lib.rs
+@@ -430,10 +430,22 @@ extern "C-unwind" fn nombre(_this: Id, _cmd: Sel) -> Id {
+     objc::nsstring(if n.is_empty() { "Tahoe GPU" } else { &n })
+ }
+ 
++/// `respondsToSelector:` sobre el dispositivo: contesta YES para todo lo que la clase tiene, stubs incluidos.
++///
++/// `_MTLDevice` NO implementa `respondsToSelector:` (en el runtime de macOS 26 no aparece
++/// `-[_MTLDevice respondsToSelector…]`, sólo el símbolo indefinido `_objc_opt_respondsToSelector`), así que el
++/// `objc_msgSendSuper` de abajo acaba ejecutando la IMP de NSObject (`-[NSObject respondsToSelector:]`). Esa IMP
++/// reenvía a `objc_msgSend`, que consulta la clase REAL del receptor (`object_getClass` -> TahoeMTLDevice), y
++/// ahí los stubs que añade `stubs::registrar` con `class_addMethod` sí están: por eso la respuesta es YES.
++///
++/// Es intencionado: el driver registra los stubs del protocolo MTLDevice (los que pone `stubs::registrar`, y
++/// cuyo número sale en el registro: «stubs del protocolo MTLDevice: N») precisamente para que el cliente NO
++/// reciba la implementación abstracta de Apple (que lanza una NSException y mata el proceso). Por eso
++/// `respondsToSelector:` contesta YES y, si el cliente pregunta, llama al stub y recibe nil/0.
+ extern "C-unwind" fn responde(this: Id, cmd: Sel, s: Sel) -> Bool {
+-    // SAFETY: NSObject implementa respondsToSelector:.
++    // SAFETY: la IMP que se ejecuta es la de NSObject (`-[NSObject respondsToSelector:]`), que existe.
+     let r: Bool = unsafe { objc::super1(this, madre(), cmd, s) };
+-    registro(&format!("respondsToSelector:{} -> {r}", objc::nombre_sel(s)));
++    registro(&format!("respondsToSelector:{} -> {}", objc::nombre_sel(s), if r != 0 { "YES" } else { "NO" }));
+     r
+ }
+ 

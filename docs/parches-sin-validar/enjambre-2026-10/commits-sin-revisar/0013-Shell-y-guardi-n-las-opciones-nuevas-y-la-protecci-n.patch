@@ -1,0 +1,233 @@
+From 66364b29f7b3b90bc85f76d13a16f0fbad195706 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:41:52 -0600
+Subject: [PATCH 13/57] =?UTF-8?q?Shell=20y=20guardi=C3=A1n:=20las=20opcion?=
+ =?UTF-8?q?es=20nuevas=20y=20la=20protecci=C3=B3n=20de=20la=20memoria?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- macos-shell.sh: --launchd para unirse al launchd emulado, --pantalla para
+  el visor y --depurar para el modo de depuración.
+- mem_guard.sh: el guardián que vigila la RAM disponible y el crecimiento
+  del swap durante las pruebas.
+- shell_survey.sh: el inventario corto de 79 órdenes, con la clasificación
+  OK, ERR, COLGADA o SEÑAL.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tools/macos-shell.sh  | 87 ++++++++++++++++++++++++++++++++++++++-----
+ tools/mem_guard.sh    | 16 +++++---
+ tools/shell_survey.sh | 14 ++++++-
+ 3 files changed, 101 insertions(+), 16 deletions(-)
+
+diff --git a/tools/macos-shell.sh b/tools/macos-shell.sh
+index 019db34..ad6208b 100755
+--- a/tools/macos-shell.sh
++++ b/tools/macos-shell.sh
+@@ -6,8 +6,10 @@
+ #   tools/macos-shell.sh --launchd                # shell unida a launchd (launchctl, defaults... hablan con sus servicios)
+ #   tools/macos-shell.sh --launchd -c 'launchctl list'
+ #   tools/macos-shell.sh --launchd --depurar      # modo depuración (ver abajo)
++#   tools/macos-shell.sh --launchd --pantalla     # además abre el visor de la pantalla de macOS (tools/tahoe-view)
+ #
+ # TAHOE_RUN: binario de tahoe-run a usar (por omisión, el del repo).
++# TAHOE_NICE: prioridad de macOS en Linux (nice, por omisión 0, la normal; p. ej. 10 para que moleste menos al escritorio).
+ # TAHOE_ROOT: carpeta con el sistema base de macOS extraído (por omisión ~/macos26/base/macOS Base System).
+ # El entorno se limpia: el programa ve un entorno de macOS (PATH, HOME=/var/root, usuario root), no el de Linux.
+ #
+@@ -20,26 +22,61 @@
+ # --depurar: modo depuración. Pone en la NVRAM emulada ROS_SLEEP_ON_FAILURE, el ajuste de recoveryosd para que, si algo le
+ # obliga a reiniciar (hoy: el llavero de root), se quede dormido en vez de ejecutar /sbin/reboot y apagar todo el arranque.
+ # Sin la opción, el arranque es el normal, como en un Mac.
++#
++# --pantalla: abre el visor tools/tahoe-view (Rust; compílalo con `cargo build --release` en esa carpeta), que muestra en una ventana la
++# memoria de vídeo emulada en la que dibuja WindowServer (/dev/shm/tahoe-fb-<id>). Implica --launchd.
+ ROOT="${TAHOE_ROOT:-$HOME/macos26/base/macOS Base System}"
+ TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ RUN="${TAHOE_RUN:-$(cd "$TOOLS/../tahoe-run" && pwd)/tahoe-run}"   # TAHOE_RUN: otro binario (comparar versiones)
+ if [ ! -x "$RUN" ]; then echo "falta $RUN: compila con tahoe-run/build.sh" >&2; exit 1; fi
+-if [ ! -f "$ROOT/System/Library/dyld/dyld_shared_cache_x86_64" ]; then echo "no encuentro el sistema base de macOS en: $ROOT (define TAHOE_ROOT)" >&2; exit 1; fi
++# Caché de dyld: en la Recovery está en el propio sistema; en un macOS completo viene en el cryptex del sistema (Preboot), y en
++# un procesador Haswell o posterior dyld usa la variante x86_64h, como en un Mac.
++DYLD_CACHE=
++for c in "$ROOT/System/Library/dyld/dyld_shared_cache_x86_64" \
++	"$ROOT/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h" \
++	"$ROOT/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64"; do
++	[ -f "$c" ] && { DYLD_CACHE="$c"; break; }
++done
++if [ -z "$DYLD_CACHE" ]; then echo "no encuentro el sistema de macOS en: $ROOT (define TAHOE_ROOT)" >&2; exit 1; fi
+ CACHE="${TAHOE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tahoe-run}"   # el slide de la caché de dyld se calcula una vez
+ LOG="${TAHOE_LOGFILE:-/tmp/tahoe-shell-$USER.log}"
++# El registro crece con cada arranque (las herramientas toman de él solo el último) y /tmp suele ser tmpfs, es decir, RAM:
++# pasado TAHOE_LOG_MAX_MB (300) se vacía antes de arrancar. Lleno, /tmp daba «Disk quota exceeded» y no arrancaba nada.
++if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt $(( ${TAHOE_LOG_MAX_MB:-300} * 1024 * 1024 )) ]; then : > "$LOG"; fi
+ 
+ WITH_LAUNCHD= DEBUG_ENV=()
+-while [ "$1" = --launchd ] || [ "$1" = --depurar ]; do
++while [ "$1" = --launchd ] || [ "$1" = --depurar ] || [ "$1" = --pantalla ]; do
+ 	[ "$1" = --launchd ] && WITH_LAUNCHD=1
++	[ "$1" = --pantalla ] && WITH_LAUNCHD=1 WITH_VIEW=1
+ 	[ "$1" = --depurar ] && DEBUG_ENV=(TAHOE_DEBUG_NOREBOOT=1)
+ 	shift
+ done
+ [ $# -eq 0 ] && set -- -l
+ 
++# Clave OSK del SMC (64 bytes) para descifrar los programas protegidos de macOS (loginwindow, Finder, Dock...): no va en el
++# repositorio; si existe ~/.config/tahoe-run/osk (o TAHOE_OSK_FILE), tahoe-run la usa (ver tahoe-run/emu_dsmos.c).
++OSK="${TAHOE_OSK_FILE:-$HOME/.config/tahoe-run/osk}"
++OSK_ENV=(); [ -r "$OSK" ] && OSK_ENV=(TAHOE_OSK_FILE="$(readlink -f "$OSK")")
++# Identidad del equipo (modelo, número de serie, MLB, UUID, ROM) generada con macserial por tools/smbios.sh: tampoco va en el
++# repositorio. Sin ella, tahoe-run se presenta como un MacBookPro16,1 ficticio.
++SMBIOS="${TAHOE_SMBIOS_FILE:-$HOME/.config/tahoe-run/smbios.json}"
++[ -r "$SMBIOS" ] && OSK_ENV+=(TAHOE_SMBIOS_FILE="$(readlink -f "$SMBIOS")")
++# Argumentos de arranque de macOS (NVRAM boot-args y kern.bootargs), p. ej. TAHOE_BOOTARGS="useIOP=0".
++[ -n "$TAHOE_BOOTARGS" ] && OSK_ENV+=(TAHOE_BOOTARGS="$TAHOE_BOOTARGS")
++[ -n "$TAHOE_GPU" ] && OSK_ENV+=(TAHOE_GPU="$TAHOE_GPU")          # otra identidad PCI para la GPU emulada
++# Driver Metal (tahoe-metal): carpeta del anfitrión con TahoeMetal.bundle; con ella macOS ve un IOAccelerator con ese driver.
++# Con él arranca también el servidor de GPU de Linux (tahoe-gpu servir, Vulkan), al que el driver manda los comandos por
++# el socket TAHOE_GPU_SOCK (por omisión /dev/shm/tahoe-gpu-<uid>.sock).
++GPU_SRV=
++if [ -n "$TAHOE_METAL" ]; then
++	OSK_ENV+=(TAHOE_METAL="$(readlink -f "$TAHOE_METAL")")
++	TAHOE_GPU_SOCK="${TAHOE_GPU_SOCK:-/dev/shm/tahoe-gpu-$(id -u).sock}"
++	OSK_ENV+=(TAHOE_GPU_SOCK="$TAHOE_GPU_SOCK")
++fi
+ MACOS_ENV=(PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root USER=root LOGNAME=root SHELL=/bin/bash
+ 	TERM="${TERM:-xterm-256color}" LANG="${LANG:-es_ES.UTF-8}"
+-	TAHOE_ROOT="$ROOT" TAHOE_CACHE_DIR="$CACHE" TAHOE_LOGFILE="$LOG" "${DEBUG_ENV[@]}")
+-SHELL_ARGS=("$ROOT/System/Library/dyld/dyld_shared_cache_x86_64" "$ROOT/usr/lib/dyld" "$ROOT/bin/bash" "$@")
++	TAHOE_ROOT="$ROOT" TAHOE_CACHE_DIR="$CACHE" TAHOE_LOGFILE="$LOG" "${DEBUG_ENV[@]}" "${OSK_ENV[@]}")
++SHELL_ARGS=("$DYLD_CACHE" "$ROOT/usr/lib/dyld" "$ROOT/bin/bash" "$@")
+ 
+ if [ -z "$WITH_LAUNCHD" ]; then
+ 	exec env -i "${MACOS_ENV[@]}" "$RUN" "${SHELL_ARGS[@]}"
+@@ -61,28 +98,58 @@ STARTED=
+ stop_launchd() {
+ 	[ -n "$STARTED" ] || return
+ 	kill -9 "$L" $(pgrep -P "$U" 2>/dev/null) 2>/dev/null   # al morir el PID 1 del espacio, el núcleo termina a todos sus procesos
++	[ -n "$VIEW" ] && kill "$VIEW" 2>/dev/null
++	[ -n "$GPU_SRV" ] && kill "$GPU_SRV" 2>/dev/null && rm -f "$TAHOE_GPU_SOCK"
++	if [ -n "$REGION" ]; then                         # memoria de vídeo y superficies de este arranque (RAM en /dev/shm)
++		local id=${REGION#/dev/shm/tahoe-ports-}
++		rm -f "/dev/shm/tahoe-fb-$id" "/dev/shm/tahoe-fbcursor-$id" "/dev/shm/tahoe-surfaces-$id" /dev/shm/tahoe-surf-*-"$id"
++	fi
+ 	touch /dev/shm/tahoe-guard-stop; wait "$GUARD" 2>/dev/null
+ 	rm -f /dev/shm/tahoe-guard-stop
+ }
+ trap stop_launchd EXIT
+ trap 'exit 130' INT TERM HUP                       # para que también se limpie al interrumpir
++start_gpu_server() {
++	[ -n "$TAHOE_METAL" ] || return
++	local srv="$TOOLS/../tahoe-gpu/target/release/tahoe-gpu"
++	if [ ! -x "$srv" ]; then echo "falta $srv: compila tahoe-gpu (cargo build --release)" >&2; return; fi
++	rm -f "$TAHOE_GPU_SOCK"
++	"$srv" servir "$TAHOE_GPU_SOCK" < /dev/null >> "$LOG.gpu" 2>&1 & GPU_SRV=$!
++}
+ if [ -z "$L" ]; then
++	start_gpu_server
+ 	rm -f /dev/shm/tahoe-guard-stop
+ 	"$TOOLS/mem_guard.sh" & GUARD=$!
+ 	setsid env -i "${MACOS_ENV[@]}" TAHOE_FD2LOG=1 \
+ 		unshare --pid --fork --user --map-root-user --mount-proc \
+-		nice -n 10 "$RUN" "$ROOT/System/Library/dyld/dyld_shared_cache_x86_64" "$ROOT/usr/lib/dyld" "$ROOT/sbin/launchd" \
++		nice -n "${TAHOE_NICE:-0}" "$RUN" "$DYLD_CACHE" "$ROOT/usr/lib/dyld" "$ROOT/sbin/launchd" \
+ 		< /dev/null > /dev/null 2>&1 &
+ 	U=$! STARTED=1
+-	for _ in $(seq 50); do L=$(find_launchd); [ -n "$L" ] && [ -n "$(find_region "$L")" ] && break; sleep 0.2; done
+-	if [ -z "$L" ]; then echo "launchd no arrancó (registro: $LOG)" >&2; touch /dev/shm/tahoe-guard-stop; exit 1; fi
++	for _ in $(seq 300); do L=$(find_launchd); [ -n "$L" ] && REGION=$(find_region "$L") && [ -n "$REGION" ] && break; sleep 0.2; done
++	if [ -z "$L" ] || [ -z "$REGION" ]; then echo "launchd no arrancó (registro: $LOG)" >&2; touch /dev/shm/tahoe-guard-stop; exit 1; fi
+ 	echo "launchd arrancado (pid $L en Linux); esperando ${TAHOE_BOOT_WAIT:-10} s a los servicios..." >&2
+ 	sleep "${TAHOE_BOOT_WAIT:-10}"
++	# la región se apunta antes de esperar: si launchd muere en la espera (un abort suyo), se dice eso y se limpia igual
++	if [ -z "$(find_region "$L")" ]; then
++		echo "launchd (pid $L) terminó durante la espera; mira el final de $LOG (abort, assertion)" >&2; exit 1
++	fi
++else
++	REGION=$(find_region "$L")
++	if [ -z "$REGION" ]; then echo "no encuentro la región de puertos de launchd (pid $L)" >&2; exit 1; fi
++fi
++
++if [ -n "$WITH_VIEW" ]; then
++	VIEWER="$TOOLS/tahoe-view/target/release/tahoe-view"
++	if [ -x "$VIEWER" ]; then
++		"$VIEWER" "/dev/shm/tahoe-fb-${REGION#/dev/shm/tahoe-ports-}" < /dev/null > /dev/null 2>&1 & VIEW=$!
++	else
++		echo "falta el visor: compílalo con «cargo build --release» en tools/tahoe-view" >&2
++	fi
+ fi
+-REGION=$(find_region "$L")
+-if [ -z "$REGION" ]; then echo "no encuentro la región de puertos de launchd (pid $L)" >&2; exit 1; fi
+ 
+ T=$(ls /proc/$L/task | grep -vx "$L" | head -1)       # un hilo vivo: con el principal terminado, /proc/<pid>/ns no se abre
++# TAHOE_TRACE_SHELL=1: traza completa de las llamadas al sistema solo de la shell y de lo que lance (no de todo el arranque)
++TRACE_ENV=(); [ -n "$TAHOE_TRACE_SHELL" ] && TRACE_ENV=(TAHOE_TRACE=1)
+ nsenter --target "${T:-$L}" --user --mount --pid --preserve-credentials -- \
+-	env -i "${MACOS_ENV[@]}" TAHOE_PORTS="$REGION" TAHOE_PORTS_OWNER="${REGION#/dev/shm/tahoe-ports-}" \
++	env -i "${MACOS_ENV[@]}" "${TRACE_ENV[@]}" TAHOE_PORTS="$REGION" TAHOE_PORTS_OWNER="${REGION#/dev/shm/tahoe-ports-}" \
+ 	"$RUN" "${SHELL_ARGS[@]}"
+diff --git a/tools/mem_guard.sh b/tools/mem_guard.sh
+index 71c2152..ab8b909 100755
+--- a/tools/mem_guard.sh
++++ b/tools/mem_guard.sh
+@@ -1,16 +1,22 @@
+ #!/bin/bash
+-# Guardián de memoria para las pruebas: si la RAM disponible baja de 900 MB o el swap usado crece más de 1 GB desde que
+-# arrancó (el swap que ya usaban otros programas no cuenta), mata todo tahoe-run.
++# Guardián de memoria para las pruebas: si la RAM disponible baja de TAHOE_GUARD_MB (600 MB por omisión; con zram la PC
++# aún responde ahí) o el swap en disco usado crece más de 1 GB
++# desde que arrancó (el que ya usaban otros programas no cuenta), mata todo tahoe-run. El swap en zram (RAM comprimida)
++# no cuenta: no hace trabajar al disco y lo que ocupa ya se descuenta de la RAM disponible.
+ # Parar con: touch /dev/shm/tahoe-guard-stop
+-swap_used() { awk '/SwapTotal/{t=$2}/SwapFree/{f=$2}END{print int((t-f)/1024)}' /proc/meminfo; }
++swap_used() { awk 'NR > 1 && $1 !~ /zram/ {u += $4} END {print int(u / 1024)}' /proc/swaps; }   # KiB usados en disco
+ sw0=$(swap_used)
+ while [ ! -e /dev/shm/tahoe-guard-stop ]; do
+   av=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+   sw=$(swap_used)
+-  if [ "$av" -lt 900 ] || [ "$sw" -gt $((sw0 + 1000)) ]; then
++  if [ "$av" -lt "${TAHOE_GUARD_MB:-600}" ] || [ "$sw" -gt $((sw0 + 1000)) ]; then
+     pkill -9 -x tahoe-run; pkill -9 unshare
+     echo "guardian: disponible=${av}MB swap=${sw}MB -> procesos de tahoe-run terminados" >> ${TMPDIR:-/tmp}/tahoe-guard.log
+   fi
+-  for p in $(pgrep -x tahoe-run); do a=$(awk '/RssAnon/{print int($2/1024)}' /proc/$p/status 2>/dev/null); if [ "${a:-0}" -gt 700 ]; then echo "guardián: pid $p anon=${a}MB -> terminado" >&2; pkill -9 -x tahoe-run; pkill -9 unshare; fi; done
++  for p in $(pgrep -x tahoe-run); do a=$(awk '/RssAnon/{print int($2/1024)}' /proc/$p/status 2>/dev/null); if [ "${a:-0}" -gt 700 ]; then
++    # quién es en macOS: su pid allí (último campo de NSpid) y el programa (tahoe-run <caché> <dyld> <programa> ...)
++    ns=$(awk '/^NSpid/{print $NF}' /proc/$p/status 2>/dev/null); prog=$(tr '\0' '\n' < /proc/$p/cmdline 2>/dev/null | sed -n 4p)
++    echo "guardián: pid $p (macOS $ns, ${prog##*/}) anon=${a}MB -> procesos de tahoe-run terminados" | tee -a ${TMPDIR:-/tmp}/tahoe-guard.log >&2
++    pkill -9 -x tahoe-run; pkill -9 unshare; fi; done
+   sleep 1
+ done
+diff --git a/tools/shell_survey.sh b/tools/shell_survey.sh
+index f297b61..27a27fa 100755
+--- a/tools/shell_survey.sh
++++ b/tools/shell_survey.sh
+@@ -10,6 +10,10 @@
+ #   tools/shell_survey.sh 'orden 1' 'orden 2' ...
+ #
+ # Usa tools/macos-shell.sh --launchd (arranca launchd y lo detiene al terminar). PLAZO: segundos por orden (6).
++# DEPURAR=1: arranque con --depurar (recoveryosd no reinicia la máquina si falla). LISTO: segundos máximos de espera a
++# que launchd responda antes de empezar (180).
++# ANTES: órdenes de macOS que se ejecutan antes de la lista, sin contarlas (p. ej. quitar un servicio que estorba:
++#   ANTES='launchctl bootout system/com.apple.WindowServer' tools/shell_survey.sh).
+ TOOLS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ PLAZO="${PLAZO:-6}"
+ if [ $# -eq 0 ]; then
+@@ -36,7 +40,15 @@ SCRIPT="t() { c=\"\$1\"; f=/tmp/.survey.\$\$; /bin/bash -c \"\$c\" > \$f 2>&1 <
+  if [ \$r = 0 ]; then e=OK; elif [ \$r = 999 ]; then e=COLGADA; elif [ \$r -gt 128 ]; then e=\"SEÑAL \$((r-128))\"; else e=\"ERR \$r\"; fi
+  printf '%-9s %-40s %s\\n' \"\$e\" \"\$c\" \"\$( [ \$r = 0 ] || echo \"\$l\")\"; }
+ "
++# Antes de la lista, esperar a que launchd haya terminado de arrancar (responde a launchctl): con solo TAHOE_BOOT_WAIT (10 s)
++# el inventario empezaba en mitad del arranque y, según lo que tardara (p. ej. si top cargaba la CPU), launchctl, defaults,
++# diskutil... fallaban con «141: Reentrancy avoided» sin que el emulador tuviera la culpa. LISTO: plazo máximo (180 s).
++SCRIPT+="w=0; while ! perl -e 'alarm 8; exec @ARGV' launchctl print system >/dev/null 2>&1 && [ \$w -lt ${LISTO:-180} ]; do sleep 3; w=\$((w+3)); done
++echo \"(launchd listo tras \$w s)\"
++"
++[ -n "$ANTES" ] && SCRIPT+="$ANTES >/dev/null 2>&1
++"
+ for c in "$@"; do SCRIPT+="t $(printf '%q' "$c")
+ "; done
+ [ -n "$TAHOE_LOGFILE" ] && rm -f "$TAHOE_LOGFILE"          # un registro por inventario (tahoe-run añade al final)
+-"$TOOLS/macos-shell.sh" --launchd -c "$SCRIPT"
++"$TOOLS/macos-shell.sh" ${DEPURAR:+--depurar} --launchd -c "$SCRIPT"

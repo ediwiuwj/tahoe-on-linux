@@ -1,0 +1,44 @@
+From 24c08455f46e06513aacf6c4be5320ddd297fa62 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 21:55:11 -0600
+Subject: [PATCH 22/57] Emulador: se comprueba el malloc de la memoria que se
+ copia al puerto
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_mach.c: al crear una entrada de memoria, el malloc del búfer
+  intermedio se comprueba antes de copiar en él. Si malloc devuelve
+  NULL, el memcpy lo habría desreferenciado y el proceso habría
+  muerto con un fallo de segmentación, en vez de devolver el error
+  de la llamada.
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_mach.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/tahoe-run/emu_mach.c b/tahoe-run/emu_mach.c
+index cae833c..8c617e7 100644
+--- a/tahoe-run/emu_mach.c
++++ b/tahoe-run/emu_mach.c
+@@ -99,10 +99,13 @@ static size_t mig_make_memory_entry(const struct hdr* req, const uint8_t* m, uin
+ 	int ok = fd >= 0 && len && ftruncate(fd, (off_t)len) == 0 && (off != 0 || named_create);
+ 	if (ok && !named_create) {
+ 		uint8_t* tmp = malloc(len);
+-		memcpy(tmp, (void*)off, len);                           // lo que ya hubiera escrito el creador
+-		if (pwrite(fd, tmp, len, 0) != (ssize_t)len) ok = 0;
+-		free(tmp);
+-		if (ok && mmap((void*)off, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) ok = 0;
++		if (!tmp) ok = 0;                                       // sin memoria: se informa del fallo, sin copiar nada
++		else {
++			memcpy(tmp, (void*)off, len);                       // lo que ya hubiera escrito el creador
++			if (pwrite(fd, tmp, len, 0) != (ssize_t)len) ok = 0;
++			free(tmp);
++			if (ok && mmap((void*)off, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) ok = 0;
++		}
+ 	}
+ 	if (fd >= 0) close(fd);
+ 	if (ok) port_me_created(port); else unlink(path);

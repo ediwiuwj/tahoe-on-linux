@@ -1,0 +1,33 @@
+From 0ab9889c390037118d26cfe789095098bd977815 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 21:48:13 -0600
+Subject: [PATCH 17/57] Emulador: getrusage devuelve ru_maxrss en bytes, como
+ en Darwin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_proc.c: getrusage multiplica ru_maxrss por 1024. Linux lo da en
+  kilobytes y XNU lo da en bytes (getrusage.2: "the maximum resident set
+  size utilized (in bytes)"), así que el valor que ve el proceso macOS
+  era mil veces menor que el real.
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_proc.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/tahoe-run/emu_proc.c b/tahoe-run/emu_proc.c
+index df521de..963860b 100644
+--- a/tahoe-run/emu_proc.c
++++ b/tahoe-run/emu_proc.c
+@@ -200,6 +200,7 @@ static long bsd_getrusage(struct ctx* c) {
+ 	if (who != 0 && who != -1) return -D_EINVAL;
+ 	struct rusage ru;
+ 	if (getrusage(who == 0 ? RUSAGE_SELF : RUSAGE_CHILDREN, &ru) != 0) return -darwin_errno(errno);
++	ru.ru_maxrss *= 1024;            // Linux: KB -> Darwin: bytes (XNU: getrusage.2, "in bytes")
+ 	_Static_assert(sizeof ru == 144, "struct rusage de Linux x86_64");
+ 	return safe_write(c->a[1], &ru, sizeof ru) == (ssize_t)sizeof ru ? 0 : -D_EFAULT;
+ }

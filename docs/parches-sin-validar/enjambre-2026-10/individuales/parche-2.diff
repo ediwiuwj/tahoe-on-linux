@@ -1,0 +1,225 @@
+diff --git i/Pendientes.md w/Pendientes.md
+index 2c36a0b..98b1778 100644
+--- i/Pendientes.md
++++ w/Pendientes.md
+@@ -152,8 +152,10 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
+ 6. **Sesión gráfica**: con ella, `screencapture`, `osascript` y `pbcopy` (hoy se caen por no haber sesión).
+ 7. **Servicios que fallan al arrancar**: mobileassetd, softwareupdate; apsd se cae en bucle («ProductType» nil);
+    relanzados en bucle: cryptexd, watchdogd, diskmanagementstartup, triald_system, cupsd. Muchas preferencias de
+-   `/Library/Preferences` y de root se guardan vacías (0 bytes): loginwindow, dock, CoreGraphics... (¿cfprefsd?
+-   `fcntl F_PREALLOCATE` no está implementado).
++   `/Library/Preferences` y de root se guardan vacías (0 bytes): loginwindow, dock, CoreGraphics... (¿cfprefsd?).
++   `fcntl F_PREALLOCATE` ya está implementado en el emulador (`tahoe-run/emu_fs.c`, con `fst_bytesalloc` y los
++   errores de XNU; también `F_SETSIZE`, `F_PUNCHHOLE` y `F_RDADVISE`), pero **sin verificar en un arranque real**:
++   falta confirmarlo con la batería (`tools/diag/bateria.sh`), que no se pudo ejecutar aquí.
+ 8. **Sonido** dentro de macOS (teclado y ratón ya funcionan, ver «Hecho recientemente»). coreaudiod ya arranca y `say`
+    termina, pero no hay tarjeta de sonido: hace falta un dispositivo de audio que macOS vea como propio y que mande el
+    sonido a PipeWire/PulseAudio del PC (para oír un vídeo, `say`...).
+diff --git i/tahoe-run/emu_fs.c w/tahoe-run/emu_fs.c
+index 6512f85..fa9c947 100644
+--- i/tahoe-run/emu_fs.c
++++ w/tahoe-run/emu_fs.c
+@@ -592,6 +592,57 @@ static long bsd_fstatat64(struct ctx* c) {
+ 	return 0;
+ }
+ 
++// ---- fcntl de XNU: F_PREALLOCATE, F_SETSIZE, F_RDADVISE y F_PUNCHHOLE ----
++// Referencia: bsd/kern/kern_descrip.c y bsd/man/man2/fcntl.2 de XNU 12377.
++//
++// Estructuras de Darwin (bsd/sys/fcntl.h):
++//   fstore_t:     u32 fst_flags; i32 fst_posmode; off_t fst_offset; off_t fst_length; off_t fst_bytesalloc (32 bytes)
++//   fpunchhole_t: u32 fp_flags; u32 reserved; off_t fp_offset; off_t fp_length                           (24 bytes)
++//   radvisory_t:  off_t ra_offset; i32 ra_count                                                         (12 bytes)
++#define UF_APPEND 0x00000004
++#define SF_APPEND 0x00040000
++#define F_ALLOCATECONTIG  0x00000002
++#define F_ALLOCATEALL     0x00000004
++#define F_ALLOCATEPERSIST 0x00000008
++#define F_PEOFPOSMODE 3
++#define F_VOLPOSMODE  4
++// Si el descriptor real (Linux) permite escritura: XNU exige FWRITE en F_PREALLOCATE y F_SETSIZE (EBADF)
++// y en F_PUNCHHOLE (EPERM). -1 si el descriptor ya no existe.
++static int fd_writable(int fd) {
++	int f = fcntl(fd, F_GETFL);
++	if (f < 0) return -1;
++	return (f & O_ACCMODE) != O_RDONLY;
++}
++// 1 si el descriptor corresponde a un vnode de XNU (DTYPE_VNODE), 0 si no lo es y -1 si el descriptor no existe.
++// En XNU una tubería (DTYPE_PIPE) o un socket (DTYPE_SOCKET) no son vnodes: EBADF. Un FIFO de POSIX sí lo es
++// (vfifo), pero en Linux el FIFO y la tubería son los dos S_ISFIFO: se distinguen por el enlace de /proc.
++static int fd_is_vnode(int fd) {
++	struct stat st;
++	if (fstat(fd, &st) != 0) return -1;
++	if (S_ISSOCK(st.st_mode)) return 0;
++	char link[64], p[64];
++	snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
++	ssize_t n = readlink(link, p, sizeof p - 1);
++	if (n > 0) {
++		p[n] = 0;
++		if (!strncmp(p, "pipe:[", 6) || !strncmp(p, "/anon_inode/", 12)) return 0;
++	}
++	return 1;
++}
++// Tipo del vnode del descriptor: 0 fichero normal, 1 directorio, 2 otro (un dispositivo...), -1 si no existe.
++static int fd_vnodeclass(int fd) {
++	struct stat st;
++	if (fstat(fd, &st) != 0) return -1;
++	if (S_ISREG(st.st_mode)) return 0;
++	if (S_ISDIR(st.st_mode)) return 1;
++	return 2;
++}
++// Bloque del sistema de ficheros (alineación de F_PUNCHHOLE y redondeo de fst_bytesalloc).
++static uint64_t fs_blocksize(int fd) {
++	struct statfs sb;
++	if (fstatfs(fd, &sb) == 0 && sb.f_bsize > 0) return (uint64_t)sb.f_bsize;
++	return 4096;
++}
+ // fcntl de Darwin: solo los comandos que usa el arranque
+ static long bsd_fcntl(struct ctx* c) {
+ 	int fd = (int)c->a[0], cmd = (int)c->a[1];
+@@ -603,6 +654,94 @@ static long bsd_fcntl(struct ctx* c) {
+ 	case 3: { int f = fcntl(fd, F_GETFL); if (f < 0) return err(); return (f & 3) | ((f & O_NONBLOCK) ? 4 : 0) | ((f & O_APPEND) ? 8 : 0); }
+ 	case 4: { int f = (int)c->a[2], lf = 0; if (f & 4) lf |= O_NONBLOCK; if (f & 8) lf |= O_APPEND; RET(fcntl(fd, F_SETFL, lf)); }
+ 	case 45: case 48: case 51: return 0;                  // F_RDAHEAD, F_NOCACHE, F_FULLFSYNC: sin efecto
++	case 42: {                                            // F_PREALLOCATE (fstore_t), XNU kern_descrip.c:3371
++		// XNU: si no es un vnode o no se abrió para escribir, EBADF; copyin de la fstore_t, EFAULT;
++		// el posmode decide dónde se reserva (F_PEOFPOSMODE: desde el EOF; F_VOLPOSMODE: desde un punto
++		// del volumen); un posmode desconocido, EINVAL (y entonces la estructura no se copia de vuelta);
++		// y al final se copia la fstore_t con fst_bytesalloc = bytes reservados (tb. si la reserva falla).
++		int w = fd_writable(fd);
++		if (w < 0) return err();                          // el descriptor no existe
++		if (!w) return -D_EBADF;                          // XNU: sin FWRITE, EBADF
++		int v = fd_is_vnode(fd);
++		if (v < 0) return err();                           // el descriptor no existe
++		if (!v) return -D_EBADF;                           // XNU: DTYPE_VNODE
++		uint8_t fs[32];
++		if (safe_read(c->a[2], fs, 32) != 32) return -D_EFAULT;
++		uint32_t aflags; int32_t pmode; int64_t off, len;
++		memcpy(&aflags, fs, 4); memcpy(&pmode, fs + 4, 4); memcpy(&off, fs + 8, 8); memcpy(&len, fs + 16, 8);
++		int64_t base;
++		if (pmode == F_PEOFPOSMODE) {
++			if (off != 0) return -D_EINVAL;               // XNU: F_PEOFPOSMODE con offset distinto de 0
++			struct stat st;
++			if (fstat(fd, &st) != 0) return err();
++			base = st.st_size;                            // XNU: se reserva desde el EOF físico
++		} else if (pmode == F_VOLPOSMODE) {
++			if (off <= 0) return -D_EINVAL;               // XNU: F_VOLPOSMODE con offset <= 0
++			// XNU reserva desde una posición del volumen, que en Linux no existe: se usa como
++			// desplazamiento dentro del fichero (la posición en el volumen no es representable).
++			base = off;
++		} else return -D_EINVAL;                          // XNU: posmode que no es ninguno de los dos
++		if (len < 0) return -D_EINVAL;
++		// Solo los ficheros normales se preasignan: en un directorio o en un dispositivo la operación del
++		// vnode no existe y XNU devuelve ENOTSUP (la operación por defecto de un vnode, vfs_init.c).
++		if (fd_vnodeclass(fd) != 0) return -D_ENOTSUP;
++		// F_ALLOCATEALL: fallocate() reserva el rango entero o falla (igual que "todo o nada").
++		// F_ALLOCATECONTIG: Linux no puede garantizar la contigüidad (la decide el fs): se ignora, como
++		//   permite el manual de fcntl(2) ("the file system may ignore this request").
++		// F_ALLOCATEPERSIST: en Linux los bloques reservados no se sueltan al cerrar el fichero.
++		// KEEP_SIZE: el tamaño del fichero no cambia (XNU tampoco lo cambia al preasignar).
++		uint64_t bytesalloc = 0;
++		if (len > 0) {
++			if (fallocate(fd, FALLOC_FL_KEEP_SIZE, (off_t)base, (off_t)len) != 0) {
++				int e = errno;
++				memcpy(fs + 24, &bytesalloc, 8);          // XNU copia la estructura aunque la reserva falle
++				safe_write(c->a[2], fs, 32);
++				if (trace_all) logf_("    F_PREALLOCATE(fd=%d, flags=0x%x, base=%lld, len=%lld) -> %s\n", fd, aflags, (long long)base, (long long)len, strerror(e));
++				return -darwin_errno(e);                  // ENOSPC si no hay sitio, EFBIG si no cabe
++			}
++			uint64_t bs = fs_blocksize(fd);               // los bytes reservados, redondeados al bloque
++			// Los bloques que reserva el fs cubren el rango [base, base+len) redondeado a los bloques: eso
++			// es lo que informa fst_bytesalloc (el manual dice que puede ser mayor que lo pedido). Con
++			// F_PEOFPOSMODE el origen es el EOF, que casi nunca está alineado: por eso se redondea el rango
++			// entero y no solo la longitud.
++			uint64_t lo = (uint64_t)base / bs * bs;
++			uint64_t hi = ((uint64_t)base + (uint64_t)len + bs - 1) / bs * bs;
++			bytesalloc = hi - lo;
++		}
++		memcpy(fs + 24, &bytesalloc, 8);
++		if (trace_all) logf_("    F_PREALLOCATE(fd=%d, flags=0x%x, base=%lld, len=%lld) -> %llu bytes\n", fd, aflags, (long long)base, (long long)len, (unsigned long long)bytesalloc);
++		return safe_write(c->a[2], fs, 32) == 32 ? 0 : -D_EFAULT;
++	}
++	case 43: {                                            // F_SETSIZE (off_t), XNU kern_descrip.c:3619
++		// XNU: si no es un vnode o no se abrió para escribir, EBADF; copyin del off_t, EFAULT; con el
++		// fichero de solo-anexar (APPEND), EPERM; y si quien llama no es root, EACCES (el privilegio de
++		// truncar sin rellenar con ceros ya no existe: se trunca como truncate(2), rellenando con ceros).
++		int w = fd_writable(fd);
++		if (w < 0) return err();                          // el descriptor no existe
++		if (!w) return -D_EBADF;                          // XNU: sin FWRITE, EBADF
++		int v = fd_is_vnode(fd);
++		if (v < 0) return err();                           // el descriptor no existe
++		if (!v) return -D_EBADF;                           // XNU: DTYPE_VNODE
++		int64_t sz;
++		if (safe_read(c->a[2], &sz, 8) != 8) return -D_EFAULT;
++		if (tahoe_flags_fd(fd) & (UF_APPEND | SF_APPEND)) return -D_EPERM;   // XNU: vnode_isappendonly
++		if (cred_euid() != 0) return -D_EACCES;            // XNU: hace falta ser root
++		if (fd_vnodeclass(fd) == 1) return -D_EISDIR;       // XNU: en un directorio el tamano no tiene sentido
++		RET(ftruncate(fd, (off_t)sz));                     // en otro tipo de vnode, EINVAL (como en XNU)
++	}
++	case 44: {                                            // F_RDADVISE (radvisory_t), XNU kern_descrip.c:3786
++		// XNU: si no es un vnode, EBADF; copyin de la radvisory_t, EFAULT; offset o cuenta negativos,
++		// EINVAL; y luego se pasa al fs, que solo hace una lectura preventiva (no copia nada al usuario).
++		int v = fd_is_vnode(fd);
++		if (v < 0) return err();                            // el descriptor no existe
++		if (!v) return -D_EBADF;                            // XNU: DTYPE_VNODE
++		uint8_t rv[12];
++		if (safe_read(c->a[2], rv, 12) != 12) return -D_EFAULT;
++		int64_t off; int32_t cnt;
++		memcpy(&off, rv, 8); memcpy(&cnt, rv + 8, 4);
++		if (off < 0 || cnt < 0) return -D_EINVAL;
++		return 0;
++	}
+ 	case 50: case 102: {                                  // F_GETPATH / F_GETPATH_NOFIRMLINK: ruta del descriptor
+ 		char link[64], path[4096];
+ 		snprintf(link, sizeof link, "/proc/thread-self/fd/%d", fd);
+@@ -659,11 +798,36 @@ static long bsd_fcntl(struct ctx* c) {
+ 	case 74: case 63: case 77: return 0;                    // F_GETNOSIGPIPE, F_GETPROTECTIONCLASS, F_GETPROTECTIONLEVEL: 0
+ 	case 64: return 0;                                      // F_SETPROTECTIONCLASS: sin clases de protección
+ 	case 85: RET(fdatasync(fd));                            // F_BARRIERFSYNC
+-	case 99: {                                              // F_PUNCHHOLE(fpunchhole_t: flags, reservado, offset, length)
+-		uint64_t ph[3]; uint8_t raw[24];
++	case 99: {                                              // F_PUNCHHOLE (fpunchhole_t), XNU kern_descrip.c:3463
++		// XNU: si no es un vnode, EBADF; sin permiso de escritura, EPERM; copyin de la fpunchhole_t,
++		// EFAULT; offset o longitud negativos, o banderas/reservado distintos de cero, EINVAL; y si el
++		// offset y la longitud son los dos desalineados respecto al bloque del fs, EINVAL. El rango se
++		// desasigna (se lee como ceros) y el tamaño del fichero no cambia.
++		int v = fd_is_vnode(fd);
++		if (v < 0) return err();                               // el descriptor no existe
++		if (!v) return -D_EBADF;                               // XNU: DTYPE_VNODE
++		int w = fd_writable(fd);
++		if (w < 0) return err();                            // el descriptor no existe
++		if (!w) return -D_EPERM;                             // XNU: sin FWRITE, EPERM
++		uint8_t raw[24];
+ 		if (safe_read(c->a[2], raw, 24) != 24) return -D_EFAULT;
+-		memcpy(&ph[1], raw + 8, 8); memcpy(&ph[2], raw + 16, 8);
+-		RET(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)ph[1], (off_t)ph[2]));
++		uint32_t fl, rsv; int64_t off, len;
++		memcpy(&fl, raw, 4); memcpy(&rsv, raw + 4, 4); memcpy(&off, raw + 8, 8); memcpy(&len, raw + 16, 8);
++		if (off < 0 || len < 0) return -D_EINVAL;
++		if (fl || rsv) return -D_EINVAL;                     // fp_flags y reserved tienen que ser 0
++		if (fd_vnodeclass(fd) != 0) return -D_ENOTSUP;       // el fs solo desasigna en ficheros normales
++		uint64_t bs = fs_blocksize(fd);
++		if ((off % (int64_t)bs) && (len % (int64_t)bs)) return -D_EINVAL;   // XNU: los dos desalineados
++		// Si solo uno de los dos está desalineado, XNU no falla (el manual solo da EINVAL cuando los dos
++		// lo están): el fs redondea el rango al bloque. Se redondea aquí por lo mismo, y porque el
++		// fallocate() de Linux trabaja con bloques enteros.
++		int64_t lo = off / (int64_t)bs * (int64_t)bs;
++		int64_t hi = (off + len + (int64_t)bs - 1) / (int64_t)bs * (int64_t)bs;
++		struct stat st;
++		if (fstat(fd, &st) == 0 && hi > st.st_size) hi = st.st_size;   // el agujero no pasa del final
++		if (hi <= lo) return 0;                                          // no hay nada que desasignar
++		// PUNCH_HOLE desasigna el rango (luego se lee como ceros) sin cambiar el tamaño del fichero.
++		RET(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)lo, (off_t)(hi - lo)));
+ 	}
+ 	case 106: RET(fcntl(fd, F_SETLEASE, (int)c->a[2] == 1 ? F_RDLCK : (int)c->a[2] == 3 ? F_WRLCK : F_UNLCK));
+ 	case 107: { int l = fcntl(fd, F_GETLEASE); if (l < 0) return err(); return l == F_RDLCK ? 1 : l == F_WRLCK ? 3 : 2; }
+diff --git i/tahoe-run/tahoe.h w/tahoe-run/tahoe.h
+index d30b47b..c12f435 100644
+--- i/tahoe-run/tahoe.h
++++ w/tahoe-run/tahoe.h
+@@ -213,4 +213,4 @@ void special_port_set(int which, uint32_t name);
+ void reenable_dispatch(void);   // el kernel no hereda la interceptación de syscalls en el hijo de un fork
+ 
+ // Códigos de error de Darwin
+-enum { D_EPERM = 1, D_ENOENT = 2, D_ESRCH = 3, D_EBADF = 9, D_ENOMEM = 12, D_EFAULT = 14, D_EINVAL = 22, D_ENOSYS = 78, D_ERANGE = 34 };
++enum { D_EPERM = 1, D_ENOENT = 2, D_ESRCH = 3, D_EBADF = 9, D_ENOMEM = 12, D_EACCES = 13, D_EFAULT = 14, D_EINVAL = 22, D_ENOSYS = 78, D_ERANGE = 34, D_EISDIR = 21, D_ENOTSUP = 102 };

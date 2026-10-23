@@ -1,0 +1,1641 @@
+From 9665506c08121a9f1a40adcfe8508728a33e46d5 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:37:43 -0600
+Subject: [PATCH 07/57] =?UTF-8?q?Procesos,=20credenciales=20y=20auditor?=
+ =?UTF-8?q?=C3=ADa?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_proc.c: posix_spawn con las acciones de archivo de XNU (open, close,
+  dup2, chdir, inherit) y las port actions; execve con EBADARCH cuando el
+  Mach-O no trae el slice x86_64; el arranque bajo el launchd emulado.
+- emu_cred.c: la sesión de auditoría (auid, asid) se propaga por fork y por
+  spawn, con el registro de sesiones compartido; los puertos de sesión son
+  objetos del núcleo, que es lo que permite a launchd montar el dominio
+  gui/<uid>. La identidad de las reglas de setuid es la de XNU.
+- tahoe_run.c: la interceptación de syscalls con el dispatcher de usuario y
+  la construcción del marco de pila; también el TLS por hilo que se reserva
+  con mmap (el estático de glibc ocupaba ~830 KB por hilo y se ponía a cero
+  en cada hilo nuevo).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_cred.c  | 177 +++++++++++++++-
+ tahoe-run/emu_proc.c  | 469 ++++++++++++++++++++++++++++++++++++------
+ tahoe-run/tahoe_run.c | 257 ++++++++++++++++++++---
+ 3 files changed, 805 insertions(+), 98 deletions(-)
+
+diff --git a/tahoe-run/emu_cred.c b/tahoe-run/emu_cred.c
+index bb90555..1a0c6f1 100644
+--- a/tahoe-run/emu_cred.c
++++ b/tahoe-run/emu_cred.c
+@@ -9,6 +9,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <fcntl.h>
++#include <unistd.h>
+ 
+ #include "tahoe.h"
+ 
+@@ -17,13 +19,35 @@ static uint32_t ruid, euid, svuid, rgid, egid, svgid;
+ static uint32_t groups[NGROUPS_MAX_];
+ static int ngroups = 1;                       // como root: grupo 0
+ 
++// Sesión de auditoría (BSM de XNU): auid (usuario de la sesión de inicio, -1 = ninguno), asid (identificador de la
++// sesión), banderas y máscara. Se heredan como las credenciales. launchd y sus servicios están en la sesión del sistema;
++// setaudit_addr con AU_ASSIGN_ASID crea una nueva (loginwindow / SessionCreate para la sesión de la consola). Los
++// servicios distinguen así las sesiones de usuario: launchservicesd guarda una por asid y aborta si la ve dos veces.
++#define AU_DEFAULT_ASID 100000u                                  // primera sesión asignada por XNU (ASSIGNED_ASID_MIN)
++static uint32_t au_auid = (uint32_t)-1, au_asid = AU_DEFAULT_ASID, au_mask[2];
++static uint64_t au_flags;
++uint32_t cred_auid(void) { return au_auid; }
++uint32_t cred_asid(void) { return au_asid; }
+ uint32_t cred_euid(void) { return euid; }
+ uint32_t cred_egid(void) { return egid; }
+ 
+-// TAHOE_CRED=ruid,euid,svuid,rgid,egid,svgid,g1,g2...
++// Sesión para el próximo hijo de posix_spawn (acción de puerto PSPA_AU_SESSION: launchd arranca así los LaunchAgents en
++// la sesión gráfica sin unirse él). 0 = la del padre. La fija bsd_posix_spawn y la quita al terminar.
++static uint32_t spawn_asid;
++static int ses_get(uint32_t asid, uint8_t out[0x30]);
++void cred_spawn_session(uint32_t asid) { spawn_asid = asid; }
++
++// TAHOE_CRED=ruid,euid,svuid,rgid,egid,svgid,g1,g2.../auid,asid,máscara,máscara,banderas
+ void cred_env(char* out, size_t cap) {
+ 	int k = snprintf(out, cap, "TAHOE_CRED=%u,%u,%u,%u,%u,%u", ruid, euid, svuid, rgid, egid, svgid);
+ 	for (int i = 0; i < ngroups && k > 0 && (size_t)k < cap; i++) k += snprintf(out + k, cap - (size_t)k, ",%u", groups[i]);
++	uint32_t auid = au_auid, asid = au_asid, m0 = au_mask[0], m1 = au_mask[1]; uint64_t fl = au_flags;
++	uint8_t a[0x30];
++	if (spawn_asid && spawn_asid != au_asid) {                       // el hijo entra en esa sesión con sus datos (como XNU)
++		asid = spawn_asid;
++		if (ses_get(spawn_asid, a) == 0) { memcpy(&auid, a, 4); memcpy(&m0, a + 4, 4); memcpy(&m1, a + 8, 4); memcpy(&fl, a + 40, 8); }
++	}
++	if (k > 0 && (size_t)k < cap) snprintf(out + k, cap - (size_t)k, "/%u,%u,%u,%u,%llu", auid, asid, m0, m1, (unsigned long long)fl);   // /sesión de auditoría
+ }
+ static void cred_load(void) {
+ 	const char* v = getenv("TAHOE_CRED");
+@@ -35,6 +59,127 @@ static void cred_load(void) {
+ 	ruid = (uint32_t)x[0]; euid = (uint32_t)x[1]; svuid = (uint32_t)x[2]; rgid = (uint32_t)x[3]; egid = (uint32_t)x[4]; svgid = (uint32_t)x[5];
+ 	ngroups = 0;
+ 	for (int i = 6; i < n; i++) groups[ngroups++] = (uint32_t)x[i];
++	const char* a = strchr(getenv("TAHOE_CRED"), '/');
++	if (a) { unsigned long long f = 0; unsigned u = 0, s = 0, m0 = 0, m1 = 0;
++		if (sscanf(a + 1, "%u,%u,%u,%u,%llu", &u, &s, &m0, &m1, &f) >= 2) { au_auid = u; au_asid = s; au_mask[0] = m0; au_mask[1] = m1; au_flags = f; } }
++}
++// getaudit_addr / setaudit_addr (auditinfo_addr_t, 0x30 bytes): auid, máscara (2×u32), terminal (24 bytes), asid (+36)
++// y banderas (+40). AU_ASSIGN_ASID (-1) en asid pide una sesión nueva: se le da un número propio (sesión base + pid, único
++// mientras viva quien la creó). Solo root cambia la sesión.
++// Registro de sesiones compartido por todo el arranque (como la tabla de sesiones de XNU): asid -> auditinfo_addr (0x30
++// bytes) del que la creó o la cambió. launchd pregunta por una sesión ajena con auditon(A_GETSINFO_ADDR) para montar el
++// dominio de la sesión gráfica (comprueba su auid y que tenga AU_SESSION_FLAG_HAS_GRAPHIC_ACCESS). Archivo en /dev/shm
++// con huecos fijos: hueco = asid % SES_N, sondeo lineal.
++#define SES_N 512
++static int ses_fd(void) {
++	static int fd = -2;
++	if (fd == -2) {
++		char p[160];
++		snprintf(p, sizeof p, "/dev/shm/tahoe.%s.sesiones", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
++		fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
++		if (fd >= 0 && ftruncate(fd, SES_N * 0x30) != 0) { close(fd); fd = -1; }
++	}
++	return fd;
++}
++static void ses_put(const uint8_t a[0x30]) {
++	int fd = ses_fd(); if (fd < 0) return;
++	uint32_t asid; memcpy(&asid, a + 36, 4);
++	for (uint32_t k = 0; k < SES_N; k++) {
++		uint32_t slot = (asid + k) % SES_N, cur = 0; uint8_t e[0x30];
++		if (pread(fd, e, sizeof e, slot * 0x30) == (ssize_t)sizeof e) memcpy(&cur, e + 36, 4);
++		if (cur == 0 || cur == asid) { if (pwrite(fd, a, 0x30, slot * 0x30) != 0x30) {} return; }
++	}
++}
++static int ses_get(uint32_t asid, uint8_t out[0x30]) {
++	int fd = ses_fd(); if (fd < 0 || !asid) return -1;
++	for (uint32_t k = 0; k < SES_N; k++) {
++		uint32_t slot = (asid + k) % SES_N, cur = 0;
++		if (pread(fd, out, 0x30, slot * 0x30) != 0x30) return -1;
++		memcpy(&cur, out + 36, 4);
++		if (cur == asid) return 0;
++		if (cur == 0) return -1;
++	}
++	return -1;
++}
++static uint8_t au_tid[24];                                       // terminal de la sesión (solo para el registro)
++static void ses_mine(uint8_t a[0x30]) {
++	memset(a, 0, 0x30);
++	memcpy(a, &au_auid, 4); memcpy(a + 4, au_mask, 8); memcpy(a + 12, au_tid, 24); memcpy(a + 36, &au_asid, 4); memcpy(a + 40, &au_flags, 8);
++}
++static long b_getaudit_addr(struct ctx* c) {
++	uint8_t a[0x30] = { 0 };
++	memcpy(a, &au_auid, 4); memcpy(a + 4, au_mask, 8); memcpy(a + 36, &au_asid, 4); memcpy(a + 40, &au_flags, 8);
++	return safe_write(c->a[0], a, c->a[1] < sizeof a ? c->a[1] : sizeof a) < 0 ? -D_EFAULT : 0;
++}
++static long b_setaudit_addr(struct ctx* c) {
++	uint8_t a[0x30] = { 0 };
++	if (c->a[1] < sizeof a || safe_read(c->a[0], a, sizeof a) != sizeof a) return -D_EINVAL;
++	if (euid != 0) return -D_EPERM;
++	uint32_t auid, asid; uint64_t fl;
++	memcpy(&auid, a, 4); memcpy(&asid, a + 36, 4); memcpy(&fl, a + 40, 8);
++	au_auid = auid; memcpy(au_mask, a + 4, 8); au_flags = fl;
++	au_asid = asid == (uint32_t)-1 ? AU_DEFAULT_ASID + (uint32_t)getpid() : asid;
++	memcpy(a + 36, &au_asid, 4);
++	memcpy(au_tid, a + 12, 24);
++	ses_put(a);                                                     // la sesión queda registrada para auditon
++	safe_write(c->a[0], a, sizeof a);                               // como XNU: devuelve el asid asignado
++	return 0;
++}
++// Puertos de sesión de auditoría (como audit_session.c de XNU): un objeto del núcleo por asid, el mismo nombre para todos
++// los procesos de la sesión. launchd los usa para la sesión gráfica de un usuario: recoveryosd o loginwindow crean una
++// sesión nueva (setaudit_addr con AU_ASSIGN_ASID) y le pasan su puerto; launchd se une a ella (audit_session_join) para
++// montar el dominio gui/<uid> y arrancar ahí los LaunchAgents de tipo Aqua.
++// audit_session_self(): puerto de la sesión propia.
++static long b_audit_session_self(struct ctx* c) { (void)c; return kobj_make(KO_AUDIT_SESSION, (int32_t)au_asid); }
++// audit_session_join(puerto): pasa a esa sesión y devuelve su asid. La sesión conserva el auid de este proceso (aquí la
++// sesión es solo el asid; el auid lo fija quien la crea con setaudit_addr).
++static long b_audit_session_join(struct ctx* c) {
++	int type; int32_t asid;
++	if (!kobj_lookup((uint32_t)c->a[0], &type, &asid) || type != KO_AUDIT_SESSION) return -D_EINVAL;
++	au_asid = (uint32_t)asid;
++	return asid;
++}
++// audit_session_port(asid, *puerto): puerto de la sesión asid.
++static long b_audit_session_port(struct ctx* c) {
++	uint32_t name = kobj_make(KO_AUDIT_SESSION, (int32_t)(uint32_t)c->a[0]);
++	if (!name) return -D_ENOMEM;
++	return safe_write(c->a[1], &name, 4) == 4 ? 0 : -D_EFAULT;
++}
++// auditon(orden, datos, tamaño): consultas sobre sesiones. A_GETSINFO_ADDR (32): datos de la sesión ai_asid (de este
++// proceso o del registro); A_GETPINFO_ADDR (28): auditpinfo_addr del propio proceso; A_GETSFLAGS/A_SETSFLAGS (39/40):
++// banderas de la sesión propia. El resto (política, condición, colas...) responde 0 sin efecto, como antes.
++static long b_auditon(struct ctx* c) {
++	int cmd = (int)c->a[0]; uint64_t data = c->a[1]; uint32_t len = (uint32_t)c->a[2];
++	uint8_t a[0x30];
++	switch (cmd) {
++	case 32: {
++		uint32_t asid;
++		if (len < 0x30 || safe_read(data + 36, &asid, 4) != 4) return -D_EINVAL;
++		if (asid == au_asid || asid == (uint32_t)-1 || asid == 0) ses_mine(a);
++		else if (ses_get(asid, a) != 0) return -D_EINVAL;
++		return safe_write(data, a, 0x30) == 0x30 ? 0 : -D_EFAULT;
++	}
++	case 28: {                                                      // auditpinfo_addr: pid (4) + auditinfo_addr
++		int32_t pid;
++		if (len < 0x34 || safe_read(data, &pid, 4) != 4) return -D_EINVAL;
++		if (pid != (int32_t)getpid()) return -D_EINVAL;
++		ses_mine(a);
++		return safe_write(data + 4, a, 0x30) == 0x30 ? 0 : -D_EFAULT;
++	}
++	case 39: return len >= 8 && safe_write(data, &au_flags, 8) == 8 ? 0 : -D_EINVAL;
++	case 40: {
++		uint64_t f; if (len < 8 || safe_read(data, &f, 8) != 8) return -D_EINVAL;
++		au_flags = f; ses_mine(a); ses_put(a);
++		return 0;
++	}
++	default: return 0;
++	}
++}
++static long b_getauid(struct ctx* c) { return safe_write(c->a[0], &au_auid, 4) == 4 ? 0 : -D_EFAULT; }
++static long b_setauid(struct ctx* c) {
++	uint32_t v; if (safe_read(c->a[0], &v, 4) != 4) return -D_EFAULT;
++	if (euid != 0) return -D_EPERM;
++	au_auid = v; return 0;
+ }
+ 
+ #define D_EPERM 1
+@@ -100,10 +245,40 @@ static long b_setgroups(struct ctx* c) {
+ // initgroups(n, lista, uid de gmuid): como setgroups (el núcleo guarda además el uid de pertenencia externa)
+ static long b_initgroups(struct ctx* c) { return b_setgroups(c); }
+ 
++// identitysvc(opcode, mensaje): el resolutor de identidades externas del núcleo (kern_credential.c). opendirectoryd se
++// registra como resolutor (KAUTH_EXTLOOKUP_REGISTER 0) y sus hilos trabajadores esperan en el núcleo peticiones de
++// traducción uid/gid <-> GUID (KAUTH_EXTLOOKUP_WORKER 2, con RESULT 1 para devolver la anterior). Aquí el núcleo nunca
++// pregunta (los permisos los decide Linux), así que el trabajador duerme hasta una señal, como en XNU sin peticiones.
++// Las cachés de identidades (GET/SET_CACHE_SIZES 8/16, CLEAR_CACHES 32) son las de XNU por omisión, sin efecto.
++// Sin esta llamada opendirectoryd reintentaba el registro sin parar (CPU al 100%).
++#include <unistd.h>
++static long b_identitysvc(struct ctx* c) {
++	uint32_t op = (uint32_t)c->a[0];
++	if (op == 0) return euid == 0 ? 0 : -D_EPERM;                          // REGISTER: solo root
++	if (op & 4) return 0;                                                   // DEREGISTER
++	if (op & 8) {                                                           // GET_CACHE_SIZES: struct kauth_cache_sizes
++		uint32_t sz[2] = { 100, 100 };                                      // kcs_group_size, kcs_id_size (XNU por omisión)
++		return safe_write(c->a[1], sz, sizeof sz) == (ssize_t)sizeof sz ? 0 : -D_EFAULT;
++	}
++	if (op & (16 | 32)) return euid == 0 ? 0 : -D_EPERM;                     // SET_CACHE_SIZES / CLEAR_CACHES
++	if (op & 2) { pause(); return -4; }                                     // WORKER: sin peticiones; EINTR al llegar una señal
++	if (op & 1) return 0;                                                   // RESULT suelto: nada pendiente
++	return -D_EINVAL;
++}
++
+ void emu_cred_init(void) {
+ 	cred_load();
++	// La sesión propia, en el registro si aún no está: casi todas se heredan (TAHOE_CRED) sin pasar por setaudit_addr, y
++	// securityd pregunta por la del cliente (auditon A_GETSINFO_ADDR) al darle servicio; sin ella respondía EINVAL a todo
++	// cliente de otra sesión (la shell, sus programas) y SecKeychainCreate, certtool... fallaban con errSecParam.
++	uint8_t a[0x30];
++	if (ses_get(au_asid, a) != 0) { ses_mine(a); ses_put(a); }
+ 	reg_bsd(24, b_getuid); reg_bsd(25, b_geteuid); reg_bsd(47, b_getgid); reg_bsd(43, b_getegid);
+ 	reg_bsd(23, b_setuid); reg_bsd(183, b_seteuid); reg_bsd(181, b_setgid); reg_bsd(182, b_setegid);
+ 	reg_bsd(126, b_setreuid); reg_bsd(127, b_setregid);
+ 	reg_bsd(79, b_getgroups); reg_bsd(80, b_setgroups); reg_bsd(243, b_initgroups);
++	reg_bsd(293, b_identitysvc);
++	reg_bsd(357, b_getaudit_addr); reg_bsd(358, b_setaudit_addr); reg_bsd(353, b_getauid); reg_bsd(354, b_setauid);
++	reg_bsd(351, b_auditon);
++	reg_bsd(428, b_audit_session_self); reg_bsd(429, b_audit_session_join); reg_bsd(432, b_audit_session_port);
+ }
+diff --git a/tahoe-run/emu_proc.c b/tahoe-run/emu_proc.c
+index 6565a46..4f085dd 100644
+--- a/tahoe-run/emu_proc.c
++++ b/tahoe-run/emu_proc.c
+@@ -11,6 +11,7 @@
+ #include <sys/mman.h>
+ #include <stdlib.h>
+ #include <dirent.h>
++#include <execinfo.h>
+ #include <stddef.h>
+ #include "tahoe.h"
+ __thread struct ctx* volatile t_cur;   // llamada en curso del hilo (la pone el manejador de SIGSYS)
+@@ -162,6 +163,58 @@ static long bsd_getrlimit(struct ctx* c) {
+ 	if (((int)c->a[0] & 0xfff) == 8 && out[0] > 10240 && !(c->a[0] & 0x1000)) out[0] = 10240;   // sin la marca POSIX, macOS limita NOFILE
+ 	return safe_write(c->a[1], out, 16) == 16 ? 0 : -D_EFAULT;
+ }
++// getrusage(who, struct rusage*): RUSAGE_SELF (0) y RUSAGE_CHILDREN (-1) valen lo mismo en Linux, y la struct rusage de
++// Darwin x86_64 ocupa y ordena igual que la de Linux (dos timeval de 16 bytes: en Darwin tv_usec es int32 con relleno y,
++// como es menor que 10^6, sus bytes coinciden; después 14 long). La usan los snmp* (net-snmp) al arrancar.
++// setitimer / getitimer (83 / 86): los temporizadores ITIMER_REAL/VIRTUAL/PROF (mismos números en Darwin y Linux) son los
++// de Linux; SIGALRM llega como cualquier otra señal. struct itimerval de Darwin: dos timeval {long tv_sec; int tv_usec}
++// de 16 bytes (los 4 bytes de relleno se ignoran). Sin ellos, alarm() (p. ej. perl -e 'alarm 10') no avisaba nunca.
++static void itv_in(const uint8_t* b, struct itimerval* v) {
++	int64_t s0, s1; int32_t u0, u1;
++	memcpy(&s0, b, 8); memcpy(&u0, b + 8, 4); memcpy(&s1, b + 16, 8); memcpy(&u1, b + 24, 4);
++	v->it_interval.tv_sec = s0; v->it_interval.tv_usec = u0; v->it_value.tv_sec = s1; v->it_value.tv_usec = u1;
++}
++static void itv_out(uint8_t* b, const struct itimerval* v) {
++	memset(b, 0, 32);
++	int64_t s0 = v->it_interval.tv_sec, s1 = v->it_value.tv_sec; int32_t u0 = (int32_t)v->it_interval.tv_usec, u1 = (int32_t)v->it_value.tv_usec;
++	memcpy(b, &s0, 8); memcpy(b + 8, &u0, 4); memcpy(b + 16, &s1, 8); memcpy(b + 24, &u1, 4);
++}
++static long bsd_setitimer(struct ctx* c) {
++	int which = (int)c->a[0];
++	if (which < 0 || which > 2) return -D_EINVAL;
++	struct itimerval nv = { 0 }, ov;
++	if (c->a[1]) { uint8_t b[32]; if (safe_read(c->a[1], b, 32) != 32) return -D_EFAULT; itv_in(b, &nv); }
++	if (setitimer(which, &nv, &ov) != 0) return -D_EINVAL;
++	if (c->a[2]) { uint8_t b[32]; itv_out(b, &ov); if (safe_write(c->a[2], b, 32) != 32) return -D_EFAULT; }
++	return 0;
++}
++static long bsd_getitimer(struct ctx* c) {
++	int which = (int)c->a[0];
++	if (which < 0 || which > 2) return -D_EINVAL;
++	struct itimerval v; if (getitimer(which, &v) != 0) return -D_EINVAL;
++	uint8_t b[32]; itv_out(b, &v);
++	return safe_write(c->a[1], b, 32) == 32 ? 0 : -D_EFAULT;
++}
++static long bsd_getrusage(struct ctx* c) {
++	int who = (int)c->a[0];
++	if (who != 0 && who != -1) return -D_EINVAL;
++	struct rusage ru;
++	if (getrusage(who == 0 ? RUSAGE_SELF : RUSAGE_CHILDREN, &ru) != 0) return -darwin_errno(errno);
++	_Static_assert(sizeof ru == 144, "struct rusage de Linux x86_64");
++	return safe_write(c->a[1], &ru, sizeof ru) == (ssize_t)sizeof ru ? 0 : -D_EFAULT;
++}
++// memorystatus_get_level(int* nivel): porcentaje de memoria disponible (0-100), como el memorystatus_level de XNU. Aquí,
++// MemAvailable / MemTotal de Linux. Lo usa memory_pressure.
++static long bsd_memorystatus_get_level(struct ctx* c) {
++	unsigned long long tot = 0, av = 0; char l[128];
++	FILE* f = fopen("/proc/meminfo", "r");
++	if (f) {
++		while (fgets(l, sizeof l, f)) { sscanf(l, "MemTotal: %llu", &tot); sscanf(l, "MemAvailable: %llu", &av); }
++		fclose(f);
++	}
++	int32_t lvl = tot ? (int32_t)(av * 100 / tot) : 0;
++	return safe_write(c->a[0], &lvl, 4) == 4 ? 0 : -D_EFAULT;
++}
+ static long bsd_setrlimit(struct ctx* c) {
+ 	int r = linux_rlimit((int)c->a[0]);
+ 	uint64_t in[2];
+@@ -170,8 +223,9 @@ static long bsd_setrlimit(struct ctx* c) {
+ 	// Los límites que fija launchd para cada servicio (NumberOfFiles, AS, DATA...) no deben bajar los del anfitrión: tahoe-run
+ 	// necesita descriptores altos y mucho espacio de direcciones para relanzarse, y un servicio sin ellos moría con exit(111).
+ 	if (r == RLIMIT_NOFILE) {
+-		if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < 4096) rl.rlim_cur = 4096;
+-		if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < 4096) rl.rlim_max = 4096;
++		// por encima de FD_INTERNAL_BASE: ahí viven los descriptores del emulador (fd_hi); el programa ve 10240 (getrlimit)
++		if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < FD_INTERNAL_LIMIT) rl.rlim_cur = FD_INTERNAL_LIMIT;
++		if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < FD_INTERNAL_LIMIT) rl.rlim_max = FD_INTERNAL_LIMIT;
+ 	} else if (r != RLIMIT_CORE) return 0;
+ 	return setrlimit(r, &rl) == 0 ? 0 : -darwin_errno(errno);
+ }
+@@ -203,6 +257,11 @@ static long bsd_sigaction(struct ctx* c) {
+ 		memcpy(&sigtab[s].tramp, nw + 8, 8);
+ 		memcpy(&sigtab[s].mask, nw + 16, 4);
+ 		memcpy(&sigtab[s].flags, nw + 20, 4);
++		// Señales de control de la terminal (SIGTSTP 18, SIGTTIN 21, SIGTTOU 22): SIG_IGN / SIG_DFL también en Linux. Un bash
++		// interactivo ignora SIGTTOU antes de ponerse en primer plano (tcsetpgrp); si Linux no lo sabía, lo detenía (estado T)
++		// y la shell de tools/macos-shell.sh se quedaba congelada sin prompt. Con un manejador propio se deja la acción
++		// por omisión: aún no se entregan señales al invitado.
++		if ((s == 18 || s == 21 || s == 22) && sigtab[s].handler <= 1) signal(darwin_to_linux_sig(s), sigtab[s].handler == 1 ? SIG_IGN : SIG_DFL);
+ 	}
+ 	return 0;
+ }
+@@ -221,6 +280,20 @@ static long bsd_sigaltstack(struct ctx* c) {
+ 	}
+ 	return 0;
+ }
++// sigreturn(uctx, infostyle, token). Con uctx NULL es la forma con que siglongjmp/longjmp de libplatform avisan al núcleo
++// de que salen (UC_RESET_ALT_STACK) o entran (UC_SET_ALT_STACK) en la pila alternativa: como XNU (unix_signal.c), solo
++// se cambia SS_ONSTACK en ss_flags. La vuelta de un manejador de verdad no puede darse aún (no se construyen marcos de
++// señal): se anota y EINVAL.
++#define UC_SET_ALT_STACK 0x40000000u
++#define UC_RESET_ALT_STACK 0x80000000u
++static long bsd_sigreturn(struct ctx* c) {
++	uint32_t style = (uint32_t)c->a[1];
++	if (style == UC_SET_ALT_STACK) { alt_flags |= 1; return 0; }        // SS_ONSTACK
++	if (style == UC_RESET_ALT_STACK) { alt_flags &= ~1; return 0; }
++	static int dicho;
++	if (!dicho++) logf_("    sigreturn <%d>: vuelta de un marco de señal (uctx=0x%lx estilo=0x%x) sin implementar\n", (int)getpid(), c->a[0], style);
++	return -D_EINVAL;
++}
+ static uint32_t pthread_mask;
+ static long bsd_pthread_sigmask(struct ctx* c) {                             // (how, set*, oset*) por valor en Darwin: how, set, oset
+ 	uint32_t old = pthread_mask;
+@@ -241,19 +314,35 @@ static long bsd_kill(struct ctx* c) {
+ 	int ls = darwin_to_linux_sig(s);
+ 	if (ls <= 0) return -D_EINVAL;
+ 	long r = syscall(SYS_kill, (int)c->a[0], ls);
++	// Señales que terminan a otro proceso: al registro (si no, el proceso desaparece sin dejar rastro: SIGKILL no se
++	// puede interceptar en el destino).
++	if ((int)c->a[0] != getpid() && (s == 9 || s == 15 || s == 6 || s == 3 || s == 2 || s == 1))
++		logf_("    kill: <%d> envía la señal %d a %d%s\n", (int)getpid(), s, (int)c->a[0], r < 0 ? " (falló)" : "");
+ 	return r < 0 ? -darwin_errno(errno) : 0;
+ }
+-// Diagnóstico dirigido: 1 si este proceso es el indicado en /dev/shm/tahoe-stacks (subcadena de su línea de órdenes).
+-int diag_target(void) {
+-	static int want = -1;
+-	if (want < 0) {
+-		char nm[64] = "", cl[512] = "";
+-		FILE* f = fopen("/dev/shm/tahoe-stacks", "r"); if (f) { if (fgets(nm, sizeof nm, f)) nm[strcspn(nm, "\n")] = 0; fclose(f); }
+-		f = fopen("/proc/self/cmdline", "r"); if (f) { size_t n = fread(cl, 1, 511, f); for (size_t i = 0; i < n; i++) if (!cl[i]) cl[i] = ' '; fclose(f); }
+-		want = nm[0] && strstr(cl, nm) != NULL;
+-	}
+-	return want;
++// Diagnóstico dirigido: 1 si este proceso es uno de los indicados en /dev/shm/tahoe-stacks (nombres separados por espacios;
++// cada uno, subcadena de su línea de órdenes: así también vale el xpcproxy que va a lanzar ese servicio).
++// 1 si alguno de los nombres del archivo (separados por espacios) está en la línea de órdenes de este proceso.
++static int names_match(const char* file) {
++	char nm[256] = "", cl[1024] = "";
++	FILE* f = fopen(file, "r"); if (!f) return 0;
++	if (fgets(nm, sizeof nm, f)) nm[strcspn(nm, "\n")] = 0;
++	fclose(f);
++	f = fopen("/proc/self/cmdline", "r"); if (f) { size_t n = fread(cl, 1, sizeof cl - 1, f); for (size_t i = 0; i < n; i++) if (!cl[i]) cl[i] = ' '; fclose(f); }
++	char* sv = NULL;
++	for (char* t = strtok_r(nm, " \t", &sv); t; t = strtok_r(NULL, " \t", &sv)) if (strstr(cl, t)) return 1;
++	return 0;
+ }
++// Traza activada por un archivo de /dev/shm: si está vacío vale para todos los procesos; si tiene nombres, solo para esos.
++int trace_file_on(const char* file) {
++	struct stat st;
++	if (stat(file, &st) != 0) return 0;
++	return st.st_size == 0 ? 1 : names_match(file);
++}
++int diag_target(void) { static int want = -1; if (want < 0) want = names_match("/dev/shm/tahoe-stacks"); return want; }
++// Traza de mensajes Mach (líneas «MSG»: envíos y recepciones) solo de los procesos nombrados en /dev/shm/tahoe-msg-trace;
++// tools/diag/mensajes.py la convierte en una conversación. Mucho más ligera que la traza MT de todos los procesos.
++int msg_trace(void) { static int want = -1; if (want < 0) want = names_match("/dev/shm/tahoe-msg-trace"); return want; }
+ // Con /dev/shm/tahoe-stacks-all, el proceso indicado registra todas sus syscalls BSD (no solo las que fallan).
+ int diag_all(void) { static int v = -1; if (v < 0) v = access("/dev/shm/tahoe-stacks-all", F_OK) == 0; return v; }
+ // Lee los mensajes de aborto del ejecutable principal (cargado en 0x100000000) y de todas las imágenes de la caché
+@@ -294,21 +383,23 @@ static void crash_messages(void) {
+ 		}
+ 	}
+ }
+-void diag_crash(ucontext_t* uc) {
++// Pila del hilo actual en el registro. "abort" para caídas (con el motivo que dejó la librería); "espera" para los
++// diagnósticos de bloqueo (STACKS), que no son caídas.
++void diag_stack(ucontext_t* uc, const char* what) {
+ 		// Motivo del aborto: cada librería que llama a abort/CRASH deja su texto en gCRAnnotations, en su sección
+ 		// __DATA*,__crash_info (message en +8, message2 en +32). Se recorren las imágenes de la caché compartida.
+-		crash_messages();
++		if (!strcmp(what, "abort")) crash_messages();
+ 		{
+ 			// Retornos plausibles: valores de la pila dentro de la caché cuya instrucción anterior es un "call".
+ 			static __thread uint64_t sk[2048]; memset(sk, 0, sizeof sk);
+ 			ssize_t got = safe_read((uint64_t)uc->uc_mcontext.gregs[REG_RSP], sk, sizeof sk);
+-			logf_("    abort <%d>: rip=0x%llx rsp=0x%llx rbp=0x%llx pila:", (int)getpid(), (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], (unsigned long long)uc->uc_mcontext.gregs[REG_RSP], (unsigned long long)uc->uc_mcontext.gregs[REG_RBP]);
++			logf_("    %s <%d>: rip=0x%llx rsp=0x%llx rbp=0x%llx pila:", what, (int)getpid(), (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], (unsigned long long)uc->uc_mcontext.gregs[REG_RSP], (unsigned long long)uc->uc_mcontext.gregs[REG_RBP]);
+ 			for (int k = 0; k < 14 && k < (int)(got / 8); k++) logf_(" %lx", sk[k]);
+ 			greg_t* g = uc->uc_mcontext.gregs;
+-			logf_("\n    abort <%d>: rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r12=%llx r13=%llx r14=%llx r15=%llx", (int)getpid(),
++			logf_("\n    %s <%d>: rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r12=%llx r13=%llx r14=%llx r15=%llx", what, (int)getpid(),
+ 				(unsigned long long)g[REG_RAX], (unsigned long long)g[REG_RBX], (unsigned long long)g[REG_RCX], (unsigned long long)g[REG_RDX], (unsigned long long)g[REG_RSI],
+ 				(unsigned long long)g[REG_RDI], (unsigned long long)g[REG_R8], (unsigned long long)g[REG_R12], (unsigned long long)g[REG_R13], (unsigned long long)g[REG_R14], (unsigned long long)g[REG_R15]);
+-			logf_("\n    abort <%d>: marcos (rbp):", (int)getpid());          // pila exacta: macOS conserva el puntero de marco
++			logf_("\n    %s <%d>: marcos (rbp):", what, (int)getpid());          // pila exacta: macOS conserva el puntero de marco
+ 			uint64_t fp = (uint64_t)g[REG_RBP];
+ 			for (int k = 0; k < 32 && fp; k++) {
+ 				uint64_t fr[2];
+@@ -317,11 +408,11 @@ void diag_crash(ucontext_t* uc) {
+ 				if (fr[0] <= fp) break;
+ 				fp = fr[0];
+ 			}
+-			logf_("\n    abort: llamadas plausibles:");
++			logf_("\n    %s <%d>: llamadas plausibles:", what, (int)getpid());
+ 			int shown = 0;
+ 			for (int k = 0; k < (int)(got / 8) && shown < 24; k++) {
+ 				uint64_t a = sk[k];
+-				if (!((a >= 0x7ff800000000UL && a < 0x7ff820000000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;   // caché o ejecutable
++				if (!((a >= 0x7ff800000000UL && a < 0x7ffffe600000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;   // caché o ejecutable
+ 				uint8_t pre[6];
+ 				if (safe_read(a - 6, pre, 6) != 6) continue;
+ 				if (pre[1] == 0xe8 || pre[3] == 0xff || pre[4] == 0xff || pre[2] == 0xff) { logf_(" 0x%lx", a); shown++; }
+@@ -330,6 +421,8 @@ void diag_crash(ucontext_t* uc) {
+ 		}
+ 	}
+ 
++void diag_crash(ucontext_t* uc) { diag_stack(uc, "abort"); }
++
+ // ---- Volcado de todos los hilos (diagnóstico de cuelgues): con /dev/shm/tahoe-stacks, cuando el proceso indicado cae,
+ // cada hilo dice qué llamada al núcleo emulada tiene en curso (t_cur, puesto por el manejador de SIGSYS) o, si estaba
+ // ejecutando código del invitado, dónde; y los retornos plausibles de su pila del invitado.
+@@ -341,7 +434,7 @@ static void plausible_returns(uint64_t rsp, int max) {
+ 	int shown = 0;
+ 	for (int k = 0; k < (int)(got / 8) && shown < max; k++) {
+ 		uint64_t a = sk[k];
+-		if (!((a >= 0x7ff800000000UL && a < 0x7ff820000000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;
++		if (!((a >= 0x7ff800000000UL && a < 0x7ffffe600000UL) || (a >= 0x100000000UL && a < 0x101000000UL))) continue;
+ 		uint8_t pre[6];
+ 		if (safe_read(a - 6, pre, 6) != 6) continue;
+ 		if (pre[1] == 0xe8 || pre[3] == 0xff || pre[4] == 0xff || pre[2] == 0xff) { logf_(" 0x%lx", a); shown++; }
+@@ -364,6 +457,9 @@ static void on_dump(int sig, siginfo_t* si, void* v) {
+ 		if ((nr >> 24) == 2 && (num == 5 || num == 398 || num == 463 || num == 464)) {   // open / openat: la ruta
+ 			char path[256] = ""; safe_read(num >= 463 ? a[1] : a[0], path, sizeof path - 1); path[255] = 0;
+ 			k += snprintf(ln + k, sizeof ln - k, " \"%s\"", path);
++		} else if ((nr >> 24) == 1 && num == 47) {                 // mach_msg2: opciones y puerto de recepción
++			uint64_t a5 = 0; safe_read((uint64_t)&c->a[5], &a5, 8);
++			k += snprintf(ln + k, sizeof ln - k, " args=%lx,%lx,%lx recibe en 0x%x", a[0], a[1], a[2], (uint32_t)(a5 >> 32));
+ 		} else k += snprintf(ln + k, sizeof ln - k, " args=%lx,%lx,%lx", a[0], a[1], a[2]);
+ 		logf_("%s\n", ln);
+ 	} else {
+@@ -391,6 +487,7 @@ static void on_dump_all(int sig, siginfo_t* si, void* v) {
+ 	(void)sig;
+ 	char sel = tahoe_selector_get();
+ 	tahoe_selector_set(0);
++	port_dump_queues();                                         // puertos con mensajes en cola y sus conjuntos
+ 	long me = syscall(SYS_gettid);
+ 	DIR* d = opendir("/proc/self/task");
+ 	struct dirent* e;
+@@ -435,10 +532,31 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
+ 			FILE* pk = fopen("/dev/shm/tahoe-peek", "r");       // además: valor de 8 bytes en esas direcciones
+ 			if (pk) { char ln[64]; while (fgets(ln, sizeof ln, pk)) {
+ 				uint64_t a, v = 0;
+-				static const struct { const char* n; int r; } rn[] = { {"rax",REG_RAX},{"rsi",REG_RSI},{"rdi",REG_RDI},{"rbx",REG_RBX},{"rsp",REG_RSP},{"rbp",REG_RBP},{"r12",REG_R12},{"r13",REG_R13},{"r14",REG_R14},{"r15",REG_R15} };
+-				a = 0; for (size_t q = 0; q < sizeof rn / sizeof rn[0]; q++) if (!strncmp(ln, rn[q].n, 3)) a = (uint64_t)g[rn[q].r] + (ln[3] == '+' ? strtoull(ln + 4, NULL, 16) : 0);
+-				if (!a) a = strtoull(ln, NULL, 16);
+-				if (a && safe_read(a, &v, 8) == 8) logf_("    PEEK %.*s[0x%lx] = 0x%lx\n", (int)strcspn(ln, "\n"), ln, a, v); } fclose(pk); }
++				if (!strncmp(ln, "bt", 2)) {                        // bt: cadena de rbp (direcciones de vuelta, 24 marcos)
++					uint64_t fp = (uint64_t)g[REG_RBP], fr[2];
++					for (int q = 0; q < 24 && fp && safe_read(fp, fr, 16) == 16; q++, fp = fr[0]) logf_("    BT #%d 0x%lx\n", q, fr[1]);
++					continue;
++				}
++				char* e = ln; int deref = *e == '*';                // *expr: además, el texto al que apunta el valor leído
++				if (deref) e++;
++				int strip = *e == '~';                              // ~reg: sin los 4 bits altos (objetos puenteados de Swift)
++				if (strip) e++;
++				static const struct { const char* n; int r; } rn[] = { {"rax",REG_RAX},{"rsi",REG_RSI},{"rdi",REG_RDI},{"rbx",REG_RBX},{"rsp",REG_RSP},{"rbp",REG_RBP},{"rcx",REG_RCX},{"rdx",REG_RDX},{"r8",REG_R8},{"r9",REG_R9},{"r12",REG_R12},{"r13",REG_R13},{"r14",REG_R14},{"r15",REG_R15} };
++				a = 0; for (size_t q = 0; q < sizeof rn / sizeof rn[0]; q++) { size_t nl = strlen(rn[q].n);
++					if (!strncmp(e, rn[q].n, nl) && (e[nl] == '+' || e[nl] == '@' || e[nl] == '\n' || e[nl] == 0)) { a = ((uint64_t)g[rn[q].r] & (strip ? 0x0fffffffffffffffULL : ~0ULL)) + (e[nl] == '+' ? strtoull(e + nl + 1, NULL, 16) : 0); break; } }
++				if (!a) a = strtoull(e, NULL, 16);
++				for (char* at = strchr(e, '@'); a && at; at = strchr(at + 1, '@')) {   // reg+n@m: seguir el puntero en a y sumar m
++					uint64_t nx; if (safe_read(a, &nx, 8) != 8) { a = 0; break; }
++					a = (nx & (strip ? 0x0fffffffffffffffULL : ~0ULL)) + strtoull(at + 1, NULL, 16);
++				}
++				if (a && strip && !deref) {                        // ~reg+n: el texto que hay en esa dirección
++					char t[129] = { 0 };
++					if (safe_read(a, t, 128) > 0) { for (int q = 0; q < 128 && t[q]; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK %.*s: \"%s\"\n", (int)strcspn(ln, "\n"), ln, t); }
++				} else if (a && safe_read(a, &v, 8) == 8) {
++					logf_("    PEEK %.*s[0x%lx] = 0x%lx\n", (int)strcspn(ln, "\n"), ln, a, v);
++					char t[161] = { 0 };                             // 160 bytes, ceros incluidos (objetos: cabecera y luego el texto)
++					if (deref && v && safe_read(v, t, 160) > 0) { for (int q = 0; q < 160; q++) if (t[q] < 32 || t[q] > 126) t[q] = '.'; logf_("    PEEK *: \"%s\"\n", t); }
++				} } fclose(pk); }
+ 			brk_poke(at, brk_orig[i]);
+ 			g[REG_RIP] = (greg_t)at;
+ 			g[REG_EFL] |= 0x100L;                                // TF: una instrucción y vuelve aquí
+@@ -449,7 +567,9 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
+ 	tahoe_selector_set(sel);
+ }
+ void diag_breakpoints(void) {
+-	if (!diag_target()) return;
++	// en el proceso de /dev/shm/tahoe-stacks, o en los de /dev/shm/tahoe-brk-who sin el resto del diagnóstico (que
++	// ralentiza mucho: WindowServer no llegaba en 15 minutos a donde se quería mirar)
++	if (!diag_target() && !names_match("/dev/shm/tahoe-brk-who")) return;
+ 	tahoe_sigaction(SIGRTMIN + 4, on_dump);                     // volcados de hilos a petición (SIGRTMIN+5, ver on_dump_all)
+ 	tahoe_sigaction(SIGRTMIN + 5, on_dump_all);
+ 	FILE* f = fopen("/dev/shm/tahoe-break", "r");
+@@ -475,6 +595,7 @@ void diag_dump_threads(void) {
+ 	if (done || !diag_target()) return;
+ 	done = 1;
+ 	tahoe_sigaction(SIGRTMIN + 4, on_dump);
++	port_dump_queues();                                          // puertos de este proceso con mensajes, y sus conjuntos
+ 	DIR* d = opendir("/proc/self/task");
+ 	if (!d) return;
+ 	long me = syscall(SYS_gettid);
+@@ -487,11 +608,34 @@ void diag_dump_threads(void) {
+ 	struct timespec ts = { 0, 200 * 1000000L }; nanosleep(&ts, NULL);   // que escriban antes de salir
+ }
+ 
++// SIGABRT que no viene de un abort() de macOS (ver bsd_pthread_kill): un assert o un pánico del propio tahoe-run, o un
++// kill de fuera. Sin esto el proceso moría sin rastro («fin <pid> por la señal 6 de Linux»). Se anota quién lo envió, la
++// pila de tahoe-run (addr2line -e tahoe-run) y qué hacía el hilo de macOS, y se muere igual.
++static __thread int guest_abort;
++static void on_sigabrt(int sig, siginfo_t* si, void* v) {
++	tahoe_selector_set(0);
++	if (!guest_abort) {
++		logf_("    SIGABRT del anfitrión <%d:%ld> código=%d de pid %d\n", (int)getpid(), (long)syscall(SYS_gettid), si->si_code, (int)si->si_pid);
++		void* bt[32]; int n = backtrace(bt, 32);
++		char ln[1024]; int k = snprintf(ln, sizeof ln, "    SIGABRT <%d> pila de tahoe-run:", (int)getpid());
++		for (int i = 0; i < n && k < (int)sizeof ln - 24; i++) k += snprintf(ln + k, sizeof ln - k, " %p", bt[i]);
++		logf_("%s\n", ln);
++		on_dump(sig, si, v);
++	}
++	struct { void* h; unsigned long flags; void* restorer; unsigned long mask; } dfl = { 0 };   // SIG_DFL y otra vez
++	syscall(SYS_rt_sigaction, SIGABRT, &dfl, NULL, 8);
++	syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGABRT);
++}
++
+ static long bsd_pthread_kill(struct ctx* c) {
+ 	int s = (int)c->a[1];
+ 	if (s == 0) return 0;
+ 	if (s == 6) {
++		guest_abort = 1;
+ 		diag_crash(c->uc);
++		// abort() de un programa de macOS: el proceso muere por SIGABRT de verdad (launchd lo ve como en un Mac), pero sin
++		// volcado de memoria de Linux: systemd-coredump guardaría ~10 MB y avisaría en el escritorio en cada caída.
++		syscall(SYS_prctl, 4 /* PR_SET_DUMPABLE */, 0, 0, 0, 0);
+ 	}
+ 	int ls = darwin_to_linux_sig(s);
+ 	if (ls <= 0) return -D_EINVAL;
+@@ -532,6 +676,7 @@ static long bsd_wait4(struct ctx* c) {
+ 	int st = 0;
+ 	long r = syscall(SYS_wait4, (int)c->a[0], &st, (int)c->a[2], NULL);
+ 	if (r < 0) return -darwin_errno(errno);
++	if (r > 0 && WIFSIGNALED(st)) logf_("    fin <%ld> por la señal %d de Linux (lo recoge %d)\n", r, WTERMSIG(st), (int)getpid());
+ 	if (c->a[1] && r > 0) { int ds = darwin_wait_status(st); if (safe_write(c->a[1], &ds, 4) != 4) return -D_EFAULT; }
+ 	return r;
+ }
+@@ -561,6 +706,8 @@ static int read_strv(uint64_t addr, char*** out, int max) {
+ 
+ // Ruta del programa (vista de macOS) -> ruta real en el host.
+ static void host_path(const char* guest, char* out, size_t cap) {
++	guest += tahoe_resolve_skip(guest);
++	if (tahoe_metal_path(guest, out, cap)) return;
+ 	if (tahoe_root && guest[0] == '/' && !tahoe_host_passthrough(guest)) { snprintf(out, cap, "%s%s", tahoe_root, guest); return; }
+ 	snprintf(out, cap, "%s", guest);
+ }
+@@ -575,6 +722,7 @@ enum { PSFA_OPEN = 0, PSFA_CLOSE = 1, PSFA_DUP2 = 2, PSFA_INHERIT = 3, PSFA_FILE
+ struct psfa { int type, fd, arg; int oflag; uint16_t mode; char path[1024]; };
+ static struct psfa spawn_fa[32];
+ static int spawn_fa_n, spawn_cloexec_default;
++static int spawn_setpgroup, spawn_pgroup;                          // POSIX_SPAWN_SETPGROUP: grupo de procesos del hijo (0: el suyo)
+ static void read_file_actions(uint64_t addr, uint64_t size) {
+ 	spawn_fa_n = 0;
+ 	if (!addr || size < 8) return;
+@@ -698,6 +846,21 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
+ 			snprintf(gpath, sizeof gpath, "%s", interp);
+ 			continue;
+ 		}
++		// Como XNU: un Mach-O sin parte x86_64 no se ejecuta y la llamada falla con EBADARCH (86) sin crear el proceso. El
++		// macOS completo es universal pero trae programas solo de Apple Silicon (p. ej. seputil, la tarea de arranque
++		// data-protection), y launchd en un Mac Intel cuenta con ese error para saltarlos.
++		if (hn >= 8) {
++			uint32_t m; memcpy(&m, head, 4);
++			int fat = m == 0xbebafecaU || m == 0xbfbafecaU, ok = 1;     // FAT_MAGIC / FAT_MAGIC_64 (big endian)
++			if (m == 0xfeedfacfU) ok = *(uint32_t*)(head + 4) == 0x01000007;
++			else if (fat) {
++				uint32_t n = __builtin_bswap32(*(uint32_t*)(head + 4)), esz = m == 0xbebafecaU ? 20 : 32;
++				ok = 0;
++				for (uint32_t i = 0; i < n && 8 + (i + 1) * esz <= (uint32_t)hn; i++)
++					if (__builtin_bswap32(*(uint32_t*)(head + 8 + i * esz)) == 0x01000007) ok = 1;
++			}
++			if (!ok) { logf_("    exec \"%s\": sin parte x86_64 -> EBADARCH\n", gpath); return -86; }
++		}
+ 		break;
+ 	}
+ 	// Programas que se sustituyen por un proceso que sale con éxito: rutas separadas por comas en TAHOE_STUB_EXEC (para
+@@ -728,7 +891,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
+ 	nargv[k++] = (char*)g_dyld_path;
+ 	nargv[k++] = hpath;
+ 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
+-	char** nenv = calloc(ec + 12 + 8 + 9, sizeof(char*));
++	char** nenv = calloc(ec + 17 + 8 + 9, sizeof(char*));
+ 	int e = 0;
+ 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
+ 	char b1[4300], b2[4300];
+@@ -742,6 +905,18 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
+ 	if (getenv("TAHOE_LOGFILE")) { snprintf(b3, sizeof b3, "TAHOE_LOGFILE=%s", getenv("TAHOE_LOGFILE")); nenv[e++] = b3; }
+ 	static char b6[600];
+ 	if (getenv("TAHOE_CACHE_DIR")) { snprintf(b6, sizeof b6, "TAHOE_CACHE_DIR=%s", getenv("TAHOE_CACHE_DIR")); nenv[e++] = b6; }
++	static char b8[600];
++	if (getenv("TAHOE_OSK_FILE")) { snprintf(b8, sizeof b8, "TAHOE_OSK_FILE=%s", getenv("TAHOE_OSK_FILE")); nenv[e++] = b8; }
++	static char b9[600];
++	if (getenv("TAHOE_SMBIOS_FILE")) { snprintf(b9, sizeof b9, "TAHOE_SMBIOS_FILE=%s", getenv("TAHOE_SMBIOS_FILE")); nenv[e++] = b9; }
++	static char b10[600];                                   // argumentos de arranque (boot-args): para todos los procesos
++	if (getenv("TAHOE_BOOTARGS")) { snprintf(b10, sizeof b10, "TAHOE_BOOTARGS=%s", getenv("TAHOE_BOOTARGS")); nenv[e++] = b10; }
++	static char b11[64];                                    // identidad PCI de la GPU emulada (emu_iokit.inc)
++	if (getenv("TAHOE_GPU")) { snprintf(b11, sizeof b11, "TAHOE_GPU=%s", getenv("TAHOE_GPU")); nenv[e++] = b11; }
++	static char b12[4300];                                  // driver Metal de tahoe-run (emu_fs.c, emu_iokit.inc)
++	if (getenv("TAHOE_METAL")) { snprintf(b12, sizeof b12, "TAHOE_METAL=%s", getenv("TAHOE_METAL")); nenv[e++] = b12; }
++	static char b13[300];
++	if (getenv("TAHOE_GPU_SOCK")) { snprintf(b13, sizeof b13, "TAHOE_GPU_SOCK=%s", getenv("TAHOE_GPU_SOCK")); nenv[e++] = b13; }
+ 	if (getenv("TAHOE_FD2LOG")) nenv[e++] = (char*)"TAHOE_FD2LOG=1";
+ 	if (getenv("TAHOE_DEBUG_NOREBOOT")) nenv[e++] = (char*)"TAHOE_DEBUG_NOREBOOT=1";   // modo depuración (ver emu_iokit.inc)
+ 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
+@@ -754,12 +929,16 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
+ 	if (spawn) {
+ 		posix_spawn_file_actions_t fa;
+ 		psfa_build(&fa);
+-		int pe = posix_spawn(pidout, g_self_exe, &fa, NULL, nargv, nenv);
++		posix_spawnattr_t at; posix_spawnattr_init(&at);
++		if (spawn_setpgroup) { posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP); posix_spawnattr_setpgroup(&at, spawn_pgroup); }
++		int pe = posix_spawn(pidout, g_self_exe, &fa, &at, nargv, nenv);
++		posix_spawnattr_destroy(&at);
+ 		posix_spawn_file_actions_destroy(&fa);
+-		spawn_fa_n = 0; spawn_cloexec_default = 0;
++		spawn_fa_n = 0; spawn_cloexec_default = 0; spawn_setpgroup = 0;
+ 		return pe ? -darwin_errno(pe) : 0;
+ 	}
+ 	if (spawn_fa_n || spawn_cloexec_default) { psfa_apply_here(); spawn_fa_n = 0; spawn_cloexec_default = 0; }   // POSIX_SPAWN_SETEXEC
++	if (spawn_setpgroup) { setpgid(0, spawn_pgroup); spawn_setpgroup = 0; }
+ 	execwatch_notify();                                              // NOTE_EXEC para quien vigila este proceso (kqueue)
+ 	execve(g_self_exe, nargv, nenv);
+ 	return -darwin_errno(errno);
+@@ -772,9 +951,10 @@ static long bsd_execve(struct ctx* c) { return exec_common(c->a[0], c->a[1], c->
+ static long bsd_posix_spawn(struct ctx* c) {
+ 	uint64_t ad[6] = { 0 };
+ 	uint16_t psa_flags = 0;
++	int32_t psa_pgroup = 0;
+ 	if (c->a[2]) {
+ 		safe_read(c->a[2], ad, sizeof ad);                          // attr_size, attrp, file_actions_size, file_actions
+-		if (ad[1]) safe_read(ad[1], &psa_flags, 2);
++		if (ad[1]) { safe_read(ad[1], &psa_flags, 2); safe_read(ad[1] + 12, &psa_pgroup, 4); }   // psa_flags, ..., psa_pgroup (+12)
+ 	}
+ 	char gp[256] = "?";
+ 	safe_string(c->a[1], gp, sizeof gp);
+@@ -786,19 +966,53 @@ static long bsd_posix_spawn(struct ctx* c) {
+ 			uint32_t act[6] = { 0 };                                // port_type, mask, new_port, behavior, flavor, which
+ 			if (safe_read(ad[5] + 8 + i * 24, act, 24) != 24) break;
+ 			if (act[0] == 1 && spawn_special_n < 8) snprintf(spawn_special_env[spawn_special_n++], 32, "TAHOE_SP%u=%u", act[5], act[2]);
++			if (act[0] == 2) {                                      // PSPA_AU_SESSION: el hijo nace en la sesión de ese puerto
++				int kt; int32_t asid;
++				if (kobj_lookup(act[2], &kt, &asid) && kt == KO_AUDIT_SESSION) cred_spawn_session((uint32_t)asid);
++			}
+ 			logf_("    posix_spawn: acción de puerto tipo=%u which=%u puerto=0x%x\n", act[0], act[5], act[2]);
+ 		}
+ 	}
+ 	logf_("    posix_spawn <%d>(\"%s\") attr_flags=0x%x ad=%lx,%lx,%lx,%lx,%lx,%lx\n", (int)getpid(), gp, psa_flags, ad[0], ad[1], ad[2], ad[3], ad[4], ad[5]);
+ 	read_file_actions(ad[3], ad[2]);
+ 	spawn_cloexec_default = (psa_flags & 0x4000) != 0;              // POSIX_SPAWN_CLOEXEC_DEFAULT
+-	if (psa_flags & 0x40) return exec_common(c->a[1], c->a[3], c->a[4], 0, NULL);
++	// POSIX_SPAWN_SETPGROUP (0x2): el hijo en el grupo psa_pgroup, o en uno nuevo con su pid si es 0. Quien lo lanza puede
++	// luego matar al grupo entero (system_profiler: kill(-pid, SIGTERM) a un informe que no acaba); sin esto fallaba y
++	// system_profiler se quedaba esperando para siempre.
++	spawn_setpgroup = (psa_flags & 0x2) != 0; spawn_pgroup = psa_pgroup;
++	if (psa_flags & 0x40) { long r0 = exec_common(c->a[1], c->a[3], c->a[4], 0, NULL); cred_spawn_session(0); return r0; }
+ 	pid_t pid = 0;
+ 	long r = exec_common(c->a[1], c->a[3], c->a[4], 1, &pid);
++	cred_spawn_session(0);
+ 	if (r == 0 && c->a[0]) { uint32_t p = (uint32_t)pid; safe_write(c->a[0], &p, 4); }
+ 	return r;
+ }
+ 
++// setpriority(which, who, prio) / getpriority(which, who): PRIO_PROCESS/PGRP/USER (0-2) son el nice de POSIX y van al de Linux
++// (los pid son los del espacio de PID del arranque). Bajar el nice exige CAP_SYS_NICE en el anfitrión: siendo root en macOS
++// se acepta igual, como en XNU. Las clases propias de Darwin (PRIO_DARWIN_THREAD 3, _PROCESS 4, _GPU 5, _ROLE 6, _GAME_MODE
++// 7...: modo de fondo, rol de la app) solo cambian la planificación de XNU: se aceptan sin efecto y getpriority da 0.
++static long bsd_setpriority(struct ctx* c) {
++	int which = (int)c->a[0], prio = (int)c->a[2];
++	if (which > 2) return 0;
++	if (which < 0) return -D_EINVAL;
++	if (prio < -20) prio = -20;
++	if (prio > 20) prio = 20;
++	if (setpriority(which, (id_t)c->a[1], prio) == 0) return 0;
++	if ((errno == EACCES || errno == EPERM) && cred_euid() == 0) return 0;
++	return -darwin_errno(errno);
++}
++static long bsd_getpriority(struct ctx* c) {
++	int which = (int)c->a[0];
++	if (which > 2) return 0;
++	if (which < 0) return -D_EINVAL;
++	errno = 0;
++	int v = getpriority(which, (id_t)c->a[1]);
++	if (v == -1 && errno) return -darwin_errno(errno);
++	c->raw_ret = 1;                                                  // el nice puede ser negativo: sin CF
++	return v;
++}
++
+ // bsdthread_ctl(comando, arg1, arg2, arg3): QoS, sobrescrituras de prioridad y permisos de las colas de trabajo.
+ // libdispatch llama a BSDTHREAD_CTL_WORKQ_ALLOW_KILL (0x1000) tras un fork y ABORTA si falla; sin colas de trabajo
+ // reales todos los comandos pueden aceptarse sin efecto.
+@@ -814,7 +1028,7 @@ static long bsd_bsdthread_ctl(struct ctx* c) {
+ static __thread sigjmp_buf thr_exit, wq_park;
+ static __thread int thr_exit_ok, wq_park_ok, wq_terminated;
+ extern void guest_thread_done(void);
+-struct new_thread { uint64_t pthread, func, arg, stack, flags; };
++struct new_thread { uint64_t pthread, func, arg, stack, flags; uint32_t kport; };
+ extern void enter_guest_thread(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((noreturn));
+ static void* thread_main(void* p) {
+ 	struct new_thread t = *(struct new_thread*)p;
+@@ -822,10 +1036,8 @@ static void* thread_main(void* p) {
+ 	// Como XNU: base de GS en el TSD del hilo, se avisa con TSD_BASE_SET y se retira SUSPENDED (libpthread lo exige).
+ 	{ FILE* f = fopen("/dev/shm/tahoe-watch-func", "r"); unsigned long fn = 0; if (f) { if (fscanf(f, "%lx", &fn) != 1) fn = 0; fclose(f); } g_watch = fn && fn == t.func; }
+ 	uint64_t flags = t.flags & ~0x20000000u;
+-	uint32_t kport = alloc_port();
++	uint32_t kport = t.kport;
+ 	if (mach_trace()) logf_("    THR <%d:%ld> puerto de hilo 0x%x func=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), kport, t.func);
+-	// cada hilo tiene su propio nombre de puerto (os_unfair_lock lo usa como dueño)
+-	if (mach_thread_self_offset) *(uint32_t*)(t.pthread + tsd_offset + mach_thread_self_offset) = kport;   // el kernel deja aquí el puerto del hilo (relativo al TSD)
+ 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, t.pthread + tsd_offset); flags |= 0x10000000u; }
+ 	if (sigsetjmp(thr_exit, 1) == 0) {
+ 		thr_exit_ok = 1;
+@@ -838,6 +1050,11 @@ static long bsd_bsdthread_create(struct ctx* c) {
+ 	struct new_thread* t = malloc(sizeof *t);
+ 	if (!t) return -D_ENOMEM;
+ 	*t = (struct new_thread){ .pthread = c->a[3], .func = c->a[0], .arg = c->a[1], .stack = c->a[2], .flags = c->a[4] };
++	// Cada hilo tiene su propio nombre de puerto (os_unfair_lock lo usa como dueño). Como XNU, queda en el TSD del
++	// pthread antes de volver: pthread_join lo mira, y si el hilo aún no había arrancado lo daba por terminado (volvía en
++	// el acto, liberaba la pila y el hilo nuevo caía al arrancar sobre ella).
++	t->kport = alloc_port();
++	if (mach_thread_self_offset) safe_write(t->pthread + tsd_offset + mach_thread_self_offset, &t->kport, 4);
+ 	pthread_attr_t at; pthread_attr_init(&at);
+ 	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+ 	pthread_attr_setstacksize(&at, 1 << 20);
+@@ -877,8 +1094,9 @@ static __thread uint64_t my_workloop;   // workloop que atiende este hilo
+ #define WQ_DATA_SIZE 32768
+ // npre/pre/pdata: eventos que el vigilante ya recogió del kqueue (y el búfer donde quedaron los mensajes Mach recibidos).
+ struct wq_job { uint64_t kqid; int workloop, has_req, npre; uint32_t prio; uint8_t req[72]; uint8_t pre[16 * 72]; uint8_t* pdata; struct wq_job* next; };
+-struct wl_state { uint64_t kqid; int running, pending, watching, has_req; uint8_t req[72]; struct wl_state* next; };   // watching: ya tiene vigilante
++struct wl_state { uint64_t kqid; int running, pending, watching, has_req, owned; unsigned gen; uint8_t req[72]; struct wl_state* next; };   // gen: cuántas veces se armó (para no retirar un vigilante que acaban de volver a necesitar)   // watching: ya tiene vigilante; owned: petición en espera porque la cola tiene propietario
+ extern int kq_workloop_fd(uint64_t);
++extern int kq_workloop_try_free(uint64_t);
+ extern long kq_drain(uint64_t, uint64_t, int, uint64_t, uint64_t);
+ static void wl_arm(uint64_t kqid);
+ // El kernel solo lanza el hilo si el estado de la cola sigue siendo el que esperaba libdispatch:
+@@ -907,8 +1125,81 @@ static int req_still_valid(const uint8_t* req) {
+ 	if (safe_read(ext[1], &cur, 8) != 8) return 1;
+ 	return (cur & ext[2]) == (ext[3] & ext[2]);
+ }
++// Propietario de la cola (NOTE_WL_DISCOVER_OWNER, 0x80): XNU lee el nombre del hilo propietario de los bits bajos de
++// dq_state (kdata & ~3). Mientras un workloop tiene propietario (un hilo que vacía la cola por su cuenta, p. ej. con
++// dispatch_sync), su petición de hilo no se atiende: queda pendiente hasta que el propietario la suelta. Si se atendía,
++// el hilo no podía tomar la cola, volvía a pedirla y terminaba, en bucle (systemstats gastaba así 1,4 núcleos).
++static uint32_t req_owner(const uint8_t* req) {
++	uint32_t ff; memcpy(&ff, req + 24, 4);
++	if (!(ff & 0x80u)) return 0;
++	uint64_t ext[4]; memcpy(ext, req + 40, 32);
++	uint64_t cur;
++	if (!ext[1] || safe_read(ext[1], &cur, 8) != 8) return 0;
++	return (uint32_t)cur & ~3u;
++}
++// diagnóstico (MACH=1): máscara, valor esperado y valor actual de una petición de hilo
++static void wl_trace(const char* que, uint64_t kqid, const uint8_t* req) {
++	if (!wl_trace_on()) return;
++	uint64_t ext[4] = { 0 }, cur = 0; if (req) memcpy(ext, req + 40, 32);
++	if (ext[1]) safe_read(ext[1], &cur, 8);
++	logf_("    WLQ <%d:%ld> %s kqid=0x%lx máscara=0x%lx valor=0x%lx actual=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), que, (unsigned long)kqid, (unsigned long)ext[2], (unsigned long)ext[3], (unsigned long)cur);
++}
+ static struct wl_state* wl_states;
+ static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
++// Punto de no retorno de una entrega (como filt_wlprocess de XNU, bajo el candado del kqueue): la petición tiene que seguir
++// registrada y válida. libdispatch la retira (EV_DELETE, wq_cancel_workloop) cuando otro hilo toma la cola por traspaso
++// síncrono; un hilo lanzado antes con su copia la entregaba igual, y al encontrar la cola con dueño y sin encolar,
++// libdispatch abortaba («BUG IN LIBDISPATCH: Invalid wlh state»). Se entrega la versión vigente (libdispatch puede haberla
++// actualizado entretanto). 1 si se entrega (req queda con la vigente), 0 si el hilo va sin ella.
++static int wl_req_deliver(uint64_t kqid, uint8_t* req) {
++	pthread_mutex_lock(&wl_lock);
++	struct wl_state* w = wl_states;
++	while (w && w->kqid != kqid) w = w->next;
++	int ok = w && w->has_req;
++	if (ok) memcpy(req, w->req, 72);
++	if (ok && !req_still_valid(req)) ok = 0;
++	pthread_mutex_unlock(&wl_lock);
++	return ok;
++}
++static void wq_spawn(uint64_t kqid, int workloop, const uint8_t* req);
++// Peticiones en espera de que su cola deje de tener propietario: un hilo las revisa cada 10 ms mientras haya alguna (la
++// liberación llega también con NOTE_WL_END_OWNERSHIP, pero así no depende de ella). Llamar con wl_lock tomado.
++static pthread_cond_t wl_owner_cv = PTHREAD_COND_INITIALIZER;
++static pthread_cond_t wl_cv;                                   // (definida más abajo) avisa a los vigilantes
++static int wl_owner_started;
++static void* wl_owner_poll(void* p) {
++	(void)p;
++	pthread_mutex_lock(&wl_lock);
++	for (;;) {
++		int any = 0;
++		for (struct wl_state* w = wl_states; w; w = w->next) {
++			if (!w->owned) continue;
++			if (!w->pending || w->running || !req_still_valid(w->req)) { w->owned = 0; pthread_cond_broadcast(&wl_cv); continue; }
++			if (req_owner(w->req)) { any = 1; continue; }
++			w->owned = 0; w->pending = 0; w->running = 1;           // el propietario la soltó: ahora sí, un hilo
++			uint8_t copy[72]; memcpy(copy, w->req, 72); uint64_t kq = w->kqid;
++			pthread_mutex_unlock(&wl_lock);
++			wl_trace("propietario libre: lanza", kq, copy);
++			wq_spawn(kq, 1, copy);
++			pthread_mutex_lock(&wl_lock);
++			any = 1;                                                 // la lista pudo cambiar: otra vuelta
++			break;
++		}
++		if (any) { struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 10000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
++			pthread_cond_timedwait(&wl_owner_cv, &wl_lock, &dl); }
++		else pthread_cond_wait(&wl_owner_cv, &wl_lock);
++	}
++	return NULL;
++}
++static void wl_defer_owned_locked(struct wl_state* w) {
++	w->owned = 1; w->pending = 1; w->running = 0;
++	if (!wl_owner_started) {
++		wl_owner_started = 1;
++		pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
++		pthread_t th; if (pthread_create(&th, &at, wl_owner_poll, NULL)) wl_owner_started = 0;
++	}
++	pthread_cond_signal(&wl_owner_cv);
++}
+ 
+ // Hilos de las colas de trabajo: un grupo reutilizable. Cuando libpthread "aparca" un hilo (workq_kernreturn) no se
+ // termina: se vuelve a la función del anfitrión con siglongjmp y el hilo espera la siguiente petición. Así las pilas
+@@ -919,7 +1210,7 @@ static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_mutex_t wq_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t wq_pool_cv = PTHREAD_COND_INITIALIZER;
+ static struct wq_job* wq_queue_head; static struct wq_job** wq_queue_tail = &wq_queue_head;
+-static int wq_live, wq_idle;
++static int wq_live, wq_idle, wq_nq;   // hilos vivos, hilos libres esperando, trabajos en cola
+ 
+ // first: primer servicio de este hilo (libpthread inicializa su pthread_t). exit_thread: en vez de trabajo, la llamada de
+ // salida de XNU (nkevents = -1, WORKQ_EXIT_THREAD_NKEVENT) para que libpthread retire el hilo de su lista y lo termine.
+@@ -939,6 +1230,8 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int
+ 	my_workloop = j.workloop ? j.kqid : 0;
+ 	static __thread uint8_t* data;                                   // búfer de datos (32 KB) de los mensajes Mach, uno por hilo
+ 	if (exit_thread) { j.workloop = 0; nev = -1; }
++	// La petición va como evento 0; abajo, en el punto de no retorno, se comprueba que siga registrada y válida (si no, el
++	// hilo llega sin ella y libdispatch lo trata como «cancelada antes del punto de no retorno»).
+ 	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= (j.kqid == ~0ULL ? 0 : WQ_WORKLOOP) | WQ_KEVENT; if (j.has_req) { memcpy((void*)events, j.req, 72); nev = 1; }
+ 		if (jp->npre) { memcpy((void*)(events + nev * 72), jp->pre, (size_t)jp->npre * 72); nev += jp->npre; }   // ya recogidos por el vigilante
+ 		else {
+@@ -948,17 +1241,22 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int
+ 			long d = kq_drain(j.kqid, events + nev * 72, 16 - nev, (uint64_t)data, (uint64_t)avail);
+ 			if (d > 0) nev += (int)d;
+ 		} }
++	// Punto de no retorno, lo más tarde posible: la petición (evento 0) sigue registrada y válida, o el hilo va sin ella.
++	if (j.workloop && j.has_req && j.kqid != ~0ULL && !wl_req_deliver(j.kqid, (uint8_t*)events)) {
++		wl_trace("entrega: retirada o caducada, sin petición", j.kqid, j.req);
++		memmove((void*)events, (void*)(events + 72), (size_t)(nev - 1) * 72); nev--;
++	}
+ 	if (trace_all) logf_("    wqthread: %s kqid=0x%lx pthread=0x%lx flags=0x%lx\n", j.workloop ? "workloop" : "worker", j.kqid, self, flags);
+ 	if (sigsetjmp(wq_park, 1) == 0) {
+ 		wq_park_ok = 1;
+ 		static __thread uint32_t kp_cache; if (!kp_cache) kp_cache = alloc_port();
+ 		uint32_t kp = kp_cache;
+-		if (mach_trace()) logf_("    THR <%d:%ld> hilo de cola puerto 0x%x %s kqid=0x%lx eventos=%d\n", (int)getpid(), (long)syscall(SYS_gettid), kp, j.workloop ? (j.kqid == ~0ULL ? "kq-cola" : "workloop") : "trabajador", j.kqid, nev);
++		if (wl_trace_on()) logf_("    THR <%d:%ld> hilo de cola puerto 0x%x %s kqid=0x%lx eventos=%d\n", (int)getpid(), (long)syscall(SYS_gettid), kp, j.workloop ? (j.kqid == ~0ULL ? "kq-cola" : "workloop") : "trabajador", j.kqid, nev);
+ 		enter_guest_thread(wqthread_fn, self - 0x3000, self, kp, (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)(int64_t)nev);
+ 	}
+ 	wq_park_ok = 0;                                                  // volvió el hilo aparcado
+ 	t_cur = NULL;                                                    // salió de la llamada con siglongjmp
+-	if (mach_trace()) logf_("    THR <%d:%ld> fin del trabajo\n", (int)getpid(), (long)syscall(SYS_gettid));
++	if (wl_trace_on()) logf_("    THR <%d:%ld> fin del trabajo\n", (int)getpid(), (long)syscall(SYS_gettid));
+ }
+ 
+ static void* wq_main(void* p) {
+@@ -977,7 +1275,7 @@ static void* wq_main(void* p) {
+ 		pthread_mutex_lock(&wq_pool_lock);
+ 		job = NULL;
+ 		for (;;) {
+-			if (wq_queue_head) { job = wq_queue_head; wq_queue_head = job->next; if (!wq_queue_head) wq_queue_tail = &wq_queue_head; break; }
++			if (wq_queue_head) { job = wq_queue_head; wq_queue_head = job->next; if (!wq_queue_head) wq_queue_tail = &wq_queue_head; wq_nq--; break; }
+ 			struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+ 			dl.tv_sec += WQ_IDLE_MS / 1000; dl.tv_nsec += (WQ_IDLE_MS % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+ 			wq_idle++;
+@@ -998,9 +1296,18 @@ static void* wq_main(void* p) {
+ }
+ 
+ static void wq_spawn_job(struct wq_job* j) {
++	static int max_hilos;
++	if (!max_hilos) { const char* e = getenv("TAHOE_WQ_MAX"); max_hilos = e && atoi(e) > 0 ? atoi(e) : WQ_MAX_HILOS; }
+ 	pthread_mutex_lock(&wq_pool_lock);
+-	if (wq_idle > 0 || wq_live >= WQ_MAX_HILOS) {                  // un hilo libre la atiende, o espera turno
+-		*wq_queue_tail = j; wq_queue_tail = &j->next;
++	// Un hilo libre la atiende, o espera turno. Los libres se cuentan descontando los trabajos ya encolados: un hilo
++	// despertado no deja de contar como libre hasta que retoma el candado, y dos peticiones seguidas iban a la cola para
++	// un único hilo libre; si la primera bloqueaba (una llamada síncrona al propio proceso), la segunda no salía nunca.
++	if (wq_nq < wq_idle || wq_live >= max_hilos) {
++		if (wq_nq >= wq_idle) {                                    // sin hilos libres: la petición espera (una línea por segundo)
++			static time_t ult; time_t now = time(NULL);
++			if (now != ult) { ult = now; logf_("    hilos de cola: %d en uso (máximo), la petición espera\n", wq_live); }
++		}
++		*wq_queue_tail = j; wq_queue_tail = &j->next; wq_nq++;
+ 		pthread_cond_signal(&wq_pool_cv);
+ 		pthread_mutex_unlock(&wq_pool_lock);
+ 		return;
+@@ -1033,8 +1340,10 @@ void wq_request_workloop(uint64_t kqid, const void* req) {
+ 	int start = !w->running;
+ 	memcpy(w->req, req, 72); w->has_req = 1;
+ 	uint8_t copy[72]; memcpy(copy, req, 72);
++	if (start && req_owner(req)) { wl_defer_owned_locked(w); pthread_mutex_unlock(&wl_lock); wl_trace("petición: cola con propietario, espera", kqid, copy); return; }
+ 	if (start) w->running = 1; else w->pending = 1;
+ 	pthread_mutex_unlock(&wl_lock);
++	wl_trace(start ? "petición: lanza" : "petición: pendiente", kqid, copy);
+ 	if (start) wq_spawn(kqid, 1, copy);
+ }
+ 
+@@ -1043,8 +1352,9 @@ void wq_cancel_workloop(uint64_t kqid) {
+ 	pthread_mutex_lock(&wl_lock);
+ 	struct wl_state* w = wl_states;
+ 	while (w && w->kqid != kqid) w = w->next;
+-	if (w) { w->pending = 0; w->has_req = 0; }
++	if (w) { w->pending = 0; w->has_req = 0; if (w->owned) { w->owned = 0; pthread_cond_broadcast(&wl_cv); } }
+ 	pthread_mutex_unlock(&wl_lock);
++	wl_trace("petición retirada", kqid, NULL);
+ }
+ 
+ static pthread_cond_t wl_cv = PTHREAD_COND_INITIALIZER;     // avisa a los vigilantes de que su workloop quedó libre
+@@ -1054,12 +1364,24 @@ static void wl_finished(uint64_t kqid) {
+ 	struct wl_state* w = wl_states;
+ 	while (w && w->kqid != kqid) w = w->next;
+ 	// Como en XNU: la petición que llegó con el workloop ocupado sigue activa hasta que se entrega o libdispatch la retira
+-	// (EV_DELETE con NOTE_WL_THREAD_REQUEST, ver wq_cancel_workloop); el rebote solo se mira al registrarla y al retirarla.
+-	int again = w && w->pending;
++	// (EV_DELETE con NOTE_WL_THREAD_REQUEST, ver wq_cancel_workloop). Al entregarla se comprueba otra vez que la cola siga
++	// en el estado que esperaba ((*addr & mask) == value): el servidor que acaba de terminar puede haberla vaciado, y un
++	// hilo con una petición caducada hace abortar a libdispatch («BUG IN LIBDISPATCH: Invalid wlh state»). Si vuelve a
++	// hacer falta, libdispatch pide otro hilo al encolar.
++	int again = w && w->pending && req_still_valid(w->req);
+ 	uint8_t copy[72];
++	if (again && req_owner(w->req)) {                                // la cola tiene propietario: esperar a que la suelte
++		wl_defer_owned_locked(w); memcpy(copy, w->req, 72);
++		pthread_cond_broadcast(&wl_cv);
++		pthread_mutex_unlock(&wl_lock);
++		wl_trace("fin: cola con propietario, espera", kqid, copy);
++		wl_arm(kqid);
++		return;
++	}
+ 	if (w) { w->pending = 0; w->running = again; memcpy(copy, w->req, 72); }
+ 	pthread_cond_broadcast(&wl_cv);
+ 	pthread_mutex_unlock(&wl_lock);
++	if (w) wl_trace(again ? "fin: relanza pendiente" : "fin: libre", kqid, copy);
+ 	if (again) wq_spawn(kqid, 1, copy); else wl_arm(kqid);
+ }
+ 
+@@ -1077,10 +1399,29 @@ static void* wl_watch(void* p) {
+ 	if (!w || fd < 0) return NULL;
+ 	for (;;) {
+ 		pthread_mutex_lock(&wl_lock);
+-		while (w->running) pthread_cond_wait(&wl_cv, &wl_lock);
++		while (w->running || w->owned) pthread_cond_wait(&wl_cv, &wl_lock);   // con propietario, los eventos son suyos
+ 		pthread_mutex_unlock(&wl_lock);
+ 		struct pollfd pf = { .fd = fd, .events = POLLIN };
+-		if (poll(&pf, 1, -1) < 0) { if (errno == EINTR) continue; logf_("    wl_watch <%d>: poll falló: %s\n", (int)getpid(), strerror(errno)); break; }
++		int pr = poll(&pf, 1, kqid == ~0ULL ? -1 : 2000);
++		if (pr < 0) { if (errno == EINTR) continue; logf_("    wl_watch <%d>: poll falló: %s\n", (int)getpid(), strerror(errno)); break; }
++		if (pr == 0) {                                              // 2 s sin eventos: ¿se puede liberar el workloop?
++			pthread_mutex_lock(&wl_lock);
++			int idle = !w->running && !w->owned && !w->pending; unsigned g = w->gen;
++			pthread_mutex_unlock(&wl_lock);
++			if (!idle || !kq_workloop_try_free(kqid)) continue;
++			pthread_mutex_lock(&wl_lock);
++			if (!w->running && !w->owned && !w->pending && w->gen == g) {   // nadie lo volvió a usar: fuera el vigilante
++				for (struct wl_state** pp = &wl_states; *pp; pp = &(*pp)->next) if (*pp == w) { *pp = w->next; break; }
++				pthread_mutex_unlock(&wl_lock);
++				if (mach_trace()) logf_("    wl_watch <%d> kqid=0x%lx liberado\n", (int)getpid(), (unsigned long)kqid);
++				free(w);
++				return NULL;
++			}
++			pthread_mutex_unlock(&wl_lock);
++			fd = kq_workloop_fd(kqid);                              // se volvió a usar entretanto: vigilar el nuevo
++			if (fd < 0) break;
++			continue;
++		}
+ 		if (!(pf.revents & POLLIN)) continue;
+ 		pthread_mutex_lock(&wl_lock);
+ 		if (w->running) { pthread_mutex_unlock(&wl_lock); continue; }   // otra petición ya lanzó el hilo
+@@ -1094,7 +1435,9 @@ static void* wl_watch(void* p) {
+ 			*avail = WQ_DATA_SIZE;
+ 			d = kq_drain(kqid, (uint64_t)j->pre, 16, (uint64_t)data, (uint64_t)avail);
+ 		}
+-		if (mach_trace()) logf_("    wl_watch <%d> kqid=0x%lx recogió %ld\n", (int)getpid(), (unsigned long)kqid, d);
++		if (wl_trace_on()) { logf_("    wl_watch <%d> kqid=0x%lx recogió %ld:", (int)getpid(), (unsigned long)kqid, d);
++			for (long q = 0; q < d && j; q++) { uint64_t id; int16_t fl; uint32_t ff; memcpy(&id, j->pre + q * 72, 8); memcpy(&fl, j->pre + q * 72 + 8, 2); memcpy(&ff, j->pre + q * 72 + 24, 4); logf_(" [id=0x%lx filtro=%d fflags=0x%x]", (unsigned long)id, fl, ff); }
++			logf_("\n"); }
+ 		if (d > 0) {
+ 			j->kqid = kqid; j->workloop = 1; j->npre = (int)d; j->pdata = data;
+ 			pthread_mutex_lock(&wl_lock);
+@@ -1132,6 +1475,7 @@ static void* wl_watch(void* p) {
+ 		pthread_mutex_lock(&wl_lock);                               // aviso falso: liberar, salvo que entretanto llegara una petición
+ 		int again = w->pending && req_still_valid(w->req);
+ 		uint8_t copy[72]; memcpy(copy, w->req, 72);
++		if (again && req_owner(w->req)) { wl_defer_owned_locked(w); pthread_mutex_unlock(&wl_lock); continue; }
+ 		w->pending = 0; w->running = again;
+ 		pthread_mutex_unlock(&wl_lock);
+ 		if (again) wq_spawn(kqid, 1, copy);
+@@ -1145,6 +1489,7 @@ static void wl_arm(uint64_t kqid) {
+ 	if (!w) { w = calloc(1, sizeof *w); w->kqid = kqid; w->next = wl_states; wl_states = w; }
+ 	int start = !w->watching;
+ 	if (start) w->watching = 1;
++	w->gen++;
+ 	if (mach_trace()) logf_("    wl_arm <%d> kqid=0x%lx start=%d running=%d\n", (int)getpid(), (unsigned long)kqid, start, w->running);
+ 	pthread_cond_broadcast(&wl_cv);
+ 	pthread_mutex_unlock(&wl_lock);
+@@ -1199,17 +1544,6 @@ static long bsd_workq_kernreturn(struct ctx* c) {
+ 
+ static long bsd_proc_rlimit_control(struct ctx* c) { (void)c; return 0; }   // límites de monitorización: sin efecto
+ 
+-static long bsd_audit_session_self(struct ctx* c) { (void)c; return 0x1503; }   // puerto ficticio de la sesión de auditoría
+-
+-// getaudit_addr(auditinfo_addr_t*, tamaño 0x30): auid=-1 (sin sesión de inicio), máscara 0, terminal vacío y
+-// un identificador de sesión de auditoría no nulo.
+-static long bsd_getaudit_addr(struct ctx* c) {
+-	uint8_t a[0x30] = { 0 };
+-	uint32_t auid = (uint32_t)-1, asid = (uint32_t)getpid();
+-	memcpy(a, &auid, 4);
+-	memcpy(a + 36, &asid, 4);
+-	return safe_write(c->a[0], a, c->a[1] < sizeof a ? c->a[1] : sizeof a) < 0 ? -D_EFAULT : 0;
+-}
+ 
+ // sigsuspend(mask): aquí no hay señales de Darwin reales todavía; el hilo se duerme hasta que Linux lo interrumpa.
+ static long bsd_sigsuspend(struct ctx* c) { (void)c; syscall(SYS_pause); return -4; /* EINTR */ }
+@@ -1259,7 +1593,7 @@ static long ulock_wait_impl(struct ctx* c, uint64_t timeout_ns) {
+ 	if (c->a[0] & 0x1000000) c->raw_ret = 1;     // ULF_NO_ERRNO
+ 	if (mach_trace()) {                          // diagnóstico: pila de cada hilo que se bloquea sin plazo en el proceso indicado por /dev/shm/tahoe-stacks
+ 		int want = diag_target();
+-		if (want && (!timeout_ns || syscall(SYS_gettid) == getpid())) { logf_("    ULW <%d:%ld> %p esperado=0x%x plazo=%lu op=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), (void*)addr, expect, (unsigned long)timeout_ns, c->a[0]); { uint64_t m[8] = { 0 }; safe_read((uint64_t)addr - 24, m, 64); logf_("    ULW mem[-24..+40]: %lx %lx %lx %lx %lx %lx %lx %lx\n", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]); } diag_crash(c->uc); }
++		if (want && (!timeout_ns || syscall(SYS_gettid) == getpid())) { logf_("    ULW <%d:%ld> %p esperado=0x%x plazo=%lu op=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), (void*)addr, expect, (unsigned long)timeout_ns, c->a[0]); { uint64_t m[8] = { 0 }; safe_read((uint64_t)addr - 24, m, 64); logf_("    ULW mem[-24..+40]: %lx %lx %lx %lx %lx %lx %lx %lx\n", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]); } diag_stack(c->uc, "espera"); }
+ 	}
+ 	if (trace_all) logf_("    ulock_wait(op=0x%lx, %p, esperado=0x%x, plazo=%luns)\n", c->a[0], (void*)addr, expect, (unsigned long)timeout_ns);
+ 	int wslot = -1;
+@@ -1291,20 +1625,29 @@ static long bsd_ulock_wake(struct ctx* c) {
+ 	return n > 0 ? 0 : -D_ENOENT;
+ }
+ 
++// ptrace: no hay depuradores dentro del emulador. PT_DENY_ATTACH (31, «que nadie me depure») y PT_TRACE_ME (0) se aceptan
++// sin efecto; SecurityAgent (la ventana de inicio de sesión) sale con «Unable to deny attach» si PT_DENY_ATTACH falla.
++// El resto (adjuntarse a otro proceso, leer su memoria...) no se admite: EPERM, como con un proceso protegido.
++static long bsd_ptrace(struct ctx* c) {
++	int req = (int)c->a[0];
++	if (req == 31 || req == 0) return 0;
++	return -1;                                              // EPERM
++}
++
+ void emu_proc_init(void) {
++	tahoe_sigaction(SIGABRT, on_sigabrt);
++	reg_bsd(26, bsd_ptrace);
+ 	reg_bsd(515, bsd_ulock_wait); reg_bsd(516, bsd_ulock_wake); reg_bsd(544, bsd_ulock_wait2);
+ 	reg_bsd(550, bsd_map_with_linking);
++	reg_bsd(96, bsd_setpriority); reg_bsd(100, bsd_getpriority);
+ 	reg_bsd(322, bsd_proc_rlimit_control);   // iopolicysys: sin efecto
+ 	reg_bsd(331, bsd_proc_rlimit_control);   // __disable_threadsignal: sin efecto
+ 	reg_bsd(111, bsd_sigsuspend); reg_bsd(410, bsd_sigsuspend);
+-	reg_bsd(357, bsd_getaudit_addr);
+-	reg_bsd(428, bsd_audit_session_self);
+ 	reg_bsd(446, bsd_proc_rlimit_control);
+ 	reg_bsd(243, bsd_proc_rlimit_control);   // initgroups: sin efecto
+ 	reg_bsd(499, bsd_work_interval_ctl);
+ 	reg_bsd(440, bsd_proc_rlimit_control);   // memorystatus_control: sin efecto reg_bsd(444, bsd_proc_rlimit_control);   // change_fdguard_np
+ 	reg_bsd(552, bsd_proc_rlimit_control);   // record_system_event: sin efecto
+-	reg_bsd(358, bsd_proc_rlimit_control);   // setaudit_addr: sin efecto
+ 	reg_bsd(50, bsd_proc_rlimit_control);   // setlogin: sin efecto
+ 	reg_bsd(367, bsd_workq_open); reg_bsd(368, bsd_workq_kernreturn);
+ 	reg_bsd(360, bsd_bsdthread_create); reg_bsd(361, bsd_bsdthread_terminate);
+@@ -1314,7 +1657,7 @@ void emu_proc_init(void) {
+ 	reg_bsd(31, bsd_getpeername); reg_bsd(59, bsd_execve);
+ 	reg_bsd(39, bsd_getppid); reg_bsd(81, bsd_getpgrp); reg_bsd(151, bsd_getpgid); reg_bsd(82, bsd_setpgid);
+ 	reg_bsd(310, bsd_getsid); reg_bsd(147, bsd_setsid); reg_bsd(60, bsd_umask);
+-	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit);
++	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit); reg_bsd(117, bsd_getrusage); reg_bsd(83, bsd_setitimer); reg_bsd(86, bsd_getitimer); reg_bsd(453, bsd_memorystatus_get_level); reg_bsd(184, bsd_sigreturn);
+ 	reg_bsd(46, bsd_sigaction); reg_bsd(53, bsd_sigaltstack); reg_bsd(329, bsd_pthread_sigmask); reg_bsd(52, bsd_sigpending);
+ 	reg_bsd(37, bsd_kill); reg_bsd(328, bsd_pthread_kill);
+ 	reg_bsd(98, bsd_connect);
+diff --git a/tahoe-run/tahoe_run.c b/tahoe-run/tahoe_run.c
+index 4cd7c71..9826d2c 100644
+--- a/tahoe-run/tahoe_run.c
++++ b/tahoe-run/tahoe_run.c
+@@ -11,6 +11,7 @@
+ //
+ // Hito actual: arrancar dyld y ver qué pide. Todo el código es propio (sin código de Darling).
+ #define _GNU_SOURCE
++#include <dirent.h>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <glob.h>
+@@ -21,6 +22,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/resource.h>
+ #include <sys/mman.h>
+ #include <sys/personality.h>
+ #include <sys/prctl.h>
+@@ -46,7 +48,9 @@
+ #endif
+ 
+ #define COMMPAGE     0x00007fffffe00000UL
+-#define DYLD_SLIDE   0x00007ffc00000000UL
++// dyld se carga por debajo de la región compartida (0x7ff800000000-0x7ffffe600000 en XNU): la caché de un macOS completo
++// (principal + 6 subcachés) la llena casi entera.
++#define DYLD_SLIDE   0x00007ff000000000UL
+ #define STACK_SIZE   (8UL << 20)
+ 
+ int trace_all;
+@@ -101,7 +105,7 @@ static int memfd = -1;
+ static void memfd_init(void) {
+ 	int fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+ 	if (fd < 0) DIE("no puedo abrir /proc/self/mem: %s", strerror(errno));
+-	memfd = fcntl(fd, F_DUPFD_CLOEXEC, 1000);
++	memfd = fcntl(fd, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE);
+ 	close(fd);
+ 	if (memfd < 0) DIE("no puedo reservar el descriptor de /proc/self/mem: %s", strerror(errno));
+ }
+@@ -262,7 +266,9 @@ static void map_one(const char* path) {
+ 				// algo del proceso ya ocupa esa dirección (ASLR): reintentar sin aleatorización
+ 				setenv("TAHOE_REEXEC", "1", 1);
+ 				personality(personality(0xffffffff) | ADDR_NO_RANDOMIZE);
+-				execve("/proc/self/exe", g_argv, environ);
++				// por su ruta y no por /proc/self/exe: si no, Linux llama al proceso "exe" y las herramientas que buscan
++				// tahoe-run (limpieza, guardián de memoria, diagnóstico) dejan de verlo
++				execve(g_self_exe ? g_self_exe : "/proc/self/exe", g_argv, environ);
+ 			}
+ 			DIE("mmap de la caché falló en 0x%lx (+0x%lx): %s", m[i].addr, m[i].size, strerror(errno));
+ 		}
+@@ -316,9 +322,17 @@ static void map_dynamic_region(const char* main_path) {
+ 	memcpy(p, "dyld_data    v3", 16);
+ 	*(uint64_t*)(p + 16) = (uint64_t)st.st_dev;                   // fsid
+ 	*(uint64_t*)(p + 24) = (uint64_t)st.st_ino;                   // fsobjid
+-	*(uint32_t*)(p + 32) = 0;                                     // _osCryptexPathOffset: sin cryptex
+ 	*(uint32_t*)(p + 36) = 80;                                    // _cachePathOffset = sizeof(DynamicRegion)
+ 	strlcpy_((char*)p + 80, main_path, maxsize - 80);
++	// En un macOS completo la caché viene en el cryptex del sistema (montado en Preboot): launchd anota también su raíz
++	// (_osCryptexPathOffset), que dyld antepone a las rutas que busca fuera de la caché. En la Recovery no hay cryptex: 0.
++	static const char cryptex[] = "/System/Volumes/Preboot/Cryptexes/OS";
++	uint32_t coff = 0;
++	if (!strncmp(cache_guest_path, cryptex, sizeof cryptex - 1) && cache_guest_path[sizeof cryptex - 1] == '/') {
++		coff = 80 + (uint32_t)strlen(main_path) + 1;
++		if (coff + sizeof cryptex <= maxsize) memcpy(p + coff, cryptex, sizeof cryptex); else coff = 0;
++	}
++	*(uint32_t*)(p + 32) = coff;                                  // _osCryptexPathOffset
+ 	mprotect(p, maxsize, PROT_READ);
+ }
+ 
+@@ -336,6 +350,7 @@ static void map_cache(const char* main_path) {
+ 
+ // ---------------------------------------------------------------- commpage (macOS 26, x86_64)
+ // Diseño tomado de osfmk/i386/cpu_capabilities.h de XNU 12377.
++uint64_t tsc_hz;                                         // frecuencia del TSC medida (setup_commpage)
+ static uint64_t tsc_hz_estimate(void) {
+ 	struct timespec a, b;
+ 	clock_gettime(CLOCK_MONOTONIC, &a);
+@@ -362,7 +377,21 @@ static void setup_commpage(void) {
+ 	*(uint64_t*)(p + 0x38) = (uint64_t)sysconf(_SC_PHYS_PAGES) * (uint64_t)sysconf(_SC_PAGESIZE);
+ 	p[0x4D] = 12; p[0x4E] = 12;                          // desplazamientos de página (4 KiB)
+ 	// nanotime: ns = ns_base + (((tsc - tsc_base) << shift) * scale >> 32)
+-	uint64_t hz = tsc_hz_estimate();
++	// La frecuencia del TSC se mide una vez (30 ms de espera activa) y se guarda en /dev/shm/tahoe-tsc-hz para los demás
++	// procesos: medirla en cada arranque costaba 30 ms de CPU por proceso (dos por servicio: xpcproxy y el programa), y
++	// en el arranque de macOS, con decenas de procesos a la vez, alargaba la avalancha de servicios.
++	uint64_t hz = 0;
++	{
++		char b[32] = ""; int f = open("/dev/shm/tahoe-tsc-hz", O_RDONLY | O_CLOEXEC);
++		if (f >= 0) { ssize_t n = read(f, b, sizeof b - 1); close(f); if (n > 0) { b[n] = 0; hz = strtoull(b, NULL, 10); } }
++		if (hz < 100000000ULL || hz > 10000000000ULL) {          // sin guardar o absurda: medir y guardar
++			hz = tsc_hz_estimate();
++			char tmp[64]; snprintf(tmp, sizeof tmp, "/dev/shm/tahoe-tsc-hz.%d", (int)getpid());
++			f = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++			if (f >= 0) { int n = snprintf(b, sizeof b, "%lu\n", (unsigned long)hz); if (write(f, b, (size_t)n) == n) { close(f); rename(tmp, "/dev/shm/tahoe-tsc-hz"); } else { close(f); unlink(tmp); } }
++		}
++	}
++	tsc_hz = hz;
+ 	struct timespec now;
+ 	clock_gettime(CLOCK_MONOTONIC, &now);
+ 	*(uint64_t*)(p + 0x50) = __builtin_ia32_rdtsc();
+@@ -384,7 +413,10 @@ struct seg64 { uint32_t cmd, cmdsize; char segname[16]; uint64_t vmaddr, vmsize,
+ 
+ struct image { uint64_t mh; uint64_t entry; uint32_t filetype; uint64_t hi; };
+ 
++static char prog_name[64] = "?";                      // programa de macOS de este proceso (para el registro)
++static double lm_ms(const struct timespec* a) { struct timespec b; clock_gettime(CLOCK_MONOTONIC, &b); return (b.tv_sec - a->tv_sec) * 1e3 + (b.tv_nsec - a->tv_nsec) / 1e6; }
+ static void load_macho(const char* path, uint64_t slide, struct image* out) {
++	struct timespec lm0; clock_gettime(CLOCK_MONOTONIC, &lm0); double t_map = 0, t_dsmos = 0, t_prot = 0;   // diagnóstico de velocidad
+ 	int fd = open(path, O_RDONLY);
+ 	if (fd < 0) DIE("no puedo abrir %s: %s", path, strerror(errno));
+ 	uint64_t base_off = 0;
+@@ -416,10 +448,15 @@ static void load_macho(const char* path, uint64_t slide, struct image* out) {
+ 			uint64_t maplen = round_up(s->filesize);
+ 			int prot = s->initprot & 7;
+ 			if (s->filesize) {
++				struct timespec q; clock_gettime(CLOCK_MONOTONIC, &q);
+ 				void* p = mmap((void*)addr, maplen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, base_off + s->fileoff);
+ 				if (p == MAP_FAILED) DIE("%s: mmap de %s en 0x%lx falló: %s", path, s->segname, addr, strerror(errno));
+ 				if (s->vmsize > s->filesize && maplen > s->filesize) memset((void*)(addr + s->filesize), 0, maplen - s->filesize);
++				t_map += lm_ms(&q); clock_gettime(CLOCK_MONOTONIC, &q);
++				if (s->flags & 0x8) dsmos_unprotect((uint8_t*)addr, s->fileoff, s->filesize, path);   // SG_PROTECTED_VERSION_1
++				t_dsmos += lm_ms(&q); clock_gettime(CLOCK_MONOTONIC, &q);
+ 				mprotect((void*)addr, maplen, prot);
++				t_prot += lm_ms(&q);
+ 			}
+ 			if (round_up(s->vmsize) > maplen) {
+ 				void* p = mmap((void*)(addr + maplen), round_up(s->vmsize) - maplen, prot ? prot : PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+@@ -440,7 +477,10 @@ static void load_macho(const char* path, uint64_t slide, struct image* out) {
+ 	free(cmds);
+ 	close(fd);
+ 	if (!out->mh) DIE("%s: no se encontró el segmento __TEXT", path);
++	if (access("/dev/shm/tahoe-log-time", F_OK) == 0)
++		logf_("    carga <%d> %s: %.1f ms (mmap %.1f, dsmos %.1f, mprotect %.1f)\n", (int)getpid(), strrchr(path, '/') ? strrchr(path, '/') + 1 : path, lm_ms(&lm0), t_map, t_dsmos, t_prot);
+ 	LOG("<%d> cargado %-28s mh=0x%lx entrada=0x%lx tipo=%u\n", (int)getpid(), strrchr(path, '/') ? strrchr(path, '/') + 1 : path, out->mh, out->entry, out->filetype);
++	if (out->filetype == 2) snprintf(prog_name, sizeof prog_name, "%s", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
+ }
+ 
+ // ---------------------------------------------------------------- pila inicial
+@@ -491,7 +531,21 @@ typedef emu_fn bsd_fn;
+ 
+ // BSD: devuelven >= 0 o -errno_de_Darwin
+ extern void ports_cleanup(void);
+-static long bsd_exit(struct ctx* c)  { if (trace_all || getpid() == 1) logf_("    exit(%d) <%d>\n", (int)c->a[0], getpid()); ports_cleanup(); _exit((int)c->a[0]); }
++// Medida del coste de la emulación (diagnóstico de velocidad): llamadas atendidas por clase y ciclos del TSC dentro del
++// manejador (on_sigsys); se registran al salir, junto a la CPU del proceso.
++static uint64_t sc_count[4], sc_cycles;
++// Cada salida queda en el registro (una línea): sin ella, un servicio que termina por su cuenta desaparece sin rastro.
++static void show_frames(struct ctx* c);
++// exit: con error y en un proceso de STACKS, también los marcos de quien sale (para saber por qué).
++static long bsd_exit(struct ctx* c)  {
++	struct rusage ru; getrusage(RUSAGE_SELF, &ru);       // y la CPU que gastó: el coste de los servicios que se relanzan
++	                                                     // y cuántas llamadas atendió y el tiempo dentro del manejador
++	logf_("    fin <%d> [%s] exit(%d) cpu=%.2fs llamadas bsd=%lu mach=%lu manejador=%.2fs\n", getpid(), prog_name, (int)c->a[0],
++	      ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6,
++	      (unsigned long)sc_count[2], (unsigned long)sc_count[1], tsc_hz ? (double)sc_cycles / (double)tsc_hz : 0.0);
++	if ((int)c->a[0] != 0 && diag_target()) show_frames(c);
++	ports_cleanup(); _exit((int)c->a[0]);
++}
+ static long bsd_getpid(struct ctx* c) { (void)c; return getpid(); }
+ static long bsd_issetugid(struct ctx* c) { (void)c; return 0; }
+ static long bsd_write(struct ctx* c) {
+@@ -513,6 +567,7 @@ static long bsd_read(struct ctx* c) {
+ 	return r < 0 ? -darwin_errno(errno) : r;
+ }
+ static long bsd_close(struct ctx* c) {
++	if ((int)c->a[0] >= FD_INTERNAL_BASE) return -9;                 // EBADF: descriptores del emulador (ver fd_hi)
+ 	long r = syscall(SYS_close, c->a[0]);
+ 	return r < 0 ? -darwin_errno(errno) : r;
+ }
+@@ -531,11 +586,20 @@ int darwin_open_flags(int f) {
+ 	if (f & 0x100000) o |= O_DIRECTORY;
+ 	if (f & 0x400000) o |= O_DSYNC;
+ 	if (f & 0x1000000) o |= O_CLOEXEC;
++	if (f & 0x200000) o |= O_NOFOLLOW;               // O_SYMLINK: ver open_symlink
+ 	return o;
+ }
++// O_SYMLINK (0x200000) de Darwin: si la ruta es un enlace simbólico, se abre el propio enlace (ditto lo usa para copiar
++// enlaces que no apuntan a nada). Con O_NOFOLLOW Linux da ELOOP; entonces se abre el enlace con O_PATH (vale para fstat,
++// readlinkat y fchown, que es lo que se hace con él).
++long open_symlink(int dfd, const char* p, int dflags, int lflags, long fd) {
++	if (fd >= 0 || !(dflags & 0x200000) || errno != ELOOP) return fd;
++	return syscall(SYS_openat, dfd, p, O_PATH | O_NOFOLLOW | (lflags & O_CLOEXEC));
++}
+ static long bsd_open(struct ctx* c) {
+ 	char path[4096], full[4200];
+ 	if (safe_string(c->a[0], path, sizeof path) != 0) return -14;          // EFAULT
++	tahoe_resolve_strip(path);
+ 	if (!strcmp(path, "/dev/console")) {                                  // sin consola real dentro del entorno
+ 		// diagnóstico: si existe /dev/shm/tahoe-console, la consola es ese archivo (lo que launchd y otros escriben ahí)
+ 		if (access("/dev/shm/tahoe-console", W_OK) == 0) {
+@@ -549,8 +613,8 @@ static long bsd_open(struct ctx* c) {
+ 	int flags = darwin_open_flags((int)c->a[1]);
+ 	long fd = -1;
+ 	if (tahoe_root && path[0] == '/' && !tahoe_host_passthrough(path)) {
+-		snprintf(full, sizeof full, "%s%s", tahoe_root, path);
+-		fd = syscall(SYS_open, full, flags, (int)c->a[2]);
++		if (!tahoe_metal_path(path, full, sizeof full)) snprintf(full, sizeof full, "%s%s", tahoe_root, path);
++		fd = open_symlink(AT_FDCWD, full, (int)c->a[1], flags, syscall(SYS_open, full, flags, (int)c->a[2]));
+ 		if (fd < 0 && ((flags & O_CREAT) || !tahoe_host_passthrough(path))) goto done;   // fuera de /dev, solo la raíz de macOS
+ 	}
+ 	if (fd < 0) { char al[64]; fd = syscall(SYS_open, tahoe_dev_alias(path, al, sizeof al), flags, (int)c->a[2]); }
+@@ -561,15 +625,17 @@ done:
+ // guarded_pwrite_np(fd, guard*, búfer, tamaño, desplazamiento): pwrite; la guarda no se comprueba.
+ static long bsd_guarded_pwrite(struct ctx* c) { long r = pwrite((int)c->a[0], (const void*)c->a[2], c->a[3], (off_t)c->a[4]); return r < 0 ? -darwin_errno(errno) : r; }
+ static long bsd_proc_info(struct ctx* c);
+-// proc_info_extended_id(callnum, pid, flags, ext_id_type, ext_id, flavor, arg, buffer, buffersize): proc_info con una
+-// comprobación de identidad extra (uniqueid/versión) que aquí no hace falta.
++// proc_info_extended_id(callnum, pid, flavor, flags, ext_id, arg, buffer, buffersize): proc_info con una comprobación de
++// identidad extra (flags PIF_COMPARE_*: versión o uniqueid del pid en ext_id) que aquí no hace falta. Los dos últimos van
++// en la pila. La usa proc_pidpath_audittoken (airportd la pide de cada cliente XPC: si falla, rechaza la conexión y el
++// cliente reconecta sin parar, decenas de miles de líneas de registro por minuto).
+ static long bsd_proc_info_ext(struct ctx* c) {
+ 	struct ctx c2 = *c;
+ 	c2.a[0] = c->a[0]; c2.a[1] = c->a[1];
+-	c2.a[2] = c->a[5];                                   // flavor
+-	c2.a[3] = ctx_arg(c, 6);                             // arg
+-	c2.a[4] = ctx_arg(c, 7);                             // buffer
+-	c2.a[5] = ctx_arg(c, 8);                             // buffersize
++	c2.a[2] = c->a[2];                                   // flavor
++	c2.a[3] = c->a[5];                                   // arg
++	c2.a[4] = ctx_arg(c, 6);                             // buffer
++	c2.a[5] = ctx_arg(c, 7);                             // buffersize
+ 	return bsd_proc_info(&c2);
+ }
+ // open_dprotected_np(ruta, oflags, clase, dpflags, mode): como open; la clase de protección de datos no existe aquí.
+@@ -585,7 +651,15 @@ static long bsd_getlogin(struct ctx* c) {
+ 	return safe_write(c->a[0], u, sizeof u) == (ssize_t)sizeof u ? 0 : -14;
+ }
+ static long bsd_enotsup(struct ctx* c) { (void)c; return -45; }   // ENOTSUP: funciones que este sistema no ofrece (personas)
+-static long bsd_eperm(struct ctx* c) { (void)c; return -1; }      // EPERM: reboot desde dentro no apaga el anfitrión
++// reboot(howto): solo launchd (pid 1 del espacio de procesos del arranque) apaga o reinicia. Aquí eso es terminar el
++// arranque: al salir el pid 1, Linux termina todos los procesos de su espacio (el anfitrión no se toca). launchd aborta si
++// reboot() vuelve con error (assertion en launchd + 284047), así que no vuelve. Los demás reciben EPERM, como un no-root.
++static long bsd_reboot(struct ctx* c) {
++	if (getpid() != 1) return -1;
++	logf_("    reinicio pedido (reboot howto=0x%lx) por <%d> [%s]: fin del arranque\n", (unsigned long)c->a[0], getpid(), prog_name);
++	ports_cleanup();
++	_exit(0);
++}
+ // guarded_open_np(ruta, guard*, guardflags, oflags, mode): como open; la guarda se ignora.
+ static long bsd_guarded_open(struct ctx* c) {
+ 	struct ctx c2 = *c;
+@@ -640,6 +714,13 @@ static long bsd_abort_with_payload(struct ctx* c) {
+ 	show_frames(c);
+ 	_exit(134);
+ }
++// os_fault_with_payload(espacio, código, carga, tamaño, motivo, banderas): un fallo que se informa sin terminar (libxpc,
++// LaunchServices...). Se anota como abort_with_payload y se sigue.
++static long bsd_os_fault_with_payload(struct ctx* c) {
++	show_payload("os_fault_with_payload", c->a[0], c->a[1], c->a[2], c->a[3], c->a[4]);
++	show_frames(c);
++	return 0;
++}
+ static long bsd_terminate_with_payload(struct ctx* c) {
+ 	show_payload("terminate_with_payload", c->a[1], c->a[2], c->a[3], c->a[4], c->a[5]);
+ 	show_frames(c);
+@@ -647,6 +728,9 @@ static long bsd_terminate_with_payload(struct ctx* c) {
+ }
+ // csrctl: consulta de SIP. op 0 = CSR_SYSCALL_CHECK; 0 significa "permitido" (como con SIP desactivado).
+ static long bsd_csrctl(struct ctx* c) { (void)c; return 0; }
++// system_override(plazo, banderas): launchd quita o repone la limitación de CPU y de E/S del sistema (al arrancar o
++// parar servicios en masa). En Linux no hay esa limitación: se acepta sin efecto. Si falla (ENOSYS), launchd aborta.
++static long bsd_system_override(struct ctx* c) { (void)c; return 0; }
+ // proc_info: dyld usa la llamada 15 (SET_DYLD_IMAGES) para informar al kernel de las imágenes cargadas.
+ // Datos de un proceso desde /proc (nativo). El nombre es el del ejecutable de macOS (tahoe-run <caché> <dyld> <exe>).
+ struct pinfo { int pid, ppid, pgid, status, uid, gid, ruid, rgid, svuid, svgid, nfiles; char comm[17], name[33]; uint64_t start_sec, start_usec; };
+@@ -733,8 +817,33 @@ static long proc_signal_call(struct ctx* c) {
+ 	if (r != 0) return -darwin_errno(errno);
+ 	return terminate ? sig : 0;                                            // proc_terminate devuelve la señal enviada
+ }
++// proc_listpids (PROC_INFO_CALL_LISTPIDS): pids de los procesos de este arranque, filtrados por tipo (todos, grupo, uid, uid
++// real, padre). Sin búfer devuelve el tamaño necesario. Sin ella, MacBuddy (Asistente de configuración) no podía mirar qué
++// procesos hay, caía en sus comprobaciones antiguas y decidía «configuración inicial» aunque el sistema ya estuviera
++// configurado: loginwindow intentaba lanzar el Asistente en vez de mostrar la ventana de inicio de sesión.
++static long proc_listpids(struct ctx* c) {
++	int type = (int)c->a[1]; uint32_t info = (uint32_t)c->a[2];
++	uint64_t buf = c->a[4]; size_t cap = (size_t)c->a[5] / 4;
++	DIR* d = opendir("/proc"); struct dirent* de;
++	size_t n = 0, total = 0;
++	while (d && (de = readdir(d))) {
++		int pid = atoi(de->d_name);
++		if (pid <= 0) continue;
++		struct pinfo pi;
++		if (proc_snapshot(pid, &pi) != 0) continue;
++		int keep = type == 1 || (type == 2 && (uint32_t)pi.pgid == info) || (type == 4 && (uint32_t)pi.uid == info) ||
++		           (type == 5 && (uint32_t)pi.ruid == info) || (type == 6 && (uint32_t)pi.ppid == info);
++		if (!keep) continue;
++		total++;
++		if (buf && n < cap) { int32_t v = pid; if (safe_write(buf + n * 4, &v, 4) != 4) { closedir(d); return -D_EFAULT; } n++; }
++	}
++	if (d) closedir(d);
++	if (!buf || !cap) return (long)((total + 16) * 4);     // como XNU: una estimación con margen
++	return (long)(n * 4);
++}
+ static long bsd_proc_info(struct ctx* c) {
+ 	if ((int)c->a[0] == 15) return 0;
++	if ((int)c->a[0] == 1) return proc_listpids(c);
+ 	if ((int)c->a[0] == 7 || ((int)c->a[0] >= 0x11 && (int)c->a[0] <= 0x14)) return proc_signal_call(c);
+ 	if ((int)c->a[0] == 5 || (int)c->a[0] == 8) return 0;                 // SETCONTROL / DIRTYCONTROL: sin efecto
+ 	if ((int)c->a[0] == 9) {                                              // PIDRUSAGE: contadores a cero
+@@ -792,8 +901,8 @@ static long bsd_shared_region_check_np(struct ctx* c) {
+ 
+ static bsd_fn bsd_table[BSD_NAMES_N] = {
+ 	[1] = bsd_exit, [3] = bsd_read, [4] = bsd_write, [6] = bsd_close, [20] = bsd_getpid,
+-	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [336] = bsd_proc_info,
+-	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_eperm, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
++	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [454] = bsd_system_override, [336] = bsd_proc_info,
++	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_reboot, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload, [529] = bsd_os_fault_with_payload,
+ };
+ 
+ 
+@@ -877,6 +986,9 @@ static mach_fn mach_table[MACH_NAMES_N] = {
+ 	[10] = mach_vm_allocate_trap, [12] = mach_vm_deallocate_trap, [15] = mach_vm_map_trap,
+ 	[18] = mach_nop_success, [88] = mach_not_supported, [19] = mach_nop_success, [21] = mach_nop_success, [24] = mach_nop_success, [25] = mach_nop_success,
+ 	[89] = mach_timebase_info_trap,
++	// macx_triggers(alto, bajo, flags, puerto): launchd activa al arrancar la compactación del compresor de memoria y el
++	// intercambio (SWAP_COMPACT_ENABLE 0x20) y comprueba el resultado. La memoria la gestiona Linux: éxito sin efecto.
++	[51] = mach_nop_success,
+ 	[14] = mach_vm_protect_trap, [11] = mach_vm_purgable_trap,
+ 	[26] = mach_reply_port_trap, [27] = mach_thread_self_trap, [28] = mach_task_self_trap, [29] = mach_host_self_trap,
+ };
+@@ -901,9 +1013,29 @@ static void log_call(const char* kind, uint32_t num, const char* name, struct ct
+ 	logf_("  [%s] <%d:%d> %s %u %s(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", verdict, getpid(), (int)(syscall(SYS_gettid) - getpid()), kind, num, name ? name : "?", c->a[0], c->a[1], c->a[2], c->a[3]);
+ }
+ 
++// Diagnóstico: con /dev/shm/tahoe-watch-path (un texto), todos los procesos anotan las llamadas que crean, escriben, borran o
++// renombran una ruta que lo contenga (para saber quién toca un archivo: el llavero del sistema se convertía en -db).
++static void watch_path_call(unsigned num, struct ctx* c, long r) {
++	static int on = -1; static char want[128];
++	if (on < 0) { FILE* f = fopen("/dev/shm/tahoe-watch-path", "r"); on = 0; if (f) { if (fgets(want, sizeof want, f)) { want[strcspn(want, "\n")] = 0; on = want[0] != 0; } fclose(f); } }
++	if (!on) return;
++	int p1 = -1, p2 = -1;
++	switch (num) {
++	case 5: case 398: if (!(c->a[1] & 0x603)) return; p1 = 0; break;          // open/open_nocancel para escribir o crear
++	case 463: if (!(c->a[2] & 0x603)) return; p1 = 1; break;                   // openat
++	case 10: p1 = 0; break; case 472: p1 = 1; break;                           // unlink / unlinkat
++	case 128: p1 = 0; p2 = 1; break; case 465: case 488: p1 = 1; p2 = 3; break; // rename / renameat / renameatx_np
++	default: return;
++	}
++	char a[300] = "", b[300] = "";
++	safe_string(c->a[p1], a, sizeof a); if (p2 >= 0) safe_string(c->a[p2], b, sizeof b);
++	if (!strstr(a, want) && !strstr(b, want)) return;
++	logf_("    VIGILA <%d:%ld> %s bsd %u \"%s\"%s%s%s -> %ld\n", (int)getpid(), (long)syscall(SYS_gettid), prog_name, num, a, p2 >= 0 ? " -> \"" : "", b, p2 >= 0 ? "\"" : "", r);
++}
+ static void on_sigsys(int sig, siginfo_t* si, void* v) {
+ 	(void)sig;
+ 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;   // dentro del manejador, las syscalls van directas a Linux
++	uint64_t t_in = __builtin_ia32_rdtsc();
+ 	ucontext_t* uc = v;
+ 	greg_t* g = uc->uc_mcontext.gregs;
+ 	if (si->si_code != SYS_USER_DISPATCH) DIE("SIGSYS inesperado (si_code=%d) en rip=0x%llx", si->si_code, (unsigned long long)g[REG_RIP]);
+@@ -922,10 +1054,11 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
+ 			char v[24]; if (r < 0 && r > -4096 && !c.raw_ret) snprintf(v, sizeof v, "E%-4ld", -r); else snprintf(v, sizeof v, "=%lx", r);
+ 			log_call("bsd", num, name, &c, v);
+ 			int pa = -1;                                         // argumento con ruta: open, access, readlink, stat, lstat, getattrlist...
+-			if (num == 5 || num == 398 || num == 33 || num == 58 || num == 338 || num == 340 || num == 220 || num == 136 || num == 10 || num == 128) pa = 0;
++			if (num == 5 || num == 398 || num == 33 || num == 58 || num == 338 || num == 340 || num == 220 || num == 136 || num == 10 || num == 128 || num == 345) pa = 0;
+ 			else if (num == 463 || num == 464 || num == 469 || num == 470 || num == 466) pa = 1;
+ 			if (pa >= 0) { char path[200] = ""; if (safe_read(c.a[pa], path, sizeof path - 1) > 0) { path[199] = 0; logf_("        ruta: \"%s\"\n", path); } }
+ 		}
++		watch_path_call(num, &c, r);
+ 		if (c.raw_ret) { g[REG_RAX] = (uint64_t)r; g[REG_EFL] &= ~1UL; }
+ 		else if (r < 0 && r > -4096) { g[REG_RAX] = -r; g[REG_EFL] |= 1; }   // error: rax = errno, CF = 1
+ 		else { g[REG_RAX] = r; g[REG_EFL] &= ~1UL; if (c.has_ret2) g[REG_RDX] = c.ret2; }
+@@ -953,6 +1086,8 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
+ 		g[REG_RAX] = (uint64_t)-1;
+ 	}
+ 	t_cur = NULL;
++	__atomic_add_fetch(&sc_count[cls & 3], 1, __ATOMIC_RELAXED);
++	__atomic_add_fetch(&sc_cycles, __builtin_ia32_rdtsc() - t_in, __ATOMIC_RELAXED);
+ 	selector = SYSCALL_DISPATCH_FILTER_BLOCK;
+ }
+ 
+@@ -973,7 +1108,36 @@ void reenable_dispatch(void) {
+ extern __thread uint32_t g_thread_port;
+ static __thread void* alt_stack;
+ // El hilo del invitado terminó y su función del anfitrión va a volver: se quita el despacho de syscalls y la pila alterna.
++// Sube el límite de descriptores del anfitrión si hace falta para la zona del emulador (un servicio de launchd hereda el que
++// le fijó su plist, p. ej. 256 o 4096, con el que F_DUPFD por encima de FD_INTERNAL_BASE fallaría).
++void fd_limit_raise(void) {
++	struct rlimit rl;
++	if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur >= FD_INTERNAL_LIMIT) return;
++	if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < FD_INTERNAL_LIMIT) rl.rlim_max = FD_INTERNAL_LIMIT;   // root puede subirlo
++	rl.rlim_cur = FD_INTERNAL_LIMIT;
++	if (setrlimit(RLIMIT_NOFILE, &rl) != 0) { getrlimit(RLIMIT_NOFILE, &rl); rl.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_NOFILE, &rl); }
++}
++int fd_hi(int fd) {
++	if (fd < 0 || fd >= FD_INTERNAL_BASE) return fd;
++	int fl = fcntl(fd, F_GETFD);
++	int n = fcntl(fd, (fl >= 0 && (fl & FD_CLOEXEC)) ? F_DUPFD_CLOEXEC : F_DUPFD, FD_INTERNAL_BASE);
++	if (n < 0) return fd;
++	close(fd);
++	return n;
++}
++static __thread struct { void** slot; size_t size; } tls_lazies[16];
++static __thread int n_tls_lazies;
++void* tls_lazy(void** slot, size_t size) {
++	if (*slot) return *slot;
++	void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	if (p == MAP_FAILED) DIE("tls_lazy: mmap de %zu bytes: %s", size, strerror(errno));
++	*slot = p;
++	if (n_tls_lazies < 16) { tls_lazies[n_tls_lazies].slot = slot; tls_lazies[n_tls_lazies].size = size; n_tls_lazies++; }
++	return p;
++}
+ void guest_thread_done(void) {
++	for (int i = 0; i < n_tls_lazies; i++) { munmap(*tls_lazies[i].slot, tls_lazies[i].size); *tls_lazies[i].slot = NULL; }
++	n_tls_lazies = 0;
+ 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
+ 	prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF, 0, 0, 0);
+ 	if (alt_stack) { stack_t ss = { .ss_flags = SS_DISABLE }; sigaltstack(&ss, NULL); munmap(alt_stack, 1 << 18); alt_stack = NULL; }
+@@ -1002,7 +1166,11 @@ void __attribute__((noreturn)) enter_guest_thread(uint64_t rip, uint64_t rsp, ui
+ static void on_sigill(int sig, siginfo_t* si, void* v) {
+ 	(void)sig; (void)si;
+ 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
+-	logf_("    SIGILL <%d>\n", getpid());
++	{
++		const uint8_t* ip = (const uint8_t*)((ucontext_t*)v)->uc_mcontext.gregs[REG_RIP]; uint8_t b[4] = { 0 };
++		safe_read((uint64_t)ip, b, 4);
++		logf_("    SIGILL <%d> hilo %ld rip=%p (%02x %02x %02x %02x)\n", getpid(), (long)syscall(SYS_gettid), (void*)ip, b[0], b[1], b[2], b[3]);
++	}
+ 	diag_crash(v);
+ 	diag_dump_threads();
+ 	_exit(132);
+@@ -1078,16 +1246,21 @@ static void install_dispatch(void) {
+ 		DIE("PR_SET_SYSCALL_USER_DISPATCH: %s (hace falta Linux >= 5.11)", strerror(errno));
+ }
+ 
+-// Número de CPU: libsystem_pthread, libsystem_malloc y libdispatch lo leen con "sidt [rsp-0x10]" y se quedan con los
++// Número de CPU: libsystem_pthread, libsystem_malloc y libdispatch lo leen con "sidt [rsp-0x10]" (o, según cómo se compiló la
++// caché, "sidt [rbp-0x10]", p. ej. en la del macOS completo) y se quedan con los
+ // 12 bits bajos del límite de la IDT, porque XNU pone en cada CPU límite = 0x1000 + número de CPU (mp_desc.c). En Linux
+ // el límite es 0xfff, así que salía la CPU 4095 y libdispatch indexaba su montón por CPU fuera de rango. Sin UMIP la
+ // instrucción no se puede atrapar, de modo que en nuestra copia privada de la caché se cambia por una de igual tamaño,
+-// "and dword [rsp-0x10], 0": límite & 0xfff = 0, la CPU 0, válida siempre (solo cambia el reparto por CPU).
++// "and dword [rsp-0x10], 0" / "and dword [rbp-0x10], 0": límite & 0xfff = 0, la CPU 0, válida siempre (solo cambia el
++// reparto por CPU).
+ static void patch_cpu_number(void) {
+ 	const uint64_t cache = 0x7ff800000000UL;
+ 	uint32_t io = *(uint32_t*)(cache + 0x1c0), ic = *(uint32_t*)(cache + 0x1c4);
+ 	static const char* libs[] = { "/libdispatch.dylib", "/libsystem_malloc.dylib", "/libsystem_pthread.dylib" };
+-	static const uint8_t sidt[5] = { 0x0f, 0x01, 0x4c, 0x24, 0xf0 }, repl[5] = { 0x83, 0x64, 0x24, 0xf0, 0x00 };
++	static const struct { uint8_t len, sidt[5], repl[5]; } pat[] = {
++		{ 5, { 0x0f, 0x01, 0x4c, 0x24, 0xf0 }, { 0x83, 0x64, 0x24, 0xf0, 0x00 } },   // sidt [rsp-0x10]
++		{ 4, { 0x0f, 0x01, 0x4d, 0xf0 },       { 0x83, 0x65, 0xf0, 0x00 } },         // sidt [rbp-0x10]
++	};
+ 	int patched = 0;
+ 	for (uint32_t i = 0; i < ic && i < 10000; i++) {
+ 		uint64_t mh = *(uint64_t*)(cache + io + i * 32ULL);
+@@ -1102,10 +1275,13 @@ static void patch_cpu_number(void) {
+ 			if (sg->cmd == 0x19 && !strcmp(sg->segname, "__TEXT")) {
+ 				uint8_t* a = (uint8_t*)sg->vmaddr; uint64_t n = sg->vmsize;
+ 				for (uint64_t off = 0; off + 5 <= n; off++) {
+-					if (a[off] != 0x0f || memcmp(a + off, sidt, 5) != 0) continue;
++					if (a[off] != 0x0f || a[off + 1] != 0x01) continue;
++					int k = -1;
++					for (int j = 0; j < (int)(sizeof pat / sizeof pat[0]); j++) if (!memcmp(a + off, pat[j].sidt, pat[j].len)) k = j;
++					if (k < 0) continue;
+ 					uint64_t pg = ((uint64_t)a + off) & ~(uint64_t)(PAGE - 1);
+ 					if (mprotect((void*)pg, PAGE * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) continue;
+-					memcpy(a + off, repl, 5);
++					memcpy(a + off, pat[k].repl, pat[k].len);
+ 					mprotect((void*)pg, PAGE * 2, PROT_READ | PROT_EXEC);
+ 					patched++;
+ 				}
+@@ -1140,10 +1316,11 @@ int main(int argc, char** argv, char** envp) {
+ 		return 2;
+ 	}
+ 	g_argv = argv;
+-	{ int f = fcntl(2, F_DUPFD_CLOEXEC, 900); if (f >= 0) logfd = f; }
++	fd_limit_raise();                                   // antes de reservar descriptores en la zona del emulador
++	{ int f = fcntl(2, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE); if (f >= 0) logfd = f; }
+ 	if (getenv("TAHOE_LOGFILE")) {          // los procesos hijos escriben su registro en un archivo común
+ 		int f = open(getenv("TAHOE_LOGFILE"), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+-		if (f >= 0) { int g = fcntl(f, F_DUPFD_CLOEXEC, 900); close(f); if (g >= 0) logfd = g; }
++		if (f >= 0) { int g = fcntl(f, F_DUPFD_CLOEXEC, FD_INTERNAL_BASE); close(f); if (g >= 0) logfd = g; }
+ 	}
+ 	tahoe_root = getenv("TAHOE_ROOT");
+ 	trace_all = getenv("TAHOE_TRACE") != NULL;
+@@ -1152,18 +1329,24 @@ int main(int argc, char** argv, char** envp) {
+ 	static char self[4096];
+ 	ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
+ 	g_self_exe = sl > 0 ? (self[sl] = 0, self) : argv[0];
+-	// execve relanza tahoe-run: TAHOE_ARGV0 permite que argv[0] del programa no sea su ruta
+-	const char* argv0 = getenv("TAHOE_ARGV0");
+-	if (argv0) { argv[3] = (char*)argv0; unsetenv("TAHOE_ARGV0"); }
+-	map_cache(cache);
+-	patch_cpu_number();
++	// Fases del arranque de este proceso (diagnóstico de velocidad, con /dev/shm/tahoe-log-time): ms de cada una.
++	struct timespec ft[8]; int nft = 0;
++#define FASE() clock_gettime(CLOCK_MONOTONIC, &ft[nft++])
++	FASE();
++	if (getpid() == 1) sys_volumes_mount();                      // launchd: antes de que macOS mire sus volúmenes
++	map_cache(cache); FASE();
++	patch_cpu_number(); FASE();
+ 	LOG("caché mapeada en 0x%lx\n", CACHE_BASE);
+-	setup_commpage();
++	setup_commpage(); FASE();
+ 	struct image di, ei;
+ 	load_macho(dyld, DYLD_SLIDE, &di);
+-	load_macho(exe, 0, &ei);
++	load_macho(exe, 0, &ei); FASE();
+ 	diag_breakpoints();                                          // /dev/shm/tahoe-break en el proceso de /dev/shm/tahoe-stacks
+ 	if (di.filetype != 7) DIE("%s no es un MH_DYLINKER", dyld);
++	// execve relanza tahoe-run: TAHOE_ARGV0 permite que argv[0] del programa no sea su ruta. Se aplica después de mapear la
++	// caché: si allí hay que relanzarse sin ASLR (g_argv), el programa a cargar tiene que seguir en argv[3].
++	const char* argv0 = getenv("TAHOE_ARGV0");
++	if (argv0) { argv[3] = (char*)argv0; unsetenv("TAHOE_ARGV0"); }
+ 	char real[4096];
+ 	if (!realpath(exe, real)) snprintf(real, sizeof real, "%s", exe);
+ 	// el programa debe ver su ruta como macOS (/bin/ls), no la del host
+@@ -1203,7 +1386,13 @@ int main(int argc, char** argv, char** envp) {
+ 		{ 423, 334 }, { 464, 463 }, { 542, 540 }, { 543, 541 },
+ 	};
+ 	for (size_t i = 0; i < sizeof alias / sizeof alias[0]; i++) if (bsd_table[alias[i].normal] && !bsd_table[alias[i].nocancel]) bsd_table[alias[i].nocancel] = bsd_table[alias[i].normal];
+-	install_dispatch();
++	install_dispatch(); FASE();
++#define MS(a, b) ((ft[b].tv_sec - ft[a].tv_sec) * 1e3 + (ft[b].tv_nsec - ft[a].tv_nsec) / 1e6)
++	if (access("/dev/shm/tahoe-log-time", F_OK) == 0)
++		logf_("    arranque <%d>: caché %.1f ms, cpu %.1f, commpage %.1f, mach-o %.1f, resto %.1f, total %.1f\n", (int)getpid(),
++		      MS(0, 1), MS(1, 2), MS(2, 3), MS(3, 4), MS(4, 5), MS(0, 5));
++#undef MS
++#undef FASE
+ 	LOG("saltando a dyld (rip=0x%lx rsp=0x%lx)\n", di.entry, sp);
+ 	enter(di.entry, sp);
+ }

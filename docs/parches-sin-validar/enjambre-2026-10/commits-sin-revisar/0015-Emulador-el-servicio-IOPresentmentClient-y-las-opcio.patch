@@ -1,0 +1,146 @@
+From 1c69ee1c6e4d6de593b356ea2968e21e4f7222ae Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 20:54:26 -0600
+Subject: [PATCH 15/57] Emulador: el servicio IOPresentmentClient y las
+ opciones AGDC del arranque
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_iokit.inc: servicio IOPresentmentClient (UC tipo 2) con su display pipe
+  y el diccionario de capacidades. El binario de tahoe-run aún no lo lleva
+  compilado: falta recompilarlo y probarlo con una traza real.
+- emu_proc.c: TAHOE_AGDC y TAHOE_FB_INTEL en el entorno de los procesos, para
+  que el GPUWrangler y el framebuffer usen el camino acelerado.
+- macos-shell.sh: TAHOE_AGDC y TAHOE_FB_INTEL pasan al emulador.
+- tahoe-gpu/src/servir.rs: log del tamaño de las órdenes de cada command
+  buffer, para distinguir un passthrough vacío de un fallo de traducción.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-gpu/src/servir.rs |  1 +
+ tahoe-run/emu_iokit.inc | 37 +++++++++++++++++++++++++++++++++++--
+ tahoe-run/emu_proc.c    |  2 ++
+ tools/macos-shell.sh    |  6 ++++++
+ 4 files changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/tahoe-gpu/src/servir.rs b/tahoe-gpu/src/servir.rs
+index 6747bf0..d2cfb01 100644
+--- a/tahoe-gpu/src/servir.rs
++++ b/tahoe-gpu/src/servir.rs
+@@ -276,6 +276,7 @@ impl Cliente {
+                 let ordenes = l.bytes()?.to_vec();
+                 match self.ejecutar(&ordenes) {
+                     Ok(()) => {
++                        eprintln!("tahoe-gpu: command buffer: {} bytes de órdenes", ordenes.len());
+                         e.u32(0).texto("");
+                     }
+                     Err(er) => {
+diff --git a/tahoe-run/emu_iokit.inc b/tahoe-run/emu_iokit.inc
+index 2cc3b8d..947ecb7 100644
+--- a/tahoe-run/emu_iokit.inc
++++ b/tahoe-run/emu_iokit.inc
+@@ -458,7 +458,13 @@ static void fb_path(char* b, size_t n, const char* what);
+ // Con «AppleIntelFramebuffer», CoreDisplay veía «Intel» en el nombre, daba la GPU por una Intel integrada y presentaba las
+ // imágenes con IOPresentment, que exige acelerador (AGDC, IOAccelerator): WindowServer abortaba al mostrar la primera
+ // ventana (la de inicio de sesión). Sin fabricante en el nombre usa el camino clásico del framebuffer.
+-#define FB_CLASS  "IONDRVFramebuffer"
++// Con TAHOE_FB_INTEL=1 se usa la de Intel, para estudiar ese camino (M0).
++static const char* fb_class(void) {
++	static const char* c;
++	if (!c) c = getenv("TAHOE_FB_INTEL") ? "AppleIntelFramebuffer" : "IONDRVFramebuffer";
++	return c;
++}
++#define FB_CLASS fb_class()
+ // EDID 1.4 de un panel interno de 13,3" (286×179 mm) con el modo nativo como temporización detallada (CVT con borrado reducido:
+ // 71 MHz, 1280+160 × 800+23). Fabricante "TAH" (no es un panel real).
+ static void edid_make(uint8_t e[128]) {
+@@ -496,7 +502,7 @@ static void display_props(int d) {
+ 	p_num(d, "DisplayVendorID", 0x5028, 32);
+ 	p_num(d, "DisplayProductID", 0x1280, 32);
+ 	p_num(d, "DisplaySerialNumber", 0, 32);
+-	p_str(d, "IODisplayPrefsKey", "IOService:/AppleACPIPlatformExpert/PCI0/IGPU@20000/" FB_CLASS "@0/display0/AppleDisplay-5028-1280");
++	{ static char pk[256]; snprintf(pk, sizeof pk, "IOService:/AppleACPIPlatformExpert/PCI0/IGPU@20000/%s@0/display0/AppleDisplay-5028-1280", FB_CLASS); p_str(d, "IODisplayPrefsKey", pk); }
+ 	p_num(d, "IODisplayConnectFlags", 0, 32);
+ }
+ 
+@@ -727,6 +733,15 @@ static void io_init(void) {
+ 		char sp[200];
+ 		snprintf(sp, sizeof sp, "/dev/shm/tahoe-surf-%%u-%s", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
+ 		p_str(ta, "TahoeSurfacePath", strdup(sp));
++		// El cliente de presentación (IOPresentmentClient): lo que WindowServer busca cuando la pantalla va por la GPU
++		// (con TAHOE_FB_INTEL=1; el API de usuario es el framework privado IOPresentment, que crea la presentación con
++		// IOPresentmentCreateForRegistryID, el ID de registro que lleva la lista del GPUWrangler). En un Mac lo publica
++		// el AGDC; aquí es un servicio hijo del acelerador emulado, con su user client, para ver qué se le pide (M1).
++		int pcl = ent_add(ta, "IOPresentmentClient", "IOPresentmentClient", "IORegistryEntry IOService IOPresentmentClient", "", PL_SERVICE, 1);
++		p_str(pcl, "IOClass", "IOPresentmentClient");
++		p_str(pcl, "IOProviderClass", "IOPresentmentClient");
++		p_str(pcl, "IOUserClientClass", "IOPresentmentClientUserClient");
++		p_num(pcl, "IOAccelIndex", 0, 32);
+ 	}
+ 	int dcon = ent_add(accel, "display0", "IODisplayConnect", "IORegistryEntry IOService", "", PL_SERVICE, 0);
+ 	p_str(dcon, "IOClass", "IODisplayConnect");
+@@ -1414,6 +1429,11 @@ static int32_t uc_gpuwrangler(struct uc_call* c) {
+ 		memset(list, 0, sizeof list);
+ 		int gpu = ent_by_name_cls("IGPU", "IOPCIDevice"), fb = ent_by_name_cls(FB_CLASS, FB_CLASS);
+ 		int acc = ent_by_name_cls("IOAccelerator", "IOAccelerator");
++		// Con TAHOE_AGDC: el campo AGDC lleva el ID del acelerador emulado (TahoeAccelerator). Sin esto vale 0 y
++		// CoreDisplay presenta por software; con ello CoreDisplay intenta presentar con IOPresentment, que es el
++		// camino de la GPU de verdad. Sirve para estudiar qué se pide por ese camino (el acelerador emulado aún no
++		// tiene user client, así que se ve a CoreDisplay intentarlo y fallar).
++		if (acc < 0 && getenv("TAHOE_AGDC")) acc = ent_by_name_cls("TahoeAccelerator", "TahoeAccelerator");
+ 		if (gpu >= 0) {
+ 			uint32_t n = 1; memcpy(list, &n, 4);
+ 			uint8_t* e = list + 0x3c;
+@@ -1769,8 +1789,21 @@ long io_user_client_trap(uint32_t port, uint32_t idx, const uint64_t* p) {
+ 	if (!fn) { logf_("    iokit: trampa %u de %s sin gancho\n", idx, io_e[o->ent].cls); return kIOReturnUnsupported; }
+ 	return fn(o->ent, idx, p);
+ }
++// IOPresentmentClient (el cliente de presentación del AGDC): aún sin implementar; se anota lo que se le pide
++// (selectores, escalares y bytes) para deducir el protocolo (M1).
++static int32_t uc_presentacion(struct uc_call* c) {
++	static uint64_t seen;
++	if (c->selector < 64 && !(seen & (1ull << c->selector))) {
++		seen |= 1ull << c->selector;
++		logf_("    iokit: <%d> IOPresentmentClient selector %u (%u escalares, %u bytes)\n", (int)getpid(), c->selector, c->nsin, c->ninband);
++	}
++	*c->nsout = 0; *c->noutband = 0;
++	return 0;
++}
++
+ static uc_method_fn uc_hook_for(const char* cls) {
+ 	if (!strcmp(cls, "AppleGPUWrangler")) return uc_gpuwrangler;
++	if (!strcmp(cls, "IOPresentmentClient")) return uc_presentacion;
+ 	if (!strcmp(cls, FB_CLASS)) return uc_fb;
+ 	if (!strcmp(cls, "IOSurfaceRoot")) return uc_iosurface;
+ 	if (!strcmp(cls, "IOWatchdog")) return uc_watchdog;
+diff --git a/tahoe-run/emu_proc.c b/tahoe-run/emu_proc.c
+index 4f085dd..bf40e2a 100644
+--- a/tahoe-run/emu_proc.c
++++ b/tahoe-run/emu_proc.c
+@@ -919,6 +919,8 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
+ 	if (getenv("TAHOE_GPU_SOCK")) { snprintf(b13, sizeof b13, "TAHOE_GPU_SOCK=%s", getenv("TAHOE_GPU_SOCK")); nenv[e++] = b13; }
+ 	if (getenv("TAHOE_FD2LOG")) nenv[e++] = (char*)"TAHOE_FD2LOG=1";
+ 	if (getenv("TAHOE_DEBUG_NOREBOOT")) nenv[e++] = (char*)"TAHOE_DEBUG_NOREBOOT=1";   // modo depuración (ver emu_iokit.inc)
++	if (getenv("TAHOE_AGDC")) nenv[e++] = (char*)"TAHOE_AGDC=1";                     // el campo AGDC del GPUWrangler lleva el acelerador (ver emu_iokit.inc)
++	if (getenv("TAHOE_FB_INTEL")) nenv[e++] = (char*)"TAHOE_FB_INTEL=1";             // el framebuffer se presenta como el de una Intel (ver emu_iokit.inc)
+ 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
+ 	static char b7[300]; cred_env(b7, sizeof b7); nenv[e++] = b7;   // credenciales emuladas (uid/gid) para el hijo
+ 	for (int i = 0; i < spawn_special_n; i++) nenv[e++] = spawn_special_env[i];
+diff --git a/tools/macos-shell.sh b/tools/macos-shell.sh
+index ad6208b..ed10e23 100755
+--- a/tools/macos-shell.sh
++++ b/tools/macos-shell.sh
+@@ -64,6 +64,12 @@ SMBIOS="${TAHOE_SMBIOS_FILE:-$HOME/.config/tahoe-run/smbios.json}"
+ # Argumentos de arranque de macOS (NVRAM boot-args y kern.bootargs), p. ej. TAHOE_BOOTARGS="useIOP=0".
+ [ -n "$TAHOE_BOOTARGS" ] && OSK_ENV+=(TAHOE_BOOTARGS="$TAHOE_BOOTARGS")
+ [ -n "$TAHOE_GPU" ] && OSK_ENV+=(TAHOE_GPU="$TAHOE_GPU")          # otra identidad PCI para la GPU emulada
++# Camino acelerado de la pantalla (AGDC/IOPresentment): con TAHOE_AGDC=1 el GPUWrangler da el ID del acelerador
++# emulado, con lo que CoreDisplay intenta presentar por la GPU en vez de por software (ver emu_iokit.inc).
++[ -n "$TAHOE_AGDC" ] && OSK_ENV+=(TAHOE_AGDC=1)
++# Con TAHOE_FB_INTEL=1 el framebuffer emulado se presenta como el de una Intel, con lo que CoreDisplay usa el camino
++# AGDC/IOPresentment en vez del clásico por software (ver emu_iokit.inc).
++[ -n "$TAHOE_FB_INTEL" ] && OSK_ENV+=(TAHOE_FB_INTEL=1)
+ # Driver Metal (tahoe-metal): carpeta del anfitrión con TahoeMetal.bundle; con ella macOS ve un IOAccelerator con ese driver.
+ # Con él arranca también el servidor de GPU de Linux (tahoe-gpu servir, Vulkan), al que el driver manda los comandos por
+ # el socket TAHOE_GPU_SOCK (por omisión /dev/shm/tahoe-gpu-<uid>.sock).

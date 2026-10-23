@@ -1,0 +1,40 @@
+From 1e627eb2e2a0a6dfd1fc9599dad95bbbb99b5690 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:37:40 -0600
+Subject: [PATCH 51/57] Emulador: el estado de spawn va por hilo, no es global
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_proc.c: spawn_suspended era una variable global, pero el estado de
+  una llamada de spawn pertenece al hilo que la hace (cada hilo del
+  invitado es un hilo de Linux y su syscall se despacha en él). Con
+  dos spawn a la vez, uno ponía el flag de suspensión y el otro lo
+  quitaba: el hijo del primero nacía sin parar, o el del segundo se
+  paraba sin que nadie lo hubiera pedido. Ahora va por hilo, como el
+  resto del estado de despacho del emulador (g_dout, g_no_poll,
+  pe_nofirm).
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_proc.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/tahoe-run/emu_proc.c b/tahoe-run/emu_proc.c
+index 94424e0..76e196e 100644
+--- a/tahoe-run/emu_proc.c
++++ b/tahoe-run/emu_proc.c
+@@ -882,7 +882,10 @@ static int spawn_special_n;
+ // entorno, antes de que cargue nada del programa. El padre no devuelve el control hasta que el hijo está de verdad
+ // parado: un SIGCONT enviado a un proceso que todavía no se ha parado se pierde (su acción por defecto no hace nada) y
+ // el hijo quedaría colgado para siempre.
+-static int spawn_suspended;                                  // POSIX_SPAWN_START_SUSPENDED en el atributo de spawn
++// El estado de una llamada de spawn pertenece al hilo que la hace (cada hilo del invitado es un hilo de Linux y su
++// syscall se despacha en él), así que va por hilo: si no, dos spawn a la vez se pisan y, sobre todo, un spawn que falla
++// a mitad deja el flag de suspensión puesto y el siguiente spawn suspende su hijo sin que nadie lo haya pedido.
++static __thread int spawn_suspended;                    // POSIX_SPAWN_START_SUSPENDED en el atributo de spawn
+ 
+ __attribute__((constructor)) static void spawn_suspended_child(void) {
+ 	const char* s = getenv("TAHOE_SPAWN_SUSPENDED");

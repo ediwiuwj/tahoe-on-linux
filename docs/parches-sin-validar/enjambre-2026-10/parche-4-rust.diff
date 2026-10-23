@@ -1,0 +1,243 @@
+diff -ruN a/tahoe-gpu/src/air/ir.rs b/tahoe-gpu/src/air/ir.rs
+--- a/tahoe-gpu/src/air/ir.rs
++++ b/tahoe-gpu/src/air/ir.rs
+@@ -36,6 +36,7 @@
+     pub fn recs(&self) -> impl Iterator<Item = &Rec> {
+         self.elems.iter().filter_map(|e| if let Elem::Rec(r) = e { Some(r) } else { None })
+     }
++    #[allow(dead_code)]
+     pub fn blks(&self) -> impl Iterator<Item = &Blk> {
+         self.elems.iter().filter_map(|e| if let Elem::Blk(b) = e { Some(b) } else { None })
+     }
+@@ -122,6 +123,7 @@
+     /// Resultado de una instrucción: (bloque, posición).
+     Inst(usize, usize),
+     /// Valor de metadatos usado como operando (llamadas a llvm.dbg.* y similares).
++    #[allow(dead_code)]
+     Metadata(usize),
+ }
+ 
+@@ -229,6 +231,7 @@
+     /// Tipo del contenido (no el del puntero).
+     pub ty: TypeId,
+     pub addrspace: u32,
++    #[allow(dead_code)]
+     pub is_const: bool,
+     pub init: Option<ValueId>,
+ }
+@@ -236,6 +239,7 @@
+ // ---------------------------------------------------------------- metadatos
+ 
+ #[derive(Debug, Clone)]
++#[allow(dead_code)]
+ pub enum Md {
+     Str(String),
+     /// Un valor del módulo (número de valor global y su tipo).
+@@ -253,6 +257,7 @@
+     pub values: Vec<Value>,
+     pub md: Vec<Md>,
+     pub named_md: HashMap<String, Vec<usize>>,
++    #[allow(dead_code)]
+     pub triple: String,
+ }
+ 
+@@ -905,6 +910,7 @@
+             _ => None,
+         }
+     }
++    #[allow(dead_code)]
+     pub fn function(&self, name: &str) -> Option<&Function> {
+         self.functions.iter().find(|f| f.name == name)
+     }
+diff -ruN a/tahoe-gpu/src/protocolo.rs b/tahoe-gpu/src/protocolo.rs
+--- a/tahoe-gpu/src/protocolo.rs
++++ b/tahoe-gpu/src/protocolo.rs
+@@ -10,6 +10,13 @@
+ 
+ pub const VERSION: u32 = 1;
+ 
++/// Límite máximo de un mensaje individual (256 MiB).
++const MAX_MENSAJE: usize = 256 << 20;
++/// Límite máximo para un string/texto (1 MiB).
++const MAX_TEXTO: usize = 1 << 20;
++/// Límite máximo para bytes (64 MiB).
++const MAX_BYTES: usize = 64 << 20;
++
+ /// Tipos de mensaje.
+ pub mod tipo {
+     /// driver → servidor: versión del protocolo. Respuesta: `Info`.
+@@ -162,18 +169,31 @@
+         self.pos += n;
+         Ok(r)
+     }
++    fn tomar_fijo<const N: usize>(&mut self) -> io::Result<[u8; N]> {
++        let slice = self.tomar(N)?;
++        // SAFETY: slice tiene exactamente N bytes porque tomar lo garantiza
++        Ok(slice.try_into().expect("tamaño fijo inválido"))
++    }
+     pub fn u32(&mut self) -> io::Result<u32> {
+-        Ok(u32::from_le_bytes(self.tomar(4)?.try_into().unwrap()))
++        Ok(u32::from_le_bytes(self.tomar_fijo::<4>()?))
+     }
+     pub fn u64(&mut self) -> io::Result<u64> {
+-        Ok(u64::from_le_bytes(self.tomar(8)?.try_into().unwrap()))
++        Ok(u64::from_le_bytes(self.tomar_fijo::<8>()?))
+     }
+     pub fn bytes(&mut self) -> io::Result<&'a [u8]> {
+         let n = self.u32()? as usize;
++        if n > MAX_BYTES {
++            return Err(io::Error::new(io::ErrorKind::InvalidData, "bytes demasiado grandes"));
++        }
+         self.tomar(n)
+     }
+     pub fn texto(&mut self) -> io::Result<String> {
+-        Ok(String::from_utf8_lossy(self.bytes()?).into_owned())
++        let n = self.u32()? as usize;
++        if n > MAX_TEXTO {
++            return Err(io::Error::new(io::ErrorKind::InvalidData, "texto demasiado grande"));
++        }
++        let slice = self.tomar(n)?;
++        Ok(String::from_utf8_lossy(slice).into_owned())
+     }
+ }
+ 
+@@ -181,6 +201,7 @@
+     pub fn escribir(&self, e: &mut Escritor) {
+         e.u32(self.version).texto(&self.nombre).u64(self.registry_id).u64(self.max_buffer).u32(self.max_hilos_grupo).u32(self.memoria_grupo).u32(self.ancho_simd);
+     }
++    #[allow(dead_code)]
+     pub fn leer(l: &mut Lector) -> io::Result<Info> {
+         Ok(Info {
+             version: l.u32()?,
+@@ -208,7 +229,7 @@
+     let mut h = [0u8; 8];
+     r.read_exact(&mut h)?;
+     let n = u32::from_le_bytes(h[..4].try_into().unwrap()) as usize;
+-    if n > 256 << 20 {
++    if n > MAX_MENSAJE {
+         return Err(io::Error::new(io::ErrorKind::InvalidData, "mensaje demasiado grande"));
+     }
+     let tipo = u32::from_le_bytes(h[4..].try_into().unwrap());
+diff -ruN a/tahoe-gpu/src/render.rs b/tahoe-gpu/src/render.rs
+--- a/tahoe-gpu/src/render.rs
++++ b/tahoe-gpu/src/render.rs
+@@ -121,7 +121,9 @@
+     /// x, y, ancho, alto, profundidad mínima y máxima (como MTLViewport)
+     pub viewport: [f32; 6],
+     pub tijera: Option<[i32; 4]>,
++    #[allow(dead_code)]
+     pub cull: vk::CullModeFlags,
++    #[allow(dead_code)]
+     pub horario: bool,
+ }
+ 
+diff -ruN a/tahoe-metal/src/bin/metalsuite.rs b/tahoe-metal/src/bin/metalsuite.rs
+--- a/tahoe-metal/src/bin/metalsuite.rs
++++ b/tahoe-metal/src/bin/metalsuite.rs
+@@ -616,16 +616,14 @@
+             let f = funcion_de_computo(d).ok_or("no hay función de cómputo")?;
+             let mut reflexion: Id = std::ptr::null_mut();
+             let mut err: Id = std::ptr::null_mut();
+-            let p = unsafe {
+-                m4::<Id, u64, *mut Id, *mut Id, Id>(
+-                    d,
+-                    "newComputePipelineStateWithFunction:options:reflection:error:",
+-                    f,
+-                    0,
+-                    &mut reflexion as *mut Id,
+-                    &mut err as *mut Id,
+-                )
+-            };
++            let p = m4::<Id, u64, *mut Id, *mut Id, Id>(
++                d,
++                "newComputePipelineStateWithFunction:options:reflection:error:",
++                f,
++                0,
++                &mut reflexion as *mut Id,
++                &mut err as *mut Id,
++            );
+             if p.is_null() {
+                 return Err(format!("nil: {}", objc::texto(err)));
+             }
+@@ -640,16 +638,14 @@
+             objc::m1::<Id, ()>(pd, "setComputeFunction:", f);
+             let mut reflexion: Id = std::ptr::null_mut();
+             let mut err: Id = std::ptr::null_mut();
+-            let p = unsafe {
+-                m4::<Id, u64, *mut Id, *mut Id, Id>(
+-                    d,
+-                    "newComputePipelineStateWithDescriptor:options:reflection:error:",
+-                    pd,
+-                    0,
+-                    &mut reflexion as *mut Id,
+-                    &mut err as *mut Id,
+-                )
+-            };
++            let p = m4::<Id, u64, *mut Id, *mut Id, Id>(
++                d,
++                "newComputePipelineStateWithDescriptor:options:reflection:error:",
++                pd,
++                0,
++                &mut reflexion as *mut Id,
++                &mut err as *mut Id,
++            );
+             if p.is_null() {
+                 return Err(format!("nil: {}", objc::texto(err)));
+             }
+diff -ruN a/tahoe-metal/src/render.rs b/tahoe-metal/src/render.rs
+--- a/tahoe-metal/src/render.rs
++++ b/tahoe-metal/src/render.rs
+@@ -456,21 +456,18 @@
+ extern "C-unwind" fn dev_sampler(_this: Id, _cmd: Sel, d: Id) -> Id {
+     let id = nuevo_id();
+     let mut e = Escritor::default();
+-    // SAFETY: d es un MTLSamplerDescriptor.
+-    unsafe {
+-        let u = |s: &str| -> u32 { campo(d, s, 0u64) as u32 };
+-        e.u32(id).u32(u("minFilter")).u32(u("magFilter")).u32(u("mipFilter")).u32(u("sAddressMode")).u32(u("tAddressMode")).u32(u("rAddressMode"));
+-        let norm = if objc::responde_instancia(d, "normalizedCoordinates") {
+-            campo(d, "normalizedCoordinates", 0 as Bool) as u32
+-        } else {
+-            campo(d, "isNormalizedCoordinates", 0 as Bool) as u32
+-        };
+-        e.u32(norm).u32(u("maxAnisotropy"));
+-        let lmin = if objc::responde_instancia(d, "lodMinClamp") { campo(d, "lodMinClamp", 0f32) } else { campo(d, "minLod", 0f32) };
+-        let lmax = if objc::responde_instancia(d, "lodMaxClamp") { campo(d, "lodMaxClamp", 0f32) } else { campo(d, "maxLod", 0f32) };
+-        e.u32(lmin.to_bits()).u32(lmax.to_bits());
+-        e.u32(u("compareFunction")).u32(u("borderColor"));
+-    }
++    let u = |s: &str| -> u32 { campo(d, s, 0u64) as u32 };
++    e.u32(id).u32(u("minFilter")).u32(u("magFilter")).u32(u("mipFilter")).u32(u("sAddressMode")).u32(u("tAddressMode")).u32(u("rAddressMode"));
++    let norm = if objc::responde_instancia(d, "normalizedCoordinates") {
++        campo(d, "normalizedCoordinates", 0 as Bool) as u32
++    } else {
++        campo(d, "isNormalizedCoordinates", 0 as Bool) as u32
++    };
++    e.u32(norm).u32(u("maxAnisotropy"));
++    let lmin = if objc::responde_instancia(d, "lodMinClamp") { campo(d, "lodMinClamp", 0f32) } else { campo(d, "minLod", 0f32) };
++    let lmax = if objc::responde_instancia(d, "lodMaxClamp") { campo(d, "lodMaxClamp", 0f32) } else { campo(d, "maxLod", 0f32) };
++    e.u32(lmin.to_bits()).u32(lmax.to_bits());
++    e.u32(u("compareFunction")).u32(u("borderColor"));
+     if let Err(er) = pedir(tipo::SAMPLER, &e.0) {
+         registro(&format!("sampler: {er}"));
+         return std::ptr::null_mut();
+diff -ruN a/tahoe-metal/src/stubs.rs b/tahoe-metal/src/stubs.rs
+--- a/tahoe-metal/src/stubs.rs
++++ b/tahoe-metal/src/stubs.rs
+@@ -60,8 +60,14 @@
+ extern "C" fn nada(_this: Id, _cmd: Sel) {}
+ 
+ /// Estructura de dos enteros de 64 bits (MTLSize, MTLDrawableSize...): vuelve en rax:rdx.
+-extern "C" fn ceros2(_this: Id, _cmd: Sel) -> [u64; 2] {
+-    [0, 0]
++#[repr(C)]
++struct DosU64 {
++    a: u64,
++    b: u64,
++}
++
++extern "C" fn ceros2(_this: Id, _cmd: Sel) -> DosU64 {
++    DosU64 { a: 0, b: 0 }
+ }
+ 
+ /// Estructura de tres enteros de 64 bits: vuelve por puntero oculto (`objc_msgSend_stret`).

@@ -1,0 +1,47 @@
+From c280798f0ca20ffc96eed236eacc9304e09bb649 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:33:31 -0600
+Subject: [PATCH 30/57] Emulador: EVFILT_MACHPORT con un puerto que no existe
+ falla el kevent
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_kqueue.c: al registrar un EVFILT_MACHPORT de un puerto
+  desconocido, el knote se quedaba con fd = -1: el kevent aparentemente
+  se registraba bien, pero el evento no llegaba nunca y el puerto
+  vigilado seguía vivo. Ahora el knote se destruye y el kevent
+  devuelve el error, como en XNU, donde filt_machportattach
+  (osfmk/ipc/ipc_pset.c:765-806) marca el knote con ENOENT si el
+  nombre no está en el espacio de IPs del proceso, o ENOTSUP si
+  existe pero sin derecho de recepción, y knote_set_error
+  (kern_event.c:923-929) lo devuelve como evento EV_ERROR.
+
+Verificado: compila (clang -fsyntax-only, sin avisos).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_kqueue.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/tahoe-run/emu_kqueue.c b/tahoe-run/emu_kqueue.c
+index fb2e734..86a6adc 100644
+--- a/tahoe-run/emu_kqueue.c
++++ b/tahoe-run/emu_kqueue.c
+@@ -357,7 +357,15 @@ static int apply(int kq, const struct kev* c) {
+ 		}
+ 		case EVFILT_MACHPORT: {
+ 			int pfd = port_eventfd((uint32_t)c->ident);
+-			if (pfd < 0) { logf_("    kevent: EVFILT_MACHPORT 0x%lx: puerto desconocido o de otro proceso\n", c->ident); break; }
++			if (pfd < 0) {
++				// XNU (osfmk/ipc/ipc_pset.c:765-790, filt_machportattach): si el nombre no está en el espacio de IPs del
++				// proceso, el knote queda con error ENOENT y el kevent lo devuelve como EV_ERROR (un nombre que existe pero
++				// sin derecho de recepción daría ENOTSUP). Aquí el knote se destruye: si no, quedaba colgado (registrado
++				// con éxito, pero sin evento nunca) y su fd nulo no disparaba jamás.
++				logf_("    kevent: EVFILT_MACHPORT 0x%lx: puerto desconocido o de otro proceso\n", c->ident);
++				drop(n);
++				return port_exists((uint32_t)c->ident) ? D_ENOMEM : D_ENOENT;
++			}
+ 			n->fd = pfd;
+ 			if (trace_all || mach_trace()) logf_("    kevent: EVFILT_MACHPORT puerto=0x%lx flags=0x%x fflags=0x%x udata=0x%lx kq=%d\n", c->ident, c->flags, c->fflags, c->udata, kq);
+ 			break;

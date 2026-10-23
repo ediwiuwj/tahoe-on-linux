@@ -1,0 +1,122 @@
+From a3c60b4f7a1ce83a7e78b13db34f49bcade9f059 Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:23:38 -0600
+Subject: [PATCH 25/57] Emulador: mach_vm_copy valida el rango antes de copiar
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_mach.c: mach_vm_copy y mach_vm_read_overwrite copiaban el rango
+  con memmove y sin comprobarlo. Como el proceso invitado comparte el
+  espacio de direcciones con el emulador, un rango inválido provocaba
+  un fallo de segmentación que mataba el proceso tahoe-run entero, no
+  solo al invitado. Ahora el rango se comprueba y se copia por
+  /proc/self/mem (safe_read/safe_write, las mismas primitivas que ya
+  usa mach_vm_read), que devuelve un error limpio si la dirección no
+  existe.
+- emu_mach.c: se sigue la semántica de XNU: con tamaño 0 se devuelve
+  KERN_SUCCESS sin comprobar nada, un rango que no cabe en la
+  dirección o que sale del espacio de 48 bits da KERN_INVALID_ADDRESS,
+  y un hueco en el origen o en el destino también.
+- emu_mach.c: la copia va por trozos de 64 KiB (sin un malloc enorme)
+  y de atrás hacia delante si los rangos se solapan, como memmove.
+- emu_mach.c: al crear una entrada de memoria, el contenido se lee con
+  safe_read en vez de con memcpy: si el rango que escribió el creador
+  no es válido, la llamada falla con KERN_INVALID_ARGUMENT en vez de
+  tumbar el emulador.
+
+Verificado: compila (clang -fsyntax-only, sin avisos); la lógica de la
+copia se probó aparte con safe_read/safe_write reales (11/11 casos:
+tamaño 0, hueco en origen y destino, desbordamiento, rango a caballo
+de un hueco, copia de 1 MB y solapados).
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_mach.c | 56 +++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/tahoe-run/emu_mach.c b/tahoe-run/emu_mach.c
+index 8c617e7..21f9a29 100644
+--- a/tahoe-run/emu_mach.c
++++ b/tahoe-run/emu_mach.c
+@@ -101,8 +101,10 @@ static size_t mig_make_memory_entry(const struct hdr* req, const uint8_t* m, uin
+ 		uint8_t* tmp = malloc(len);
+ 		if (!tmp) ok = 0;                                       // sin memoria: se informa del fallo, sin copiar nada
+ 		else {
+-			memcpy(tmp, (void*)off, len);                       // lo que ya hubiera escrito el creador
+-			if (pwrite(fd, tmp, len, 0) != (ssize_t)len) ok = 0;
++			// La dirección es del invitado: se lee con safe_read, que falla si el rango no es válido (XNU
++			// devuelve KERN_INVALID_ARGUMENT) en vez de matar el proceso emulado con un SIGSEGV.
++			if (safe_read(off, tmp, (size_t)len) != (ssize_t)len) ok = 0;
++			else if (pwrite(fd, tmp, len, 0) != (ssize_t)len) ok = 0;
+ 			free(tmp);
+ 			if (ok && mmap((void*)off, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) ok = 0;
+ 		}
+@@ -743,6 +745,45 @@ static long vec_aux(long r, uint64_t aux_addr, uint32_t aux_size) {
+ 	return r;
+ }
+ 
++// ---------------------------------------------------------------- copia de memoria entre rangos del invitado
++// El proceso invitado comparte el espacio de direcciones con el emulador, así que copiar un rango que no
++// exista provoca un fallo de segmentación que mata al proceso tahoe-run entero (no solo al invitado). El
++// rango se comprueba y se copia por /proc/self/mem (safe_read/safe_write, tahoe_run.c:120), que devuelve un
++// error limpio cuando la dirección no existe, en vez de tumbar el emulador.
++//
++// Semántica de XNU (osfmk/vm/vm_user.c:727, mach_vm_copy -> vm_map_copyin + vm_map_copy_overwrite):
++//   - size == 0: no hay nada que copiar ni que comprobar; KERN_SUCCESS (vm_sanitize.c:575, VM_SANITIZE_FLAGS_SIZE_ZERO_SUCCEEDS).
++//   - hueco (dirección no mapeada) en el origen o en el destino: KERN_INVALID_ADDRESS (xnu/tests/vm/vm_allocation.c:2793).
++//   - el rango no cabe en la dirección (desbordamiento al sumar addr+size): KERN_INVALID_ADDRESS (vm_sanitize.c:611
++//     lo devuelve como KERN_INVALID_ARGUMENT, pero vm_sanitize_error_compat.c:360 lo reescribe a KERN_INVALID_ADDRESS
++//     para las rutinas de copia).
++//   - sin permiso para leer o escribir: KERN_PROTECTION_FAILURE (vm_map.c:11639). Por /proc/self/mem no se puede
++//     distinguir del caso anterior (el acceso forzoso ignora la protección de la página), así que se devuelve
++//     KERN_INVALID_ADDRESS, como hace ya el caso 4804 (mach_vm_read) de este emulador.
++static int32_t vm_copy_guest(uint64_t src, uint64_t dst, uint64_t size) {
++	if (!size) return KERN_SUCCESS_;                                                 // nada que copiar ni que comprobar
++	if (src + size < src || dst + size < dst) return KERN_INVALID_ADDR;              // el rango no cabe (desbordamiento)
++	if (((src ^ (src + size)) | (dst ^ (dst + size))) >> 48) return KERN_INVALID_ADDR; // fuera del espacio de 48 bits (vm_sanitize.c:645)
++	enum { TROZO = 64 * 1024 };                                                       // a trozos: no hace falta un malloc enorme
++	uint8_t* buf = malloc(TROZO);
++	if (!buf) return 6;                                                              // KERN_RESOURCE_SHORTAGE
++	int32_t kr = KERN_SUCCESS_;
++	uint64_t hecho = 0;
++	int back = (dst > src && dst - src < size);                                      // rangos solapados: como memmove, de atrás hacia delante
++	while (hecho < size) {
++		uint64_t n = size - hecho; if (n > TROZO) n = TROZO;
++		uint64_t off = back ? size - hecho - n : hecho;
++		if (safe_read(src + off, buf, n) != (ssize_t)n) { kr = KERN_INVALID_ADDR; break; }
++		if (safe_write(dst + off, buf, n) != (ssize_t)n) { kr = KERN_INVALID_ADDR; break; }
++		hecho += n;
++	}
++	free(buf);
++	if (kr != KERN_SUCCESS_)
++		logf_("    mach_msg2: mach_vm_copy: rango no válido 0x%lx -> 0x%lx (%lu bytes): kr=%d\n",
++		      (unsigned long)src, (unsigned long)dst, (unsigned long)size, kr);
++	return kr;
++}
++
+ static long mach_msg2(struct ctx* c) {
+ 	uint64_t options = c->a[1];
+ 	uint64_t buf = c->a[0];
+@@ -1047,14 +1088,17 @@ static long mach_msg2(struct ctx* c) {
+ 	case 4813: n = mig_mach_vm_remap(&h, req, rep); break;
+ 	case 4807: {                                                  // mach_vm_copy(task, src, size, dst): el destino ya está asignado
+ 		uint64_t src, size, dst; memcpy(&src, req + 32, 8); memcpy(&size, req + 40, 8); memcpy(&dst, req + 48, 8);
+-		memmove((void*)dst, (void*)src, size);
+-		n = reply_begin(rep, &h, KERN_SUCCESS_);
++		// Las dos direcciones son del invitado: sin comprobarlas, un rango inválido mataba el proceso emulado
++		// con un SIGSEGV (el invitado comparte el espacio de direcciones con el emulador). XNU valida el rango
++		// y devuelve KERN_INVALID_ADDRESS (hueco) o KERN_PROTECTION_FAILURE (sin permiso).
++		n = reply_begin(rep, &h, vm_copy_guest(src, dst, size));
+ 		break;
+ 	}
+ 	case 4808: {                                                  // mach_vm_read_overwrite(task, addr, size, data) -> outsize
+ 		uint64_t src, size, dst; memcpy(&src, req + 32, 8); memcpy(&size, req + 40, 8); memcpy(&dst, req + 48, 8);
+-		memmove((void*)dst, (void*)src, size);
+-		n = reply_begin(rep, &h, KERN_SUCCESS_); memcpy(rep + n, &size, 8); n += 8;
++		int32_t kr = vm_copy_guest(src, dst, size);                // idem: el rango se comprueba antes de copiar
++		n = reply_begin(rep, &h, kr);
++		if (kr == KERN_SUCCESS_) { memcpy(rep + n, &size, 8); n += 8; }   // outsize (si hay error, la respuesta es la de error)
+ 		break;
+ 	}
+ 	case 4804: {                                                  // mach_vm_read(task, addr, size) -> data (OOL), dataCnt

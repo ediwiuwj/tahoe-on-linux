@@ -1,0 +1,42 @@
+From ea0a9e46895dc57f7277859fd7b33236499858fb Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:36:08 -0600
+Subject: [PATCH 01/57] =?UTF-8?q?.gitignore:=20excluir=20artefactos=20de?=
+ =?UTF-8?q?=20compilaci=C3=B3n=20y=20volcados=20locales?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+target/ solo cubría el directorio de compilación estándar de Cargo; los
+directorios alternativos (target-b/) y las copias locales del binario
+(tahoe-run.A, tahoe-run.viejo, tahoe_run.c.orig) se colaban sin querer
+en el índice.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ .gitignore | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/.gitignore b/.gitignore
+index 8fd01a1..daf9cab 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -10,9 +10,18 @@ target/
+ __pycache__/
+ *.pyc
+ 
++# Rust: target/ y los directorios de compilación alternativos (target-b/)
++target/
++target-*/
++
+ # tahoe-run
+ tahoe-run/tahoe-run
+ tahoe-run/sysnames.h
+ 
++# Binarios y volcados locales de tahoe-run (comparaciones A/B y copias de trabajo)
++tahoe-run/tahoe-run.*
++tahoe-run/*.orig
++tahoe-run/*.rej
++
+ # Volcados de diagnóstico locales
+ tahoe-run/ss.out

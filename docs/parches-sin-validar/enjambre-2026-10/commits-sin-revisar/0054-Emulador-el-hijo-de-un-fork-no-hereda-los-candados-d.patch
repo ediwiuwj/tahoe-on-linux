@@ -1,0 +1,354 @@
+From 73683ef25208ac76c2f89032145626972ce37b5f Mon Sep 17 00:00:00 2001
+From: ediwiuwj <218842615+ediwiuwj@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:54:48 -0600
+Subject: [PATCH 54/57] Emulador: el hijo de un fork no hereda los candados del
+ emulador cogidos
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- emu_proc.c: el fork se hacía con la syscall cruda (syscall(SYS_fork)),
+  que no ejecuta ningún manejador de atfork. El hijo heredaba la arena
+  de malloc a medias (se colgaba en su primer calloc) y los candados
+  del emulador que otro hilo tuviera cogidos (se colgaba en la primera
+  syscall que los coja). Ahora se usa el fork() de glibc, que ejecuta
+  los manejadores de atfork, los nuestros y los internos de glibc.
+- emu_proc.c, emu_kqueue.c, emu_mach.c, emu_port.c, emu_fileport.c,
+  emu_psynch.c, emu_sem.c, emu_iokit.inc: antes del fork se cogen
+  todos los candados del emulador y después se sueltan, en el padre y
+  en el hijo. El orden es global y lo fija tahoe.h: si el código normal
+  puede tener un candado cogido y pedir otro, el primero tiene que ir
+  antes, o el fork se cruzaría con un hilo. Las cuatro aristas reales
+  (kq->wl, kq->sig, wlt->kq, wlt->wls) se respetan.
+- tahoe.h: se documenta el orden y por qué el módulo de kqueue va el
+  primero.
+
+Verificado: compila (clang -fsyntax-only en los 15 ficheros, sin
+avisos). El mecanismo se probó aparte: con el candado cogido por otro
+hilo, el hijo lo recibe desbloqueado y puede usarlo.
+
+Co-Authored-By: MiniMax M3.1 Flash <noreply@minimax.io>
+---
+ tahoe-run/emu_fileport.c | 11 +++++
+ tahoe-run/emu_iokit.inc  | 10 +++++
+ tahoe-run/emu_kqueue.c   | 19 +++++++++
+ tahoe-run/emu_mach.c     | 11 +++++
+ tahoe-run/emu_port.c     | 12 ++++++
+ tahoe-run/emu_proc.c     | 86 +++++++++++++++++++++++++++++++++-------
+ tahoe-run/emu_psynch.c   | 12 ++++++
+ tahoe-run/emu_sem.c      | 20 ++++++++++
+ tahoe-run/tahoe.h        | 29 ++++++++++++++
+ 9 files changed, 196 insertions(+), 14 deletions(-)
+
+diff --git a/tahoe-run/emu_fileport.c b/tahoe-run/emu_fileport.c
+index c33b0aa..f440004 100644
+--- a/tahoe-run/emu_fileport.c
++++ b/tahoe-run/emu_fileport.c
+@@ -137,6 +137,17 @@ static long bsd_fileport_makefd(struct ctx* c) {
+ 	return fd >= 0 ? fd : -D_EINVAL;   // el dueño ya no lo tiene (o murió): como un puerto que no es un fileport
+ }
+ 
++// ---- fork: candados de este módulo
++// Se cogen antes del fork y se sueltan después (en el padre y en el hijo), para que el hijo no herede ninguno cogido
++// (ver tahoe.h). El orden es el global: si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir
++// antes. fp_lock es un mutex normal (PTHREAD_MUTEX_INITIALIZER, ni recursive ni robust).
++void emu_fileport_fork_lock(void) {
++	pthread_mutex_lock(&fp_lock);
++}
++void emu_fileport_fork_unlock(void) {
++	pthread_mutex_unlock(&fp_lock);
++}
++
+ void emu_fileport_init(void) {
+ 	reg_bsd(430, bsd_fileport_makeport);
+ 	reg_bsd(431, bsd_fileport_makefd);
+diff --git a/tahoe-run/emu_iokit.inc b/tahoe-run/emu_iokit.inc
+index 947ecb7..02f83b0 100644
+--- a/tahoe-run/emu_iokit.inc
++++ b/tahoe-run/emu_iokit.inc
+@@ -2333,3 +2333,13 @@ static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* re
+ 	*handled = 0;
+ 	return 0;
+ }
++
++// ---- fork: candados de este módulo
++// Se cogen antes del fork y se sueltan después, para que el hijo no herede ninguno cogido (ver tahoe.h). El orden global
++// es el de tahoe.h (hidq_lock va después de table_lock/psem_lock y antes de wq_pool_lock). No es recursive ni robust.
++void emu_iokit_fork_lock(void) {
++	pthread_mutex_lock(&hidq_lock);
++}
++void emu_iokit_fork_unlock(void) {
++	pthread_mutex_unlock(&hidq_lock);
++}
+diff --git a/tahoe-run/emu_kqueue.c b/tahoe-run/emu_kqueue.c
+index 71408ff..390a629 100644
+--- a/tahoe-run/emu_kqueue.c
++++ b/tahoe-run/emu_kqueue.c
+@@ -901,3 +901,22 @@ long kq_apply_changes(int layout, uint64_t chg, long n, uint64_t workloop) {
+ 	if (kq >= 0) wl_put(workloop);
+ 	return r;
+ }
++
++// ---- fork: candados de este módulo
++// Se cogen antes del fork y se sueltan después (en el padre y en el hijo), para que el hijo no herede ninguno cogido
++// (ver tahoe.h). El orden es el global: si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir
++// antes. Todos son mutex normales (PTHREAD_MUTEX_INITIALIZER, ni recursive ni robust).
++void emu_kqueue_fork_lock(void) {
++	pthread_mutex_lock(&wlt_lock);
++	pthread_mutex_lock(&kq_lock);
++	pthread_mutex_lock(&wls_lock);
++	pthread_mutex_lock(&sig_lock);
++	pthread_mutex_lock(&kqr_lock);
++}
++void emu_kqueue_fork_unlock(void) {
++	pthread_mutex_unlock(&kqr_lock);      // al revés que al cogerlos
++	pthread_mutex_unlock(&sig_lock);
++	pthread_mutex_unlock(&wls_lock);
++	pthread_mutex_unlock(&kq_lock);
++	pthread_mutex_unlock(&wlt_lock);
++}
+diff --git a/tahoe-run/emu_mach.c b/tahoe-run/emu_mach.c
+index 4d7abf9..8722979 100644
+--- a/tahoe-run/emu_mach.c
++++ b/tahoe-run/emu_mach.c
+@@ -81,6 +81,17 @@ static int tpol_get(uint32_t port, uint32_t flavor, uint32_t* v, uint32_t cnt) {
+ 	pthread_mutex_unlock(&tpol_lock);
+ 	return ok;
+ }
++// ---- fork: candados de este módulo
++// Se cogen antes del fork y se sueltan después (en el padre y en el hijo), para que el hijo no herede ninguno cogido
++// (ver tahoe.h). El orden es el global: si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir
++// antes. tpol_lock es un mutex normal (PTHREAD_MUTEX_INITIALIZER, ni recursive ni robust).
++void emu_mach_fork_lock(void) {
++	pthread_mutex_lock(&tpol_lock);
++}
++void emu_mach_fork_unlock(void) {
++	pthread_mutex_unlock(&tpol_lock);
++}
++
+ static size_t reply_begin(uint8_t* r, const struct hdr* req, int32_t retcode) {
+ 	struct hdr h = { .bits = 0, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = req->id + 100 };
+ 	memcpy(r, &h, sizeof h);
+diff --git a/tahoe-run/emu_port.c b/tahoe-run/emu_port.c
+index b15e233..7e19be7 100644
+--- a/tahoe-run/emu_port.c
++++ b/tahoe-run/emu_port.c
+@@ -1372,6 +1372,18 @@ static long t_mk_destroy(struct ctx* c) {
+ 	return KERN_OK;
+ }
+ 
++// ---- fork: candados de este módulo
++// Se cogen antes del fork y se sueltan después (en el padre y en el hijo), para que el hijo no herede ninguno cogido
++// (ver tahoe.h). El orden es el global: si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir
++// antes. Solo timers_lock: el candado de la región compartida (shm->lk, de nucleo/src/candado.rs) no es un mutex de
++// glibc y lo gestiona otro sitio. timers_lock es un mutex normal (PTHREAD_MUTEX_INITIALIZER, ni recursive ni robust).
++void emu_port_fork_lock(void) {
++	pthread_mutex_lock(&timers_lock);
++}
++void emu_port_fork_unlock(void) {
++	pthread_mutex_unlock(&timers_lock);
++}
++
+ // host_create_mach_voucher_trap(host, recetas*, tamaño, *puerto): los vouchers son nombres de puerto sin contenido
+ static long t_voucher_create(struct ctx* c) {
+ 	uint32_t n = alloc_port();
+diff --git a/tahoe-run/emu_proc.c b/tahoe-run/emu_proc.c
+index 76e196e..c23f3a7 100644
+--- a/tahoe-run/emu_proc.c
++++ b/tahoe-run/emu_proc.c
+@@ -685,27 +685,38 @@ static int thread_count(void) {
+ 	closedir(d);
+ 	return n;
+ }
+-// fork: se usa el de Linux. La interceptación y la memoria se heredan. Convenio de Darwin: padre rax=pid hijo, rdx=0;
+-// hijo rax=pid del padre, rdx=1 (libsyscall devuelve 0 al hijo al ver rdx != 0).
++// fork: se usa el fork() de glibc, no la llamada al sistema cruda. La interceptación y la memoria se heredan. Convenio de
++// Darwin: padre rax=pid hijo, rdx=0; hijo rax=pid del padre, rdx=1 (libsyscall devuelve 0 al hijo al ver rdx != 0).
+ //
+ // El hijo de un fork en un proceso con varios hilos solo puede llamar a funciones async-signal-safe: en el hijo, malloc y
+ // los candados no se pueden usar, porque su estado puede haber quedado a medias por el hilo que se copió (POSIX,
+-// "fork() in a multithreaded process"). El camino del hijo de aquí lo respeta: el fork se hace con la llamada al sistema
+-// cruda (fork(3) ejecutaría manejadores atfork y reservaría memoria) y en el hijo solo se llama a open/dup3/close
+-// (memfd_reopen), a un memset (fileport_forked_child) y a prctl (reenable_dispatch): nada de malloc ni de candados.
++// "fork() in a multithreaded process"). Con el fork() de glibc esto se resuelve solo: ejecuta los manejadores de
++// pthread_atfork (los nuestros, que cogen y sueltan los candados del emulador, y los internos de glibc, que dejan la
++// arena de malloc del hijo en buen estado) y el hijo sigue con la memoria y los descriptores del padre.
+ //
+-// Lo que queda fuera de este fichero: los candados que el emulador toma al despachar la syscall de otro hilo (kq_lock,
+-// sig_lock, wls_lock y wlt_lock en emu_kqueue.c; tpol_lock en emu_mach.c; timers_lock en emu_port.c) pueden quedar
+-// cogidos en el momento del fork, y entonces el hijo se queda colgado en la primera syscall que los coja. Arreglo
+-// pendiente: registrar pthread_atfork en esos módulos (coger los candados antes del fork y soltarlos en el hijo). Lo
+-// mismo con las kqueues, que en XNU no se heredan (bsd/man/man2/kqueue.2:119-120: "The queue is not inherited by a child
+-// created with fork(2)") y aquí sí: la lista de knotes se copia con la memoria.
++// Por eso el fork NO se hace con syscall(SYS_fork): esa llamada no ejecuta ningún manejador, así que el hijo heredaría la
++// arena de malloc a medias (se colgaría en su primer calloc) y los candados del emulador que otro hilo tuviera cogidos
++// (se colgaría en la primera syscall que los coja). Los manejadores se registran una sola vez, con pthread_once: si se
++// registraran varias veces se acumularían y cada fork los ejecutaría todas las veces.
++//
++// En el hijo, el camino es el de siempre: open/dup3/close (memfd_reopen), un memset (fileport_forked_child) y un prctl
++// (reenable_dispatch). En el hijo NO se sueltan los candados a mano: el manejador "child" de pthread_atfork ya lo ha
++// hecho (soltarlos otra vez sería un doble unlock).
++//
++// Lo que queda fuera de este fichero: las kqueues, que en XNU no se heredan (bsd/man/man2/kqueue.2:119-120: "The queue is
++// not inherited by a child created with fork(2)") y aquí sí: la lista de knotes se copia con la memoria.
++static void atfork_prepare(void) { emu_fork_lock_all(); }     // antes del fork: coger todos los candados del emulador
++static void atfork_parent(void) { emu_fork_unlock_all(); }     // en el padre: soltarlos
++static void atfork_child(void) { emu_fork_unlock_all(); }      // en el hijo: soltarlos (los tenía cogidos)
++static void atfork_register(void) { pthread_atfork(atfork_prepare, atfork_parent, atfork_child); }
++static pthread_once_t atfork_once = PTHREAD_ONCE_INIT;
+ static long bsd_fork(struct ctx* c) {
+ 	int nthr = trace_all ? thread_count() : 0;
+-	long p = syscall(SYS_fork);
+-	if (p < 0) return -darwin_errno(errno);
++	pthread_once(&atfork_once, atfork_register);       // los manejadores de atfork, una sola vez en todo el proceso
++	long p = fork();                                  // fork() de glibc: ejecuta los manejadores de atfork
++	if (p < 0) return -darwin_errno(errno);            // glibc devuelve -1 y pone errno
+ 	if (p == 0) { memfd_reopen(); ports_forked_child(); fileport_forked_child(); reenable_dispatch(); }  // el hijo: su propia memoria, no es el creador
+-	if (nthr > 1) logf_("    fork: proceso de %d hilos: el hijo hereda el estado de los candados del emulador\n", nthr);
++	if (nthr > 1) logf_("    fork: proceso de %d hilos: los candados del emulador se han cogido antes del fork y se han soltado en el padre y en el hijo\n", nthr);
+ 	// Convenio de Darwin: hijo rax=pid del padre, rdx=1; padre rax=pid del hijo, rdx=0. libsyscall devuelve 0 al hijo
+ 	// al ver rdx != 0, y libc ejecuta entonces los manejadores de hijo (reinicio de puertos Mach, hilo principal...).
+ 	c->has_ret2 = 1;
+@@ -1771,7 +1782,54 @@ static long bsd_ptrace(struct ctx* c) {
+ 	return -1;                                              // EPERM
+ }
+ 
++// ---- fork: los candados de este módulo y el orden global de todos
++// Se cogen antes del fork y se sueltan después (en el padre y en el hijo), para que el hijo no herede ninguno cogido
++// (ver tahoe.h). El orden es el global: si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir
++// antes. Los tres son mutex normales (PTHREAD_MUTEX_INITIALIZER: ni recursive ni robust ni error-checking), así que se
++// pueden coger y soltar sin más. wl_lock va antes que uwait_lock y que wq_pool_lock (wl_lock es una hoja: no pide ningún
++// otro candado del emulador mientras lo tiene cogido).
++void emu_proc_fork_lock(void) {
++	pthread_mutex_lock(&wl_lock);
++	pthread_mutex_lock(&uwait_lock);
++	pthread_mutex_lock(&wq_pool_lock);
++}
++void emu_proc_fork_unlock(void) {
++	pthread_mutex_unlock(&wq_pool_lock);      // al revés que al cogerlos
++	pthread_mutex_unlock(&uwait_lock);
++	pthread_mutex_unlock(&wl_lock);
++}
++
++// Los ocho módulos, en el orden global de tahoe.h:
++//	kqueue (wlt, kq, wls, sig, kqr) -> proc (wl, uwait, wq_pool) -> mach (tpol) -> port (timers) -> fileport (fp)
++//	-> psynch (ps) -> sem (table, psem) -> iokit (hidq).
++// Las cuatro aristas reales del grafo de anidamiento (kq->wl, kq->sig, wlt->kq, wlt->wls) se respetan: wlt_lock se coge
++// antes que kq_lock y que wls_lock (dentro del módulo kqueue) y kq_lock antes que wl_lock (módulo proc) y que sig_lock
++// (también módulo kqueue). Los que quedan entre medias (uwait, wq_pool, tpol, timers, fp, ps, table, psem, hidq) son
++// hojas: no piden ningún otro candado del emulador, así que su posición relativa es libre.
++void emu_fork_lock_all(void) {
++	emu_kqueue_fork_lock();
++	emu_proc_fork_lock();
++	emu_mach_fork_lock();
++	emu_port_fork_lock();
++	emu_fileport_fork_lock();
++	emu_psynch_fork_lock();
++	emu_sem_fork_lock();
++	emu_iokit_fork_lock();
++}
++// Al revés que al cogerlos: iokit, sem, psynch, fileport, port, mach, proc, kqueue.
++void emu_fork_unlock_all(void) {
++	emu_iokit_fork_unlock();
++	emu_sem_fork_unlock();
++	emu_psynch_fork_unlock();
++	emu_fileport_fork_unlock();
++	emu_port_fork_unlock();
++	emu_mach_fork_unlock();
++	emu_proc_fork_unlock();
++	emu_kqueue_fork_unlock();
++}
++
+ void emu_proc_init(void) {
++	pthread_once(&atfork_once, atfork_register);       // manejadores de atfork del fork, registrados una sola vez
+ 	tahoe_sigaction(SIGABRT, on_sigabrt);
+ 	reg_bsd(26, bsd_ptrace);
+ 	reg_bsd(515, bsd_ulock_wait); reg_bsd(516, bsd_ulock_wake); reg_bsd(544, bsd_ulock_wait2);
+diff --git a/tahoe-run/emu_psynch.c b/tahoe-run/emu_psynch.c
+index ce392e1..26d06a8 100644
+--- a/tahoe-run/emu_psynch.c
++++ b/tahoe-run/emu_psynch.c
+@@ -173,3 +173,15 @@ void emu_psynch_init(void) {
+ 	reg_bsd(297, bsd_psynch_esrch); reg_bsd(298, bsd_psynch_esrch);
+ 	reg_bsd(306, bsd_psynch_rw_rdlock); reg_bsd(307, bsd_psynch_rw_wrlock); reg_bsd(308, bsd_psynch_rw_unlock);
+ }
++
++// ---- fork: candados de este módulo
++// Se cogen antes del fork y se sueltan después, para que el hijo no herede ninguno cogido (ver tahoe.h). El orden es el
++// global: si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir antes.
++// Este módulo solo tiene ps_lock: es un mutex normal (PTHREAD_MUTEX_INITIALIZER, ni recursive ni robust). Los ps_obj
++// no tienen mutex propio (su pthread_cond_t se espera siempre con ps_lock), así que no hay nada dinámico que coger aquí.
++void emu_psynch_fork_lock(void) {
++	pthread_mutex_lock(&ps_lock);
++}
++void emu_psynch_fork_unlock(void) {
++	pthread_mutex_unlock(&ps_lock);
++}
+diff --git a/tahoe-run/emu_sem.c b/tahoe-run/emu_sem.c
+index 3853fd2..3e08c38 100644
+--- a/tahoe-run/emu_sem.c
++++ b/tahoe-run/emu_sem.c
+@@ -186,3 +186,23 @@ void emu_sem_init(void) {
+ 	reg_bsd(268, bsd_sem_open); reg_bsd(269, bsd_sem_close); reg_bsd(270, bsd_sem_unlink);
+ 	reg_bsd(271, bsd_sem_wait); reg_bsd(272, bsd_sem_trywait); reg_bsd(273, bsd_sem_post);
+ }
++
++// ---- fork: candados de este módulo
++// Se cogen antes del fork y se sueltan después, para que el hijo no herede ninguno cogido (ver tahoe.h). El orden es el
++// global (table_lock -> psem_lock): si el código normal puede tener uno cogido y pedir otro, el primero tiene que ir
++// antes. Ninguno de los dos es recursive ni robust, así que se pueden coger y soltar sin más.
++void emu_sem_fork_lock(void) {
++	pthread_mutex_lock(&table_lock);
++	pthread_mutex_lock(&psem_lock);
++}
++void emu_sem_fork_unlock(void) {
++	pthread_mutex_unlock(&psem_lock);      // al revés que al cogerlos
++	pthread_mutex_unlock(&table_lock);
++}
++// El candado por semáforo (struct sem::m) NO se puede coger aquí: es dinámico (uno por semáforo, creado en sem_create)
++// y el atfork tendría que recorrer la lista, que además cambia con table_lock. En XNU un semáforo con
++// PSYNC_PROCESS_SHARED se comparte entre procesos, así que no es un candado "del emulador" que deba Cogerse en el fork.
++// AVISO (no arreglado, solo documentado): si otro hilo estaba dentro de wait_sem/signal_one/machsem_destroy (con
++// s->m cogido) en el instante del fork, el hijo hereda su copia de ese candado en estado "cogido" y no hay nadie que lo
++// suelte: si el hijo usa ese semáforo se queda colgado. Afecta solo a los semáforos Mach (los POSIX de nombre son
++// compartidos por el kernel de Linux y no tienen este problema).
+diff --git a/tahoe-run/tahoe.h b/tahoe-run/tahoe.h
+index d744554..d30b47b 100644
+--- a/tahoe-run/tahoe.h
++++ b/tahoe-run/tahoe.h
+@@ -147,6 +147,35 @@ void emu_psynch_init(void);
+ void emu_cs_init(void);
+ uint32_t sem_create(int value);
+ int machsem_destroy(uint32_t name);
++// ---- fork y los candados del emulador
++// Un fork en un proceso con varios hilos deja vivo solo al hilo que lo llama: si otro hilo estaba en mitad de una
++// syscall con un candado del emulador cogido, el hijo hereda ese candado cogido y se queda colgado en su primera
++// syscall que lo necesite (POSIX: en el hijo de un fork solo se pueden usar funciones async-signal-safe). Para evitarlo,
++// antes del fork se cogen TODOS los candados del emulador y después se sueltan, en el padre y en el hijo.
++// El orden en que se cogen es global y no se puede cambiar sin revisar el anidamiento: si el código normal puede tener
++// A cogido y pedir B, no puede haber un hilo con B cogido que pida A, o el fork se cuelga. Las aristas reales del
++// emulador son solo cuatro (análisis en /tmp/opencode/analisis-candados.txt):
++//	kq_lock -> wl_lock, kq_lock -> sig_lock, wlt_lock -> kq_lock, wlt_lock -> wls_lock
++// y el orden que se aplica es por módulos, que cumple las cuatro:
++//	emu_kqueue (wlt, kq, wls, sig, kqr) -> emu_proc (wl, uwait, wq_pool) -> emu_mach (tpol)
++//	-> emu_port (timers) -> emu_fileport (fp) -> emu_psynch (ps) -> emu_sem (table, psem) -> emu_iokit (hidq)
++// OJO: el módulo kqueue va el primero porque el código normal puede tener kq_lock cogido y pedir wl_lock; si el
++// fork cogiera wl_lock antes que kq_lock, un hilo con wl_lock cogido pidiendo kq_lock se cruzaría con el fork.
++// Por eso el fork se hace con el fork() de glibc y no con la syscall cruda: solo el fork() de glibc ejecuta los
++// manejadores de atfork y deja el hijo con la arena de malloc en buen estado.
++void emu_fork_lock_all(void);            // coge todos los candados (manejador "prepare")
++void emu_fork_unlock_all(void);          // los suelta, en orden inverso (manejadores "parent" y "child")
++// Cada módulo aporta la parte que le toca. El orden global se respeta porque emu_fork_lock_all() llama a estos en el
++// orden correcto, y dentro de cada módulo los candados se cogen y sueltan en orden inverso.
++void emu_kqueue_fork_lock(void);  void emu_kqueue_fork_unlock(void);     // wlt_lock, kq_lock, wls_lock, sig_lock, kqr_lock
++void emu_proc_fork_lock(void);   void emu_proc_fork_unlock(void);      // wl_lock, uwait_lock, wq_pool_lock
++void emu_mach_fork_lock(void);   void emu_mach_fork_unlock(void);      // tpol_lock
++void emu_port_fork_lock(void);   void emu_port_fork_unlock(void);      // timers_lock
++void emu_fileport_fork_lock(void); void emu_fileport_fork_unlock(void);// fp_lock
++void emu_psynch_fork_lock(void); void emu_psynch_fork_unlock(void);    // ps_lock
++void emu_sem_fork_lock(void);    void emu_sem_fork_unlock(void);       // table_lock, psem_lock
++void emu_iokit_fork_lock(void);  void emu_iokit_fork_unlock(void);     // hidq_lock
++
+ uint32_t alloc_port(void);
+ uint32_t tahoe_flags_fd(int fd);
+ uint32_t tahoe_flags_path(const char* p);
