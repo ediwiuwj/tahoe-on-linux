@@ -962,7 +962,7 @@ static mach_fn mach_table[MACH_NAMES_N] = {
 uint64_t ctx_arg(struct ctx* c, int i) {
 	if (i < 6) return c->a[i];
 	uint64_t v = 0;
-	safe_read((uint64_t)c->uc->uc_mcontext.gregs[REG_RSP] + 8 * (i - 5), &v, 8);
+	safe_read((uint64_t)c->uc->uc_mcontext.gregs[REG_RSP] + 8 * (i - 5 + c->ind), &v, 8);   // ind: en la syscall indirecta el número de syscall ocupa el primer argumento
 	return v;
 }
 
@@ -989,6 +989,15 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 	extern __thread struct ctx* volatile t_cur;
 	t_cur = &c;                                                  // para el volcado de hilos (diag_dump_threads)
 	uint32_t cls = c.nr >> 24, num = c.nr & 0xffffff;
+	if (cls == 2 && num == 0) {                                  // syscall indirecta, como unix_syscall64 de XNU: el número va en rdi y los
+		uint64_t code = c.a[0];                                  // argumentos empiezan en rsi (5 en registros; el 6.º es el primero de la pila)
+		uint64_t a5 = ctx_arg(&c, 6);
+		for (int i = 0; i < 5; i++) c.a[i] = c.a[i + 1];
+		c.a[5] = a5;
+		c.ind = 1;
+		num = code < BSD_NAMES_N ? (uint32_t)code : 0xffffff;    // fuera de la tabla: nosys. Una indirecta dentro de otra (code 0) también acaba en nosys
+		c.nr = (2UL << 24) | num;
+	}
 	if (cls == 2) {                                              // syscall BSD
 		const char* name = num < BSD_NAMES_N ? bsd_names[num] : NULL;
 		long r;

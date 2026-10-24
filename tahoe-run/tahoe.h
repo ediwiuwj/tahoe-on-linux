@@ -13,7 +13,7 @@ static inline uint64_t round_up(uint64_t v) { return (v + PAGE - 1) & ~(PAGE - 1
 #define STACK_TOP  0x00007ff7bff00000UL
 
 // Contexto de una syscall interceptada: número y hasta 6 argumentos (registros rdi, rsi, rdx, r10, r8, r9).
-struct ctx { uint64_t nr, a[6]; ucontext_t* uc; uint64_t ret2; int has_ret2; int raw_ret; };   // raw_ret: devolver r tal cual (sin CF), p. ej. ULF_NO_ERRNO   // ret2 -> rdx (fork, pipe)
+struct ctx { uint64_t nr, a[6]; ucontext_t* uc; uint64_t ret2; int has_ret2; int raw_ret; int ind; };   // raw_ret: devolver r tal cual (sin CF), p. ej. ULF; ind: 1 si llegó por la syscall indirecta (0): los argumentos de pila van desplazados un lugar_NO_ERRNO   // ret2 -> rdx (fork, pipe)
 typedef long (*emu_fn)(struct ctx*);
 
 uint64_t ctx_arg(struct ctx* c, int i);   // argumento i (0..7); a partir del 6.º va en la pila
