@@ -1,9 +1,51 @@
-# tahoe-on-linux — macOS 26 (Tahoe) sobre el kernel de Linux, sin XNU
+# tahoe-on-linux — macOS 26 (Tahoe) on the Linux kernel, without XNU
 
-> **Proyecto en pausa (14 de octubre de 2026).** Todo lo que funciona está en `main`. Para retomarlo, ver
-> [«Cómo retomarlo»](#cómo-retomarlo) y la lista de trabajo en [`Pendientes.md`](Pendientes.md).
-> *Paused project: macOS 26 userland booting on Linux without XNU. Everything that works is on `main`; see
-> `Pendientes.md` (Spanish) for the work list. Contributions welcome.*
+**Status: active development** · last update **24 October 2026** · MIT · C + Rust
+
+---
+
+## English
+
+A from-scratch compatibility layer, written in **C and Rust**, that runs **unmodified x86_64 binaries from macOS 26
+(Tahoe) directly on Linux**. It emulates XNU's BSD syscalls and Mach traps in user space and boots **Apple's real
+`launchd` as PID 1** inside a Linux PID namespace, without root — **no virtual machine, no XNU, no Darling**.
+
+It does not stop at "hello world": the **full macOS 26.7.1 userland** boots, `launchd` loads **~400 services**,
+`WindowServer` owns an emulated framebuffer, and the **login window is on screen with a working keyboard and mouse** — drawn in software, **without Metal**.
+
+| Part | Status |
+|---|---|
+| Boot | Real `launchd` of macOS 26 as PID 1 in a PID namespace, no root. ~400 services, ~90–110 processes. |
+| macOS shell | `tools/macos-shell.sh` opens macOS's own `bash`: 58–62 of 79 common commands work (`diskutil`, `top`, `vm_stat`, `launchctl`, `defaults`, keychains…). |
+| Full macOS 26 | 26.7.1 extracted from the official installer. `WindowServer`, `loginwindow`, Setup Assistant. |
+| Graphics | Emulated `AppleIntelFramebuffer` (1280×800), IOSurface, stable `WindowServer` (~95 MB), cursor drawn in software. The desktop is rendered by the CPU: **Metal is not involved yet**. |
+| Input | Keyboard and mouse reach macOS through an emulated IOHID family (`IODataQueue`). |
+| Metal | AIR → SPIR-V (`metal2vulkan`) → Vulkan, running on an Intel HD 4400 with Mesa `hasvk`. Not yet wired into `tahoe-run`. |
+
+Every number above is measured on a **2014 laptop**: i5-4210U Haswell (no UMIP), 5.8 GB RAM, Arch/Omarchy, kernel 7.2.
+
+**Why this exists.** Darling stops at macOS 11 and emulates a Darwin 20 ABI. This project takes the *real* Tahoe `dyld`,
+`libSystem` and `launchd` and implements what XNU 12377 actually asks for — following XNU and libdispatch semantics
+instead of adding patches. On top of that it targets what a Hackintosh never had: Bluetooth over BlueZ, audio over
+PipeWire, Metal over Vulkan.
+
+**Roadmap.** Desktop and Setup Assistant → Metal over Vulkan (Rust) → Bluetooth, audio and networking → stability.
+
+**Apple binaries are not included.** You need your own macOS 26 recovery/installer and the extraction tools in `tools/`.
+Our own code is [MIT](LICENSE); `patches/` is derived from Indium (MPL-2.0).
+
+```sh
+tahoe-run/build.sh <path to xnu sources>    # build (C, static)
+tools/macos-shell.sh --launchd              # macOS bash joined to launchd
+```
+
+**Supporting the project.** The test machine is a 2014 laptop with 5.8 GB of RAM, and that is the bottleneck.
+Sponsorship goes to a **reference MacBook Air M5**, to validate Metal natively and `metal2vulkan` against real hardware
+instead of only through `hasvk` on an HD 4400. → [github.com/sponsors/ediwiuwj](https://github.com/sponsors/ediwiuwj)
+
+---
+
+## Español
 
 Capa de compatibilidad propia (`tahoe-run`, en C) que ejecuta binarios x86_64 de **macOS 26** directamente sobre Linux:
 traduce las syscalls BSD y las trampas Mach de XNU en espacio de usuario, y arranca el `launchd` real de macOS.
@@ -13,20 +55,22 @@ Metal 3 de cara a macOS, emulando lo que falte, ampliando `hasvk` de Mesa si hac
 tenía, como Bluetooth (a través de BlueZ). La Recovery fue el primer paso y sigue sirviendo de prueba de regresiones.
 [Darling](https://github.com/darlinghq/darling) se usa solo como referencia.
 
-**Estado actual (14 de octubre de 2026)**, medido en la PC de pruebas (i5-4210U Haswell, 5,8 GB de RAM, Arch/Omarchy, kernel 7.2):
+**Estado actual (24 de octubre de 2026)**, medido en la PC de pruebas (i5-4210U Haswell, 5,8 GB de RAM, Arch/Omarchy, kernel 7.2):
 
 | Parte | Estado |
 |---|---|
 | Arranque | El `launchd` real de macOS 26 corre como **PID 1** en un espacio de nombres de PID de Linux, sin root. `launchctl list` registra **169 servicios**, en un arranque se cargan unos **155-170 procesos**, y es estable (sin reinicios). Funcionan los dominios de proceso de launchd (servicios XPC de los frameworks, como `authd`), las fases de montaje del arranque (`mount -P`) y las señales de `launchctl kill`/`kickstart -k`. Entre los servicios: `syslogd`, `notifyd`, `cfprefsd`, `configd`, `powerd`, `securityd`, `opendirectoryd`, `diskarbitrationd`, `storagekitd`, `fskitd`, `authd`, `trustd`, `coreservicesd`, `WindowServer`. |
-| Shell de macOS | `tools/macos-shell.sh` abre el `bash` de macOS en la terminal. Con `--launchd` se une a launchd y funcionan las órdenes que usan servicios. En el **macOS completo**, inventario corto (`tools/shell_survey.sh`, 79 órdenes): **58–62 funcionan** (varía de un arranque a otro). Funcionan, entre otras, `id` (usuario, grupos), `diskutil list`/`info` (con el sistema ya asentado), `top`, `vm_stat`, `memory_pressure`, los llaveros de usuario (`security create-keychain`, `add`/`find-generic-password`, `list-keychains`) y `alarm`. Falta: el llavero del sistema no se desbloquea, las capacidades de `diskutil apfs list`, `log show` lento, `system_profiler` se cuelga. Inventario de **todos** los programas (1.167): `tools/inventario_total.sh`. |
+| Shell de macOS | `tools/macos-shell.sh` abre el `bash` de macOS en la terminal. Con `--launchd` se une a launchd y funcionan las órdenes que usan servicios. En el **macOS completo**, inventario corto (`tools/shell_survey.sh`, 79 órdenes): **58–62 funcionan** (varía de un arranque a otro). Funcionan, entre otras, `id` (usuario, grupos), `diskutil list`/`info` (con el sistema ya asentado), `top`, `vm_stat`, `memory_pressure`, los llaveros de usuario (`security create-keychain`, `add`/`find-generic-password`, `list-keychains`) y `alarm`. El llavero del sistema se desbloquea (`systemkeychain -t`: «System unlock is working», comprobado el 24 de octubre de 2026 con `tools/diag/llaveros.sh`). Falta: las capacidades de `diskutil apfs list`, `log show` lento, `system_profiler` se cuelga. Inventario de **todos** los programas (1.167): `tools/inventario_total.sh`. |
 | macOS completo | El **macOS 26.7.1 completo** (del instalador oficial, extraído con las herramientas de `tools/`) arranca: launchd carga **~400 servicios**, ~110 procesos, y se lanzan `WindowServer` y `loginwindow` (sistema recién instalado: toca el Asistente de configuración). `loginwindow` ya obtiene de opendirectoryd la lista de usuarios y **lanza Language Chooser** (la pantalla de idioma, la primera del Asistente), que se conecta a WindowServer y le pide ventanas, pero a veces no carga su interfaz (`MainMenu.nib`) y se cierra. Queda una fuga de memoria de 1-3 GB en algún proceso (el guardián ya dice cuál). Ver «macOS 26 completo» al final. |
 | Interfaz gráfica | **Primera imagen** (macOS 26 completo): `WindowServer` abre el framebuffer emulado (`AppleIntelFramebuffer`, 1280×800, EDID propio), crea el cursor compartido, proyecta la memoria de vídeo (en `/dev/shm`) y **dibuja el cursor**, por software (sin dispositivo Metal: CoreDisplay registra «MetalDevice ... 0x0»). Hay IOSurface emulado (superficies compartidas entre procesos). Desde el 12 de octubre WindowServer **ya no se cae** (rwlock de libpthread y workloops de libdispatch implementados) ni crece en memoria (avisos «send-possible» como en XNU): se queda estable en ~95 MB. Desde el 16 de octubre se ve la **pantalla de inicio de sesión** (a los ~8 minutos del arranque) y **funcionan el teclado y el ratón** del visor. Visor en Linux: `tools/tahoe-view` (`macos-shell.sh --pantalla`); captura: `tools/diag/captura.py`. |
 | Metal | Un kernel de Metal (AIR) traducido a SPIR-V con `metal2vulkan` se ejecuta en la GPU (Intel HD 4400) por Vulkan (`test/run_add_arrays.c`). Aún no está conectado a `tahoe-run`. |
 
-Primera imagen de macOS 26 en la PC de pruebas (11 de octubre de 2026): la memoria de vídeo emulada con el cursor que dibuja
-WindowServer, arriba a la izquierda; el escritorio aún no se compone.
+<!-- TODO(capturas): subir la captura a docs/capturas/inicio-sesion.png y descomentar:
+Primera imagen de macOS 26 en la PC de pruebas (11 de octubre de 2026): la memoria de vídeo emulada con el cursor que
+dibuja WindowServer; el escritorio aún no se compone.
 
-![Primera imagen: el cursor de macOS 26 dibujado por WindowServer en el framebuffer emulado](docs/capturas/2026-10-11-primer-cursor.png)
+![Pantalla de inicio de sesión de macOS 26 sobre Linux, dibujada por WindowServer](docs/capturas/inicio-sesion.png)
+-->
 
 Qué funciona en la shell de la Recovery (con `--launchd`): `ls`, `cp`/`mv`/`rm`, `find`, `grep`, `sed`, `awk`, `sort`, `tar`, `vim`, `less`, `perl`, `curl`,
 `ssh -V`, `ps aux` (estado, CPU, memoria, hora de inicio), `log show`, `df`, `mount`, `stat`, `xattr`, `chmod`/`chown`, `sysctl`,
@@ -86,7 +130,7 @@ la memoria de WindowServer (`memoria.sh`) y `cargo test --lib` en `tahoe-run/nuc
 1. Compilar: `tahoe-run/build.sh` y comprobar que arranca: `TAHOE_ROOT=~/macos26/completo/macOS tools/macos-shell.sh --launchd -c 'sw_vers; id'`.
 2. Guardar una copia del binario como «anterior» (`cp tahoe-run/tahoe-run /tmp/tahoe-run-A`) para comparar.
 3. Elegir trabajo en [`Pendientes.md`](Pendientes.md) (arriba, «Por dónde seguir»). Los cambios a medias que no se subieron
-   están en [`docs/parches-sin-validar/`](docs/parches-sin-validar/LEEME.md), con lo que falta de cada uno.
+   están descritos en [`Pendientes.md`](Pendientes.md), con lo que falta de cada uno.
 4. Un cambio cada vez; antes de subirlo, `tools/diag/bateria.sh /tmp/tahoe-run-A`.
 
 
