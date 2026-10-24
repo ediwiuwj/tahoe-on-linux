@@ -13,6 +13,19 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
 
 
 ## Hecho recientemente
+- **Syscall indirecta (número 0)**, como `unix_syscall64` de XNU (`bsd/dev/i386/systemcalls.c`): el número de syscall va en
+  rdi y los argumentos empiezan en rsi (5 en registros; el 6.º es el primero de la pila, y `ctx.ind` desplaza `ctx_arg`).
+  Antes el emulador la contestaba `nosys`: launchd pide `reboot` por esa vía y, al volver con error, abortaba con SIGILL en
+  vez de terminar el arranque como ya hace `bsd_reboot`. Comprobado con `perl` (`syscall(20)` devuelve el PID,
+  `syscall(4, 1, ...)` escribe, `syscall(9999)` da ENOSYS y `syscall(197, ...)` de 6 argumentos devuelve una dirección).
+  **Sin comprobar todavía** el camino completo de reboot de launchd, ni los argumentos de pila 7 y 8 por esta vía.
+- **Llavero del sistema comprobado** (24 de octubre de 2026): `tools/diag/llaveros.sh` da «System unlock is working» y
+  create/add/find con rc=0. El README y el encabezado del script decían que no se desbloqueaba (ya corregidos).
+- **Arranques que fallan por el anfitrión.** El 23 de octubre tres arranques seguidos fallaron (launchd abortaba, o
+  arrancaba y no lanzaba servicios) con el PC al 83–87 % de espera de E/S (zram de ~4 GB y la RAM llena); al bajar la
+  carga el mismo binario arrancó con normalidad (553 programas, llavero bien). Es la explicación más probable, pero no se
+  demostró qué provocó esa tormenta de E/S. Antes de buscar en el código: `top` (columna `wa`), cerrar aplicaciones pesadas
+  o reiniciar el PC.
 - **Teclado y ratón.** En macOS el sistema de eventos HID vive en WindowServer, que busca en IOKit los servicios con
   `HIDServiceSupport`. tahoe-run publica un teclado y un puntero (IOHIDEventDriver) con su IOHIDEventServiceUserClient:
   la cola de eventos es un IODataQueue compartido y cada evento un IOHIDSystemQueueElement (formatos de IOHIDFamily,

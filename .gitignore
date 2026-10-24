@@ -26,3 +26,10 @@ tahoe-run/*.rej
 
 # Volcados de diagnóstico locales
 tahoe-run/ss.out
+
+# Parches fallidos de la iteración local
+*.orig
+*.rej
+
+# Binario compilado de tools/pty_run.c (se compila con: cc -o tools/pty_run tools/pty_run.c -lutil)
+tools/pty_run
