@@ -39,10 +39,6 @@ tahoe-run/build.sh <path to xnu sources>    # build (C, static)
 tools/macos-shell.sh --launchd              # macOS bash joined to launchd
 ```
 
-**Supporting the project.** The test machine is a 2014 laptop with 5.8 GB of RAM, and that is the bottleneck.
-Sponsorship goes to a **reference MacBook Air M5**, to validate Metal natively and `metal2vulkan` against real hardware
-instead of only through `hasvk` on an HD 4400. → [github.com/sponsors/ediwiuwj](https://github.com/sponsors/ediwiuwj)
-
 ---
 
 ## Español
