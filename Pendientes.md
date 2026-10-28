@@ -12,13 +12,26 @@ Lista de trabajo del macOS 26 completo sobre tahoe-run, en orden de prioridad. S
    `systemkeychain -C -f`. Por eso falla el Kerberos local (configureLocalKDC: certtool no encuentra la clave privada) y
    digest-service sale con error y se relanza. securityd ya valida a los clientes (csops); el siguiente paso es ver por
    qué el desbloqueo con `/var/db/SystemKey` no funciona (el cliente recibe el error CSSM 0x800110e0). Prueba:
-   `tools/diag/llaveros.sh`.
+   `tools/diag/llaveros.sh`. **Nota del 24 de octubre de 2026:** en la historia local que nunca se subió (57 commits desde
+   `b46a26b`; con los firmlinks, commit `193fb4c`, exportados como parches en la rama `parches-sin-validar-enjambre-2026-10`)
+   esa prueba da «System unlock is working». En este `main` no se ha comprobado.
 3. **Capacidades de `diskutil apfs list`**: parche guardado en `docs/parches-sin-validar/contenedor-apfs.patch`
    (storagekitd lanza una excepción tras el selector 8; ver su LEEME).
 4. **`diskutil list` en la Recovery** se cuelga a veces (también con el binario anterior): mirar con `tools/diag/discos.sh`.
 5. Lo demás, en la lista de abajo.
 
 ## Hecho recientemente
+- **Syscall indirecta (número 0)**, como `unix_syscall64` de XNU (`bsd/dev/i386/systemcalls.c`): el número de syscall va en
+  rdi y los argumentos empiezan en rsi (5 en registros; el 6.º es el primero de la pila, y `ctx.ind` desplaza `ctx_arg`).
+  Antes el emulador la contestaba `nosys`: launchd pide `reboot` por esa vía (llamada 0 con 55 como primer argumento) y, al
+  volver con error, abortaba con SIGILL en vez de terminar el arranque como ya hace `bsd_reboot`. Comprobado con `perl`
+  (`syscall(20)` devuelve el PID, `syscall(4, 1, ...)` escribe, `syscall(9999)` da ENOSYS y `syscall(197, ...)` de 6
+  argumentos devuelve una dirección). **Sin comprobar todavía** el camino completo de reboot de launchd, ni los argumentos
+  de pila 7 y 8 por esta vía.
+- **Arranques que fallan por el anfitrión.** El 23 de octubre tres arranques seguidos fallaron (launchd abortaba, o
+  arrancaba y no lanzaba servicios) con el PC al 83–87 % de espera de E/S (zram de ~4 GB y la RAM llena); al bajar la
+  carga el mismo binario arrancó con normalidad. Es la explicación más probable, pero no se demostró qué provocó esa
+  tormenta de E/S. Antes de buscar en el código: `top` (columna `wa`), cerrar aplicaciones pesadas o reiniciar el PC.
 - Listado de carpetas con `NSFileManager`/`CFURLEnumerator` (todo macOS): `getattrlist` marcaba siempre `ATTR_CMN_ERROR`
   en los atributos devueltos, y CoreServices lo toma por «esta entrada falló» → `ENOTDIR`; además `getattrlistbulk` no
   admitía los comunes extendidos (`REALDEVID`, `EXT_FLAGS`). Con ello `init_featureflags` ve las 500 listas de
