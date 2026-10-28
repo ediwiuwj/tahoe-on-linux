@@ -1,9 +1,5 @@
 # tahoe-on-linux — macOS 26 (Tahoe) sobre el kernel de Linux, sin XNU
 
-> **Proyecto en pausa (14 de octubre de 2026).** Todo lo que funciona está en `main`. Para retomarlo, ver
-> [«Cómo retomarlo»](#cómo-retomarlo) y la lista de trabajo en [`Pendientes.md`](Pendientes.md).
-> *Paused project: macOS 26 userland booting on Linux without XNU. Everything that works is on `main`; see
-> `Pendientes.md` (Spanish) for the work list. Contributions welcome.*
 
 Capa de compatibilidad propia (`tahoe-run`, en C) que ejecuta binarios x86_64 de **macOS 26** directamente sobre Linux:
 traduce las syscalls BSD y las trampas Mach de XNU en espacio de usuario, y arranca el `launchd` real de macOS.
