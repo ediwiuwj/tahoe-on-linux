@@ -20,14 +20,16 @@ def main():
     a.salida.mkdir(parents=True, exist_ok=True)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resultados = []
-    for nombre, signo in [('USR1', signal.SIGUSR1), ('USR2', signal.SIGUSR2)]:
+    for nombre, signo, trap in [('INT', signal.SIGINT, 'INT'),
+                                 ('USR1', signal.SIGUSR1, 'USR1'),
+                                 ('USR2', signal.SIGUSR2, 'USR2')]:
         archivo = a.salida/(nombre+'.txt')
         env = dict(PATH='/usr/bin:/bin', HOME='/var/root', USER='root', LANG='C',
                    TAHOE_ROOT=str(root), TAHOE_CACHE_DIR=str(a.salida.resolve()/'cache'),
                    TAHOE_LOGFILE=str(a.salida.resolve()/(nombre+'.log')))
         # La shell debe seguir haciendo syscalls: no prueba entrega en bucles
         # puramente CPU ni interrupción de operaciones bloqueantes.
-        codigo = ("trap 'printf EXTERNA_OK; exit 0' " + nombre +
+        codigo = ("trap 'printf EXTERNA_OK; exit 0' " + trap +
                   "; printf LISTA; while :; do kill -0 $$ || exit 3; done")
         cmd = [str(run), str(root/'System/Library/dyld/dyld_shared_cache_x86_64'),
                str(root/'usr/lib/dyld'), str(root/'bin/bash'),
