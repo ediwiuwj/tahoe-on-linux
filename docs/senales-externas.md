@@ -8,6 +8,22 @@ La entrega ocurre en un epílogo SIGSYS posterior, después de materializar el r
 
 Cada señal estándar coalesce en un slot: gana el primer remitente hasta consumirlo; no hay FIFO ni contador de envíos. Las pendientes self y externas son fuentes separadas y pueden producir dos entregas. El hijo de fork no hereda pendientes externas. Cambiar a IGN/DFL descarta el slot externo del hilo actual.
 
+## Validación ejecutada 9 de noviembre de 2026
+
+El artefacto emulador/probe del commit `e728e3870d939359f5fa118bea9a40ad54aed3ba`
+(Actions `42668468391`) se ejecutó con Recovery 26.6.2:
+
+- `tools/probar-senales-externas.py`: INT, USR1 y USR2 (kill externo) aprobadas.
+- `tools/probar-sigint-info.py`: SIGINT SI_USER aprobada; `pid` y `uid` del
+  `siginfo` Darwin coinciden con el emisor.
+- PTY: diez Ctrl-C en prompt y diez sobre sleep foreground aprobados; job-control
+  básico también pasó.
+- Suite shell: 23/24; sigue visible el caso `trap_cruzado` de Bash 3.2.
+
+Pruebas ejecutadas en la máquina con artefactos compilados en Actions; no se
+compiló localmente. El job global de Actions estaba completando el `cargo check`
+GPU; los jobs de emulador y prueba Mach-O ya habían concluido exitosos.
+
 ## Límites explícitos
 
 - No entrega en bucles sin syscalls ni garantía de latencia.

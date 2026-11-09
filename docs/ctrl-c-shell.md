@@ -1,8 +1,9 @@
 # Ctrl-C en el prompt: SIGINT diferida
 
-Estado: compilado en Actions `42590955503` y repetido en el artefacto de
-`42666648197` (commit `1744198342befcab792223e91bf0eae9f231a0dc`), Recovery
-26.6.2. Pasaron Ctrl-C en prompt y foreground (1 y 10 veces), y Ctrl-Z/jobs/bg/fg.
+Estado: compilado en Actions `42668468391`, commit
+`e728e3870d939359f5fa118bea9a40ad54aed3ba`, y probado con Recovery 26.6.2.
+Pasaron Ctrl-C en prompt y foreground (1 y 10 veces), Ctrl-Z/jobs/bg/fg, y
+SIGINT externa SI_USER con `siginfo` pid/uid coincidentes con el emisor.
 Estas pruebas PTY no equivalen a soporte completo de señales/grupos.
 
 ## Entrega

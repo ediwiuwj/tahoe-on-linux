@@ -45,7 +45,21 @@ Esto aún NO demuestra shell completa: quedan EINTR/SA_RESTART en todas las
 esperas, señales externas durante loops sin syscalls, multihilo, todos los
 servicios, la compatibilidad cruzada de Bash, y más escenarios de spawn.
 
-## Extracción
+## Artefactos recientes SIGINT y spawn
+
+- Emulador de Actions `42666648197`, commit
+  `1744198342befcab792223e91bf0eae9f231a0dc`, Recovery Tahoe26.6.2:
+  `spawnprobe` pasó E2BIG explícito y herencia de fd fuente alto a 1025 bajo
+  `CLOEXEC_DEFAULT`, verificada escribiendo a pipe. Suite shell 23/24; solo
+  `trap_cruzado` Bash3.2 falla (retorno139). PTY Ctrl-Z/jobs/bg/fg pasó.
+  `launchctl list` salió0, aunque mostró servicios sin proceso y un estado de error.
+- Emulador de Actions `42668468391`, commit
+  `e728e3870d939359f5fa118bea9a40ad54aed3ba`: PTY diez Ctrl-C en prompt y diez
+  en foreground pasaron; SIGINT, USR1 y USR2 externas pasaron. El probe adicional
+  confirmó SI_USER y pid/uid de SIGINT coincidentes con el emisor.
+
+Ninguna compilación local. Ninguno de estos resultados implica que todos los
+servicios de Recovery funcionen.
 
 7zip dejó archivos HFS vacíos; no usar esa extracción como referencia completa.
 Se compiló `hfsdump`/`hfstar` en GitHub desde `0x09/hfsfuse`, revisión
