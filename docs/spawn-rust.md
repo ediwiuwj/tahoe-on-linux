@@ -28,8 +28,3 @@ Pruebas Rust cubren cabeceras, tipos, límites, descriptores y plan CLOEXEC.
 `spawnprobe.c` verifica un spawn normal, E2BIG con 33 acciones y un descriptor
 origen alto duplicado a 1025 bajo `CLOEXEC_DEFAULT`. El probe debe compilarse en
 Actions y ejecutarse sobre Recovery antes de afirmar que está verificado.
-
-Pruebas Rust: cabeceras inválidas, cantidades, tipos, descriptores, rutas y
-flags. `tools/macos/spawnprobe.c`, compilado exclusivamente en Actions, comprueba
-un spawn normal y el rechazo explícito de 33 acciones. No se considera aprobado
-hasta ejecutar el nuevo artefacto sobre Recovery.
