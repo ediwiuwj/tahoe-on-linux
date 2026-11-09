@@ -15,6 +15,17 @@ SIGCHLD asíncrono, Ctrl-C, conservación SIMD bajo todas las variantes ni
 soporte completo de los servicios de Recovery. Nuevos casos de la suite
 pueden seguir fallando: la cuenta anterior corresponde al commit indicado.
 
+## Ampliación verificada
+
+El emulador `80cb7ab` (Actions `42583758088`) pasó 23/24 regresiones y PTY.
+El fallo es `trap_cruzado` de Bash, documentado separadamente; no se elimina ni
+se cuenta como aprobado. El mismo script pasó con Dash original.
+
+`signalprobe`, compilado en Actions `42584735861` desde `556734a`, se ejecutó
+sobre ese emulador y Recovery con salida 0 y `SENALES_MASCARAS_SIGINFO_OK`.
+Comprueba bloqueo de USR1/USR2, pendientes, desbloqueo selectivo, `siginfo`
+y entrega anidada de USR2 desde el handler USR1. No prueba señales externas.
+
 ## Extracción
 
 7zip dejó archivos HFS vacíos; no usar esa extracción como referencia completa.

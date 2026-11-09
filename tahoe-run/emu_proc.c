@@ -386,7 +386,7 @@ long emu_signal_epilogue(struct ctx* c) {
 		if (!ready) return 0; // otra pendiente se atenderá en otro epílogo
 	}
 	// Prioridad determinista por número Darwin, no promesa de orden FIFO.
-	uint32_t bit = (ready & DARWIN_USR1_BIT) ? DARWIN_USR1_BIT : DARWIN_USR2_BIT;
+	uint32_t bit = nucleo_senal_elegible(ready, 0, SIGNAL_SUPPORTED_BITS);
 	int signo = bit == DARWIN_USR1_BIT ? 30 : 31;
 	long err = signal_deliver(c, signo, bit);
 	// Sólo revocar el envío cuyo kill devuelve error. Las demás pendientes

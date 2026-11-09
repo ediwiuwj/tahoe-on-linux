@@ -219,6 +219,13 @@ pub fn nucleo_senal_pila(rsp: u64, tam: u64) -> u64 {
     reservar_pila(rsp, tam).unwrap_or(0)
 }
 
+/// Selección determinista de auto-señales soportadas; cero si ninguna es elegible.
+/// No consume pendientes: C sólo las retira después de publicar el marco.
+pub fn nucleo_senal_elegible(pendientes: u32, mascara: u32, permitidas: u32) -> u32 {
+    let listas = pendientes & !mascara & permitidas & ((1u32 << 29) | (1u32 << 30));
+    listas & listas.wrapping_neg()
+}
+
 /// Resultado empaquetado: máscara en 32 bits bajos, errno en altos.
 pub fn nucleo_senal_mascara(old: u32, set: u32, how: u64, has_set: u32) -> u64 {
     let next = if has_set == 0 { old } else {
@@ -230,6 +237,21 @@ pub fn nucleo_senal_mascara(old: u32, set: u32, how: u64, has_set: u32) -> u64 {
 #[cfg(test)]
 mod conversion_tests {
     use super::*;
+    #[test]
+    fn pendientes_y_prioridad() {
+        let uno = 1u32 << 29;
+        let dos = 1u32 << 30;
+        for p in [0, uno, dos, uno | dos, u32::MAX] {
+            for m in [0, uno, dos, u32::MAX] {
+                for a in [0, uno, dos, u32::MAX] {
+                    let esperado = if p & uno != 0 && m & uno == 0 && a & uno != 0 { uno }
+                        else if p & dos != 0 && m & dos == 0 && a & dos != 0 { dos }
+                        else { 0 };
+                    assert_eq!(nucleo_senal_elegible(p, m, a), esperado);
+                }
+            }
+        }
+    }
     #[test]
     fn mascaras_y_senales_no_bloqueables() {
         assert_eq!(nucleo_senal_mascara(1, 2, 1, 1), 3);

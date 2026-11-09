@@ -27,6 +27,7 @@ struct nucleo_senal_vuelta nucleo_senal_decodificar(struct nucleo_senal_bytes, s
 uint32_t nucleo_senal_xstate_largo(struct nucleo_senal_fp);
 struct nucleo_senal_fp nucleo_senal_fp_inicial(struct nucleo_senal_fp, uint64_t bv);
 uint64_t nucleo_senal_pila(uint64_t rsp, uint64_t tam);
+uint32_t nucleo_senal_elegible(uint32_t pendientes, uint32_t mascara, uint32_t permitidas);
 uint64_t nucleo_senal_mascara(uint32_t old, uint32_t set, uint64_t how, uint32_t has_set);
 
 // Un descriptor de mensaje Mach ya leído (nucleo/src/mensaje.rs, struct Desc).
