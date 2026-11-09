@@ -15,7 +15,7 @@ mkdir -p bin obj
 tbd() {   # tbd <install-name> <símbolos...>
 	printf -- '--- !tapi-tbd\ntbd-version: 4\ntargets: [ x86_64-macos ]\ninstall-name: '"'%s'"'\nexports:\n  - targets: [ x86_64-macos ]\n    symbols: [ %s ]\n...\n' "$1" "$(shift; echo "$@" | sed 's/ /, /g')"
 }
-tbd /usr/lib/libSystem.B.dylib _open _read _write _close _lseek _malloc _free _unlink _printf _strlen _memcpy _snprintf _getline ___stdinp _sigaction _sigsetjmp _siglongjmp _sigprocmask _sigpending _kill _getpid _posix_spawn_file_actions_init _posix_spawn_file_actions_destroy _posix_spawn_file_actions_adddup2 _posix_spawn_file_actions_addopen _posix_spawnattr_init _posix_spawnattr_destroy _posix_spawnattr_setflags _posix_spawn _waitpid ___stack_chk_fail ___stack_chk_guard dyld_stub_binder > obj/libSystem.tbd
+tbd /usr/lib/libSystem.B.dylib _open _read _write _close _lseek _dup2 _pipe _malloc _free _unlink _printf _strlen _memcpy _snprintf _getline ___stdinp _sigaction _sigsetjmp _siglongjmp _sigprocmask _sigpending _kill _getpid _posix_spawn_file_actions_init _posix_spawn_file_actions_destroy _posix_spawn_file_actions_adddup2 _posix_spawn_file_actions_addopen _posix_spawnattr_init _posix_spawnattr_destroy _posix_spawnattr_setflags _posix_spawn _waitpid ___stack_chk_fail ___stack_chk_guard dyld_stub_binder > obj/libSystem.tbd
 tbd /usr/lib/libcompression.dylib _compression_decode_buffer > obj/libcompression.tbd
 for src in *.c; do
 	n="${src%.c}"
