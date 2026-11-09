@@ -7,7 +7,9 @@ Para compilar, `tahoe-run/build.sh` consulta un árbol fuente de XNU para genera
 
 **Meta a largo plazo, no estado actual:** ejecutar el userland de macOS 26 hasta el Asistente de configuración y un escritorio funcional dentro de una ventana de Linux, con aceleración gráfica Metal sobre Vulkan (Intel HD 4400). La Recovery fue el primer paso y sigue sirviendo de prueba de regresiones. [Darling](https://github.com/darlinghq/darling) se usa solo como referencia.
 
-**Estado actual (14 de octubre de 2026)**, medido en la PC de pruebas (i5-4210U Haswell, 5,8 GB de RAM, Arch/Omarchy, kernel 7.2):
+**Mediciones funcionales (14 de octubre de 2026)** en la PC de pruebas (i5-4210U Haswell, 5,8 GB de RAM, Arch/Omarchy):
+
+**Kernel de esta terminal**, consultado con Fastfetch el 8 de noviembre de 2026: `Linux 7.2.15-1-omarchy`. Esta lectura no vuelve a validar las mediciones funcionales fechadas el 14 de octubre.
 
 | Parte | Estado |
 |---|---|
