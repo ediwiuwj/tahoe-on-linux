@@ -5,6 +5,8 @@
 
 // Traducción pura de MSG_* Darwin a Linux x86_64; conserva la supresión de SIGPIPE.
 uint32_t nucleo_red_msg_flags(uint32_t darwin);
+int32_t nucleo_senal_linux(int32_t darwin);
+int32_t nucleo_wait_estado(int32_t linux_estado);
 
 // Un descriptor de mensaje Mach ya leído (nucleo/src/mensaje.rs, struct Desc).
 struct nucleo_desc {

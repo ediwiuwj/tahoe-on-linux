@@ -14,6 +14,7 @@
 #include <execinfo.h>
 #include <stddef.h>
 #include "tahoe.h"
+#include "nucleo.h"
 __thread struct ctx* volatile t_cur;   // llamada en curso del hilo (la pone el manejador de SIGSYS)
 
 // bsdthread_register(thread_start, wqthread, pthread_size, ...): libpthread registra aquí las funciones con las
@@ -233,12 +234,15 @@ static long bsd_setrlimit(struct ctx* c) {
 
 // ---------------------------------------------------------------- señales (virtuales por ahora)
 // Los manejadores se registran, pero no se entregan señales asíncronas: hace falta construir marcos de señal de macOS.
-static int darwin_to_linux_sig(int s) {
-	static const int m[32] = { 0, SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, 0, SIGFPE, SIGKILL, SIGBUS, SIGSEGV, SIGSYS, SIGPIPE,
-		SIGALRM, SIGTERM, SIGURG, SIGSTOP, SIGTSTP, SIGCONT, SIGCHLD, SIGTTIN, SIGTTOU, SIGIO, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF,
-		SIGWINCH, 0, SIGUSR1, SIGUSR2 };
-	return s > 0 && s < 32 ? m[s] : -1;
-}
+_Static_assert(SIGHUP == 1 && SIGINT == 2 && SIGQUIT == 3 && SIGILL == 4 &&
+	SIGTRAP == 5 && SIGABRT == 6 && SIGBUS == 7 && SIGFPE == 8 && SIGKILL == 9 &&
+	SIGUSR1 == 10 && SIGSEGV == 11 && SIGUSR2 == 12 && SIGPIPE == 13 &&
+	SIGALRM == 14 && SIGTERM == 15 && SIGCHLD == 17 && SIGCONT == 18 &&
+	SIGSTOP == 19 && SIGTSTP == 20 && SIGTTIN == 21 && SIGTTOU == 22 &&
+	SIGURG == 23 && SIGXCPU == 24 && SIGXFSZ == 25 && SIGVTALRM == 26 &&
+	SIGPROF == 27 && SIGWINCH == 28 && SIGIO == 29 && SIGSYS == 31,
+	"ABI de señales Linux incompatible con nucleo/src/senales.rs");
+static int darwin_to_linux_sig(int s) { return nucleo_senal_linux(s); }
 int darwin_sig_to_linux(int s) { return darwin_to_linux_sig(s); }   // para tahoe_run.c (proc_info)
 static struct { uint64_t handler, tramp; uint32_t mask, flags; } sigtab[32];
 static long bsd_sigaction(struct ctx* c) {
@@ -649,20 +653,8 @@ static long bsd_pthread_kill(struct ctx* c) {
 #include <stdlib.h>
 #include <sys/wait.h>
 
-static int linux_to_darwin_sig(int s) {
-	for (int d = 1; d < 32; d++) if (darwin_to_linux_sig(d) == s) return d;
-	return s;
-}
-// Estado de wait4: salida normal = código << 8; terminado por señal = nº de señal de Darwin (+0x80 si volcó core);
-// parado = 0x7f | (señal << 8); continuado = W_STOPCODE(SIGCONT) = 0x137f (como en XNU, kern_exit.c:3209).
-static int darwin_wait_status(int st) {
-	if (WIFEXITED(st)) return WEXITSTATUS(st) << 8;
-	if (WIFSIGNALED(st)) return linux_to_darwin_sig(WTERMSIG(st)) | (WCOREDUMP(st) ? 0x80 : 0);
-	if (WIFSTOPPED(st)) return 0x7f | (linux_to_darwin_sig(WSTOPSIG(st)) << 8);
-	if (st == 0xFFFF) return 0x137f;                // Linux: __WCONTINUED (el hijo se paró y siguió). En Darwin, WIFSIGNALED
-	                                                // de 0xffff sería "muerto por la señal 255", así que hay que traducirlo.
-	return st;
-}
+// Estado wait traducido mediante lógica pura Rust; acceso al invitado permanece en C.
+static int darwin_wait_status(int st) { return nucleo_wait_estado(st); }
 
 // fork: se usa el de Linux. La interceptación y la memoria se heredan. Convenio de Darwin: padre rax=pid hijo, rdx=0;
 // hijo rax=pid del padre, rdx=1 (libsyscall devuelve 0 al hijo al ver rdx != 0).
