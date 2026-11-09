@@ -973,26 +973,28 @@ static void host_path(const char* guest, char* out, size_t cap) {
 // heredaban todos los descriptores.
 enum { PSFA_OPEN = 0, PSFA_CLOSE = 1, PSFA_DUP2 = 2, PSFA_INHERIT = 3, PSFA_FILEPORT_DUP2 = 4, PSFA_CHDIR = 5, PSFA_FCHDIR = 6 };
 #define PSFA_SIZE 1040
-struct psfa { int type, fd, arg; int oflag; uint16_t mode; char path[1024]; };
-static struct psfa spawn_fa[32];
+static struct nucleo_spawn_accion spawn_fa[32];
 static int spawn_fa_n, spawn_cloexec_default;
 static int spawn_setpgroup, spawn_pgroup;                          // POSIX_SPAWN_SETPGROUP: grupo de procesos del hijo (0: el suyo)
-static void read_file_actions(uint64_t addr, uint64_t size) {
+static int read_file_actions(uint64_t addr, uint64_t size) {
 	spawn_fa_n = 0;
-	if (!addr || size < 8) return;
-	int hdr[2] = { 0, 0 };
-	if (safe_read(addr, hdr, 8) != 8) return;
-	if (trace_all) logf_("    posix_spawn: acciones de archivo: espacio=%d número=%d tamaño=%lu\n", hdr[0], hdr[1], size);
-	for (int i = 0; i < hdr[1] && i < 32 && 8 + (uint64_t)(i + 1) * PSFA_SIZE <= size; i++) {
-		uint8_t a[PSFA_SIZE];
-		if (safe_read(addr + 8 + (uint64_t)i * PSFA_SIZE, a, sizeof a) != (ssize_t)sizeof a) break;
-		struct psfa* f = &spawn_fa[spawn_fa_n++];
-		memset(f, 0, sizeof *f);
-		memcpy(&f->type, a, 4); memcpy(&f->fd, a + 4, 4); memcpy(&f->arg, a + 8, 4);
-		if (f->type == PSFA_OPEN) { memcpy(&f->oflag, a + 8, 4); memcpy(&f->mode, a + 12, 2); memcpy(f->path, a + 14, 1023); }
-		else if (f->type == PSFA_CHDIR) memcpy(f->path, a + 8, 1023);
-		if (trace_all) logf_("    posix_spawn: acción %d fd=%d arg=%d ruta=\"%s\"\n", f->type, f->fd, f->arg, f->path);
+	if (!addr) return size ? -D_EFAULT : 0;
+	if (size < 8 || addr > UINT64_MAX - size) return -D_EINVAL;
+	int32_t hdr[2];
+	if (safe_read(addr, hdr, sizeof hdr) != sizeof hdr) return -D_EFAULT;
+	uint64_t checked = nucleo_spawn_cabecera(hdr[0], hdr[1], size, 32);
+	if (checked >> 32) return -(int)(checked >> 32);
+	int n = (int)checked;
+	for (int i = 0; i < n; i++) {
+		struct nucleo_spawn_bytes bytes;
+		if (safe_read(addr + 8 + (uint64_t)i * PSFA_SIZE, bytes.bytes, sizeof bytes.bytes) != sizeof bytes.bytes) return -D_EFAULT;
+		struct nucleo_spawn_resultado r = nucleo_spawn_accion(bytes);
+		if (r.error) return -r.error;
+		spawn_fa[i] = r.accion;
 	}
+	// Publicar sólo el conjunto completo: ningún prefijo parcial se ejecuta.
+	spawn_fa_n = n;
+	return 0;
 }
 static void psfa_host(const char* guest, char* out, size_t cap) {
 	char tmp[1100];
@@ -1009,7 +1011,7 @@ static int psfa_build(posix_spawn_file_actions_t* fa) {
 	uint8_t keep[1024] = { 0 };
 	int maxk = 2;
 	for (int i = 0; i < spawn_fa_n; i++) {
-		struct psfa* f = &spawn_fa[i];
+		struct nucleo_spawn_accion* f = &spawn_fa[i];
 		char hp[1100];
 		switch (f->type) {
 		case PSFA_OPEN: psfa_host(f->path, hp, sizeof hp); posix_spawn_file_actions_addopen(fa, f->fd, hp, darwin_open_flags(f->oflag), f->mode); break;
@@ -1033,7 +1035,7 @@ static int psfa_build(posix_spawn_file_actions_t* fa) {
 static void psfa_apply_here(void) {
 	uint8_t keep[1024] = { 0 };
 	for (int i = 0; i < spawn_fa_n; i++) {
-		struct psfa* f = &spawn_fa[i];
+		struct nucleo_spawn_accion* f = &spawn_fa[i];
 		char hp[1100];
 		switch (f->type) {
 		case PSFA_OPEN: {
@@ -1212,6 +1214,8 @@ static long bsd_posix_spawn(struct ctx* c) {
 		safe_read(c->a[2], ad, sizeof ad);                          // attr_size, attrp, file_actions_size, file_actions
 		if (ad[1]) { safe_read(ad[1], &psa_flags, 2); safe_read(ad[1] + 12, &psa_pgroup, 4); }   // psa_flags, ..., psa_pgroup (+12)
 	}
+	int file_actions_error = read_file_actions(ad[3], ad[2]);
+	if (file_actions_error) return file_actions_error;
 	char gp[256] = "?";
 	safe_string(c->a[1], gp, sizeof gp);
 	spawn_special_n = 0;
@@ -1230,7 +1234,6 @@ static long bsd_posix_spawn(struct ctx* c) {
 		}
 	}
 	logf_("    posix_spawn <%d>(\"%s\") attr_flags=0x%x ad=%lx,%lx,%lx,%lx,%lx,%lx\n", (int)getpid(), gp, psa_flags, ad[0], ad[1], ad[2], ad[3], ad[4], ad[5]);
-	read_file_actions(ad[3], ad[2]);
 	spawn_cloexec_default = (psa_flags & 0x4000) != 0;              // POSIX_SPAWN_CLOEXEC_DEFAULT
 	// POSIX_SPAWN_SETPGROUP (0x2): el hijo en el grupo psa_pgroup, o en uno nuevo con su pid si es 0. Quien lo lanza puede
 	// luego matar al grupo entero (system_profiler: kill(-pid, SIGTERM) a un informe que no acaba); sin esto fallaba y

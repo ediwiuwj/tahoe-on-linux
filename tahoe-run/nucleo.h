@@ -8,6 +8,14 @@ uint32_t nucleo_red_msg_flags(uint32_t darwin);
 int32_t nucleo_senal_linux(int32_t darwin);
 int32_t nucleo_wait_estado(int32_t linux_estado);
 
+struct nucleo_spawn_bytes { uint8_t bytes[1040]; };
+struct nucleo_spawn_accion { int32_t type, fd, arg, oflag; uint16_t mode; char path[1024]; };
+struct nucleo_spawn_resultado { struct nucleo_spawn_accion accion; int32_t error; };
+_Static_assert(sizeof(struct nucleo_spawn_accion) == 1044 && offsetof(struct nucleo_spawn_accion, path) == 18, "spawn_accion");
+_Static_assert(sizeof(struct nucleo_spawn_resultado) == 1048, "spawn_resultado");
+uint64_t nucleo_spawn_cabecera(int32_t cap, int32_t n, uint64_t tam, uint32_t limite);
+struct nucleo_spawn_resultado nucleo_spawn_accion(struct nucleo_spawn_bytes);
+
 // Señales normales: frontera Rust segura por valor, sin punteros invitados.
 struct nucleo_senal_maquina { uint64_t regs[21]; uint8_t fp[512]; };
 struct nucleo_senal_bytes { uint8_t uc[56], mc[712]; };
