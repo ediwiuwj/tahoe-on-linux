@@ -25,7 +25,7 @@
 #include "tahoe.h"
 
 #define FP_MAX 512
-#define FP_FD_MIN 1100          // duplicados fuera del rango que usan los programas
+#define FP_FD_MIN FD_INTERNAL_BASE   // duplicados fuera del rango que usan los programas (ver fd_hi)
 static struct { uint32_t name; int fd; } fp_tab[FP_MAX];
 static int fp_next;             // reemplazo circular si la tabla se llena (el más antiguo)
 static pthread_mutex_t fp_lock = PTHREAD_MUTEX_INITIALIZER;

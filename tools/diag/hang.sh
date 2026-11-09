@@ -27,6 +27,9 @@ pids_of() {
 	local s n
 	for s in /proc/[0-9]*/status; do
 		[ "$(readlink ${s%/status}/ns/pid 2>/dev/null)" = "$NS" ] || continue
+		# solo procesos, no hilos sueltos: el número de hilo de un proceso puede coincidir con el pid de macOS de otro, y la
+		# señal de volcado (RTMIN+5) mata a un proceso que no la espera (pasó con WindowServer)
+		[ "$(awk '/^Tgid/{print $2}' "$s" 2>/dev/null)" = "$(awk '/^Pid/{print $2}' "$s" 2>/dev/null)" ] || continue
 		n=$(awk '/^NSpid/{if (NF > 2) print $NF}' "$s" 2>/dev/null)
 		[ -n "$n" ] && [ "$(echo "$PROGS" | awk -v n="$n" '$1==n{print $2}')" = "$1" ] && { s=${s#/proc/}; echo "${s%/status}"; }
 	done

@@ -17,6 +17,8 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #define IOKIT_RET(x) ((int32_t)(0xe0000000u | (x)))
 #define kIOReturnError        IOKIT_RET(0x2bc)
@@ -364,7 +366,7 @@ static void io_disks(int bus) {
 	p_str(csch, "IOClass", "AppleAPFSContainerScheme");
 	int d1 = ent_add(csch, "AppleAPFSMedia", "AppleAPFSMedia", "IORegistryEntry IOService IOStorage IOMedia", "", PL_SERVICE, 0);
 	disk_media(d1, "disk1", 1, 2, size, "EF57347C-0000-11AA-AA11-00306543ECAC", 1, 0);
-	int cont = ent_add(d1, "AppleAPFSContainer", "AppleAPFSContainer", "IORegistryEntry IOService IOStorage IOPartitionScheme", "", PL_SERVICE, 0);
+	int cont = ent_add(d1, "AppleAPFSContainer", "AppleAPFSContainer", "IORegistryEntry IOService IOStorage IOPartitionScheme", "", PL_SERVICE, 1);
 	p_str(cont, "IOClass", "AppleAPFSContainer"); p_str(cont, "UUID", "B0070000-0000-4000-8000-0000000000C1");
 	p_num(cont, "Size", size, 64); p_num(cont, "CapacityInUse", used, 64);
 	// En un macOS completo el contenedor tiene además los volúmenes Data y Preboot (los mismos que da getfsstat: disk1s2 y
@@ -443,11 +445,20 @@ static void io_nvram_boot(int opt) {
 // ------------------------------------------------------------------ pantalla emulada
 // Un único modo: 1280×800 a 60 Hz, 32 bits por píxel (IO32BitDirectPixels: en memoria B, G, R, X). La memoria de vídeo es un
 // archivo de /dev/shm que ven a la vez WindowServer (la proyecta con IOConnectMapMemory) y el visor de Linux (tools/tahoe-view).
+// Colas de eventos del teclado y del puntero (ver uc_hidev)
+#define HIDQ_SIZE 16384                                              // kQueueSizeMax de IOHIDEventServiceUserClient
+static struct hidq { int ent; uint8_t* mem; uint32_t port; int open; } hidq[2] = { { .ent = -1 }, { .ent = -1 } };   // 0 teclado, 1 puntero
+static void fb_path(char* b, size_t n, const char* what);
 #define FB_W      1280
 #define FB_H      800
 #define FB_BPR    (FB_W * 4)
 #define FB_VRAM   (16u << 20)                           // 16 MiB: IOFBMemorySize
 #define FB_MODE   1                                     // IODisplayModeID del único modo
+// Clase del framebuffer: la genérica de Apple (la de un framebuffer sencillo sin driver de GPU, como en una máquina virtual).
+// Con «AppleIntelFramebuffer», CoreDisplay veía «Intel» en el nombre, daba la GPU por una Intel integrada y presentaba las
+// imágenes con IOPresentment, que exige acelerador (AGDC, IOAccelerator): WindowServer abortaba al mostrar la primera
+// ventana (la de inicio de sesión). Sin fabricante en el nombre usa el camino clásico del framebuffer.
+#define FB_CLASS  "IONDRVFramebuffer"
 // EDID 1.4 de un panel interno de 13,3" (286×179 mm) con el modo nativo como temporización detallada (CVT con borrado reducido:
 // 71 MHz, 1280+160 × 800+23). Fabricante "TAH" (no es un panel real).
 static void edid_make(uint8_t e[128]) {
@@ -485,7 +496,7 @@ static void display_props(int d) {
 	p_num(d, "DisplayVendorID", 0x5028, 32);
 	p_num(d, "DisplayProductID", 0x1280, 32);
 	p_num(d, "DisplaySerialNumber", 0, 32);
-	p_str(d, "IODisplayPrefsKey", "IOService:/AppleACPIPlatformExpert/PCI0/IGPU@20000/AppleIntelFramebuffer@0/display0/AppleDisplay-5028-1280");
+	p_str(d, "IODisplayPrefsKey", "IOService:/AppleACPIPlatformExpert/PCI0/IGPU@20000/" FB_CLASS "@0/display0/AppleDisplay-5028-1280");
 	p_num(d, "IODisplayConnectFlags", 0, 32);
 }
 
@@ -495,6 +506,11 @@ static void io_init(void) {
 	char gv[32] = "0x8086", gd[32] = "0x0a16", dmi[64] = "";
 	rd_sys("/sys/class/drm/card0/device/vendor", gv, sizeof gv);
 	rd_sys("/sys/class/drm/card0/device/device", gd, sizeof gd);
+	// TAHOE_GPU=vvvv:dddd: otra identidad PCI para la GPU emulada (p. ej. 1234:1111, la VGA estándar de una máquina virtual)
+	if (getenv("TAHOE_GPU") && strchr(getenv("TAHOE_GPU"), ':')) {
+		snprintf(gv, sizeof gv, "0x%.*s", (int)(strchr(getenv("TAHOE_GPU"), ':') - getenv("TAHOE_GPU")), getenv("TAHOE_GPU"));
+		snprintf(gd, sizeof gd, "0x%s", strchr(getenv("TAHOE_GPU"), ':') + 1);
+	}
 	rd_sys("/sys/class/dmi/id/product_name", dmi, sizeof dmi);
 	uint32_t vendor = (uint32_t)strtoul(gv, NULL, 0), device = (uint32_t)strtoul(gd, NULL, 0);
 	long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -608,7 +624,9 @@ static void io_init(void) {
 
 	int opt = ent_add(plat, "options", "IODTNVRAM", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(opt, "name", "options");
-	p_str(opt, "boot-args", "");                              // OSString, como IONVRAMCHRPHandler (las variables de texto son cadenas)
+	// OSString, como IONVRAMCHRPHandler (las variables de texto son cadenas). TAHOE_BOOTARGS: argumentos de arranque (los
+	// leen, p. ej., CoreDisplay y WindowServer: useIOP=0 para no usar IOPresentment, que exige una GPU con acelerador).
+	p_str(opt, "boot-args", getenv("TAHOE_BOOTARGS") ? getenv("TAHOE_BOOTARGS") : "");
 	// MLB y ROM en la NVRAM de Apple (las pone el firmware; OpenCore, en un Hackintosh): los de smbios.json si los hay.
 	{
 		const char* mlb = smbios("mlb", NULL), *rom = smbios("rom", NULL);
@@ -680,13 +698,36 @@ static void io_init(void) {
 	p_u32(gpu, "AAPL,ig-platform-id", 0x0a260006);                // Haswell móvil (HD 4400), como en las guías de Dortania
 	p_num(gpu, "IOPCIExpressCapabilities", 2, 32);
 	p_bool(gpu, "built-in", 1);
-	int accel = ent_add(gpu, "AppleIntelFramebuffer", "AppleIntelFramebuffer", "IORegistryEntry IOService IOFramebuffer", "0", PL_SERVICE, 1);
-	p_str(accel, "IOClass", "AppleIntelFramebuffer");
+	int accel = ent_add(gpu, FB_CLASS, FB_CLASS, "IORegistryEntry IOService IOFramebuffer", "0", PL_SERVICE, 1);
+	p_str(accel, "IOClass", FB_CLASS);
 	p_str(accel, "IOProviderClass", "IOPCIDevice");
 	fb_props(accel);
 	// Sin IOAccelerator: no hay driver Metal para esta GPU (la HD 4400 no tiene driver en macOS 26), y un acelerador sin
 	// "MetalPluginName" deja a CoreDisplay sin dispositivo Metal y a WindowServer cayendo al iniciar las pantallas. Sin
 	// acelerador, como en una máquina virtual sin GPU, WindowServer compone por software en el framebuffer.
+	// Con TAHOE_METAL (driver Metal de tahoe-run, tahoe-metal): un IOAccelerator cuyo MetalPluginName es el bundle
+	// TahoeMetal (lo pone en /System/Library/Extensions el overlay de emu_fs.c). Metal lo encuentra al enumerar los
+	// IOAccelerator, carga el bundle y crea su clase principal. Sin TAHOE_METAL no hay acelerador (ver arriba).
+	if (getenv("TAHOE_METAL")) {
+		int ta = ent_add(gpu, "TahoeAccelerator", "TahoeAccelerator", "IORegistryEntry IOService IOAccelerator TahoeAccelerator", "", PL_SERVICE, 1);
+		p_str(ta, "IOClass", "TahoeAccelerator");
+		p_str(ta, "IOProviderClass", "IOPCIDevice");
+		p_str(ta, "IOMatchCategory", "IOAccelerator");
+		p_str(ta, "MetalPluginName", "TahoeMetal");
+		p_str(ta, "MetalPluginClassName", "TahoeMTLDevice");
+		p_str(ta, "model", "Tahoe GPU (Vulkan)");
+		p_num(ta, "IOAccelIndex", 0, 32);
+		p_num(ta, "IOAccelRevision", 2, 32);
+		// socket del servidor de GPU (tahoe-gpu servir, en Linux): el driver le manda los comandos
+		char sock[256];
+		snprintf(sock, sizeof sock, "%s", getenv("TAHOE_GPU_SOCK") ? getenv("TAHOE_GPU_SOCK") : "/dev/shm/tahoe-gpu.sock");
+		p_str(ta, "TahoeGPUSocket", strdup(sock));
+		// memoria de las IOSurface de este arranque (el servidor de GPU la proyecta para las texturas sobre IOSurface):
+		// la ruta de cada una con %u en vez del ID
+		char sp[200];
+		snprintf(sp, sizeof sp, "/dev/shm/tahoe-surf-%%u-%s", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
+		p_str(ta, "TahoeSurfacePath", strdup(sp));
+	}
 	int dcon = ent_add(accel, "display0", "IODisplayConnect", "IORegistryEntry IOService", "", PL_SERVICE, 0);
 	p_str(dcon, "IOClass", "IODisplayConnect");
 	int disp = ent_add(dcon, "AppleDisplay", "IODisplay", "IORegistryEntry IOService", "", PL_SERVICE, 1);
@@ -746,6 +787,24 @@ static void io_init(void) {
 	p_num(ptr, "PrimaryUsagePage", 1, 32); p_num(ptr, "PrimaryUsage", 2, 32); p_num(ptr, "DeviceUsagePage", 1, 32); p_num(ptr, "DeviceUsage", 2, 32);
 	p_str(ptr, "Product", "Apple Internal Keyboard / Trackpad");
 	p_num(ptr, "VendorID", 0x5ac, 32); p_num(ptr, "ProductID", 0x27e, 32); p_str(ptr, "Transport", "USB");
+	// Servicios de eventos HID (IOHIDEventDriver, como el de un teclado y un ratón USB): WindowServer, que en macOS lleva
+	// dentro el sistema de eventos HID, los busca por HIDServiceSupport y les abre un IOHIDEventServiceUserClient por el
+	// que llegan las teclas y el ratón que manda tahoe-view.
+	for (int k = 0; k < 2; k++) {
+		int dev = k ? ptr : kbd, up = 1, u = k ? 2 : 6;
+		int ev = ent_add(dev, "IOHIDEventDriver", "IOHIDEventDriver", "IORegistryEntry IOService IOHIDEventService IOHIDEventDriver", "", PL_SERVICE, 1);
+		p_str(ev, "IOClass", "IOHIDEventDriver"); p_str(ev, "IOProviderClass", "IOHIDInterface");
+		p_str(ev, "IOUserClientClass", "IOHIDEventServiceUserClient");
+		p_bool(ev, "HIDServiceSupport", 1);
+		p_num(ev, "PrimaryUsagePage", up, 32); p_num(ev, "PrimaryUsage", u, 32);
+		struct val* pairs = v_new(V_ARRAY); struct val* pr = v_new(V_DICT);
+		v_add(pr, "DeviceUsagePage", v_num(up, 32)); v_add(pr, "DeviceUsage", v_num(u, 32)); v_add(pairs, NULL, pr);
+		v_set(io_e[ev].props, "DeviceUsagePairs", pairs);
+		p_str(ev, "Product", k ? "tahoe-view Mouse" : "tahoe-view Keyboard"); p_str(ev, "Manufacturer", "tahoe-run");
+		p_num(ev, "VendorID", 0x5ac, 32); p_num(ev, "ProductID", 0x27e, 32); p_str(ev, "Transport", "USB");
+		p_num(ev, "LocationID", 0x14100000 + k, 32); p_num(ev, "CountryCode", 0, 32);
+		hidq[k].ent = ev;
+	}
 
 	int batt = ent_add(acpi, "AppleSmartBattery", "AppleSmartBattery", "IORegistryEntry IOService IOPMPowerSource", "", PL_SERVICE, 1);
 	p_bool(batt, "ExternalConnected", 1); p_bool(batt, "IsCharging", 0); p_bool(batt, "FullyCharged", 1);
@@ -953,9 +1012,9 @@ static uint64_t rq_u64(struct rq* r) { uint64_t v = 0; if (r->p + 8 <= r->len) m
 // "IOServiceTerminate" se leía como el diccionario: la notificación de terminación devolvía todos los discos y
 // diskarbitrationd los daba por retirados nada más crearlos.
 static const char* rq_str(struct rq* r) {
-	static __thread char ring[4][4100];
+	TLS_LAZY(char, ring, 4 * 4100);
 	static __thread unsigned next;
-	char* tmp = ring[next++ & 3];
+	char* tmp = ring + 4100 * (next++ & 3);
 	rq_u32(r); uint32_t n = rq_u32(r);
 	if (n > 4096 || r->p + n > r->len) { tmp[0] = 0; r->p = r->len; return tmp; }
 	memcpy(tmp, r->b + r->p, n); tmp[n] = 0;
@@ -1113,6 +1172,122 @@ static int32_t uc_hid(struct uc_call* c) {
 		return kIOReturnUnsupported;
 	}
 }
+// Teclado y ratón (IOHIDEventDriver, ver io_registry): IOHIDEventServiceUserClient de IOHIDFamily. WindowServer abre la
+// conexión (tipo 'esuc'), registra un puerto de avisos, proyecta la cola (memoria tipo 0) y llama a open (selector 0).
+// La cola es un IODataQueue de xnu: {queueSize, head, tail} y entradas {tamaño (alineado a 4), datos}; cada evento va
+// como IOHIDSystemQueueElement (marca de tiempo, emisor, opciones, 0, número de eventos) seguido de los datos del evento
+// (cabecera {tamaño, tipo, opciones, profundidad}). El núcleo avisa con un mensaje vacío (id 0) cuando la cola estaba
+// vacía. Los eventos llegan de tahoe-view por /dev/shm/tahoe-input-<id> (ver tools/tahoe-view/src/entrada.rs): un hilo
+// de este proceso (WindowServer) los convierte y los encola. Disposición de los datos medida en IOKit.framework
+// (IOHIDEventCreateKeyboardEvent, RelativePointerEvent, ScrollEvent):
+//   teclado (tipo 3, 32 bytes): +0x10 página de uso (u16), +0x12 uso (u16), +0x14 pulsada (u32), +0x1c pulsaciones (u8)
+//   puntero (tipo 17, 48 bytes): +0x10/+0x18/+0x20 x, y, z (double), +0x28 botones; absoluto: x e y de 0 a 1
+//   rueda (tipo 6, 28 bytes): +0x10/+0x14/+0x18 x, y, z en 16.16
+static pthread_mutex_t hidq_lock = PTHREAD_MUTEX_INITIALIZER;
+static int hidq_of(int ent) { for (int k = 0; k < 2; k++) if (hidq[k].ent == ent) return k; return -1; }
+static void hidq_put(int k, const uint8_t* ev, uint32_t evsize) {
+	pthread_mutex_lock(&hidq_lock);
+	struct hidq* q = &hidq[k];
+	if (!q->mem || !q->open) { pthread_mutex_unlock(&hidq_lock); return; }
+	struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+	uint8_t el[28 + 64] = { 0 };                                     // IOHIDSystemQueueElement + datos
+	uint64_t t = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec, sender = io_e[q->ent].id;
+	uint32_t one = 1;
+	memcpy(el, &t, 8); memcpy(el + 8, &sender, 8); memcpy(el + 24, &one, 4);
+	memcpy(el + 28, ev, evsize);
+	uint32_t len = 28 + evsize, dsize = (len + 3) & ~3u, esize = dsize + 4;
+	volatile uint32_t* hdr = (volatile uint32_t*)q->mem;            // queueSize, head, tail
+	uint8_t* data = q->mem + 12;
+	uint32_t qs = hdr[0], tail = __atomic_load_n(&hdr[2], __ATOMIC_RELAXED), head = __atomic_load_n(&hdr[1], __ATOMIC_ACQUIRE), nt;
+	if (tail >= head) {
+		if (qs - tail >= esize) { memcpy(data + tail, &dsize, 4); memcpy(data + tail + 4, el, len); nt = tail + esize; }
+		else if (head > esize) {                                     // vuelta al principio (como IOSharedDataQueue)
+			memcpy(data, &dsize, 4);
+			if (qs - tail >= 4) memcpy(data + tail, &dsize, 4);
+			memcpy(data + 4, el, len); nt = esize;
+		} else { pthread_mutex_unlock(&hidq_lock); return; }        // llena: se pierde
+	} else if (head - tail > esize) { memcpy(data + tail, &dsize, 4); memcpy(data + tail + 4, el, len); nt = tail + esize; }
+	else { pthread_mutex_unlock(&hidq_lock); return; }
+	__atomic_store_n(&hdr[2], nt, __ATOMIC_RELEASE);
+	if (tail != head) { __atomic_thread_fence(__ATOMIC_SEQ_CST); head = __atomic_load_n(&hdr[1], __ATOMIC_RELAXED); }
+	uint32_t port = q->port;
+	pthread_mutex_unlock(&hidq_lock);
+	if (tail == head && port) {                                      // estaba vacía: aviso (cabecera sola, id 0)
+		struct hdr h = { .bits = 0x13 /* COPY_SEND */, .size = sizeof h, .remote = port };
+		port_send(port, (const uint8_t*)&h, sizeof h);
+	}
+}
+static void* hid_input_thread(void* p) {
+	(void)p;
+	int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	struct sockaddr_un a = { .sun_family = AF_UNIX };
+	fb_path(a.sun_path, sizeof a.sun_path, "input");
+	unlink(a.sun_path);
+	if (fd < 0 || bind(fd, (struct sockaddr*)&a, sizeof a) != 0) { logf_("    iokit: entrada %s: %s\n", a.sun_path, strerror(errno)); return NULL; }
+	chmod(a.sun_path, 0600);
+	logf_("    iokit: <%d> teclado y ratón en %s\n", (int)getpid(), a.sun_path);
+	int32_t m[4];
+	for (;;) {
+		ssize_t n = recv(fd, m, sizeof m, 0);
+		if (n < 0 && errno == EINTR) continue;
+		if (n < 0) break;
+		if (n != sizeof m) continue;
+		uint8_t ev[48] = { 0 };
+		uint32_t opt = 0;
+		if (m[0] == 1) {                                             // tecla
+			uint32_t sz = 0x20, ty = 3, down = m[3] != 0; uint16_t up = (uint16_t)m[1], u = (uint16_t)m[2];
+			memcpy(ev, &sz, 4); memcpy(ev + 4, &ty, 4); memcpy(ev + 8, &opt, 4);
+			memcpy(ev + 0x10, &up, 2); memcpy(ev + 0x12, &u, 2); memcpy(ev + 0x14, &down, 4); ev[0x1c] = 1;
+			hidq_put(0, ev, sz);
+		} else if (m[0] == 2) {                                      // puntero absoluto
+			uint32_t sz = 0x30, ty = 17, btn = (uint32_t)m[3]; opt = 1;   // kIOHIDEventOptionIsAbsolute
+			double x = (double)m[1] / (FB_W - 1), y = (double)m[2] / (FB_H - 1), z = 0;
+			if (x < 0) x = 0; if (x > 1) x = 1; if (y < 0) y = 0; if (y > 1) y = 1;
+			memcpy(ev, &sz, 4); memcpy(ev + 4, &ty, 4); memcpy(ev + 8, &opt, 4);
+			memcpy(ev + 0x10, &x, 8); memcpy(ev + 0x18, &y, 8); memcpy(ev + 0x20, &z, 8); memcpy(ev + 0x28, &btn, 4);
+			hidq_put(1, ev, sz);
+		} else if (m[0] == 3) {                                      // rueda (líneas)
+			uint32_t sz = 0x1c, ty = 6; int32_t fx = m[1] * 65536, fy = m[2] * 65536, fz = 0;
+			memcpy(ev, &sz, 4); memcpy(ev + 4, &ty, 4); memcpy(ev + 8, &opt, 4);
+			memcpy(ev + 0x10, &fx, 4); memcpy(ev + 0x14, &fy, 4); memcpy(ev + 0x18, &fz, 4);
+			hidq_put(1, ev, sz);
+		}
+		if (io_trace_on()) logf_("    iokit: entrada %d %d %d %d\n", m[0], m[1], m[2], m[3]);
+	}
+	return NULL;
+}
+// Memoria de la cola (connect_map_memory tipo 0): la primera vez arranca el hilo que recibe de tahoe-view.
+static uint8_t* hidq_map(int ent) {
+	pthread_mutex_lock(&hidq_lock);
+	int k = -1;
+	for (int i = 0; i < 2; i++) if (hidq[i].ent == ent) k = i;
+	uint8_t* m = k >= 0 ? hidq[k].mem : NULL;
+	if (k >= 0 && !m) {
+		m = mmap(NULL, HIDQ_SIZE + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (m == MAP_FAILED) m = NULL;
+		else { uint32_t qs = HIDQ_SIZE; memcpy(m, &qs, 4); hidq[k].mem = m; }   // tras la cola, el apéndice (versión 0)
+	}
+	static int started;
+	int start = m && !started;
+	if (start) started = 1;
+	pthread_mutex_unlock(&hidq_lock);
+	if (start) {
+		pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+		pthread_t th; pthread_create(&th, &at, hid_input_thread, NULL);
+	}
+	return m;
+}
+static int32_t uc_hidev(struct uc_call* c) {
+	*c->noutband = 0; *c->nsout = 0;
+	int k = hidq_of(c->ent);
+	switch (c->selector) {
+	case 0: case 1:                                                    // open(opciones) / close(opciones)
+		if (k >= 0) { pthread_mutex_lock(&hidq_lock); hidq[k].open = c->selector == 0; pthread_mutex_unlock(&hidq_lock); }
+		return 0;
+	case 3: return 0;                                                  // setElementValue (LED de mayúsculas...): sin efecto
+	default: return kIOReturnUnsupported;                              // copyEvent / copyMatchingEvent: no hay estado que dar
+	}
+}
 // LiveFS (AppleLIFSUserClient): fskitd registra con él sus puertos al arrancar. El kext no está (su código va en la colección
 // del núcleo), así que no se conocen sus métodos: se aceptan sin datos de salida y se anota cada selector la primera vez. Los
 // montajes de FSKit no funcionan; basta para que fskitd arranque y conteste qué módulos hay (ninguno de usuario).
@@ -1163,6 +1338,53 @@ static int32_t uc_es(struct uc_call* c) {
 	}
 	return 0;
 }
+// AppleAPFSContainer (cliente deducido de APFS.framework, que es quien lo usa; storagekitd y diskutil pasan por él):
+//   8    APFSExtendedSpaceInfo: salida variable, diccionario serializado con «size», «used», «reserve» y «Max volume count»
+//        (storagekitd mete cada uno en un NSDictionary: si falta alguno, se cae).
+//   9    APFSVolumeRole: entra u32 índice del volumen (sN - 1), u16 0xffff si se cambia el rol y u16 el rol nuevo; sale u16
+//        el rol (System 1, Preboot 0x10, Data 0x40, como RoleValue).
+//   0x12 APFSVolumeQueryCryptoProgress (entran 8 bytes, salen 32) y 0x1e APFSStatisticsProcessContainer (entran 4, salen
+//        64): a cero, sin cifrado en curso ni estadísticas.
+// El resto (crear o borrar volúmenes, etc.) sale a cero sin efecto; se anota cada selector la primera vez. El espacio es
+// el del disco de Linux donde está la raíz de macOS.
+static int32_t uc_apfs_container(struct uc_call* c) {
+	static uint64_t seen;
+	if (c->selector < 64 && !(seen & (1ull << c->selector))) {
+		seen |= 1ull << c->selector;
+		logf_("    iokit: <%d> AppleAPFSContainer selector %u (%u escalares, %u bytes, salida %u)\n", (int)getpid(), c->selector, c->nsin, c->ninband, *c->noutband);
+	}
+	memset(c->outband, 0, *c->noutband);
+	memset(c->sout, 0, *c->nsout * 8);
+	if (c->selector == 8) {
+		// Diccionario por nombre BSD: el contenedor (disk1: size, used, reserve, «Max volume count») y cada volumen (disk1sN:
+		// fs_used, fs_reserve, fs_quota). storagekitd lo recorre (_addToExtendedDiskInfoCacheWithDictionary:) y cada valor
+		// tiene que ser otro diccionario. Los volúmenes comparten el sistema de archivos de Linux: lo usado va al del sistema.
+		if (!c->ool_out || !c->ool_out_size) return kIOReturnBadArgument;
+		struct statfs sf; uint64_t size = io_disk_size, used = 0;
+		if (tahoe_root && statfs(tahoe_root, &sf) == 0) used = (uint64_t)(sf.f_blocks - sf.f_bfree) * sf.f_bsize;
+		int nvol = (sys_volume_present(0) && sys_volume_present(1)) ? 3 : 1;
+		char d[2048];
+		int n = snprintf(d, sizeof d, "<dict><key>disk1</key><dict><key>size</key><integer size=\"64\">%llu</integer><key>used</key>"
+		                 "<integer size=\"64\">%llu</integer><key>reserve</key><integer size=\"64\">0</integer>"
+		                 "<key>Max volume count</key><integer size=\"32\">100</integer></dict>", (unsigned long long)size, (unsigned long long)used);
+		for (int v = 1; v <= nvol && n > 0 && (size_t)n < sizeof d; v++)
+			n += snprintf(d + n, sizeof d - n, "<key>disk1s%d</key><dict><key>fs_used</key><integer size=\"64\">%llu</integer>"
+			              "<key>fs_reserve</key><integer size=\"64\">0</integer><key>fs_quota</key><integer size=\"64\">0</integer></dict>",
+			              v, (unsigned long long)(v == 1 ? used : 0));
+		if (n > 0 && (size_t)n < sizeof d) n += snprintf(d + n, sizeof d - n, "</dict>");
+		if (n < 0 || (size_t)n + 1 > sizeof d || (size_t)n + 1 > c->ool_out_size) return kIOReturnNoMemory;
+		memcpy((void*)c->ool_out, d, (size_t)n + 1); *c->ool_out_len = (uint64_t)n + 1; *c->noutband = 0; *c->nsout = 0;
+		return 0;
+	}
+	if (c->selector == 9) {
+		static const uint16_t roles[] = { 1, 0x40, 0x10 };                 // disk1s1, s2, s3 (como RoleValue)
+		uint32_t i = 0; if (c->ninband >= 4) memcpy(&i, c->inband, 4);
+		int full = sys_volume_present(0) && sys_volume_present(1);
+		if (i >= (full ? 3u : 1u) || *c->noutband < 2) return kIOReturnBadArgument;
+		uint16_t r = roles[i]; memcpy(c->outband, &r, 2); *c->noutband = 2;
+	}
+	return 0;
+}
 static int io_trace = -1;                                   // traza de IOKit (TAHOE_IOKIT o /dev/shm/tahoe-iokit-trace)
 // AppleGPUWranglerUserClient (interfaz deducida de GPUWrangler.framework, que es quien la usa):
 //   0xa0000001 saludo: entra y sale una estructura de 4 bytes con la versión ('GW' << 16 | 2).
@@ -1190,7 +1412,7 @@ static int32_t uc_gpuwrangler(struct uc_call* c) {
 	case 0xa0000002: {
 		static uint8_t list[0x23bc];
 		memset(list, 0, sizeof list);
-		int gpu = ent_by_name_cls("IGPU", "IOPCIDevice"), fb = ent_by_name_cls("AppleIntelFramebuffer", "AppleIntelFramebuffer");
+		int gpu = ent_by_name_cls("IGPU", "IOPCIDevice"), fb = ent_by_name_cls(FB_CLASS, FB_CLASS);
 		int acc = ent_by_name_cls("IOAccelerator", "IOAccelerator");
 		if (gpu >= 0) {
 			uint32_t n = 1; memcpy(list, &n, 4);
@@ -1198,7 +1420,9 @@ static int32_t uc_gpuwrangler(struct uc_call* c) {
 			uint16_t id = 1; memcpy(e, &id, 2);
 			uint32_t fl = 0x10; memcpy(e + 4, &fl, 4);              // integrada
 			uint64_t rg = io_e[gpu].id, ra = acc >= 0 ? io_e[acc].id : 0, nfb = fb >= 0, rfb = fb >= 0 ? io_e[fb].id : 0;
-			memcpy(e + 0x10, &rg, 8); memcpy(e + 8, ra ? &ra : &rg, 8);
+			// +8 es el AGDC (AppleGraphicsDeviceControl): sin acelerador no hay ninguno (0). Con el ID de la GPU ahí,
+			// CoreDisplay intentaba presentar con IOPresentment, fallaba y dejaba la pantalla desconectada (offline).
+			memcpy(e + 0x10, &rg, 8); memcpy(e + 8, &ra, 8);
 			memcpy(e + 0x18, &nfb, 8); memcpy(e + 0x20, &rfb, 8);
 		}
 		if (c->ool_out && c->ool_out_size >= sizeof list) {
@@ -1359,8 +1583,13 @@ static int32_t uc_fb(struct uc_call* c) {
 		return 0;
 	case 3: case 4: case 9: case 10: case 11: case 12: case 14: case 15: case 16: case 19: case 20:
 		return 0;                                                      // cambios de modo, cursor, gamma, CLUT, atributos: aceptados
-	case 21:                                                           // CoreDisplay::Framebuffer registra un búfer suyo de 0x20
-		return 0;                                                      // bytes (1, 0, dirección, tamaño): se acepta, queda a cero
+	case 21: {                                                         // CoreDisplay::Framebuffer registra un búfer suyo de 0x20
+		char hx[200] = ""; int o = 0;                                  // bytes (1, 0, dirección, tamaño): se acepta, queda a cero
+		for (uint32_t i = 0; i < c->ninband && i < 64 && o < (int)sizeof hx - 4; i++) o += snprintf(hx + o, sizeof hx - o, "%02x", ((const uint8_t*)c->inband)[i]);
+		logf_("    iokit: <%d> framebuffer selector 21: %u escalares (%lx %lx), entrada %uB %s, salida %uB\n", (int)getpid(), c->nsin,
+			c->nsin > 0 ? (unsigned long)c->sin[0] : 0UL, c->nsin > 1 ? (unsigned long)c->sin[1] : 0UL, c->ninband, hx, want);
+		return 0;
+	}
 	case 18: {                                                         // getAttribute(atributo)
 		uint32_t a = c->nsin ? (uint32_t)c->sin[0] : 0;
 		c->sout[0] = 0; *c->nsout = 1;
@@ -1452,7 +1681,7 @@ static int32_t sf_fill(const struct sf_ent* e, uint8_t* out, uint32_t want, uint
 	return 0;
 }
 static int32_t uc_iosurface(struct uc_call* c) {
-	uint32_t want = *c->noutband;
+	uint32_t want = *c->noutband, want_s = *c->nsout;
 	*c->noutband = 0; *c->nsout = 0;
 	switch (c->selector) {
 	case 0: {                                                          // crear
@@ -1479,6 +1708,16 @@ static int32_t uc_iosurface(struct uc_call* c) {
 		if (!e->used || e->id != id) return kIOReturnNotFound;
 		return sf_fill(e, c->outband, want, c->noutband);
 	}
+	// Valores y metadatos de una superficie (IOSurfaceSetValue 9, IOSurfaceClientSetBulkAttachments 0x1b,
+	// IOSurfaceClientSetCoreVideoBridgedKeys 0x39) y el ajuste de la conexión 0x2b (ioSurfaceConnectInternal): se aceptan
+	// sin guardarlos. SecurityAgent (CoreVideo, el fondo de la ventana de inicio de sesión) los repetía sin fin al fallar.
+	case 9: { uint32_t n = want < 4 ? want : 4; memset(c->outband, 0, n); *c->noutband = n; return 0; }
+	case 0x1b: case 0x39: case 0x2b: return 0;
+	case 0x14:                                                         // IOSurfaceClientSetPurgeable(ID, estado) -> estado anterior
+		if (want_s >= 1) { c->sout[0] = 0; *c->nsout = 1; }           // kIOSurfacePurgeableNonVolatile
+		return 0;
+	case 0x29: return 0;                                               // IOSurfaceSharedEventRemoveEventListener: no hay
+	                                                                   // oyentes (SecurityAgent abortaba si fallaba)
 	case 0xd: {
 		uint8_t info[0x28] = { 0 };
 		uint16_t one = 1; memcpy(info + 0x22, &one, 2);
@@ -1532,13 +1771,15 @@ long io_user_client_trap(uint32_t port, uint32_t idx, const uint64_t* p) {
 }
 static uc_method_fn uc_hook_for(const char* cls) {
 	if (!strcmp(cls, "AppleGPUWrangler")) return uc_gpuwrangler;
-	if (!strcmp(cls, "AppleIntelFramebuffer")) return uc_fb;
+	if (!strcmp(cls, FB_CLASS)) return uc_fb;
 	if (!strcmp(cls, "IOSurfaceRoot")) return uc_iosurface;
 	if (!strcmp(cls, "IOWatchdog")) return uc_watchdog;
 	if (!strcmp(cls, "EndpointSecurityDriver")) return uc_es;
+	if (!strcmp(cls, "AppleAPFSContainer")) return uc_apfs_container;
 	if (!strcmp(cls, "AppleSMC")) return uc_smc;
 	if (!strcmp(cls, "com_apple_filesystems_lifs")) return uc_lifs;
 	if (!strcmp(cls, "IOHIDSystem")) return uc_hid;
+	if (!strcmp(cls, "IOHIDEventDriver")) return uc_hidev;
 	return NULL;
 }
 
@@ -1798,9 +2039,27 @@ static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* re
 		return rp_props(rep, h, v, xml);
 	}
 	case 2828: case 2821: {                                                             // set_properties (entrada / conexión)
+		// Como el núcleo: las claves quedan en la entrada (en la del servicio, si llegan por una conexión). IOGraphicsLib guarda
+		// así la configuración del framebuffer (IOFBConfig: modos y temporizaciones) y CoreDisplay la relee; si se tiraba,
+		// CoreDisplay no encontraba modos, elegía el 0 y daba la pantalla por desconectada (componía en una virtual).
 		rq_ndr(&q);
-		int ok = h->id == 2821 || (ent >= 0 && !strcmp(io_e[ent].cls, "IODTNVRAM"));
-		size_t n = reply_begin(rep, h, KERN_SUCCESS_); int32_t res = ok ? 0 : kIOReturnNotPrivileged; memcpy(rep + n, &res, 4); return n + 4;
+		struct val* nv = rq_match_ool(&q);
+		int ok = ent >= 0 && nv && nv->t == V_DICT;
+		char keys[300] = ""; int o = 0;
+		if (ok) for (int i = 0; i < nv->cnt; i++) {
+			if (!io_e[ent].props) io_e[ent].props = v_new(V_DICT);
+			v_set(io_e[ent].props, nv->key[i], nv->kid[i]);
+			if (o < (int)sizeof keys - 40) o += snprintf(keys + o, sizeof keys - o, "%s%s", i ? " " : "", nv->key[i]);
+			if (io_trace_on()) {                                       // con la traza de IOKit, el contenido entero
+				struct sbuf xb = { 0 }; xml_ser(&xb, nv->kid[i]); sb_put(&xb, "", 1);
+				for (size_t k = 0; xb.p && k < xb.n; k += 900)           // en trozos: logf_ corta a 1 KB
+					logf_("    iokit: <%d> set_properties %s [%zu] = %.900s\n", (int)getpid(), nv->key[i], k, (char*)xb.p + k);
+				free(xb.p);
+			}
+		}
+		logf_("    iokit: <%d> set_properties (%s) en %s: %s\n", (int)getpid(), h->id == 2821 ? "conexión" : "entrada",
+			ent >= 0 ? io_e[ent].cls : "?", ok ? keys : "(no es un diccionario)");
+		size_t n = reply_begin(rep, h, KERN_SUCCESS_); int32_t res = ok || h->id == 2821 ? 0 : kIOReturnBadArgument; memcpy(rep + n, &res, 4); return n + 4;
 	}
 
 	// ---- iteradores
@@ -1959,7 +2218,13 @@ static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* re
 	}
 	case 2816: if (self && self->kind == K_CONNECT) self->closed = 1; return rp_err(rep, h, KERN_SUCCESS_);
 	case 2817: if (!self || self->kind != K_CONNECT) return rp_err(rep, h, kIOReturnBadArgument); return reply_port(rep, h, ent_handle(self->ent), 17);
-	case 2820: case 2867: return rp_err(rep, h, KERN_SUCCESS_);                         // add_client / set_notification_port
+	case 2867:                                                                          // set_notification_port(tipo, puerto, ref)
+		if (self && self->kind == K_CONNECT && q.nport) {
+			int k = hidq_of(self->ent);
+			if (k >= 0) { pthread_mutex_lock(&hidq_lock); hidq[k].port = q.port[0]; pthread_mutex_unlock(&hidq_lock); }
+		}
+		return rp_err(rep, h, KERN_SUCCESS_);
+	case 2820: return rp_err(rep, h, KERN_SUCCESS_);                                    // add_client
 	case 2863: {                                                                        // io_connect_map_memory_into_task
 		if (!self || self->kind != K_CONNECT || self->closed) return rp_err(rep, h, kIOReturnNoDevice);
 		rq_ndr(&q); uint32_t mtype = rq_u32(&q); uint64_t addr = rq_u64(&q), size = rq_u64(&q); uint32_t flags = rq_u32(&q);
@@ -1971,7 +2236,14 @@ static size_t mig_iokit_req(const struct hdr* h, const uint8_t* req, uint8_t* re
 			memcpy(rep + n, &a, 8); memcpy(rep + n + 8, &sz, 8);
 			return n + 16;
 		}
-		if (!strcmp(io_e[self->ent].cls, "AppleIntelFramebuffer") && (mtype == 100 || mtype == 110 || mtype == 0)) {
+		if (!strcmp(io_e[self->ent].cls, "IOHIDEventDriver") && mtype == 0) {   // la cola de eventos
+			uint8_t* m = hidq_map(self->ent); if (!m) return rp_err(rep, h, kIOReturnNoMemory);
+			size_t n = reply_begin(rep, h, KERN_SUCCESS_);
+			uint64_t a = (uint64_t)m, sz = HIDQ_SIZE + 12 + 28;           // cabecera, cola y apéndice {versión, mensaje}
+			memcpy(rep + n, &a, 8); memcpy(rep + n + 8, &sz, 8);
+			return n + 16;
+		}
+		if (!strcmp(io_e[self->ent].cls, FB_CLASS) && (mtype == 100 || mtype == 110 || mtype == 0)) {
 			uint8_t* m = mtype == 100 ? fb_cursor : fb_map();                   // 100 cursor compartido; 110/0 memoria de vídeo
 			if (!m) return rp_err(rep, h, mtype == 100 ? kIOReturnBadArgument : kIOReturnNoMemory);
 			size_t n = reply_begin(rep, h, KERN_SUCCESS_);

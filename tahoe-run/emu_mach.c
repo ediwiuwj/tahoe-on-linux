@@ -93,9 +93,11 @@ static size_t mig_make_memory_entry(const struct hdr* req, const uint8_t* m, uin
 	uint64_t len = round_up(size);
 	uint32_t port = port_create(0);
 	char path[128]; me_path(path, sizeof path, port);
+	uint32_t perm = 0; memcpy(&perm, m + 64, 4);
+	int named_create = (perm & 0x20000) != 0;                // MAP_MEM_NAMED_CREATE: memoria nueva (a cero), sin rango de origen
 	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-	int ok = fd >= 0 && ftruncate(fd, (off_t)len) == 0 && off != 0;
-	if (ok) {
+	int ok = fd >= 0 && len && ftruncate(fd, (off_t)len) == 0 && (off != 0 || named_create);
+	if (ok && !named_create) {
 		uint8_t* tmp = malloc(len);
 		memcpy(tmp, (void*)off, len);                           // lo que ya hubiera escrito el creador
 		if (pwrite(fd, tmp, len, 0) != (ssize_t)len) ok = 0;
@@ -103,7 +105,8 @@ static size_t mig_make_memory_entry(const struct hdr* req, const uint8_t* m, uin
 		if (ok && mmap((void*)off, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) ok = 0;
 	}
 	if (fd >= 0) close(fd);
-	if (mach_trace()) { uint32_t perm = 0; memcpy(&perm, m + 64, 4); logf_("    MT pid=%d make_memory_entry tamaño=0x%lx dir=0x%lx permiso=0x%x -> puerto 0x%x %s\n", (int)getpid(), size, off, perm, port, ok ? "ok" : "FALLO"); }
+	if (ok) port_me_created(port); else unlink(path);
+	if (mach_trace()) { logf_("    MT pid=%d make_memory_entry tamaño=0x%lx dir=0x%lx permiso=0x%x -> puerto 0x%x %s\n", (int)getpid(), size, off, perm, port, ok ? "ok" : "FALLO"); }
 	if (!ok) return reply_begin(r, req, KERN_INVALID_ARG);
 	size_t n = reply_port(r, req, port, 17);
 	memcpy(r + n, NDR_LE, 8); memcpy(r + n + 8, &len, 8);
@@ -133,6 +136,7 @@ static size_t mig_mach_vm_map(const struct hdr* req, const uint8_t* m, uint8_t* 
 		char path[128]; me_path(path, sizeof path, objname);
 		addr = rmap_add(tpid, path, moff, round_up(size), cur & 7, mask + 1);
 		if (!addr) kr = KERN_NO_SPACE_;
+		else port_me_hold(objname, tpid);                    // el destino lo abre al primer acceso: que no se borre antes
 		goto done;
 	}
 	if (objname) {                                          // objeto = entrada de memoria compartida
@@ -644,6 +648,10 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	int r = port_receive(rcv_name, timeout_ms, &m, &size, snd, cap > tsize ? cap - tsize : 1, large);
 	if (r == 0x10004004 && large) {                           // el mensaje sigue en la cola; el receptor lee el tamaño de la cabecera
 		struct hdr hh; memcpy(&hh, m, sizeof hh);
+		// MACH_RCV_LARGE_IDENTITY: como XNU, msgh_local_port lleva el puerto donde espera el mensaje (el miembro del
+		// conjunto), para recibirlo de ahí con el búfer mayor. CoreAnimation lo hace así en WindowServer: con 0 recibía
+		// en el puerto 0 y abortaba al llegar la primera ventana grande.
+		if (options & 0x8) { hh.local = hh.remote; memcpy(m, &hh, sizeof hh); }
 		safe_write(buf, m, sizeof hh < size ? sizeof hh : size);
 		if (trace_all) logf_("    mach_msg: 0x%x demasiado grande (%u bytes, cabía %u): RCV_LARGE\n", rcv_name, size, cap);
 		if (total) *total = size + tsize;                      // tamaño necesario (con trailer), para kevent ext[1]
@@ -752,12 +760,14 @@ static long mach_msg2(struct ctx* c) {
 
 	static int mtr = -1;
 	if (mtr < 0) mtr = access("/dev/shm/tahoe-mach-trace", F_OK) == 0;   // traza ligera: solo envíos
-	static __thread uint8_t reqbuf[512 * 1024];     // los mensajes entre procesos (listas de servicios...) pueden ser grandes
-	uint8_t* req = reqbuf;
-	uint8_t rep[1024];
+	enum { REQBUF = 512 * 1024 };                   // los mensajes entre procesos (listas de servicios...) pueden ser grandes
+	TLS_LAZY(uint8_t, req, REQBUF);
+	// Respuesta del núcleo emulado: io_connect_method (mig_iokit) devuelve hasta 4096 bytes de salida más 16 escalares;
+	// con 1024 bytes en la pila, una salida grande (SecurityAgent) la desbordaba y el proceso moría por __stack_chk_fail.
+	TLS_LAZY(uint8_t, rep, 8192);
 	uint32_t rcv_name = (uint32_t)(c->a[5] >> 32);
 	if (!(options & 1) && (options & 2)) return vec_aux(user_receive(c, options, rbuf, rcv_name, rcvsize), aux_addr, aux_size);
-	if (ssize < sizeof(struct hdr) || ssize > sizeof reqbuf || safe_read(buf, req, ssize) != (ssize_t)ssize) {
+	if (ssize < sizeof(struct hdr) || ssize > REQBUF || safe_read(buf, req, ssize) != (ssize_t)ssize) {
 		logf_("    mach_msg2: mensaje ilegible o fuera de tamaño (%u bytes)\n", ssize);
 		return 0x10000002;                                      // MACH_SEND_INVALID_DATA
 	}
@@ -838,6 +848,7 @@ static long mach_msg2(struct ctx* c) {
 		uint32_t nm; memcpy(&nm, req + 32, 4);
 		port_release_send_once(nm);
 		kobj_release_thread(nm);                                  // puerto de un hilo de otro proceso (task_threads)
+		port_send_release(nm, -1);                                // para el aviso NO_SENDERS
 		n = reply_begin(rep, &h, KERN_SUCCESS_);
 		break;
 	}
@@ -1009,6 +1020,20 @@ static long mach_msg2(struct ctx* c) {
 		n = reply_begin(rep, &h, port_swap_guard(nm, o, nw));
 		break;
 	}
+	case 3215: {                                                  // mach_port_extract_right(task, name, msgt_name) -> poly
+		// CoreAnimation saca así un derecho send-once de un puerto suyo para cada commit síncrono (encode_sync_request): sin
+		// esta rutina (MIG_BAD_ID) el commit no quedaba programado y abortaba («Assertion failed: (scheduled)»), y con él
+		// loginwindow, SecurityAgent y cualquier app al mostrar su primera ventana. Los nombres son globales: el derecho
+		// extraído lleva el mismo nombre que el puerto.
+		uint32_t nm, how; memcpy(&nm, req + 32, 4); memcpy(&how, req + 36, 4);
+		int rp = port_rpid(nm);
+		if (rp < 0) { n = reply_begin(rep, &h, 15 /* KERN_INVALID_NAME */); break; }
+		if ((how == 20 || how == 21 || how == 16) && rp != (int32_t)getpid()) { n = reply_begin(rep, &h, 17 /* KERN_INVALID_RIGHT */); break; }
+		uint8_t disp = how == 21 || how == 18 ? 18 : how == 16 ? 16 : how == 17 || how == 19 || how == 20 ? 17 : 0;
+		if (!disp) { n = reply_begin(rep, &h, 4 /* KERN_INVALID_ARGUMENT */); break; }
+		n = reply_port(rep, &h, nm, disp);
+		break;
+	}
 	case 3229: {                                                  // mach_port_set_context(task, name, context)
 		uint32_t nm; uint64_t ctx; memcpy(&nm, req + 32, 4); memcpy(&ctx, req + 36, 8);
 		n = reply_begin(rep, &h, port_set_context(nm, ctx));
@@ -1113,6 +1138,15 @@ static long mach_msg2(struct ctx* c) {
 		return MACH_RCV_TOO_LARGE;
 	}
 	if (safe_write(rbuf, rep, n + 8) != (ssize_t)(n + 8)) return MACH_RCV_INVALID_DATA_;
+	{   // derechos de envío que la respuesta da a este proceso (task_get_special_port...): cuentan para NO_SENDERS
+		uint32_t bits; memcpy(&bits, rep, 4);
+		if (bits & 0x80000000u) {
+			struct nucleo_desc d[16];
+			int nd = nucleo_descriptores(rep, (uint32_t)n, d, 16);
+			for (int i = 0; i < nd && i < 16; i++)
+				if ((d[i].clase == NUCLEO_PUERTO || d[i].clase == NUCLEO_PUERTO_GUARDA) && d[i].disp == 17 && d[i].nombre) port_send_got(d[i].nombre);
+		}
+	}
 	return MACH_MSG_SUCCESS;
 }
 

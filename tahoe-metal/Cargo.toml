@@ -1,0 +1,17 @@
+[package]
+name = "tahoe-metal"
+version = "0.1.0"
+edition = "2021"
+description = "Driver Metal de tahoe-run: bundle de macOS (Mach-O) que implementa MTLDevice sobre la GPU de Linux (Vulkan, tahoe-gpu)"
+
+[lib]
+name = "tahoe_metal"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "metalprobe"
+path = "src/bin/metalprobe.rs"
+
+[profile.release]
+panic = "unwind"
+opt-level = 2

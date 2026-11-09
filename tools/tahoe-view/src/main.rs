@@ -5,7 +5,11 @@
 //! que es justo el formato de softbuffer: un u32 0RGB en little endian). El cursor, por software, está en
 //! `/dev/shm/tahoe-fbcursor-<id>` (StdFBShmem_t): aquí solo se marca su posición (`cursorLoc`, +28).
 //!
+//! El teclado y el ratón de la ventana van a macOS (ver `entrada.rs`).
+//!
 //! Uso: `tahoe-view [archivo]` (por omisión, el `/dev/shm/tahoe-fb-*` más reciente; espera a que aparezca). F12 cierra.
+
+mod entrada;
 
 use std::fs::File;
 use std::num::NonZeroU32;
@@ -16,9 +20,11 @@ use std::time::{Duration, Instant};
 use memmap2::Mmap;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, NamedKey, PhysicalKey};
+
+use entrada::Entrada;
 use winit::window::{Window, WindowId};
 
 const HDR_PAGE: usize = 4096;
@@ -125,14 +131,26 @@ impl Screen {
         eprintln!("tahoe-view: {}: {}x{}", path.display(), hdr.width, hdr.height);
         Some(Screen { fb, cursor, hdr })
     }
+    /// Colocación de la pantalla en una ventana de `w`×`h`: escala entera hacia abajo si la ventana es más pequeña
+    /// (si no, 1:1), centrada. Devuelve (escala, x, y, ancho, alto) de la imagen en la ventana.
+    fn layout(&self, w: usize, h: usize) -> (usize, usize, usize, usize, usize) {
+        let (sw, sh) = (self.hdr.width as usize, self.hdr.height as usize);
+        let scale = (sw.div_ceil(w.max(1))).max(sh.div_ceil(h.max(1))).max(1);
+        let (dw, dh) = (sw / scale, sh / scale);
+        (scale, (w - dw.min(w)) / 2, (h - dh.min(h)) / 2, dw, dh)
+    }
+    /// Punto de la ventana -> píxel de la pantalla de macOS (dentro de sus límites).
+    fn to_screen(&self, x: f64, y: f64, w: usize, h: usize) -> (i32, i32) {
+        let (scale, ox, oy, _, _) = self.layout(w, h);
+        let sx = ((x - ox as f64) * scale as f64).clamp(0.0, self.hdr.width as f64 - 1.0);
+        let sy = ((y - oy as f64) * scale as f64).clamp(0.0, self.hdr.height as f64 - 1.0);
+        (sx as i32, sy as i32)
+    }
     /// Dibuja la pantalla de macOS (escalada al tamaño de la ventana, sin deformar) en `out` (ancho `w`).
     fn draw(&self, out: &mut [u32], w: usize, h: usize) {
         out.fill(0);
-        let (sw, sh) = (self.hdr.width as usize, self.hdr.height as usize);
-        // escala entera hacia abajo si la ventana es más pequeña; si no, 1:1 centrado
-        let scale = (sw.div_ceil(w)).max(sh.div_ceil(h)).max(1);
-        let (dw, dh) = (sw / scale, sh / scale);
-        let (ox, oy) = ((w - dw.min(w)) / 2, (h - dh.min(h)) / 2);
+        let sw = self.hdr.width as usize;
+        let (scale, ox, oy, dw, dh) = self.layout(w, h);
         let mut row = vec![0u32; sw];
         for y in 0..dh.min(h) {
             self.fb.copy_u32(y * scale * self.hdr.bytes_per_row as usize, &mut row);
@@ -163,6 +181,9 @@ struct App {
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     screen: Option<Screen>,
     next: Instant,
+    entrada: Option<Entrada>,
+    pos: (i32, i32),
+    botones: i32,
 }
 
 impl App {
@@ -173,6 +194,9 @@ impl App {
         let path = self.path.clone().or_else(newest_framebuffer);
         if let Some(p) = path {
             self.screen = Screen::open(&p);
+            if self.screen.is_some() {
+                self.entrada = entrada::ruta_entrada(&p).map(Entrada::new);
+            }
             if let (Some(s), Some(w)) = (&self.screen, &self.window) {
                 let _ = w.request_inner_size(PhysicalSize::new(s.hdr.width, s.hdr.height));
             }
@@ -214,6 +238,41 @@ impl ApplicationHandler for App {
                 }
                 let _ = buf.present();
             }
+            WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(k), state, repeat: false, .. }, .. } => {
+                // sin las repeticiones de Linux: macOS repite por su cuenta mientras la tecla siga pulsada
+                if let (Some(e), Some(u)) = (&self.entrada, entrada::uso_hid(k)) {
+                    e.enviar(entrada::TECLA, 7, u as i32, (state == ElementState::Pressed) as i32);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let (Some(s), Some(win)) = (&self.screen, &self.window) else { return };
+                let size = win.inner_size();
+                self.pos = s.to_screen(position.x, position.y, size.width as usize, size.height as usize);
+                if let Some(e) = &self.entrada {
+                    e.enviar(entrada::PUNTERO, self.pos.0, self.pos.1, self.botones);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let bit = match button {
+                    MouseButton::Left => 1,
+                    MouseButton::Right => 2,
+                    MouseButton::Middle => 4,
+                    _ => return,
+                };
+                if state == ElementState::Pressed { self.botones |= bit } else { self.botones &= !bit }
+                if let Some(e) = &self.entrada {
+                    e.enviar(entrada::PUNTERO, self.pos.0, self.pos.1, self.botones);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x.round() as i32, y.round() as i32),
+                    MouseScrollDelta::PixelDelta(p) => ((p.x / 20.0).round() as i32, (p.y / 20.0).round() as i32),
+                };
+                if let (Some(e), true) = (&self.entrada, dx != 0 || dy != 0) {
+                    e.enviar(entrada::RUEDA, dx, dy, 0);
+                }
+            }
             _ => {}
         }
     }
@@ -234,7 +293,7 @@ impl ApplicationHandler for App {
 fn main() {
     let path = std::env::args_os().nth(1).map(PathBuf::from);
     let el = EventLoop::new().expect("no hay servidor gráfico (Wayland o X11)");
-    let mut app = App { path, window: None, surface: None, screen: None, next: Instant::now() };
+    let mut app = App { path, window: None, surface: None, screen: None, next: Instant::now(), entrada: None, pos: (0, 0), botones: 0 };
     el.run_app(&mut app).expect("bucle de eventos");
 }
 

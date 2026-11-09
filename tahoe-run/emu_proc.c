@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <dirent.h>
+#include <execinfo.h>
 #include <stddef.h>
 #include "tahoe.h"
 __thread struct ctx* volatile t_cur;   // llamada en curso del hilo (la pone el manejador de SIGSYS)
@@ -222,8 +223,9 @@ static long bsd_setrlimit(struct ctx* c) {
 	// Los límites que fija launchd para cada servicio (NumberOfFiles, AS, DATA...) no deben bajar los del anfitrión: tahoe-run
 	// necesita descriptores altos y mucho espacio de direcciones para relanzarse, y un servicio sin ellos moría con exit(111).
 	if (r == RLIMIT_NOFILE) {
-		if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < 4096) rl.rlim_cur = 4096;
-		if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < 4096) rl.rlim_max = 4096;
+		// por encima de FD_INTERNAL_BASE: ahí viven los descriptores del emulador (fd_hi); el programa ve 10240 (getrlimit)
+		if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < FD_INTERNAL_LIMIT) rl.rlim_cur = FD_INTERNAL_LIMIT;
+		if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < FD_INTERNAL_LIMIT) rl.rlim_max = FD_INTERNAL_LIMIT;
 	} else if (r != RLIMIT_CORE) return 0;
 	return setrlimit(r, &rl) == 0 ? 0 : -darwin_errno(errno);
 }
@@ -455,6 +457,9 @@ static void on_dump(int sig, siginfo_t* si, void* v) {
 		if ((nr >> 24) == 2 && (num == 5 || num == 398 || num == 463 || num == 464)) {   // open / openat: la ruta
 			char path[256] = ""; safe_read(num >= 463 ? a[1] : a[0], path, sizeof path - 1); path[255] = 0;
 			k += snprintf(ln + k, sizeof ln - k, " \"%s\"", path);
+		} else if ((nr >> 24) == 1 && num == 47) {                 // mach_msg2: opciones y puerto de recepción
+			uint64_t a5 = 0; safe_read((uint64_t)&c->a[5], &a5, 8);
+			k += snprintf(ln + k, sizeof ln - k, " args=%lx,%lx,%lx recibe en 0x%x", a[0], a[1], a[2], (uint32_t)(a5 >> 32));
 		} else k += snprintf(ln + k, sizeof ln - k, " args=%lx,%lx,%lx", a[0], a[1], a[2]);
 		logf_("%s\n", ln);
 	} else {
@@ -482,6 +487,7 @@ static void on_dump_all(int sig, siginfo_t* si, void* v) {
 	(void)sig;
 	char sel = tahoe_selector_get();
 	tahoe_selector_set(0);
+	port_dump_queues();                                         // puertos con mensajes en cola y sus conjuntos
 	long me = syscall(SYS_gettid);
 	DIR* d = opendir("/proc/self/task");
 	struct dirent* e;
@@ -561,7 +567,9 @@ static void on_sigtrap(int sig, siginfo_t* si, void* v) {
 	tahoe_selector_set(sel);
 }
 void diag_breakpoints(void) {
-	if (!diag_target()) return;
+	// en el proceso de /dev/shm/tahoe-stacks, o en los de /dev/shm/tahoe-brk-who sin el resto del diagnóstico (que
+	// ralentiza mucho: WindowServer no llegaba en 15 minutos a donde se quería mirar)
+	if (!diag_target() && !names_match("/dev/shm/tahoe-brk-who")) return;
 	tahoe_sigaction(SIGRTMIN + 4, on_dump);                     // volcados de hilos a petición (SIGRTMIN+5, ver on_dump_all)
 	tahoe_sigaction(SIGRTMIN + 5, on_dump_all);
 	FILE* f = fopen("/dev/shm/tahoe-break", "r");
@@ -587,6 +595,7 @@ void diag_dump_threads(void) {
 	if (done || !diag_target()) return;
 	done = 1;
 	tahoe_sigaction(SIGRTMIN + 4, on_dump);
+	port_dump_queues();                                          // puertos de este proceso con mensajes, y sus conjuntos
 	DIR* d = opendir("/proc/self/task");
 	if (!d) return;
 	long me = syscall(SYS_gettid);
@@ -599,10 +608,30 @@ void diag_dump_threads(void) {
 	struct timespec ts = { 0, 200 * 1000000L }; nanosleep(&ts, NULL);   // que escriban antes de salir
 }
 
+// SIGABRT que no viene de un abort() de macOS (ver bsd_pthread_kill): un assert o un pánico del propio tahoe-run, o un
+// kill de fuera. Sin esto el proceso moría sin rastro («fin <pid> por la señal 6 de Linux»). Se anota quién lo envió, la
+// pila de tahoe-run (addr2line -e tahoe-run) y qué hacía el hilo de macOS, y se muere igual.
+static __thread int guest_abort;
+static void on_sigabrt(int sig, siginfo_t* si, void* v) {
+	tahoe_selector_set(0);
+	if (!guest_abort) {
+		logf_("    SIGABRT del anfitrión <%d:%ld> código=%d de pid %d\n", (int)getpid(), (long)syscall(SYS_gettid), si->si_code, (int)si->si_pid);
+		void* bt[32]; int n = backtrace(bt, 32);
+		char ln[1024]; int k = snprintf(ln, sizeof ln, "    SIGABRT <%d> pila de tahoe-run:", (int)getpid());
+		for (int i = 0; i < n && k < (int)sizeof ln - 24; i++) k += snprintf(ln + k, sizeof ln - k, " %p", bt[i]);
+		logf_("%s\n", ln);
+		on_dump(sig, si, v);
+	}
+	struct { void* h; unsigned long flags; void* restorer; unsigned long mask; } dfl = { 0 };   // SIG_DFL y otra vez
+	syscall(SYS_rt_sigaction, SIGABRT, &dfl, NULL, 8);
+	syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGABRT);
+}
+
 static long bsd_pthread_kill(struct ctx* c) {
 	int s = (int)c->a[1];
 	if (s == 0) return 0;
 	if (s == 6) {
+		guest_abort = 1;
 		diag_crash(c->uc);
 		// abort() de un programa de macOS: el proceso muere por SIGABRT de verdad (launchd lo ve como en un Mac), pero sin
 		// volcado de memoria de Linux: systemd-coredump guardaría ~10 MB y avisaría en el escritorio en cada caída.
@@ -677,6 +706,8 @@ static int read_strv(uint64_t addr, char*** out, int max) {
 
 // Ruta del programa (vista de macOS) -> ruta real en el host.
 static void host_path(const char* guest, char* out, size_t cap) {
+	guest += tahoe_resolve_skip(guest);
+	if (tahoe_metal_path(guest, out, cap)) return;
 	if (tahoe_root && guest[0] == '/' && !tahoe_host_passthrough(guest)) { snprintf(out, cap, "%s%s", tahoe_root, guest); return; }
 	snprintf(out, cap, "%s", guest);
 }
@@ -860,7 +891,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	nargv[k++] = (char*)g_dyld_path;
 	nargv[k++] = hpath;
 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
-	char** nenv = calloc(ec + 13 + 8 + 9, sizeof(char*));
+	char** nenv = calloc(ec + 17 + 8 + 9, sizeof(char*));
 	int e = 0;
 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
 	char b1[4300], b2[4300];
@@ -878,6 +909,14 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (getenv("TAHOE_OSK_FILE")) { snprintf(b8, sizeof b8, "TAHOE_OSK_FILE=%s", getenv("TAHOE_OSK_FILE")); nenv[e++] = b8; }
 	static char b9[600];
 	if (getenv("TAHOE_SMBIOS_FILE")) { snprintf(b9, sizeof b9, "TAHOE_SMBIOS_FILE=%s", getenv("TAHOE_SMBIOS_FILE")); nenv[e++] = b9; }
+	static char b10[600];                                   // argumentos de arranque (boot-args): para todos los procesos
+	if (getenv("TAHOE_BOOTARGS")) { snprintf(b10, sizeof b10, "TAHOE_BOOTARGS=%s", getenv("TAHOE_BOOTARGS")); nenv[e++] = b10; }
+	static char b11[64];                                    // identidad PCI de la GPU emulada (emu_iokit.inc)
+	if (getenv("TAHOE_GPU")) { snprintf(b11, sizeof b11, "TAHOE_GPU=%s", getenv("TAHOE_GPU")); nenv[e++] = b11; }
+	static char b12[4300];                                  // driver Metal de tahoe-run (emu_fs.c, emu_iokit.inc)
+	if (getenv("TAHOE_METAL")) { snprintf(b12, sizeof b12, "TAHOE_METAL=%s", getenv("TAHOE_METAL")); nenv[e++] = b12; }
+	static char b13[300];
+	if (getenv("TAHOE_GPU_SOCK")) { snprintf(b13, sizeof b13, "TAHOE_GPU_SOCK=%s", getenv("TAHOE_GPU_SOCK")); nenv[e++] = b13; }
 	if (getenv("TAHOE_FD2LOG")) nenv[e++] = (char*)"TAHOE_FD2LOG=1";
 	if (getenv("TAHOE_DEBUG_NOREBOOT")) nenv[e++] = (char*)"TAHOE_DEBUG_NOREBOOT=1";   // modo depuración (ver emu_iokit.inc)
 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
@@ -989,7 +1028,7 @@ static long bsd_bsdthread_ctl(struct ctx* c) {
 static __thread sigjmp_buf thr_exit, wq_park;
 static __thread int thr_exit_ok, wq_park_ok, wq_terminated;
 extern void guest_thread_done(void);
-struct new_thread { uint64_t pthread, func, arg, stack, flags; };
+struct new_thread { uint64_t pthread, func, arg, stack, flags; uint32_t kport; };
 extern void enter_guest_thread(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((noreturn));
 static void* thread_main(void* p) {
 	struct new_thread t = *(struct new_thread*)p;
@@ -997,10 +1036,8 @@ static void* thread_main(void* p) {
 	// Como XNU: base de GS en el TSD del hilo, se avisa con TSD_BASE_SET y se retira SUSPENDED (libpthread lo exige).
 	{ FILE* f = fopen("/dev/shm/tahoe-watch-func", "r"); unsigned long fn = 0; if (f) { if (fscanf(f, "%lx", &fn) != 1) fn = 0; fclose(f); } g_watch = fn && fn == t.func; }
 	uint64_t flags = t.flags & ~0x20000000u;
-	uint32_t kport = alloc_port();
+	uint32_t kport = t.kport;
 	if (mach_trace()) logf_("    THR <%d:%ld> puerto de hilo 0x%x func=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), kport, t.func);
-	// cada hilo tiene su propio nombre de puerto (os_unfair_lock lo usa como dueño)
-	if (mach_thread_self_offset) *(uint32_t*)(t.pthread + tsd_offset + mach_thread_self_offset) = kport;   // el kernel deja aquí el puerto del hilo (relativo al TSD)
 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, t.pthread + tsd_offset); flags |= 0x10000000u; }
 	if (sigsetjmp(thr_exit, 1) == 0) {
 		thr_exit_ok = 1;
@@ -1013,6 +1050,11 @@ static long bsd_bsdthread_create(struct ctx* c) {
 	struct new_thread* t = malloc(sizeof *t);
 	if (!t) return -D_ENOMEM;
 	*t = (struct new_thread){ .pthread = c->a[3], .func = c->a[0], .arg = c->a[1], .stack = c->a[2], .flags = c->a[4] };
+	// Cada hilo tiene su propio nombre de puerto (os_unfair_lock lo usa como dueño). Como XNU, queda en el TSD del
+	// pthread antes de volver: pthread_join lo mira, y si el hilo aún no había arrancado lo daba por terminado (volvía en
+	// el acto, liberaba la pila y el hilo nuevo caía al arrancar sobre ella).
+	t->kport = alloc_port();
+	if (mach_thread_self_offset) safe_write(t->pthread + tsd_offset + mach_thread_self_offset, &t->kport, 4);
 	pthread_attr_t at; pthread_attr_init(&at);
 	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
 	pthread_attr_setstacksize(&at, 1 << 20);
@@ -1168,7 +1210,7 @@ static void wl_defer_owned_locked(struct wl_state* w) {
 static pthread_mutex_t wq_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wq_pool_cv = PTHREAD_COND_INITIALIZER;
 static struct wq_job* wq_queue_head; static struct wq_job** wq_queue_tail = &wq_queue_head;
-static int wq_live, wq_idle;
+static int wq_live, wq_idle, wq_nq;   // hilos vivos, hilos libres esperando, trabajos en cola
 
 // first: primer servicio de este hilo (libpthread inicializa su pthread_t). exit_thread: en vez de trabajo, la llamada de
 // salida de XNU (nkevents = -1, WORKQ_EXIT_THREAD_NKEVENT) para que libpthread retire el hilo de su lista y lo termine.
@@ -1233,7 +1275,7 @@ static void* wq_main(void* p) {
 		pthread_mutex_lock(&wq_pool_lock);
 		job = NULL;
 		for (;;) {
-			if (wq_queue_head) { job = wq_queue_head; wq_queue_head = job->next; if (!wq_queue_head) wq_queue_tail = &wq_queue_head; break; }
+			if (wq_queue_head) { job = wq_queue_head; wq_queue_head = job->next; if (!wq_queue_head) wq_queue_tail = &wq_queue_head; wq_nq--; break; }
 			struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
 			dl.tv_sec += WQ_IDLE_MS / 1000; dl.tv_nsec += (WQ_IDLE_MS % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
 			wq_idle++;
@@ -1257,12 +1299,15 @@ static void wq_spawn_job(struct wq_job* j) {
 	static int max_hilos;
 	if (!max_hilos) { const char* e = getenv("TAHOE_WQ_MAX"); max_hilos = e && atoi(e) > 0 ? atoi(e) : WQ_MAX_HILOS; }
 	pthread_mutex_lock(&wq_pool_lock);
-	if (wq_idle > 0 || wq_live >= max_hilos) {                     // un hilo libre la atiende, o espera turno
-		if (!wq_idle) {                                            // sin hilos libres: la petición espera (una línea por segundo)
+	// Un hilo libre la atiende, o espera turno. Los libres se cuentan descontando los trabajos ya encolados: un hilo
+	// despertado no deja de contar como libre hasta que retoma el candado, y dos peticiones seguidas iban a la cola para
+	// un único hilo libre; si la primera bloqueaba (una llamada síncrona al propio proceso), la segunda no salía nunca.
+	if (wq_nq < wq_idle || wq_live >= max_hilos) {
+		if (wq_nq >= wq_idle) {                                    // sin hilos libres: la petición espera (una línea por segundo)
 			static time_t ult; time_t now = time(NULL);
 			if (now != ult) { ult = now; logf_("    hilos de cola: %d en uso (máximo), la petición espera\n", wq_live); }
 		}
-		*wq_queue_tail = j; wq_queue_tail = &j->next;
+		*wq_queue_tail = j; wq_queue_tail = &j->next; wq_nq++;
 		pthread_cond_signal(&wq_pool_cv);
 		pthread_mutex_unlock(&wq_pool_lock);
 		return;
@@ -1580,7 +1625,18 @@ static long bsd_ulock_wake(struct ctx* c) {
 	return n > 0 ? 0 : -D_ENOENT;
 }
 
+// ptrace: no hay depuradores dentro del emulador. PT_DENY_ATTACH (31, «que nadie me depure») y PT_TRACE_ME (0) se aceptan
+// sin efecto; SecurityAgent (la ventana de inicio de sesión) sale con «Unable to deny attach» si PT_DENY_ATTACH falla.
+// El resto (adjuntarse a otro proceso, leer su memoria...) no se admite: EPERM, como con un proceso protegido.
+static long bsd_ptrace(struct ctx* c) {
+	int req = (int)c->a[0];
+	if (req == 31 || req == 0) return 0;
+	return -1;                                              // EPERM
+}
+
 void emu_proc_init(void) {
+	tahoe_sigaction(SIGABRT, on_sigabrt);
+	reg_bsd(26, bsd_ptrace);
 	reg_bsd(515, bsd_ulock_wait); reg_bsd(516, bsd_ulock_wake); reg_bsd(544, bsd_ulock_wait2);
 	reg_bsd(550, bsd_map_with_linking);
 	reg_bsd(96, bsd_setpriority); reg_bsd(100, bsd_getpriority);

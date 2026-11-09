@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 #include <sys/types.h>
 #include <ucontext.h>
 
@@ -24,6 +25,8 @@ void reg_mach(unsigned num, emu_fn fn);
 
 // Utilidades
 void logf_(const char* fmt, ...);
+int tahoe_metal_path(const char* guest, char* out, size_t cap);   // driver Metal (TAHOE_METAL): emu_fs.c
+int tahoe_metal_guest(const char* host, char* out, size_t cap);
 int darwin_errno(int linux_errno);
 int darwin_open_flags(int darwin_flags);
 long open_symlink(int dfd, const char* p, int dflags, int lflags, long fd);   // O_SYMLINK de Darwin
@@ -42,6 +45,19 @@ int cs_file_platform(int fd);     // emu_cs.c: 1 si el archivo lleva firma de pl
 void sys_volumes_mount(void);       // emu_fs.c: volúmenes Data y Preboot de un macOS completo (en el PID 1)
 extern const char *g_cache_path, *g_dyld_path, *g_self_exe;   // para relanzar tahoe-run en execve   // raíz del sistema de archivos de macOS 26 (TAHOE_ROOT)
 extern int trace_all;
+// Búferes grandes por hilo: un __thread de tamaño fijo va al TLS estático, que glibc reserva y pone a cero en CADA hilo
+// nuevo (eran ~830 KB por hilo: con ~100 procesos de 20-30 hilos, ~2 GB). Así se reservan con mmap al primer uso (solo
+// ocupa lo que se toca, a cero como antes) y se liberan al terminar el hilo (guest_thread_done).
+void* tls_lazy(void** slot, size_t size);
+// Descriptores propios del emulador (registro, sockets de aviso de los puertos, eventfd/timerfd/epoll de kqueue...): van de
+// FD_INTERNAL_BASE en adelante, por encima de lo que el programa cree tener (getdtablesize y RLIMIT_NOFILE dicen 10240), y
+// el programa no puede cerrarlos ni pisarlos con dup2. Un demonio que al arrancar cierra todos sus descriptores (snmptrapd,
+// vpnd: close desde getdtablesize hacia abajo) se llevaba por delante los del emulador y moría con SIGILL.
+#define FD_INTERNAL_BASE 10240
+#define FD_INTERNAL_LIMIT 16384                      // RLIMIT_NOFILE real mínimo (el programa no puede bajarlo)
+int fd_hi(int fd);
+void fd_limit_raise(void);
+#define TLS_LAZY(type, name, count) static __thread type* name##_tls; type* name = (type*)tls_lazy((void**)&name##_tls, sizeof(type) * (count))
 
 // Módulos
 void emu_sysctl_init(void);
@@ -59,6 +75,11 @@ void emu_net_init(void);
 void emu_fs2_init(void);
 void emu_port_init(void);
 uint32_t port_create(int is_set);
+void port_me_created(uint32_t port);
+void port_dump_queues(void);                        // diagnóstico: colas de los puertos de este proceso
+void port_send_got(uint32_t port);                 // derecho de envío recibido en una respuesta del núcleo (NO_SENDERS)
+void port_send_release(uint32_t port, int delta);  // deallocate (-1) / mod_refs de un derecho de envío
+void port_me_hold(uint32_t port, int32_t pid);
 // Códigos de mach_msg (osfmk/mach/message.h). Con sufijo _ para no chocar con definiciones locales.
 #define MACH_SEND_INVALID_DATA_  0x10000002
 #define MACH_SEND_INVALID_DEST_  0x10000003
@@ -97,6 +118,16 @@ void cred_env(char* out, size_t cap);
 void emu_cred_init(void);
 void emu_fs_xattr_init(void);
 int tahoe_host_passthrough(const char* p);
+// XNU (macOS 15+) admite «/.resolve/<opciones>/ruta»: opciones de resolución (como las de openat2) dentro de la propia
+// ruta. El Asistente de configuración mira así /private/var/db/.AppleSetupDone; sin entenderlas, el archivo «no existía»
+// y loginwindow lanzaba el Asistente en vez de la ventana de inicio de sesión. Aquí se quitan (las opciones se ignoran).
+static inline size_t tahoe_resolve_skip(const char* p) {
+	if (strncmp(p, "/.resolve/", 10)) return 0;
+	size_t k = 10;
+	while (p[k] >= '0' && p[k] <= '9') k++;
+	return (k > 10 && p[k] == '/') ? k : 0;
+}
+static inline void tahoe_resolve_strip(char* p) { size_t k = tahoe_resolve_skip(p); if (k) memmove(p, p + k, strlen(p + k) + 1); }
 const char* tahoe_dev_alias(const char* p, char* buf, size_t cap);
 void memfd_reopen(void);
 int fsevents_open(void);
