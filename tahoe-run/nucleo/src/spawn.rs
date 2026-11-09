@@ -1,6 +1,7 @@
 //! Lectura segura de acciones de archivo Darwin; no accede a memoria invitada.
 #![forbid(unsafe_code)]
 pub const TAM_ACCION: usize = 1040;
+pub const FD_INTERNAL_BASE: i32 = 10240;
 #[repr(C)]
 pub struct BytesAccion { pub bytes: [u8; TAM_ACCION] }
 #[repr(C)]
@@ -10,6 +11,25 @@ pub struct Accion {
 }
 #[repr(C)]
 pub struct Resultado { pub accion: Accion, pub error: i32 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Plan { pub destinos: [i32; 32], pub len: u32, pub max: i32, pub error: i32 }
+pub const fn plan_nuevo() -> Plan { Plan { destinos: [0;32], len: 0, max: 2, error: 0 } }
+pub fn plan_agregar(mut plan: Plan, fd: i32) -> Plan {
+    if plan.error != 0 { return plan; }
+    if plan.len as usize > plan.destinos.len() { plan.error = 22; return plan; }
+    if fd < 0 || fd >= FD_INTERNAL_BASE { plan.error = 9; return plan; }
+    if plan.destinos[..plan.len as usize].contains(&fd) { return plan; }
+    if plan.len as usize == plan.destinos.len() { plan.error = 7; return plan; }
+    plan.destinos[plan.len as usize] = fd;
+    plan.len += 1;
+    plan.max = plan.max.max(fd);
+    plan
+}
+pub fn plan_contiene(plan: Plan, fd: i32) -> u32 {
+    (plan.error == 0 && (plan.len as usize) <= plan.destinos.len() && plan.destinos[..plan.len as usize].contains(&fd)) as u32
+}
 
 /// Cuenta baja, errno Darwin alto. Capacidad local explícita: nunca truncar.
 pub fn cabecera(capacidad: i32, cantidad: i32, tam: u64, limite: u32) -> u64 {
@@ -28,7 +48,7 @@ pub fn leer(bytes: BytesAccion) -> Resultado {
         argumento: entero(&b,8), oflag: 0, modo: 0, ruta: [0;1024] }, error: 0 };
     let tipo = r.accion.tipo;
     if !matches!(tipo, 0|1|2|3|5|6) { r.error = 45; return r; }
-    if tipo != 5 && (r.accion.fd < 0 || (tipo == 2 && r.accion.argumento < 0)) {
+    if tipo != 5 && (r.accion.fd < 0 || r.accion.fd >= FD_INTERNAL_BASE || (tipo == 2 && (r.accion.argumento < 0 || r.accion.argumento >= FD_INTERNAL_BASE))) {
         r.error = 9; return r;
     }
     let inicio = match tipo { 0 => 14, 5 => 8, _ => return r };
@@ -50,6 +70,23 @@ mod tests {
         assert_eq!(size_of::<Accion>(),1044);
         assert_eq!(offset_of!(Accion,ruta),18);
         assert_eq!(size_of::<Resultado>(),1048);
+        assert_eq!(size_of::<Plan>(),140);
+    }
+    #[test] fn plan_fds_altos_y_repetidos() {
+        let p=plan_nuevo();
+        let p=plan_agregar(p,1025);
+        let p=plan_agregar(p,4096);
+        let p=plan_agregar(p,1025);
+        assert_eq!(p.error,0); assert_eq!(p.max,4096); assert_eq!(p.len,2);
+        assert_eq!(plan_contiene(p,1025),1); assert_eq!(plan_contiene(p,1),0);
+        assert_eq!(plan_agregar(p,FD_INTERNAL_BASE).error,9);
+        let mut corrupt=p; corrupt.len=33;
+        assert_eq!(plan_agregar(corrupt,10).error,22); assert_eq!(plan_contiene(corrupt,10),0);
+    }
+    #[test] fn plan_limite_de_acciones() {
+        let mut p=plan_nuevo();
+        for fd in 0..32 { p=plan_agregar(p,fd); }
+        assert_eq!(p.len,32); assert_eq!(plan_agregar(p,50).error,7);
     }
     #[test] fn cuenta_no_se_trunca() {
         assert_eq!(cabecera(32,32,8+32*1040,32),32);

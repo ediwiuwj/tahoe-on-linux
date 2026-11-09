@@ -11,8 +11,14 @@ int32_t nucleo_wait_estado(int32_t linux_estado);
 struct nucleo_spawn_bytes { uint8_t bytes[1040]; };
 struct nucleo_spawn_accion { int32_t type, fd, arg, oflag; uint16_t mode; char path[1024]; };
 struct nucleo_spawn_resultado { struct nucleo_spawn_accion accion; int32_t error; };
+struct nucleo_spawn_plan { int32_t destinos[32]; uint32_t len; int32_t max, error; };
+_Static_assert(sizeof(struct nucleo_spawn_plan) == 140, "spawn_plan");
+struct nucleo_spawn_plan nucleo_spawn_plan_nuevo(void);
+struct nucleo_spawn_plan nucleo_spawn_plan_agregar(struct nucleo_spawn_plan, int32_t);
+uint32_t nucleo_spawn_plan_contiene(struct nucleo_spawn_plan, int32_t);
 _Static_assert(sizeof(struct nucleo_spawn_accion) == 1044 && offsetof(struct nucleo_spawn_accion, path) == 18, "spawn_accion");
 _Static_assert(sizeof(struct nucleo_spawn_resultado) == 1048, "spawn_resultado");
+#define NUCLEO_FD_INTERNAL_BASE 10240
 uint64_t nucleo_spawn_cabecera(int32_t cap, int32_t n, uint64_t tam, uint32_t limite);
 struct nucleo_spawn_resultado nucleo_spawn_accion(struct nucleo_spawn_bytes);
 

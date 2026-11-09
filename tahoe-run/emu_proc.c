@@ -1029,9 +1029,10 @@ static void host_path(const char* guest, char* out, size_t cap) {
 // heredaban todos los descriptores.
 enum { PSFA_OPEN = 0, PSFA_CLOSE = 1, PSFA_DUP2 = 2, PSFA_INHERIT = 3, PSFA_FILEPORT_DUP2 = 4, PSFA_CHDIR = 5, PSFA_FCHDIR = 6 };
 #define PSFA_SIZE 1040
-static struct nucleo_spawn_accion spawn_fa[32];
-static int spawn_fa_n, spawn_cloexec_default;
-static int spawn_setpgroup, spawn_pgroup;                          // POSIX_SPAWN_SETPGROUP: grupo de procesos del hijo (0: el suyo)
+_Static_assert(FD_INTERNAL_BASE == NUCLEO_FD_INTERNAL_BASE, "rango de descriptores spawn Rust/C");
+static __thread struct nucleo_spawn_accion spawn_fa[32];
+static __thread int spawn_fa_n, spawn_cloexec_default;
+static __thread int spawn_setpgroup, spawn_pgroup;                          // POSIX_SPAWN_SETPGROUP: grupo de procesos del hijo (0: el suyo)
 static int read_file_actions(uint64_t addr, uint64_t size) {
 	spawn_fa_n = 0;
 	if (!addr) return size ? -D_EFAULT : 0;
@@ -1061,65 +1062,109 @@ static void psfa_host(const char* guest, char* out, size_t cap) {
 	host_path(guest, tmp, sizeof tmp);
 	char al[64]; snprintf(out, cap, "%s", tahoe_dev_alias(tmp, al, sizeof al));
 }
-// Para posix_spawn del anfitrión: las mismas acciones con sus equivalentes de glibc. Devuelve 0 o un errno de Darwin.
+// Construye una lista de acciones validada; cualquier error deshace el objeto glibc.
 static int psfa_build(posix_spawn_file_actions_t* fa) {
-	posix_spawn_file_actions_init(fa);
-	uint8_t keep[1024] = { 0 };
-	int maxk = 2;
+	int pe = posix_spawn_file_actions_init(fa);
+	if (pe) return -darwin_errno(pe);
+	struct nucleo_spawn_plan plan = nucleo_spawn_plan_nuevo();
+	int cerrados[32], ncerrados = 0;
 	for (int i = 0; i < spawn_fa_n; i++) {
 		struct nucleo_spawn_accion* f = &spawn_fa[i];
 		char hp[1100];
 		switch (f->type) {
-		case PSFA_OPEN: psfa_host(f->path, hp, sizeof hp); posix_spawn_file_actions_addopen(fa, f->fd, hp, darwin_open_flags(f->oflag), f->mode); break;
-		case PSFA_CLOSE: posix_spawn_file_actions_addclose(fa, f->fd); break;
-		case PSFA_DUP2: posix_spawn_file_actions_adddup2(fa, f->fd, f->arg); break;
-		case PSFA_INHERIT: posix_spawn_file_actions_adddup2(fa, f->fd, f->fd); break;   // dup2 consigo mismo: quita FD_CLOEXEC
-		case PSFA_CHDIR: psfa_host(f->path, hp, sizeof hp); posix_spawn_file_actions_addchdir_np(fa, hp); break;
-		case PSFA_FCHDIR: posix_spawn_file_actions_addfchdir_np(fa, f->fd); break;
-		default: logf_("    posix_spawn: acción de archivo %d sin implementar\n", f->type); break;
+		case PSFA_OPEN:
+			psfa_host(f->path, hp, sizeof hp);
+			pe = posix_spawn_file_actions_addopen(fa, f->fd, hp, darwin_open_flags(f->oflag), f->mode);
+			plan = nucleo_spawn_plan_agregar(plan, f->fd); break;
+		case PSFA_CLOSE:
+			pe = posix_spawn_file_actions_addclose(fa, f->fd);
+			cerrados[ncerrados++] = f->fd; break;
+		case PSFA_DUP2:
+			pe = posix_spawn_file_actions_adddup2(fa, f->fd, f->arg);
+			plan = nucleo_spawn_plan_agregar(plan, f->arg); break;
+		case PSFA_INHERIT:
+			pe = posix_spawn_file_actions_adddup2(fa, f->fd, f->fd);
+			plan = nucleo_spawn_plan_agregar(plan, f->fd); break;
+		case PSFA_CHDIR:
+			psfa_host(f->path, hp, sizeof hp);
+			pe = posix_spawn_file_actions_addchdir_np(fa, hp); break;
+		case PSFA_FCHDIR:
+			pe = posix_spawn_file_actions_addfchdir_np(fa, f->fd); break;
+		default: pe = EINVAL; break;
 		}
-		int t = f->type == PSFA_DUP2 ? f->arg : (f->type == PSFA_OPEN || f->type == PSFA_INHERIT) ? f->fd : -1;
-		if (t >= 0 && t < 1024) { keep[t] = 1; if (t > maxk) maxk = t; }
+		if (!pe && plan.error) pe = plan.error;
+		if (pe) goto fail;
 	}
-	if (spawn_cloexec_default) {                                   // el resto se cierra (después: pueden ser origen de un dup2)
-		for (int fd = 0; fd <= maxk; fd++) if (!keep[fd]) posix_spawn_file_actions_addclose(fa, fd);
-		posix_spawn_file_actions_addclosefrom_np(fa, maxk + 1);
+	if (spawn_cloexec_default) {
+		DIR* d = opendir("/proc/self/fd");
+		if (!d) { pe = errno; goto fail; }
+		int self = dirfd(d); struct dirent* e;
+		for (;;) {
+			errno = 0;
+			e = readdir(d);
+			if (!e) { if (errno) pe = errno; break; }
+			if (e->d_name[0] == '.') continue;
+			char* end; long value = strtol(e->d_name, &end, 10);
+			if (*end || value < 0 || value >= FD_INTERNAL_BASE || value == self) continue;
+			int fd = (int)value, explicit_close = 0;
+			for (int i = 0; i < ncerrados; i++) if (cerrados[i] == fd) { explicit_close = 1; break; }
+			if (explicit_close || nucleo_spawn_plan_contiene(plan, fd)) continue;
+			pe = posix_spawn_file_actions_addclose(fa, fd);
+			if (pe) break;
+		}
+		int close_error = closedir(d);
+		if (!pe && close_error) pe = errno;
+		if (pe) goto fail;
 	}
 	return 0;
+fail:
+	posix_spawn_file_actions_destroy(fa);
+	return -darwin_errno(pe);
 }
-// POSIX_SPAWN_SETEXEC: las acciones se hacen en este proceso antes de exec.
-static void psfa_apply_here(void) {
-	uint8_t keep[1024] = { 0 };
+// POSIX_SPAWN_SETEXEC: aplica acciones en el proceso actual; los errores se
+// devuelven, aunque una secuencia fallida puede haber aplicado prefijos.
+static int psfa_apply_here(void) {
+	struct nucleo_spawn_plan plan = nucleo_spawn_plan_nuevo();
 	for (int i = 0; i < spawn_fa_n; i++) {
 		struct nucleo_spawn_accion* f = &spawn_fa[i];
-		char hp[1100];
+		char hp[1100]; int r = 0, target = -1;
 		switch (f->type) {
 		case PSFA_OPEN: {
 			psfa_host(f->path, hp, sizeof hp);
 			int n = (int)syscall(SYS_openat, AT_FDCWD, hp, darwin_open_flags(f->oflag) & ~O_CLOEXEC, f->mode);
-			if (n >= 0 && n != f->fd) { dup2(n, f->fd); close(n); }
-			break;
+			if (n < 0) return -darwin_errno(errno);
+			if (n != f->fd) { r = dup2(n, f->fd); int saved = errno; close(n); if (r < 0) return -darwin_errno(saved); }
+			target = f->fd; break;
 		}
-		case PSFA_CLOSE: close(f->fd); break;
-		case PSFA_DUP2: dup2(f->fd, f->arg); break;
-		case PSFA_INHERIT: { int fl = fcntl(f->fd, F_GETFD); if (fl >= 0) fcntl(f->fd, F_SETFD, fl & ~FD_CLOEXEC); break; }
-		case PSFA_CHDIR: psfa_host(f->path, hp, sizeof hp); if (chdir(hp) != 0) {} break;
-		case PSFA_FCHDIR: if (fchdir(f->fd) != 0) {} break;
-		default: logf_("    posix_spawn: acción de archivo %d sin implementar\n", f->type); break;
+		case PSFA_CLOSE: if (close(f->fd) != 0) return -darwin_errno(errno); break;
+		case PSFA_DUP2: if (dup2(f->fd, f->arg) < 0) return -darwin_errno(errno); target = f->arg; break;
+		case PSFA_INHERIT: {
+			int fl = fcntl(f->fd, F_GETFD); if (fl < 0) return -darwin_errno(errno);
+			if (fcntl(f->fd, F_SETFD, fl & ~FD_CLOEXEC) < 0) return -darwin_errno(errno);
+			target = f->fd; break;
 		}
-		int t = f->type == PSFA_DUP2 ? f->arg : (f->type == PSFA_OPEN || f->type == PSFA_INHERIT) ? f->fd : -1;
-		if (t >= 0 && t < 1024) keep[t] = 1;
+		case PSFA_CHDIR: psfa_host(f->path, hp, sizeof hp); if (chdir(hp) != 0) return -darwin_errno(errno); break;
+		case PSFA_FCHDIR: if (fchdir(f->fd) != 0) return -darwin_errno(errno); break;
+		default: return -D_EINVAL;
+		}
+		if (target >= 0) { plan = nucleo_spawn_plan_agregar(plan, target); if (plan.error) return -plan.error; }
 	}
 	if (spawn_cloexec_default) {
-		DIR* d = opendir("/proc/self/fd"); struct dirent* e;
-		int self = d ? dirfd(d) : -1;
-		while (d && (e = readdir(d))) {
-			int fd = atoi(e->d_name);
-			if (e->d_name[0] == '.' || fd == self || (fd < 1024 && keep[fd])) continue;
-			int fl = fcntl(fd, F_GETFD); if (fl >= 0) fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+		DIR* d = opendir("/proc/self/fd"); if (!d) return -darwin_errno(errno);
+		int self = dirfd(d), error = 0; struct dirent* e;
+		for (;;) {
+			errno = 0; e = readdir(d);
+			if (!e) { if (errno) error = errno; break; }
+			if (e->d_name[0] == '.') continue;
+			char* end; long v = strtol(e->d_name, &end, 10);
+			if (*end || v < 0 || v >= FD_INTERNAL_BASE || v == self || nucleo_spawn_plan_contiene(plan, (int)v)) continue;
+			int fl = fcntl((int)v, F_GETFD); if (fl < 0) { error = errno; break; }
+			if (fcntl((int)v, F_SETFD, fl | FD_CLOEXEC) < 0) { error = errno; break; }
 		}
-		if (d) closedir(d);
+		int ce = closedir(d); if (!error && ce) error = errno;
+		if (error) return -darwin_errno(error);
 	}
+	return 0;
 }
 
 // execve: se relanza tahoe-run con el programa nuevo. Soporta "#!" (hasta 4 niveles).
@@ -1242,16 +1287,26 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (trace_all) logf_("    execve(\"%s\") -> relanzando tahoe-run\n", gpath);
 	if (spawn) {
 		posix_spawn_file_actions_t fa;
-		psfa_build(&fa);
-		posix_spawnattr_t at; posix_spawnattr_init(&at);
-		if (spawn_setpgroup) { posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP); posix_spawnattr_setpgroup(&at, spawn_pgroup); }
-		int pe = posix_spawn(pidout, g_self_exe, &fa, &at, nargv, nenv);
+		int pe = psfa_build(&fa);
+		if (pe) { spawn_fa_n = 0; spawn_cloexec_default = 0; spawn_setpgroup = 0; return pe; }
+		posix_spawnattr_t at;
+		int host_error = posix_spawnattr_init(&at);
+		if (host_error) { posix_spawn_file_actions_destroy(&fa); spawn_fa_n = 0; spawn_cloexec_default = 0; spawn_setpgroup = 0; return -darwin_errno(host_error); }
+		if (spawn_setpgroup) {
+			host_error = posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP);
+			if (!host_error) host_error = posix_spawnattr_setpgroup(&at, spawn_pgroup);
+		}
+		if (!host_error) host_error = posix_spawn(pidout, g_self_exe, &fa, &at, nargv, nenv);
 		posix_spawnattr_destroy(&at);
 		posix_spawn_file_actions_destroy(&fa);
 		spawn_fa_n = 0; spawn_cloexec_default = 0; spawn_setpgroup = 0;
-		return pe ? -darwin_errno(pe) : 0;
+		return host_error ? -darwin_errno(host_error) : 0;
 	}
-	if (spawn_fa_n || spawn_cloexec_default) { psfa_apply_here(); spawn_fa_n = 0; spawn_cloexec_default = 0; }   // POSIX_SPAWN_SETEXEC
+	if (spawn_fa_n || spawn_cloexec_default) {
+		int action_error = psfa_apply_here();
+		spawn_fa_n = 0; spawn_cloexec_default = 0;
+		if (action_error) { spawn_setpgroup = 0; return action_error; }
+	}   // POSIX_SPAWN_SETEXEC
 	if (spawn_setpgroup) { setpgid(0, spawn_pgroup); spawn_setpgroup = 0; }
 	execwatch_notify();                                              // NOTE_EXEC para quien vigila este proceso (kqueue)
 	execve(g_self_exe, nargv, nenv);
@@ -1271,7 +1326,11 @@ static long bsd_posix_spawn(struct ctx* c) {
 		if (ad[1]) { safe_read(ad[1], &psa_flags, 2); safe_read(ad[1] + 12, &psa_pgroup, 4); }   // psa_flags, ..., psa_pgroup (+12)
 	}
 	int file_actions_error = read_file_actions(ad[3], ad[2]);
-	if (file_actions_error) return file_actions_error;
+	if (file_actions_error) {
+		cred_spawn_session(0); spawn_special_n = 0; spawn_setpgroup = 0;
+		spawn_cloexec_default = 0; spawn_fa_n = 0;
+		return file_actions_error;
+	}
 	char gp[256] = "?";
 	safe_string(c->a[1], gp, sizeof gp);
 	spawn_special_n = 0;
