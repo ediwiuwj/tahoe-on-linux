@@ -1,0 +1,42 @@
+name: Integración Metal2Vulkan
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tahoe-gpu/**'
+      - '.github/workflows/metal2vulkan.yml'
+  push:
+    branches: [main, deployment, work/integrate-metal2vulkan]
+    paths:
+      - 'tahoe-gpu/**'
+      - '.github/workflows/metal2vulkan.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  comprobar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar Rust compatible con upstream
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+      - name: Comprobar servidor sin backend upstream
+        working-directory: tahoe-gpu
+        run: cargo check
+      - name: Comprobar integración opcional
+        working-directory: tahoe-gpu
+        run: cargo check --features metal2vulkan
+      - name: Probar rechazo de entradas inválidas
+        working-directory: tahoe-gpu
+        run: cargo test --features metal2vulkan upstream::tests
+      - name: Conservar resolución de dependencias para revisión
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tahoe-gpu-cargo-lock
+          path: tahoe-gpu/Cargo.lock

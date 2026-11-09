@@ -27,6 +27,8 @@ mod prueba;
 mod servir;
 mod shaders;
 mod vk;
+#[cfg(feature = "metal2vulkan")]
+mod upstream;
 
 fn main() {
     let orden = std::env::args().nth(1).unwrap_or_default();
@@ -34,6 +36,10 @@ fn main() {
         "informe" => vk::Gpu::new().map(|g| informe::informe(&g)),
         "prueba" => vk::Gpu::new().and_then(|g| prueba::prueba(&g)),
         "metallib" => listar_metallib(std::env::args().nth(2)),
+        #[cfg(feature = "metal2vulkan")]
+        "metal2vulkan" => upstream::listar(std::env::args().nth(2)),
+        #[cfg(not(feature = "metal2vulkan"))]
+        "metal2vulkan" => Err("Metal2Vulkan no está habilitado: compilar con --features metal2vulkan".into()),
         "extraer" => extraer(std::env::args().skip(2).collect()),
         "air" => leer_air(std::env::args().skip(2).collect()),
         "traducir" => traducir(std::env::args().skip(2).collect()),

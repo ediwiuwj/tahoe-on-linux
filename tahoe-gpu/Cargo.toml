@@ -5,7 +5,13 @@ edition = "2021"
 description = "La GPU del PC para el macOS de tahoe-run: Metal sobre Vulkan (lado Linux)"
 license = "MIT"
 
+[features]
+default = []
+metal2vulkan = ["dep:metal2vulkan"]
+
 [dependencies]
+# Dependencia opcional: revisar LGPL/GPL antes de distribuir el binario enlazado.
+metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan", rev = "219f01365dc4c8eb346816c405b5b17403793764", optional = true }
 ash = "0.38"
 rspirv = "0.12"
 libc = "0.2"
