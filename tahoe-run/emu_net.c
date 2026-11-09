@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 
 #include "tahoe.h"
+#include "nucleo.h"
 
 #define D_EAFNOSUPPORT 47
 #define D_ENOPROTOOPT 42
@@ -70,51 +71,12 @@ static uint32_t sa_out(const uint8_t* l, socklen_t llen, uint8_t* d) {
 	return 0;
 }
 
-// Banderas de mensaje de Darwin (bsd/sys/socket.h:613-643) y su equivalente en Linux.
-#define DMSG_OOB        0x1
-#define DMSG_PEEK       0x2
-#define DMSG_DONTROUTE  0x4
-#define DMSG_EOR        0x8
-#define DMSG_TRUNC      0x10
-#define DMSG_CTRUNC     0x20
-#define DMSG_WAITALL    0x40
-#define DMSG_DONTWAIT   0x80
-#define DMSG_EOF        0x100                          // "data completes connection" (bsd/kern/uipc_socket.c:2405-2412)
-#define DMSG_WAITSTREAM 0x200                          // obsoleto (APPLE_API_OBSOLETE): esperar hasta el final, puede devolver parcial
-#define DMSG_HAVEMORE   0x2000                         // bit de salida: queda más datos (bsd/kern/uipc_socket.c:3876-3881)
-#define DMSG_RCVMORE    0x4000                         // bit de salida: el resto del paquete sigue en el socket (bsd/kern/uipc_socket.c:3863)
-#define DMSG_NEEDSA     0x10000                        // fallar la recepción si no se puede reservar la dirección (bsd/kern/uipc_socket.c:2912)
-#define DMSG_NOSIGNAL   0x80000                        // no generar SIGPIPE (bsd/sys/socket.h:637)
-#define DMSG_USEUPCALL  0x80000000                     // solo para el núcleo: heredar el upcall en sock_accept (bsd/sys/socket.h:642)
-
-static int msg_flags(int f) {                         // MSG_* de Darwin -> Linux
-	int l = 0;
-	if (f & DMSG_OOB) l |= MSG_OOB;
-	if (f & DMSG_PEEK) l |= MSG_PEEK;
-	if (f & DMSG_DONTROUTE) l |= MSG_DONTROUTE;
-	if (f & DMSG_EOR) l |= MSG_EOR;
-	if (f & DMSG_TRUNC) l |= MSG_TRUNC;               // Darwin TRUNC 0x10 -> Linux 0x20
-	if (f & DMSG_CTRUNC) l |= MSG_CTRUNC;             // Darwin CTRUNC 0x20 -> Linux 0x8
-	if (f & DMSG_WAITALL) l |= MSG_WAITALL;           // Darwin WAITALL 0x40 -> Linux 0x100
-	if (f & DMSG_DONTWAIT) l |= MSG_DONTWAIT;         // Darwin DONTWAIT 0x80 -> Linux 0x40
-	// El resto de banderas de Darwin no tiene equivalente en Linux y ADEMÁS su valor coincide con el de otra bandera
-	// de Linux, así que traducirlas cambiaría el comportamiento del socket:
-	//   MSG_EOF 0x100 = Linux MSG_WAITALL (esperaría a llenar el búfer), MSG_HAVEMORE 0x2000 = Linux MSG_ERRQUEUE
-	//   (vaciaría la cola de errores), MSG_RCVMORE 0x4000 = Linux MSG_NOSIGNAL, MSG_NEEDSA 0x10000 = Linux
-	//   MSG_WAITFORONE. MSG_WAITSTREAM 0x200 (bsd/kern/uipc_socket.c:3788) espera el primer fragmento y devuelve lo
-	//   que haya, que es justo lo que hace Linux sin MSG_WAITALL. MSG_USEUPCALL 0x80000000 es solo del núcleo
-	//   (bsd/sys/socket.h:642) y aquí no hay upcalls. Se ignoran todas.
-	//
-	// MSG_NOSIGNAL (0x80000): en XNU el SIGPIPE se lanza al escribir en un socket cerrado si NO viene el bit y el
-	// socket no tiene SO_NOSIGPIPE (bsd/kern/uipc_syscalls.c:1388-1392 en send y 1962-1966 en sendmsg; el estado
-	// por socket está en so->so_flags & SOF_NOSIGPIPE, bsd/kern/uipc_socket.c:4986-4995). El emulador no puede
-	// entregar esa señal al invitado (las señales son virtuales: no se construyen marcos de señal, emu_proc.c:234)
-	// y una señal real en el anfitrión mataría al emulador, no al hilo que escribió. Así que se suprime siempre
-	// (MSG_NOSIGNAL de Linux). PENDIENTE: falta poder entregar SIGPIPE al invitado (ver el informe); cuando exista,
-	// aquí irá  if ((f & DMSG_NOSIGNAL) || sock_nosigpipe_get(fd)) l |= MSG_NOSIGNAL; else l &= ~MSG_NOSIGNAL;
-	l |= MSG_NOSIGNAL;
-	return l;
-}
+// El ABI Linux de la tabla Rust se verifica contra las cabeceras del anfitrión.
+_Static_assert(MSG_OOB == 0x1 && MSG_PEEK == 0x2 && MSG_DONTROUTE == 0x4 &&
+    MSG_EOR == 0x80 && MSG_TRUNC == 0x20 && MSG_CTRUNC == 0x8 &&
+    MSG_WAITALL == 0x100 && MSG_DONTWAIT == 0x40 && MSG_NOSIGNAL == 0x4000,
+    "ABI de banderas Linux incompatible con nucleo/src/red.rs");
+static int msg_flags(int f) { return (int)nucleo_red_msg_flags((uint32_t)f); }
 
 // ---- Estado por socket (descriptor del invitado): SO_NOSIGPIPE (Darwin 0x1022, bsd/sys/socket.h:174) no existe en
 // Linux, que solo tiene MSG_NOSIGNAL por llamada. Se guarda aquí para que getsockopt devuelva el valor puesto (XNU:

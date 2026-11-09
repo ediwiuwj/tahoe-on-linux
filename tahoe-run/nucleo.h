@@ -3,6 +3,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Traducción pura de MSG_* Darwin a Linux x86_64; conserva la supresión de SIGPIPE.
+uint32_t nucleo_red_msg_flags(uint32_t darwin);
+
 // Un descriptor de mensaje Mach ya leído (nucleo/src/mensaje.rs, struct Desc).
 struct nucleo_desc {
 	uint32_t off;      // desplazamiento en el mensaje
