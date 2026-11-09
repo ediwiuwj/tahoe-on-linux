@@ -1,13 +1,11 @@
 # tahoe-on-linux — macOS 26 (Tahoe) sobre el kernel de Linux, sin XNU
 
 
-Capa de compatibilidad propia (`tahoe-run`, en C) que ejecuta binarios x86_64 de **macOS 26** directamente sobre Linux:
-traduce las syscalls BSD y las trampas Mach de XNU en espacio de usuario, y arranca el `launchd` real de macOS.
-Objetivo: el **macOS 26 completo** en la PC, más rápido que un Hackintosh: llegar al Asistente de configuración y al
-escritorio en una ventana de Linux, con aceleración gráfica (Metal sobre Vulkan en la Intel HD 4400: Metal 2 nativo y
-Metal 3 de cara a macOS, emulando lo que falte, ampliando `hasvk` de Mesa si hace falta) y con lo que el Hackintosh no
-tenía, como Bluetooth (a través de BlueZ). La Recovery fue el primer paso y sigue sirviendo de prueba de regresiones.
-[Darling](https://github.com/darlinghq/darling) se usa solo como referencia.
+El propósito no es crear un sistema operativo propio ni una reimplementación de macOS: es ejecutar los binarios originales del userland de **macOS 26** sobre Linux. Linux conserva su kernel; `tahoe-run`, en C, implementa en espacio de usuario parte de las interfaces BSD/Mach que esos binarios esperan y arranca el `launchd` original de Apple. El kernel XNU no se ejecuta.
+
+Para compilar, `tahoe-run/build.sh` consulta un árbol fuente de XNU para generar `sysnames.h` con nombres de syscalls BSD y trampas Mach; no requiere el código fuente completo de macOS. Para ejecutar los componentes Apple se necesitan binarios aportados por el usuario desde una Recovery o instalador que pueda utilizar. Este repositorio no los distribuye.
+
+**Meta a largo plazo, no estado actual:** ejecutar el userland de macOS 26 hasta el Asistente de configuración y un escritorio funcional dentro de una ventana de Linux, con aceleración gráfica Metal sobre Vulkan (Intel HD 4400). La Recovery fue el primer paso y sigue sirviendo de prueba de regresiones. [Darling](https://github.com/darlinghq/darling) se usa solo como referencia.
 
 **Estado actual (14 de octubre de 2026)**, medido en la PC de pruebas (i5-4210U Haswell, 5,8 GB de RAM, Arch/Omarchy, kernel 7.2):
 
@@ -36,7 +34,7 @@ Los binarios de Apple **no** se incluyen (hay que extraerlos de una Recovery pro
 ## Probarlo
 
 ```sh
-tahoe-run/build.sh <ruta al código de xnu>          # compila tahoe-run (C, estático)
+tahoe-run/build.sh <ruta al árbol fuente de XNU>  # consulta syscalls.master/syscall_sw.c y genera sysnames.h
 tools/macos-shell.sh                                 # bash de macOS, sin launchd
 tools/macos-shell.sh --launchd                       # bash de macOS unido a launchd (lo arranca y lo detiene al salir)
 tools/macos-shell.sh --launchd -c 'launchctl list'   # una orden
