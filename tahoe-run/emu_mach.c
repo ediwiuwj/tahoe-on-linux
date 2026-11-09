@@ -858,6 +858,9 @@ static long mach_msg2(struct ctx* c) {
 	h.remote = (uint32_t)rl; h.local = (uint32_t)(rl >> 32);
 	h.voucher = (uint32_t)vi; h.id = (int32_t)(vi >> 32);
 	int kobject = (options & 0x200000000ULL) != 0;
+	int trace_mig = trace_all || (diag_target() && diag_all());
+	if (trace_mig) logf_("    MIG_REQ <%d> id=%d dest=0x%x local=0x%x kobject=%d size=%u opts=0x%lx\n",
+		(int)getpid(), h.id, h.remote, h.local, kobject, ssize, options);
 	if (mtr) logf_("    MT pid=%d.%ld %s dest=0x%x(->%d) resp=0x%x id=%d size=%u rcv=%d\n", (int)getpid(), (long)syscall(SYS_gettid), kobject ? "kobj" : "send", h.remote, kobject ? 0 : port_rpid(h.remote), h.local, h.id, ssize, (options & 2) != 0);
 	if (mtr && !kobject) { char s[200]; if (msg_texts(req, ssize, s, sizeof s)) logf_("      MT textos: %s\n", s); }
 	if (!kobject && msg_trace()) {
@@ -887,7 +890,8 @@ static long mach_msg2(struct ctx* c) {
 			logf_("    mach_msg2: <%d> envío a 0x%x (id=%d, %u bytes) no encolado\n", (int)getpid(), h.remote, h.id, ssize);
 			return port_exists(h.remote) ? 0x1000000d /* MACH_SEND_NO_BUFFER */ : MACH_SEND_INVALID_DEST_;
 		}
-		if (trace_all) logf_("    mach_msg2: envía a 0x%x (respuesta 0x%x) id=%d (%u bytes) bits=0x%x opciones=0x%lx\n", h.remote, h.local, h.id, ssize, h.bits, options);
+		if (trace_mig) logf_("    MIG_SEND_OK <%d> id=%d dest=0x%x\n", (int)getpid(), h.id, h.remote);
+		if (trace_mig) logf_("    mach_msg2: envía a 0x%x (respuesta 0x%x) id=%d (%u bytes) bits=0x%x opciones=0x%lx\n", h.remote, h.local, h.id, ssize, h.bits, options);
 		return (options & 2) ? vec_aux(user_receive(c, options, rbuf, rcv_name, rcvsize), aux_addr, aux_size) : MACH_MSG_SUCCESS;
 	}
 	size_t n;
@@ -1175,7 +1179,7 @@ static long mach_msg2(struct ctx* c) {
 		memcpy(&cnt, req + 24, 4);
 		for (uint32_t i = 0; i < cnt && i < 3; i++) memcpy(&ports[i], req + 28 + i * 12, 4);
 		registered_ports_set(ports, (int)(cnt < 3 ? cnt : 3));
-		if (trace_all) logf_("    mach_ports_register: 0x%x 0x%x 0x%x\n", ports[0], ports[1], ports[2]);
+		if (trace_mig) logf_("    mach_ports_register: 0x%x 0x%x 0x%x\n", ports[0], ports[1], ports[2]);
 		n = reply_begin(rep, &h, KERN_SUCCESS_);
 		break;
 	}     // mach_ports_register: sin efecto
@@ -1201,8 +1205,13 @@ static long mach_msg2(struct ctx* c) {
 		uint32_t bits; int32_t rc; memcpy(&bits, rep, 4); memcpy(&rc, rep + 32, 4);
 		if (n > 36 && !(bits & 0x80000000u) && rc != 0) n = 36;
 	}
+	if (trace_mig) {
+		int32_t kr = -1;
+		if (n >= 36) memcpy(&kr, rep + 32, 4);
+		logf_("    MIG_REPLY <%d> id=%d kr=%d bytes=%zu\n", (int)getpid(), h.id, kr, n);
+	}
 	reply_end(rep, n);
-	if (trace_all) logf_("    mach_msg2: id=%d -> respuesta id=%d (%zu bytes)\n", h.id, h.id + 100, n);
+	if (trace_mig) logf_("    mach_msg2: id=%d -> respuesta id=%d (%zu bytes)\n", h.id, h.id + 100, n);
 
 	if (!(options & 2)) return MACH_MSG_SUCCESS;               // solo envío: no hay respuesta que entregar
 	memset(rep + n, 0, 8);                                      // trailer: tipo 0, tamaño 8
@@ -1211,7 +1220,7 @@ static long mach_msg2(struct ctx* c) {
 	if (kobject && rcvsize < 16) {
 		// En algunas ramas (reinicialización tras fork) el tamaño de recepción de la pila no es fiable. Un cliente MIG
 		// reserva un búfer del tamaño de la respuesta + trailer, y nuestras respuestas tienen el tamaño real.
-		if (trace_all) logf_("    mach_msg2: rcv_size=%u no fiable; se usa el tamaño de la respuesta (%zu+8)\n", rcvsize, n);
+		if (trace_mig) logf_("    mach_msg2: rcv_size=%u no fiable; se usa el tamaño de la respuesta (%zu+8)\n", rcvsize, n);
 		rcvsize = (uint32_t)(n + 8);
 	}
 	if (n + 8 > rcvsize) {
