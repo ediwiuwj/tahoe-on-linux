@@ -1097,7 +1097,7 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 		} else {
 			// Una pendiente aceptada antes no puede perderse ni declarar éxito
 			// si ahora su marco no se puede construir. Fallar cerrado.
-			logf_("    entrega USR1: no se pudo construir marco (%ld)\n", signal_error);
+			logf_("    entrega de señal: no se pudo construir marco (%ld)\n", signal_error);
 			_exit(128 + SIGSEGV);
 		}
 	}
@@ -1112,14 +1112,15 @@ __asm__(".text\n.global tahoe_restorer\n.type tahoe_restorer,@function\ntahoe_re
 extern void tahoe_restorer(void);
 void* tahoe_restorer_addr(void) { return (void*)tahoe_restorer; }
 
-// Sólo USR externas: sin NODEFER, ambas bloqueadas durante el colector.
+// INT/USR externas: sin NODEFER ni RESTART; colector no reentrante.
+// SIGINT NO forma parte de la máscara permanente de SIGSYS.
 int tahoe_usr_sigaction(int sig, void (*h)(int, siginfo_t*, void*), int disposition) {
-	if (sig != SIGUSR1 && sig != SIGUSR2) { errno = EINVAL; return -1; }
+	if (sig != SIGUSR1 && sig != SIGUSR2 && sig != SIGINT) { errno = EINVAL; return -1; }
 	struct { void* h; unsigned long flags; void* restorer; unsigned long mask; } ks = {
 		.h = disposition == 0 ? (void*)SIG_DFL : disposition == 1 ? (void*)SIG_IGN : (void*)h,
 		.flags = SA_SIGINFO | SA_ONSTACK | 0x04000000UL,
 		.restorer = tahoe_restorer,
-		.mask = (1UL << (SIGUSR1 - 1)) | (1UL << (SIGUSR2 - 1)) };
+		.mask = (1UL << (SIGUSR1 - 1)) | (1UL << (SIGUSR2 - 1)) | (1UL << (SIGINT - 1)) };
 	return syscall(SYS_rt_sigaction, sig, &ks, NULL, 8);
 }
 

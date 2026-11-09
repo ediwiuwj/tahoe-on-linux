@@ -1,4 +1,4 @@
-//! Codecs y validación puros para entrega diferida de USR1.
+//! Codecs y validación puros para entrega diferida de INT/USR1/USR2.
 //! La frontera C copia el xstate completo a almacenamiento privado por hilo;
 //! este módulo no accede a memoria invitada ni restaura CPU directamente.
 #![forbid(unsafe_code)]
@@ -222,7 +222,7 @@ pub fn nucleo_senal_pila(rsp: u64, tam: u64) -> u64 {
 /// Selección determinista de auto-señales soportadas; cero si ninguna es elegible.
 /// No consume pendientes: C sólo las retira después de publicar el marco.
 pub fn nucleo_senal_elegible(pendientes: u32, mascara: u32, permitidas: u32) -> u32 {
-    let listas = pendientes & !mascara & permitidas & ((1u32 << 29) | (1u32 << 30));
+    let listas = pendientes & !mascara & permitidas & ((1u32 << 1) | (1u32 << 29) | (1u32 << 30));
     listas & listas.wrapping_neg()
 }
 
@@ -239,12 +239,17 @@ mod conversion_tests {
     use super::*;
     #[test]
     fn pendientes_y_prioridad() {
+        let int = 1u32 << 1;
         let uno = 1u32 << 29;
         let dos = 1u32 << 30;
-        for p in [0, uno, dos, uno | dos, u32::MAX] {
-            for m in [0, uno, dos, u32::MAX] {
-                for a in [0, uno, dos, u32::MAX] {
-                    let esperado = if p & uno != 0 && m & uno == 0 && a & uno != 0 { uno }
+        // Todas las combinaciones INT/USR, además de bits no soportados.
+        let casos = [0, int, uno, dos, int | uno, int | dos, uno | dos,
+            int | uno | dos, 1, 1u32 << 31, u32::MAX];
+        for p in casos {
+            for m in casos {
+                for a in casos {
+                    let esperado = if p & int != 0 && m & int == 0 && a & int != 0 { int }
+                        else if p & uno != 0 && m & uno == 0 && a & uno != 0 { uno }
                         else if p & dos != 0 && m & dos == 0 && a & dos != 0 { dos }
                         else { 0 };
                     assert_eq!(nucleo_senal_elegible(p, m, a), esperado);

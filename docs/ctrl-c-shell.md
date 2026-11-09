@@ -1,69 +1,75 @@
-# Ctrl-C en el prompt: incremento bloqueado por saltos no locales
+# Ctrl-C en el prompt: SIGINT diferida
 
-Estado: **no implementado ni validado**. No se habilita SIGINT parcialmente para
-ocultar la desaparición de Bash. No se ha compilado localmente, lanzado Actions,
-creado commits ni cambiado `tools/probar-shell-pty.py`.
+Estado: incremento implementado sobre `5e39404`, **pendiente de compilar en
+Actions y validar PTY**. No se afirma que la desaparición de Bash esté corregida.
+No se ha compilado localmente, lanzado Actions, creado commits ni cambiado
+`tools/probar-shell-pty.py` durante esta intervención.
 
-## Bloqueo concreto
+## Entrega
 
-La entrega existente en `tahoe-run/emu_proc.c` conserva hasta ocho marcos
-privados por hilo. Sólo `bsd_sigreturn` con estilo 30, dirección y token válidos
-retira el último marco. Las variantes `UC_RESET_ALT_STACK` y
-`UC_SET_ALT_STACK` únicamente actualizan `alt_flags`.
+Alcance monohilo: INT Darwin 2 y USR Darwin 30/31. La selección Rust segura
+incluye ahora el bit 1 y mantiene prioridad determinista INT, USR1, USR2, filtrada
+por máscara y señales permitidas. Las pruebas cubren combinaciones de las tres,
+más bits no soportados; no se ha añadido Rust unsafe ni cambiado la FFI.
 
-Si un handler abandona `_sigtramp` mediante un salto no local, no ejecuta ese
-retorno normal: el marco privado puede quedar activo. Habilitar SIGINT sin
-resolverlo permitiría acumular marcos y alcanzar EAGAIN; el epílogo SIGSYS
-convierte un fallo diferido en terminación. Por tanto, diez interrupciones no
-quedan cubiertas por añadir un tercer slot al colector.
+El colector conserva slots TLS initial-exec y atomics de 64 bits lock-free.
+USR1/USR2 mantienen SI_USER. INT admite SI_USER con pid positivo y SI_KERNEL
+(del terminal); no admite sigqueue/tgkill como si fueran kill. Los slots
+coalescen: gana el primer origen hasta publicar el marco o descartar por IGN.
 
-La fuente Apple consultada es
-[libplatform/src/setjmp/x86_64/setjmp.s](https://github.com/apple-oss-distributions/libplatform/blob/main/src/setjmp/x86_64/setjmp.s):
-`siglongjmp` con máscara guardada pasa por `longjmp`, que restaura la máscara
-mediante `sigprocmask`, llama a `__sigunaltstack` con el estado guardado y sólo
-entonces transfiere a `__longjmp` para restaurar registros/pila. Sin máscara
-guardada pasa directamente a `__longjmp`. Es una referencia de código fuente,
-no una comprobación de la versión concreta de la caché Tahoe usada.
+Para INT SI_KERNEL se guarda sólo un marcador, sin leer la unión pid/uid Linux.
+El siginfo Darwin lleva signo 2, código 0 (sin código específico) y pid/uid 0;
+no se etiqueta SI_USER ni se inventa un remitente. Darwin no define SI_KERNEL
+en [sys/signal.h de XNU](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/signal.h).
+SI_USER conserva código Darwin 0x10001 y pid/uid del emisor. El marcador no
+colisiona con SI_USER de INT porque este último exige pid positivo.
 
-El aviso de pila alternativa no identifica el destino del salto ni qué marcos
-privados atraviesa. Vaciar todos los marcos al recibir RESET rompería un salto
-dentro del propio handler o uno que deba conservar un handler exterior. Inferir
-abandono sólo comparando RSP tampoco cubre cambios de pila. No se ha establecido
-un protocolo seguro que distinga esos casos y preserve máscaras, tokens y
-contextos anidados; no se introduce esa heurística como solución.
+Captura, IGN y DFL se instalan mediante el restaurador propio existente;
+DFL conserva la acción Linux predeterminada. sigpending, limpieza de hilo y
+fork incluyen el nuevo slot. Self-kill INT utiliza el pendiente Darwin como
+USR, sin consumir una llegada externa simultánea. No se amplía entrega a grupos
+ni selección multihilo.
 
-## Requisitos del siguiente incremento
+El handler guest sólo se ejecuta mediante el contexto del epílogo SIGSYS,
+después de materializar el retorno de syscall. No hay llamada directa desde C.
+No se altera la instalación ni máscara de infraestructura SIGSYS. El colector
+bloquea las tres señales únicamente durante su propia ejecución, sin NODEFER
+ni SA_RESTART; no se añade un bloqueo permanente de INT.
 
-- Verificar en la libplatform efectiva de Tahoe la secuencia de salto y definir
-  una retirada precisa de los marcos abandonados, sin tocar FS/GS, selector SUD,
-  `t_cur` ni infraestructura SIGSYS. No llamar al handler invitado desde C.
-- Ampliar juntos selección Rust (bit Darwin 1), colector lock-free, sigpending,
-  limpieza de hilo, captura/IGN/DFL y selección/consumo de metadata externos.
-- Distinguir SIGINT de terminal (`SI_KERNEL`, sin remitente de usuario válido)
-  de `kill` (`SI_USER`, pid/uid); no inventar pid/uid para el primero. Los USR
-  conservan su filtro SI_USER y sus pruebas actuales.
-- Mantener entrega sólo desde el contexto del epílogo SIGSYS. No bloquear SIGINT
-  artificialmente para evitar la prueba. El colector no debe reiniciar `read`
-  automáticamente: el EINTR de Linux debe convertirse al retorno Darwin antes
-  de construir el contexto del handler. Revisar también cada espera que reintente
-  EINTR internamente: podría impedir alcanzar el epílogo.
-- Bucles sin syscalls, señales entre epílogo y una espera bloqueante, entregas
-  multihilo y trabajo foreground requieren análisis adicional. Una entrega
-  diferida no garantiza latencia ni elimina por sí sola esas ventanas.
+## Saltos no locales
+
+Se reutilizan sin refactor los marcos transaccionales y la política Rust de
+solapamiento de `5e39404`; véase [reuso-marcos-senal.md](reuso-marcos-senal.md).
+Según el coordinador, su prueba en run `42589774841` produjo
+`SIGLONGJMP_REPETIDO_OK veces=24 internas=12`. Es validación del prerrequisito,
+no de SIGINT ni del parche actual. No se vacían todos los marcos en RESET ni se
+infiere abandono comparando simplemente RSP. Los límites de reutilización y
+solapamiento parcial documentados allí siguen vigentes para Bash.
+
+## Límites
+
+`read` ya traduce EINTR Linux a Darwin antes del epílogo. No se reinicia
+artificialmente para esconder Ctrl-C. Aunque se acepta el flag Darwin
+SA_RESTART, este incremento no implementa reinicio de syscalls interrumpidas.
+Esperas que reintentan EINTR internamente podrían impedir llegar al epílogo.
+Una señal recibida fuera de una syscall puede esperar hasta la siguiente salida
+SIGSYS; existe una ventana entre el último epílogo y una espera bloqueante.
+Bucles sin syscalls no reciben el handler inmediatamente. No se garantiza
+latencia ni wakeup atómico. Trabajo foreground y gestión completa de grupos
+quedan para la siguiente fase.
 
 ## Validación pendiente
 
-1. Compilar exclusivamente en Actions, sobre la rama autorizada; registrar SHA
-   y run/artifact exactos. No usar el binario baseline como prueba del cambio.
-2. Ejecutar la prueba PTY `--ctrl-c` editada por el responsable: prompt inicial,
-   Ctrl-C, prompt nuevo y comando marcador posterior, con mismo Bash vivo.
-3. Tras el primer pase, diez Ctrl-C consecutivos sincronizados con cada prompt;
-   comprobar comando marcador tras cada uno, sin EAGAIN, salida ni bloqueo.
-4. Repetir las pruebas externas USR1/USR2, metadata, máscaras, contextos,
-   anidamiento y retorno; añadir saltos dentro/fuera de handler y con handler
-   exterior activo, incluyendo variantes de máscara guardada.
-5. Mantener visible el fallo cruzado de trap de Bash 3.2 ya documentado; no
-   reclasificarlo como pase. Foreground queda para la siguiente fase.
+1. Compilar exclusivamente en Actions; registrar SHA, run y artefacto exactos.
+2. Ejecutar PTY `--ctrl-c`: prompt inicial, Ctrl-C, nuevo prompt, mismo Bash vivo
+   y comando marcador posterior. No usar el binario baseline como prueba.
+3. Sólo tras ese pase, diez Ctrl-C sincronizados con cada prompt, comprobando
+   comando marcador tras cada uno, sin EAGAIN, salida ni bloqueo.
+4. Repetir USR externas, metadata, máscaras, contextos, anidamiento y retorno,
+   además del signaljumpprobe. Probar INT SI_USER con pid/uid reales, INT de
+   terminal sin remitente, IGN, DFL y pendiente bloqueada/desbloqueada.
+5. Mantener visible el fallo cruzado de trap de Bash 3.2 previamente documentado;
+   no reclasificarlo como pase.
 
-No se han ejecutado estas validaciones en esta intervención. La desaparición
-baseline comunicada sigue abierta; esta nota no afirma que se haya corregido.
+Sólo se ha revisado el diff y su whitespace; ninguna prueba compilada ni PTY
+se ha ejecutado para este incremento.
