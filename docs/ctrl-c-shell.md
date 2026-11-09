@@ -1,9 +1,9 @@
 # Ctrl-C en el prompt: SIGINT diferida
 
-Estado: incremento implementado sobre `5e39404`, **pendiente de compilar en
-Actions y validar PTY**. No se afirma que la desaparición de Bash esté corregida.
-No se ha compilado localmente, lanzado Actions, creado commits ni cambiado
-`tools/probar-shell-pty.py` durante esta intervención.
+Estado: compilado en Actions `42590955503`, commit
+`2c38cdae4767efffb0a21a3ffe0adfde33aaafc7`, y probado con Recovery 26.6.2.
+Pasaron Ctrl-C en el prompt (1 y 10 veces), foreground (1 y 10 veces) y
+Ctrl-Z/jobs/bg/fg. No equivale a soporte completo de señales ni grupos.
 
 ## Entrega
 
@@ -55,8 +55,8 @@ Esperas que reintentan EINTR internamente podrían impedir llegar al epílogo.
 Una señal recibida fuera de una syscall puede esperar hasta la siguiente salida
 SIGSYS; existe una ventana entre el último epílogo y una espera bloqueante.
 Bucles sin syscalls no reciben el handler inmediatamente. No se garantiza
-latencia ni wakeup atómico. Trabajo foreground y gestión completa de grupos
-quedan para la siguiente fase.
+latencia ni wakeup atómico. Las pruebas foreground y bg/fg listadas arriba
+pasaron, pero no cubren la gestión completa de grupos ni todas las carreras.
 
 ## Validación pendiente
 
@@ -71,5 +71,6 @@ quedan para la siguiente fase.
 5. Mantener visible el fallo cruzado de trap de Bash 3.2 previamente documentado;
    no reclasificarlo como pase.
 
-Sólo se ha revisado el diff y su whitespace; ninguna prueba compilada ni PTY
-se ha ejecutado para este incremento.
+Las pruebas compiladas y PTY indicadas en la cabecera se ejecutaron localmente
+con el artefacto de Actions, sin compilación local. Quedan pendientes los casos
+adicionales de metadata INT, IGN/DFL y todas las carreras de esperas descritas.
