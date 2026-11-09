@@ -146,8 +146,7 @@ fn hilo(regs: &[u64; 21]) -> ThreadState64 {
 }
 
 /// FFI exclusivamente por valor: sin direcciones ni referencias C en Rust.
-#[no_mangle]
-pub extern "C" fn nucleo_senal_codificar(contexto: Ucontext64, maquina: Maquina) -> MarcoBytes {
+pub fn nucleo_senal_codificar(contexto: Ucontext64, maquina: Maquina) -> MarcoBytes {
     let marco = MarcoNormal64 { contexto, maquina: Mcontext64 {
         hilo: hilo(&maquina.regs), flotante: fp_darwin(&maquina.fp), ..Mcontext64::default()
     }};
@@ -161,8 +160,7 @@ pub extern "C" fn nucleo_senal_codificar(contexto: Ucontext64, maquina: Maquina)
 
 fn direccion_usuario(v: u64) -> bool { v != 0 && v < 0x0000_8000_0000_0000 }
 
-#[no_mangle]
-pub extern "C" fn nucleo_senal_decodificar(bytes: MarcoBytes, guardada: Maquina, mc: u64) -> Vuelta {
+pub fn nucleo_senal_decodificar(bytes: MarcoBytes, guardada: Maquina, mc: u64) -> Vuelta {
     let mut vuelta = Vuelta { maquina: guardada, mascara: 0, onstack: 0, error: 22 };
     let Ok(marco) = MarcoNormal64::desde_slices(&bytes.uc, &bytes.mc, mc) else { return vuelta; };
     let t = marco.maquina.hilo;
@@ -194,8 +192,7 @@ pub struct PrefijoFp { pub bytes: [u8; 512] }
 
 /// XSAVE puede omitir componentes en estado inicial. Materializarlos antes
 /// de exponerlos a Darwin; después se restauran con XSTATE_BV.x87/SSE activos.
-#[no_mangle]
-pub extern "C" fn nucleo_senal_fp_inicial(mut fp: PrefijoFp, bv: u64) -> PrefijoFp {
+pub fn nucleo_senal_fp_inicial(mut fp: PrefijoFp, bv: u64) -> PrefijoFp {
     if bv & 1 == 0 {
         fp.bytes[..24].fill(0);
         fp.bytes[..2].copy_from_slice(&0x037fu16.to_le_bytes());
@@ -209,8 +206,7 @@ pub extern "C" fn nucleo_senal_fp_inicial(mut fp: PrefijoFp, bv: u64) -> Prefijo
 }
 /// Consulta por valor del largo anunciado; C lee luego esa cantidad y valida
 /// el magic2 antes de copiar. No es una validación completa del XSAVE.
-#[no_mangle]
-pub extern "C" fn nucleo_senal_xstate_largo(fp: PrefijoFp) -> u32 {
+pub fn nucleo_senal_xstate_largo(fp: PrefijoFp) -> u32 {
     let magic = u32_en(&fp.bytes, 464);
     if magic == 0 { return 512; }
     let n = u32_en(&fp.bytes, 468) as usize;
@@ -219,14 +215,12 @@ pub extern "C" fn nucleo_senal_xstate_largo(fp: PrefijoFp) -> u32 {
     n as u32
 }
 
-#[no_mangle]
-pub extern "C" fn nucleo_senal_pila(rsp: u64, tam: u64) -> u64 {
+pub fn nucleo_senal_pila(rsp: u64, tam: u64) -> u64 {
     reservar_pila(rsp, tam).unwrap_or(0)
 }
 
 /// Resultado empaquetado: máscara en 32 bits bajos, errno en altos.
-#[no_mangle]
-pub extern "C" fn nucleo_senal_mascara(old: u32, set: u32, how: u64, has_set: u32) -> u64 {
+pub fn nucleo_senal_mascara(old: u32, set: u32, how: u64, has_set: u32) -> u64 {
     let next = if has_set == 0 { old } else {
         match how { 1 => old | set, 2 => old & !set, 3 => set, _ => return 22u64 << 32 }
     };
