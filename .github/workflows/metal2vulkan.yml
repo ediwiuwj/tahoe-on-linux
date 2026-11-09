@@ -36,7 +36,7 @@ jobs:
       - name: Compilar emulador y núcleo
         run: bash tahoe-run/build.sh "$GITHUB_WORKSPACE/fuentes-xnu"
       - name: Probar núcleo Rust
-        run: cargo test --locked --manifest-path tahoe-run/nucleo/Cargo.toml
+        run: cargo test --lib --locked --manifest-path tahoe-run/nucleo/Cargo.toml
   comprobar:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
