@@ -8,12 +8,15 @@ int sigpending(sigset_t*);
 int kill(int, int);
 int getpid(void);
 int printf(const char*, ...);
-static volatile int uno, dos, fallo_info;
+static volatile int uno, dos, fallo_info, cruzar;
 static void recibir(int signo, void* info, void* contexto) {
     const int* campos = info;
     if (!info || !contexto || campos[0] != signo || campos[2] != 0x10001)
         fallo_info = 1;
-    if (signo == 30) uno++;
+    if (signo == 30) {
+        uno++;
+        if (cruzar && kill(getpid(), 31) != 0) fallo_info = 1;
+    }
     else if (signo == 31) dos++;
     else fallo_info = 1;
 }
@@ -40,6 +43,9 @@ int main(void) {
     EXIGIR(sigpending(&pendientes) == 0);
     EXIGIR((pendientes & bloqueadas) == 0);
     EXIGIR(sigprocmask(3, &original, 0) == 0);
+    cruzar = 1;
+    EXIGIR(kill(getpid(), 30) == 0);
+    EXIGIR(uno == 2 && dos == 2 && !fallo_info);
     printf("SENALES_MASCARAS_SIGINFO_OK\n");
     return 0;
 }
