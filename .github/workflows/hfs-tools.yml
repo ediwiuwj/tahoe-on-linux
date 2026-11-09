@@ -1,0 +1,28 @@
+name: Herramientas de extracción Recovery
+on:
+  workflow_dispatch:
+  push:
+    branches: [work/integrate-metal2vulkan]
+    paths: ['.github/workflows/hfs-tools.yml']
+permissions:
+  contents: read
+jobs:
+  herramientas:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: 0x09/hfsfuse
+          ref: eed780cbe0445893de6f4aa8d74461da00756984
+      - name: Instalar dependencias de compilación
+        run: sudo apt-get update && sudo apt-get install -y libarchive-dev zlib1g-dev
+      - name: Compilar herramientas sin FUSE
+        run: make -j2 hfsdump hfstar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: herramientas-hfs-linux-x86_64
+          path: |
+            hfsdump
+            hfstar
+          if-no-files-found: error
