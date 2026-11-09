@@ -25,6 +25,14 @@ enumeración de descriptores tiene una ventana frente a aperturas concurrentes
 por otros hilos; no se afirma atomicidad del snapshot.
 
 Pruebas Rust cubren cabeceras, tipos, límites, descriptores y plan CLOEXEC.
-`spawnprobe.c` verifica un spawn normal, E2BIG con 33 acciones y un descriptor
-origen alto duplicado a 1025 bajo `CLOEXEC_DEFAULT`. El probe debe compilarse en
-Actions y ejecutarse sobre Recovery antes de afirmar que está verificado.
+`spawnprobe.c`, compilado en Actions `42666648197` (commit `1744198`), se ejecutó
+sobre Recovery Tahoe 26.6.2 y emitió `SPAWN_FD_ALTO_OK`: un descriptor fuente
+mayor que 1025 se duplicó a 1025, `CLOEXEC_DEFAULT` lo conservó en el hijo y el
+hijo escribió por ese descriptor a una tubería. También emitió
+`SPAWN_SIN_TRUNCAR_OK` para spawn normal y rechazo de 33 acciones con E2BIG.
+La suite general tuvo 23/24 pases y PTY/job-control pasó; el fallo que queda es
+el trap cruzado de Bash documentado aparte.
+
+Pendiente: repetir la prueba de 33 acciones verifica límite del parser, no la
+capacidad arbitraria. El plan/ejecución usa el snapshot Linux `/proc/self/fd`
+y no es atómico frente a aperturas concurrentes por hilos del mismo proceso.
