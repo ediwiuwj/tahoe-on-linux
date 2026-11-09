@@ -16,6 +16,7 @@ pub mod marco_senal;
 pub mod entrega_senal;
 mod senal_ffi;
 pub mod spawn;
+pub mod marcos_activos;
 mod spawn_ffi;
 
 /// Un pánico en el núcleo es un error de programación: se anota y se aborta el proceso, como haría un fallo en C, pero

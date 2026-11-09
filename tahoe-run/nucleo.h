@@ -17,6 +17,8 @@ uint64_t nucleo_spawn_cabecera(int32_t cap, int32_t n, uint64_t tam, uint32_t li
 struct nucleo_spawn_resultado nucleo_spawn_accion(struct nucleo_spawn_bytes);
 
 // Señales normales: frontera Rust segura por valor, sin punteros invitados.
+struct nucleo_senal_rangos { uint64_t extremos[16]; };
+uint32_t nucleo_senal_conservar(struct nucleo_senal_rangos, uint32_t n, uint64_t inicio, uint64_t fin);
 struct nucleo_senal_maquina { uint64_t regs[21]; uint8_t fp[512]; };
 struct nucleo_senal_bytes { uint8_t uc[56], mc[712]; };
 struct nucleo_senal_uc {

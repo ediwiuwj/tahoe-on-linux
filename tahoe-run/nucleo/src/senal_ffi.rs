@@ -16,6 +16,14 @@ macro_rules! exportar {
         }
     };
 }
+// SAFETY: símbolo único con entrada entera por valor y salida entera;
+// nucleo.h declara exactamente este ABI, sin punteros invitados.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn nucleo_senal_conservar(rangos: crate::marcos_activos::Rangos, n: u32, inicio: u64, fin: u64) -> u32 {
+    crate::marcos_activos::conservar(rangos,n,inicio,fin)
+}
+
 exportar!(nucleo_senal_codificar(contexto: Ucontext64, maquina: Maquina) -> MarcoBytes);
 exportar!(nucleo_senal_decodificar(bytes: MarcoBytes, guardada: Maquina, mc: u64) -> Vuelta);
 exportar!(nucleo_senal_fp_inicial(fp: PrefijoFp, bv: u64) -> PrefijoFp);

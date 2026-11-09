@@ -289,13 +289,14 @@ static __thread unsigned signal_depth;
 static __thread int signal_registered;
 static _Atomic unsigned signal_threads;
 struct signal_frame_private {
-	uint64_t uctx, mc, token;
+	uint64_t uctx, mc, token, inicio, fin;
 	sigset_t host_mask;
 	struct nucleo_senal_maquina maquina;
 	uint32_t fp_len;
 	_Alignas(64) uint8_t fp[SIGNAL_XSTATE_MAX];
 };
 static __thread struct signal_frame_private* signal_frames;
+static __thread struct signal_frame_private* signal_scratch;
 
 void emu_signal_thread_enter(void) {
 	if (!signal_registered) { signal_registered = 1; atomic_fetch_add(&signal_threads, 1); }
@@ -339,12 +340,24 @@ static long signal_deliver(struct ctx* c, int signo, uint32_t bit, unsigned long
 	if (action.handler == 1) { if (!external) signal_pending &= ~bit; return 0; }
 	if (action.handler <= 1 || !action.tramp ||
 		(action.flags & ~SIGNAL_SUPPORTED_FLAGS) || !signal_secret) return -45;
-	if (signal_depth >= SIGNAL_FRAMES_MAX) return -35; // EAGAIN
+	greg_t* g = c->uc->uc_mcontext.gregs;
+	uint64_t rsp = g[REG_RSP], sp = nucleo_senal_pila(rsp, 56 + 104 + 712);
+	if (!sp || rsp >= 0x0000800000000000ULL) return -D_EFAULT;
+	struct nucleo_senal_rangos rangos = { 0 };
+	for (unsigned i = 0; i < signal_depth; i++) {
+		rangos.extremos[i * 2] = signal_frames[i].inicio;
+		rangos.extremos[i * 2 + 1] = signal_frames[i].fin;
+	}
+	unsigned keep = nucleo_senal_conservar(rangos, signal_depth, sp, rsp - 128);
+	if (keep == UINT32_MAX) return -D_EINVAL;
+	if (keep >= SIGNAL_FRAMES_MAX) return -35;
 	if (!signal_frames) tls_lazy((void**)&signal_frames, sizeof(*signal_frames) * SIGNAL_FRAMES_MAX);
-	struct signal_frame_private* f = &signal_frames[signal_depth];
+	if (!signal_scratch) tls_lazy((void**)&signal_scratch, sizeof(*signal_scratch));
+	// Construir fuera del registro: un fallo no debe destruir metadatos activos.
+	struct signal_frame_private* f = signal_scratch;
+	f->inicio = sp; f->fin = rsp - 128;
 	long err = signal_fp_read(c->uc, f->fp, &f->fp_len);
 	if (err) return err;
-	greg_t* g = c->uc->uc_mcontext.gregs;
 	f->host_mask = c->uc->uc_sigmask;
 	for (int i = 0; i < 18; i++) f->maquina.regs[i] = g[signal_regs[i]];
 	f->maquina.regs[18] = 0x2b; // XNU USER64_CS, no el selector Linux
@@ -356,8 +369,6 @@ static long signal_deliver(struct ctx* c, int signo, uint32_t bit, unsigned long
 	prefix = nucleo_senal_fp_inicial(prefix, bv);
 	memcpy(f->maquina.fp, prefix.bytes, 512);
 	// XNU: redzone, ucontext56, siginfo104, mcontext712, alineación, retorno.
-	uint64_t rsp = g[REG_RSP], sp = nucleo_senal_pila(rsp, 56 + 104 + 712);
-	if (!sp || rsp >= 0x0000800000000000ULL) return -D_EFAULT;
 	f->uctx = rsp - 128 - 56;
 	uint64_t sip = f->uctx - 104;
 	f->mc = sip - 712;
@@ -377,8 +388,22 @@ static long signal_deliver(struct ctx* c, int signo, uint32_t bit, unsigned long
 	memcpy(info + 24, &g[REG_RIP], 8); memcpy(info + 48, &rsp, 8);
 	uint64_t ret = 0; // _sigtramp debe salir por sigreturn, nunca por ret
 	if (signal_stack_write(f->uctx, bytes.uc, 56) != 56 || signal_stack_write(f->mc, bytes.mc, 712) != 712 ||
-		signal_stack_write(sip, info, 104) != 104 || signal_stack_write(sp, &ret, 8) != 8) return -D_EFAULT;
-	signal_depth++;
+		signal_stack_write(sip, info, 104) != 104 || signal_stack_write(sp, &ret, 8) != 8) {
+		// process_vm_writev puede haber escrito un prefijo. Si solapó un
+		// marco anterior, no es seguro devolver un error y reutilizarlo.
+		if (keep < signal_depth) {
+			for (unsigned i = keep; i < signal_depth; i++) signal_frames[i].token = 0;
+			signal_depth = keep;
+			logf_("    marco de señal solapado: escritura parcial, terminación controlada\n");
+			_exit(128 + SIGSEGV);
+		}
+		return -D_EFAULT;
+	}
+	// La nueva escritura ya invalida los marcos guest que se solapan: retirar
+	// sus tokens privados, nunca un marco anidado en una zona disjunta.
+	for (unsigned i = keep; i < signal_depth; i++) signal_frames[i].token = 0;
+	signal_frames[keep] = *f;
+	signal_depth = keep + 1;
 	if (!external) signal_pending &= ~bit;
 	pthread_mask |= action.mask | bit;
 	pthread_mask &= ~((1u << 8) | (1u << 16));
@@ -484,8 +509,14 @@ static long bsd_sigreturn(struct ctx* c) {
 	if (style == UC_SET_ALT_STACK) { alt_flags |= 1; return 0; }        // SS_ONSTACK
 	if (style == UC_RESET_ALT_STACK) { alt_flags &= ~1; return 0; }
 	if (style != 30 || !signal_depth || !signal_frames) return -D_EINVAL;
-	struct signal_frame_private* f = &signal_frames[signal_depth - 1];
-	if (c->a[0] != f->uctx || c->a[2] != f->token) return -D_EINVAL;
+	unsigned return_index = signal_depth;
+	for (unsigned i = signal_depth; i > 0; i--) {
+		if (c->a[0] == signal_frames[i - 1].uctx && c->a[2] == signal_frames[i - 1].token) {
+			return_index = i - 1; break;
+		}
+	}
+	if (return_index == signal_depth) return -D_EINVAL;
+	struct signal_frame_private* f = &signal_frames[return_index];
 	struct nucleo_senal_bytes bytes;
 	if (safe_read(f->uctx, bytes.uc, 56) != 56 || safe_read(f->mc, bytes.mc, 712) != 712) return -D_EFAULT;
 	struct nucleo_senal_vuelta restored = nucleo_senal_decodificar(bytes, f->maquina, f->mc);
@@ -508,7 +539,8 @@ static long bsd_sigreturn(struct ctx* c) {
 	c->uc->uc_sigmask = f->host_mask;
 	pthread_mask = restored.mascara;
 	alt_flags = (alt_flags & ~1) | restored.onstack;
-	f->token = 0; signal_depth--;
+	for (unsigned i = return_index; i < signal_depth; i++) signal_frames[i].token = 0;
+	signal_depth = return_index;
 	c->context_restored = 1;
 	return 0;
 }
@@ -541,7 +573,6 @@ static long bsd_kill(struct ctx* c) {
 			// convertir una captura Darwin en una señal Linux posiblemente letal.
 			if ((s != 30 && s != 31) || atomic_load(&signal_threads) != 1 || !signal_secret ||
 				!action.tramp || (action.flags & ~SIGNAL_SUPPORTED_FLAGS)) return -45;
-			if (signal_depth >= SIGNAL_FRAMES_MAX) return -35;
 			uint32_t n; long e = signal_fp_read(c->uc, NULL, &n); if (e) return e;
 			signal_pending |= 1u << (s - 1);
 			return 0;
