@@ -1,9 +1,9 @@
 # Ctrl-C en el prompt: SIGINT diferida
 
-Estado: compilado en Actions `42590955503`, commit
-`2c38cdae4767efffb0a21a3ffe0adfde33aaafc7`, y probado con Recovery 26.6.2.
-Pasaron Ctrl-C en el prompt (1 y 10 veces), foreground (1 y 10 veces) y
-Ctrl-Z/jobs/bg/fg. No equivale a soporte completo de señales ni grupos.
+Estado: compilado en Actions `42590955503` y repetido en el artefacto de
+`42666648197` (commit `1744198342befcab792223e91bf0eae9f231a0dc`), Recovery
+26.6.2. Pasaron Ctrl-C en prompt y foreground (1 y 10 veces), y Ctrl-Z/jobs/bg/fg.
+Estas pruebas PTY no equivalen a soporte completo de señales/grupos.
 
 ## Entrega
 
@@ -60,17 +60,15 @@ pasaron, pero no cubren la gestión completa de grupos ni todas las carreras.
 
 ## Validación pendiente
 
-1. Compilar exclusivamente en Actions; registrar SHA, run y artefacto exactos.
-2. Ejecutar PTY `--ctrl-c`: prompt inicial, Ctrl-C, nuevo prompt, mismo Bash vivo
-   y comando marcador posterior. No usar el binario baseline como prueba.
-3. Sólo tras ese pase, diez Ctrl-C sincronizados con cada prompt, comprobando
-   comando marcador tras cada uno, sin EAGAIN, salida ni bloqueo.
-4. Repetir USR externas, metadata, máscaras, contextos, anidamiento y retorno,
-   además del signaljumpprobe. Probar INT SI_USER con pid/uid reales, INT de
-   terminal sin remitente, IGN, DFL y pendiente bloqueada/desbloqueada.
-5. Mantener visible el fallo cruzado de trap de Bash 3.2 previamente documentado;
-   no reclasificarlo como pase.
+- Validar metadata de INT terminal (`SI_KERNEL`→siginfo Darwin sin remitente) e
+  INT externo `SI_USER` con pid/uid; combinaciones IGN/DFL y pending bloqueada.
+- Revisar ventanas de señales en todas las syscalls bloqueantes y su política de
+  EINTR/SA_RESTART; bucles CPU sin syscalls no reciben entrega diferida.
+- Probar procesos foreground/background con distintos grupos y Ctrl-Z/CONT;
+  la prueba actual cubre un sleep sencillo y no equivale a control de trabajos
+  completo.
+- Mantener visible `trap_cruzado` de Bash 3.2; no reclasificarlo como pase.
 
-Las pruebas compiladas y PTY indicadas en la cabecera se ejecutaron localmente
-con el artefacto de Actions, sin compilación local. Quedan pendientes los casos
-adicionales de metadata INT, IGN/DFL y todas las carreras de esperas descritas.
+Las pruebas compiladas y PTY se ejecutaron localmente con artefactos de Actions,
+sin compilación local. No se ha validado cada ruta de metadata/IGN/DFL ni se
+promete atomicidad de espera.

@@ -26,6 +26,25 @@ sobre ese emulador y Recovery con salida 0 y `SENALES_MASCARAS_SIGINFO_OK`.
 Comprueba bloqueo de USR1/USR2, pendientes, desbloqueo selectivo, `siginfo`
 y entrega anidada de USR2 desde el handler USR1. No prueba señales externas.
 
+## Artefacto de integración reciente
+
+- Commit emulador `1744198342befcab792223e91bf0eae9f231a0dc`, compilado en
+  Actions `42666648197`; sin compilación local.
+- `spawnprobe` imprimió `SPAWN_FD_ALTO_OK` y `SPAWN_SIN_TRUNCAR_OK`: acción
+  normal, 33 acciones rechazadas con E2BIG, fd fuente alto duplicado a 1025
+  y heredado bajo `CLOEXEC_DEFAULT` con escritura verificada por pipe.
+- La suite shell: 23/24; sigue fallando únicamente `trap_cruzado` (Bash 3.2).
+- PTY pasó Ctrl-C en el prompt y en sleep foreground, 1 y 10 repeticiones;
+  Ctrl-Z/jobs/bg/fg también pasó. No cubre todos los grupos/carreras.
+- `probar-senales-externas.py`: USR1 y USR2 aprobadas; `signalprobe` y
+  `signaljumpprobe` también aprobaron metadata/máscaras y 24 saltos combinados.
+- `launchctl list` en prueba aislada salió 0 con la extracción HFS completa;
+  hubo servicios sin PID/errores, por lo que no se declara Recovery íntegra.
+
+Esto aún NO demuestra shell completa: quedan EINTR/SA_RESTART en todas las
+esperas, señales externas durante loops sin syscalls, multihilo, todos los
+servicios, la compatibilidad cruzada de Bash, y más escenarios de spawn.
+
 ## Extracción
 
 7zip dejó archivos HFS vacíos; no usar esa extracción como referencia completa.
