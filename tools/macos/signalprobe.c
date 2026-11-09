@@ -10,13 +10,14 @@ int getpid(void);
 int printf(const char*, ...);
 int write(int, const void*, unsigned long);
 static volatile int uno, dos, fallo_info, cruzar, externa_int;
-static int pid_esperado, uid_esperado;
+static int pid_esperado, uid_esperado, pid_observado, uid_observado, codigo_observado;
 static int decimal(const char* s) { int n=0; while (*s>='0'&&*s<='9') n=n*10+(*s++-'0'); return n; }
 static void recibir(int signo, void* info, void* contexto) {
     const int* campos = info;
     if (!info || !contexto || campos[0] != signo) { fallo_info=1; return; }
     if (signo == 2) {
-        if (campos[2] != 0x10001 || campos[3] != pid_esperado || campos[4] != uid_esperado) fallo_info=1;
+        codigo_observado=campos[2]; pid_observado=campos[3]; uid_observado=campos[4];
+        if (codigo_observado != 0x10001 || pid_observado != pid_esperado || uid_observado != uid_esperado) fallo_info=1;
         externa_int++;
     } else if (campos[2] != 0x10001) fallo_info=1;
     if (signo == 30) {
@@ -32,10 +33,14 @@ int main(int argc, char** argv) {
         pid_esperado=decimal(argv[2]); uid_esperado=decimal(argv[3]);
         struct sigaction_d int_action = { recibir, 0, 0x40 };
         if (sigaction(2,&int_action,0)) return 10;
-        if (write(1,"SIGINT_LISTA\\n",13) != 13) return 13;
+        if (write(1,"SIGINT_LISTA\n",13) != 13) return 13;
         for (int i=0; i<1000000 && !externa_int; i++) if (kill(getpid(),0)) return 11;
-        if (externa_int!=1 || fallo_info) return 12;
-        printf("SIGINT_EXTERNA_INFO_OK\\n"); return 0;
+        if (externa_int!=1 || fallo_info) {
+            printf("SIGINT_DBG got=%d fail=%d pid=%d/%d uid=%d/%d code=%x\\n",
+                externa_int,fallo_info,pid_observado,pid_esperado,uid_observado,uid_esperado,codigo_observado);
+            return 12;
+        }
+        printf("SIGINT_EXTERNA_INFO_OK\n"); return 0;
     }
     struct sigaction_d action = { recibir, 0, 0x40 };
     EXIGIR(sigaction(30, &action, 0) == 0);
