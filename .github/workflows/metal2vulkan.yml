@@ -5,17 +5,39 @@ on:
   pull_request:
     paths:
       - 'tahoe-gpu/**'
+      - 'tahoe-run/**'
       - '.github/workflows/metal2vulkan.yml'
   push:
     branches: [main, deployment, work/integrate-metal2vulkan]
     paths:
       - 'tahoe-gpu/**'
+      - 'tahoe-run/**'
       - '.github/workflows/metal2vulkan.yml'
 
 permissions:
   contents: read
 
 jobs:
+  emulador:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Obtener tablas de syscalls XNU fijadas
+        uses: actions/checkout@v4
+        with:
+          repository: apple-oss-distributions/xnu
+          ref: f6217f891ac0bb64f3d375211650a4c1ff8ca1ea
+          path: fuentes-xnu
+      - name: Instalar toolchain Rust
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+      - name: Compilar emulador y núcleo
+        run: bash tahoe-run/build.sh "$GITHUB_WORKSPACE/fuentes-xnu"
+      - name: Probar núcleo Rust
+        run: cargo test --locked --manifest-path tahoe-run/nucleo/Cargo.toml
+  comprobar:
   comprobar:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
