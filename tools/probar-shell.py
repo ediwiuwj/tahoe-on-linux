@@ -40,6 +40,7 @@ def main():
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--run', type=Path, required=True)
     parser.add_argument('--salida', type=Path, required=True)
+    parser.add_argument('--caso', choices=tuple(CASOS), action='append', help='Ejecutar solo estos casos')
     args = parser.parse_args()
     root, run = args.root.resolve(), args.run.resolve()
     args.salida.mkdir(parents=True, exist_ok=True)
@@ -50,6 +51,8 @@ def main():
            str(root/'usr/lib/dyld'), str(root/'bin/bash'), '--noprofile', '--norc', '-c']
     resultados = []
     for nombre, (codigo, esperado) in CASOS.items():
+        if args.caso and nombre not in args.caso:
+            continue
         env['TAHOE_LOGFILE'] = str(args.salida.resolve()/(nombre+'.log'))
         # Cada caso tiene su propio grupo; nunca se termina un proceso ajeno.
         with (args.salida/(nombre+'.txt')).open('w') as out:
