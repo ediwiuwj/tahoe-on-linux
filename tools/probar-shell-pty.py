@@ -15,7 +15,11 @@ def main():
     p.add_argument('--root', type=Path, required=True)
     p.add_argument('--run', type=Path, required=True)
     p.add_argument('--salida', type=Path, required=True)
+    p.add_argument('--ctrl-c', action='store_true', help='Interrumpir en el prompt y comprobar que la shell continúa')
+    p.add_argument('--repeticiones', type=int, default=1)
     a = p.parse_args()
+    if not 1 <= a.repeticiones <= 100:
+        p.error('--repeticiones debe estar entre 1 y 100')
     root, run = a.root.resolve(), a.run.resolve()
     a.salida.mkdir(parents=True, exist_ok=True)
     env = dict(PATH='/usr/bin:/bin:/usr/sbin:/sbin', HOME='/var/root', USER='root',
@@ -30,9 +34,14 @@ def main():
     salida = bytearray()
     terminado = False
     retorno = None
+    interrupciones = 0
+    verificar_desde = None
     try:
-        os.write(fd, b"set +H\nprintf 'PTY_%s\\n' OK; /bin/sleep 1 & p=$!; jobs; wait $p; printf 'WAIT_%s\\n' OK; exit\n")
-        limite = time.monotonic() + 20
+        if a.ctrl_c:
+            os.write(fd, b"set +H\nprintf 'LISTA_%s\\n' OK\n")
+        else:
+            os.write(fd, b"set +H\nprintf 'PTY_%s\\n' OK; /bin/sleep 1 & p=$!; jobs; wait $p; printf 'WAIT_%s\\n' OK; exit\n")
+        limite = time.monotonic() + 20 + (a.repeticiones * .6 if a.ctrl_c else 0)
         while time.monotonic() < limite and len(salida) < 1024 * 1024:
             if select.select([fd], [], [], .2)[0]:
                 try:
@@ -44,6 +53,18 @@ def main():
                     if e.errno == errno.EIO:
                         break
                     raise
+            marcador = b'LISTA_OK' if not interrupciones else f'CTRL_{interrupciones}_OK'.encode()
+            if (a.ctrl_c and interrupciones < a.repeticiones and verificar_desde is None
+                    and marcador in salida and salida.endswith(b'TAHOE> ')):
+                os.write(fd, b'\x03')
+                interrupciones += 1
+                verificar_desde = time.monotonic() + .2
+            if verificar_desde is not None and time.monotonic() >= verificar_desde:
+                comando = f"printf 'CTRL_{interrupciones}_%s\\n' OK"
+                if interrupciones == a.repeticiones:
+                    comando += '; exit 0'
+                os.write(fd, (comando+'\n').encode())
+                verificar_desde = None
             r, estado = os.waitpid(pid, os.WNOHANG)
             if r:
                 terminado = True
@@ -60,8 +81,12 @@ def main():
             retorno = os.waitstatus_to_exitcode(estado)
         os.close(fd)
         (a.salida/'consola.txt').write_bytes(salida)
-    bien = retorno == 0 and b'PTY_OK' in salida and b'WAIT_OK' in salida
-    print('PTY y espera interactiva:', 'APROBADO' if bien else 'FALLO')
+    if a.ctrl_c:
+        bien = (retorno == 0 and interrupciones == a.repeticiones
+                and f'CTRL_{a.repeticiones}_OK'.encode() in salida)
+    else:
+        bien = retorno == 0 and b'PTY_OK' in salida and b'WAIT_OK' in salida
+    print('PTY Ctrl-C:' if a.ctrl_c else 'PTY y espera interactiva:', 'APROBADO' if bien else 'FALLO')
     return 0 if bien else 1
 
 
