@@ -37,6 +37,12 @@ jobs:
         run: bash tahoe-run/build.sh "$GITHUB_WORKSPACE/fuentes-xnu"
       - name: Probar núcleo Rust
         run: cargo test --lib --locked --manifest-path tahoe-run/nucleo/Cargo.toml
+      - name: Conservar emulador para pruebas con Recovery local
+        uses: actions/upload-artifact@v4
+        with:
+          name: tahoe-run-linux-x86_64
+          path: tahoe-run/tahoe-run
+          if-no-files-found: error
   comprobar:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
