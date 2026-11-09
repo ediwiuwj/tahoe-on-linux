@@ -1112,6 +1112,17 @@ __asm__(".text\n.global tahoe_restorer\n.type tahoe_restorer,@function\ntahoe_re
 extern void tahoe_restorer(void);
 void* tahoe_restorer_addr(void) { return (void*)tahoe_restorer; }
 
+// Sólo USR externas: sin NODEFER, ambas bloqueadas durante el colector.
+int tahoe_usr_sigaction(int sig, void (*h)(int, siginfo_t*, void*), int disposition) {
+	if (sig != SIGUSR1 && sig != SIGUSR2) { errno = EINVAL; return -1; }
+	struct { void* h; unsigned long flags; void* restorer; unsigned long mask; } ks = {
+		.h = disposition == 0 ? (void*)SIG_DFL : disposition == 1 ? (void*)SIG_IGN : (void*)h,
+		.flags = SA_SIGINFO | SA_ONSTACK | 0x04000000UL,
+		.restorer = tahoe_restorer,
+		.mask = (1UL << (SIGUSR1 - 1)) | (1UL << (SIGUSR2 - 1)) };
+	return syscall(SYS_rt_sigaction, sig, &ks, NULL, 8);
+}
+
 // Linux NO hereda el syscall user dispatch en el hijo de un fork: sin esto, las syscalls de macOS del hijo se
 // ejecutarían como syscalls reales de Linux y devolverían ENOSYS sin pasar por el manejador.
 void reenable_dispatch(void) {

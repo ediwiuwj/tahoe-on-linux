@@ -234,7 +234,7 @@ static long bsd_setrlimit(struct ctx* c) {
 }
 
 // ---------------------------------------------------------------- señales Darwin
-// USR1/USR2 self-kill se entregan al epílogo de SIGSYS. Sin recepción asíncrona Linux.
+// USR1/USR2: colector Linux mínimo y entrega diferida al epílogo SIGSYS.
 _Static_assert(SIGHUP == 1 && SIGINT == 2 && SIGQUIT == 3 && SIGILL == 4 &&
 	SIGTRAP == 5 && SIGABRT == 6 && SIGBUS == 7 && SIGFPE == 8 && SIGKILL == 9 &&
 	SIGUSR1 == 10 && SIGSEGV == 11 && SIGUSR2 == 12 && SIGPIPE == 13 &&
@@ -254,8 +254,7 @@ static struct signal_action signal_action_snapshot(int s) {
 	pthread_mutex_unlock(&sigtab_lock);
 	return a;
 }
-// Alcance inicial: USR1/USR2 enviados al PID propio; sin recepción Linux de señales
-// externas ni interrupción de bucles sin syscalls. El resto no se simula.
+// USR1/USR2 monohilo; no interrumpe bucles sin syscalls. El resto no se simula.
 #define SIGNAL_FRAMES_MAX 8
 #define SIGNAL_XSTATE_MAX (64 * 1024)
 #define DARWIN_USR1_BIT (1u << 29)
@@ -267,6 +266,23 @@ static struct signal_action signal_action_snapshot(int s) {
 static uint64_t signal_secret;                // getrandom en emu_proc_init, nunca en SIGSYS
 static __thread uint64_t signal_generation;
 static __thread uint32_t signal_pending, pthread_mask;
+// Un slot por señal/hilo: presente | pid(31) | uid(32). Primer remitente
+// gana hasta publicar el marco; stdsignals coalescen, no son una cola.
+_Static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "colector requiere atomics lock-free");
+static __thread _Atomic unsigned long long signal_external[2]
+	__attribute__((tls_model("initial-exec")));
+extern int tahoe_usr_sigaction(int, void (*)(int, siginfo_t*, void*), int);
+static void signal_collect_usr(int sig, siginfo_t* si, void* unused) {
+	(void)unused;
+	// No TLS lazy, selector, errno, libc, locks ni syscalls. No recoger otros
+	// orígenes (sigqueue/tgkill) como si fueran kill/SI_USER.
+	if ((sig != SIGUSR1 && sig != SIGUSR2) || !si || si->si_code != SI_USER) return;
+	unsigned long long value = (1ULL << 63) |
+		((unsigned long long)(uint32_t)si->si_pid << 32) | (uint32_t)si->si_uid;
+	unsigned long long empty = 0;
+	atomic_compare_exchange_strong_explicit(&signal_external[sig == SIGUSR2],
+		&empty, value, memory_order_relaxed, memory_order_relaxed);
+}
 static __thread uint64_t alt_sp, alt_size;
 static __thread int alt_flags = 4;
 static __thread unsigned signal_depth;
@@ -286,6 +302,7 @@ void emu_signal_thread_enter(void) {
 }
 void emu_signal_thread_done(void) {
 	if (signal_registered) { signal_registered = 0; atomic_fetch_sub(&signal_threads, 1); }
+	atomic_store(&signal_external[0], 0); atomic_store(&signal_external[1], 0);
 	signal_pending = 0; signal_depth = 0; alt_sp = alt_size = 0; alt_flags = 4; pthread_mask = 0;
 }
 // indices duros sólo aquí, en la frontera CPU Linux; el resto usa el codec Darwin.
@@ -317,9 +334,9 @@ static ssize_t signal_stack_write(uint64_t addr, const void* src, size_t len) {
 }
 
 // Construye una sola señal; sólo consume su bit al publicar el marco (o IGN).
-static long signal_deliver(struct ctx* c, int signo, uint32_t bit) {
+static long signal_deliver(struct ctx* c, int signo, uint32_t bit, unsigned long long external) {
 	struct signal_action action = signal_action_snapshot(signo);
-	if (action.handler == 1) { signal_pending &= ~bit; return 0; }
+	if (action.handler == 1) { if (!external) signal_pending &= ~bit; return 0; }
 	if (action.handler <= 1 || !action.tramp ||
 		(action.flags & ~SIGNAL_SUPPORTED_FLAGS) || !signal_secret) return -45;
 	if (signal_depth >= SIGNAL_FRAMES_MAX) return -35; // EAGAIN
@@ -353,7 +370,8 @@ static long signal_deliver(struct ctx* c, int signo, uint32_t bit) {
 		.mcsize = 712, .mcontext = f->mc };
 	struct nucleo_senal_bytes bytes = nucleo_senal_codificar(uc, f->maquina);
 	uint8_t info[104] = { 0 };
-	int32_t code = 0x10001, pid = getpid(); uint32_t uid = emu_signal_ruid(c);
+	int32_t code = 0x10001, pid = external ? (int32_t)((external >> 32) & 0x7fffffff) : getpid();
+	uint32_t uid = external ? (uint32_t)external : emu_signal_ruid(c);
 	memcpy(info, &signo, 4); memcpy(info + 8, &code, 4);
 	memcpy(info + 12, &pid, 4); memcpy(info + 16, &uid, 4);
 	memcpy(info + 24, &g[REG_RIP], 8); memcpy(info + 48, &rsp, 8);
@@ -361,7 +379,7 @@ static long signal_deliver(struct ctx* c, int signo, uint32_t bit) {
 	if (signal_stack_write(f->uctx, bytes.uc, 56) != 56 || signal_stack_write(f->mc, bytes.mc, 712) != 712 ||
 		signal_stack_write(sip, info, 104) != 104 || signal_stack_write(sp, &ret, 8) != 8) return -D_EFAULT;
 	signal_depth++;
-	signal_pending &= ~bit;
+	if (!external) signal_pending &= ~bit;
 	pthread_mask |= action.mask | bit;
 	pthread_mask &= ~((1u << 8) | (1u << 16));
 	g[REG_RIP] = action.tramp; g[REG_RSP] = sp;
@@ -372,9 +390,14 @@ static long signal_deliver(struct ctx* c, int signo, uint32_t bit) {
 }
 // Se llama SÓLO después de materializar RAX/CF/RDX de la syscall.
 long emu_signal_epilogue(struct ctx* c) {
-	uint32_t ready = signal_pending & SIGNAL_SUPPORTED_BITS & ~pthread_mask;
+	unsigned long long ext[2] = { atomic_load(&signal_external[0]), atomic_load(&signal_external[1]) };
+	uint32_t external_bits = atomic_load(&signal_threads) == 1 ?
+		((ext[0] ? DARWIN_USR1_BIT : 0) | (ext[1] ? DARWIN_USR2_BIT : 0)) : 0;
+	uint32_t ready = (signal_pending | external_bits) & SIGNAL_SUPPORTED_BITS & ~pthread_mask;
 	if (!ready) return 0;
-	int is_kill = c->nr == ((2UL << 24) | 37);
+	greg_t* retour = c->uc->uc_mcontext.gregs;
+	int is_kill = c->nr == ((2UL << 24) | 37) && (int)c->a[0] == getpid() &&
+		(c->a[1] == 30 || c->a[1] == 31) && retour[REG_RAX] == 0 && !(retour[REG_EFL] & 1);
 	if (is_kill) {
 		// El llamador convierte un fallo de entrega en errno de kill. No
 		// atribuirle el fallo de OTRA pendiente ni sobrescribir un kill fallido.
@@ -388,7 +411,10 @@ long emu_signal_epilogue(struct ctx* c) {
 	// Prioridad determinista por número Darwin, no promesa de orden FIFO.
 	uint32_t bit = nucleo_senal_elegible(ready, 0, SIGNAL_SUPPORTED_BITS);
 	int signo = bit == DARWIN_USR1_BIT ? 30 : 31;
-	long err = signal_deliver(c, signo, bit);
+	// Un self-kill conserva su resultado y no consume una llegada externa.
+	unsigned long long external = (signal_pending & bit) ? 0 : ext[signo == 31];
+	long err = signal_deliver(c, signo, bit, external);
+	if (!err && external) atomic_compare_exchange_strong(&signal_external[signo == 31], &external, 0);
 	// Sólo revocar el envío cuyo kill devuelve error. Las demás pendientes
 	// permanecen intactas; un fallo diferido conserva el estado y falla cerrado.
 	if (err && is_kill) signal_pending &= ~bit;
@@ -408,10 +434,19 @@ static long bsd_sigaction_locked(struct ctx* c) {
 	if (c->a[1]) {                                                           // struct __sigaction: {handler, tramp, mask(4), flags(4)}
 		uint8_t nw[24];
 		if (safe_read(c->a[1], nw, 24) != 24) return -D_EFAULT;
-		memcpy(&sigtab[s].handler, nw, 8);
-		memcpy(&sigtab[s].tramp, nw + 8, 8);
-		memcpy(&sigtab[s].mask, nw + 16, 4);
-		memcpy(&sigtab[s].flags, nw + 20, 4);
+		struct signal_action next;
+		memcpy(&next.handler, nw, 8);
+		memcpy(&next.tramp, nw + 8, 8);
+		memcpy(&next.mask, nw + 16, 4);
+		memcpy(&next.flags, nw + 20, 4);
+		if (s == 30 || s == 31) {
+			if (next.handler > 1 && (!next.tramp || (next.flags & ~SIGNAL_SUPPORTED_FLAGS) ||
+				atomic_load(&signal_threads) != 1)) return -45;
+			if (tahoe_usr_sigaction(darwin_to_linux_sig(s), signal_collect_usr,
+				next.handler <= 1 ? (int)next.handler : 2) < 0) return -darwin_errno(errno);
+			if (next.handler <= 1) atomic_store(&signal_external[s == 31], 0);
+		}
+		sigtab[s] = next;
 		// Señales de control de la terminal (SIGTSTP 18, SIGTTIN 21, SIGTTOU 22): SIG_IGN / SIG_DFL también en Linux. Un bash
 		// interactivo ignora SIGTTOU antes de ponerse en primer plano (tcsetpgrp); si Linux no lo sabía, lo detenía (estado T)
 		// y la shell de tools/macos-shell.sh se quedaba congelada sin prompt. Con un manejador propio se deja la acción
@@ -487,7 +522,7 @@ long emu_signal_mask(struct ctx* c) {
 	return 0;
 }
 static long bsd_pthread_sigmask(struct ctx* c) { return emu_signal_mask(c); }
-static long bsd_sigpending(struct ctx* c) { uint32_t z = signal_pending; return safe_write(c->a[0], &z, 4) == 4 ? 0 : -D_EFAULT; }
+static long bsd_sigpending(struct ctx* c) { uint32_t z = signal_pending | (atomic_load(&signal_external[0]) ? DARWIN_USR1_BIT : 0) | (atomic_load(&signal_external[1]) ? DARWIN_USR2_BIT : 0); return safe_write(c->a[0], &z, 4) == 4 ? 0 : -D_EFAULT; }
 
 // kill propio capturado: pendiente Darwin, nunca kill Linux. Grupos, selección
 // multihilo y capturas distintas de USR1/USR2 devuelven ENOTSUP. SA_ONSTACK,
@@ -865,6 +900,7 @@ static long bsd_fork(struct ctx* c) {
 	if (p < 0) return -darwin_errno(fork_errno);
 	if (p == 0) {
 		atomic_store(&signal_threads, 1); signal_registered = 1; signal_pending = 0;
+		atomic_store(&signal_external[0], 0); atomic_store(&signal_external[1], 0);
 		memfd_reopen(); ports_forked_child(); fileport_forked_child(); reenable_dispatch();
 	}  // el hijo conserva marcos activos, pero no señales pendientes del padre
 	// Convenio de Darwin: hijo rax=pid del padre, rdx=1; padre rax=pid del hijo, rdx=0. libsyscall devuelve 0 al hijo
