@@ -26,6 +26,11 @@ CASOS = {
     "directorio": ('cd /System && test "$PWD" = /System && printf OK', 'OK'),
     "trap": ('trap "printf TRAP_OK" USR1; kill -USR1 $$', 'TRAP_OK'),
     "trap_continuacion": ('n=0; trap "n=$((n+1))" USR1; kill -USR1 $$; test "$n" = 1 && printf OK', 'OK'),
+    "trap_usr2": ("n=0; trap 'n=$((n+1))' USR2; kill -USR2 $$; test \"$n\" = 1 && printf OK", 'OK'),
+    "trap_dos_senales": ("n=0; trap 'n=$((n+1))' USR1; trap 'n=$((n+10))' USR2; kill -USR1 $$; kill -USR2 $$; test \"$n\" = 11 && printf OK", 'OK'),
+    "trap_orden_inverso": ("n=0; trap 'n=$((n+1))' USR1; trap 'n=$((n+10))' USR2; kill -USR2 $$; kill -USR1 $$; test \"$n\" = 11 && printf OK", 'OK'),
+    "trap_cruzado": ("n=0; trap 'n=$((n+1)); kill -USR2 $$' USR1; trap 'n=$((n+10))' USR2; kill -USR1 $$; test \"$n\" = 11 && printf OK", 'OK'),
+    "perl_basico": ("/usr/bin/perl -e 'print 6*7'", '42'),
     "trap_repetido": ("n=0; trap 'n=$((n+1))' USR1; kill -USR1 $$; kill -USR1 $$; test \"$n\" = 2 && printf OK", 'OK'),
 }
 

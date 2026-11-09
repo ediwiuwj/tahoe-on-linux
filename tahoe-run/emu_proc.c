@@ -234,7 +234,7 @@ static long bsd_setrlimit(struct ctx* c) {
 }
 
 // ---------------------------------------------------------------- señales Darwin
-// USR1 self-kill se entrega al epílogo de SIGSYS. No hay recepción asíncrona Linux.
+// USR1/USR2 self-kill se entregan al epílogo de SIGSYS. Sin recepción asíncrona Linux.
 _Static_assert(SIGHUP == 1 && SIGINT == 2 && SIGQUIT == 3 && SIGILL == 4 &&
 	SIGTRAP == 5 && SIGABRT == 6 && SIGBUS == 7 && SIGFPE == 8 && SIGKILL == 9 &&
 	SIGUSR1 == 10 && SIGSEGV == 11 && SIGUSR2 == 12 && SIGPIPE == 13 &&
@@ -254,11 +254,13 @@ static struct signal_action signal_action_snapshot(int s) {
 	pthread_mutex_unlock(&sigtab_lock);
 	return a;
 }
-// Alcance inicial: USR1 enviado al PID propio; sin recepción Linux de señales
+// Alcance inicial: USR1/USR2 enviados al PID propio; sin recepción Linux de señales
 // externas ni interrupción de bucles sin syscalls. El resto no se simula.
 #define SIGNAL_FRAMES_MAX 8
 #define SIGNAL_XSTATE_MAX (64 * 1024)
 #define DARWIN_USR1_BIT (1u << 29)
+#define DARWIN_USR2_BIT (1u << 30)
+#define SIGNAL_SUPPORTED_BITS (DARWIN_USR1_BIT | DARWIN_USR2_BIT)
 // libplatform añade 0x400 incluso al handler tradicional; aquí el token se
 // valida siempre. 0x2=RESTART (sin syscall interrumpida), 0x40=SIGINFO.
 #define SIGNAL_SUPPORTED_FLAGS (0x2u | 0x40u | 0x400u)
@@ -314,13 +316,10 @@ static ssize_t signal_stack_write(uint64_t addr, const void* src, size_t len) {
 	return syscall(SYS_process_vm_writev, getpid(), &local, 1UL, &remote, 1UL, 0UL);
 }
 
-// Se llama SÓLO después de materializar RAX/CF/RDX de la syscall.
-long emu_signal_epilogue(struct ctx* c) {
-	if (!(signal_pending & DARWIN_USR1_BIT) || (pthread_mask & DARWIN_USR1_BIT)) return 0;
-	// Una entrega fallida no debe reaparecer después de devolver error a kill.
-	signal_pending &= ~DARWIN_USR1_BIT;
-	struct signal_action action = signal_action_snapshot(30);
-	if (action.handler == 1) return 0;
+// Construye una sola señal; sólo consume su bit al publicar el marco (o IGN).
+static long signal_deliver(struct ctx* c, int signo, uint32_t bit) {
+	struct signal_action action = signal_action_snapshot(signo);
+	if (action.handler == 1) { signal_pending &= ~bit; return 0; }
 	if (action.handler <= 1 || !action.tramp ||
 		(action.flags & ~SIGNAL_SUPPORTED_FLAGS) || !signal_secret) return -45;
 	if (signal_depth >= SIGNAL_FRAMES_MAX) return -35; // EAGAIN
@@ -354,7 +353,7 @@ long emu_signal_epilogue(struct ctx* c) {
 		.mcsize = 712, .mcontext = f->mc };
 	struct nucleo_senal_bytes bytes = nucleo_senal_codificar(uc, f->maquina);
 	uint8_t info[104] = { 0 };
-	int32_t signo = 30, code = 0x10001, pid = getpid(); uint32_t uid = emu_signal_ruid(c);
+	int32_t code = 0x10001, pid = getpid(); uint32_t uid = emu_signal_ruid(c);
 	memcpy(info, &signo, 4); memcpy(info + 8, &code, 4);
 	memcpy(info + 12, &pid, 4); memcpy(info + 16, &uid, 4);
 	memcpy(info + 24, &g[REG_RIP], 8); memcpy(info + 48, &rsp, 8);
@@ -362,14 +361,38 @@ long emu_signal_epilogue(struct ctx* c) {
 	if (signal_stack_write(f->uctx, bytes.uc, 56) != 56 || signal_stack_write(f->mc, bytes.mc, 712) != 712 ||
 		signal_stack_write(sip, info, 104) != 104 || signal_stack_write(sp, &ret, 8) != 8) return -D_EFAULT;
 	signal_depth++;
-	signal_pending &= ~DARWIN_USR1_BIT;
-	pthread_mask |= action.mask | DARWIN_USR1_BIT;
+	signal_pending &= ~bit;
+	pthread_mask |= action.mask | bit;
 	pthread_mask &= ~((1u << 8) | (1u << 16));
 	g[REG_RIP] = action.tramp; g[REG_RSP] = sp;
 	g[REG_RDI] = action.handler; g[REG_RSI] = (action.flags & 0x40) ? 30 : 1;
-	g[REG_RDX] = 30; g[REG_RCX] = sip; g[REG_R8] = f->uctx; g[REG_R9] = f->token;
+	g[REG_RDX] = signo; g[REG_RCX] = sip; g[REG_R8] = f->uctx; g[REG_R9] = f->token;
 	g[REG_EFL] &= ~(0x100UL | 0x400UL | 0x10000UL); // TF, DF, RF
 	return 0;
+}
+// Se llama SÓLO después de materializar RAX/CF/RDX de la syscall.
+long emu_signal_epilogue(struct ctx* c) {
+	uint32_t ready = signal_pending & SIGNAL_SUPPORTED_BITS & ~pthread_mask;
+	if (!ready) return 0;
+	int is_kill = c->nr == ((2UL << 24) | 37);
+	if (is_kill) {
+		// El llamador convierte un fallo de entrega en errno de kill. No
+		// atribuirle el fallo de OTRA pendiente ni sobrescribir un kill fallido.
+		int s = (int)c->a[1];
+		greg_t* g = c->uc->uc_mcontext.gregs;
+		if ((int)c->a[0] != getpid() || (s != 30 && s != 31) ||
+			g[REG_RAX] != 0 || (g[REG_EFL] & 1)) return 0;
+		ready &= 1u << (s - 1);
+		if (!ready) return 0; // otra pendiente se atenderá en otro epílogo
+	}
+	// Prioridad determinista por número Darwin, no promesa de orden FIFO.
+	uint32_t bit = (ready & DARWIN_USR1_BIT) ? DARWIN_USR1_BIT : DARWIN_USR2_BIT;
+	int signo = bit == DARWIN_USR1_BIT ? 30 : 31;
+	long err = signal_deliver(c, signo, bit);
+	// Sólo revocar el envío cuyo kill devuelve error. Las demás pendientes
+	// permanecen intactas; un fallo diferido conserva el estado y falla cerrado.
+	if (err && is_kill) signal_pending &= ~bit;
+	return err;
 }
 static long bsd_sigaction_locked(struct ctx* c) {
 	int s = (int)c->a[0];
@@ -467,7 +490,7 @@ static long bsd_pthread_sigmask(struct ctx* c) { return emu_signal_mask(c); }
 static long bsd_sigpending(struct ctx* c) { uint32_t z = signal_pending; return safe_write(c->a[0], &z, 4) == 4 ? 0 : -D_EFAULT; }
 
 // kill propio capturado: pendiente Darwin, nunca kill Linux. Grupos, selección
-// multihilo y capturas distintas de USR1 devuelven ENOTSUP. SA_ONSTACK,
+// multihilo y capturas distintas de USR1/USR2 devuelven ENOTSUP. SA_ONSTACK,
 // SA_NODEFER, SA_RESETHAND y SA_USERTRAMP no se implementan en esta entrega.
 static long bsd_kill(struct ctx* c) {
 	int s = (int)c->a[1];
@@ -481,11 +504,11 @@ static long bsd_kill(struct ctx* c) {
 		if (action.handler > 1) {
 			// Elección de hilo de señales de proceso aún no implementada. No
 			// convertir una captura Darwin en una señal Linux posiblemente letal.
-			if (s != 30 || atomic_load(&signal_threads) != 1 || !signal_secret ||
+			if ((s != 30 && s != 31) || atomic_load(&signal_threads) != 1 || !signal_secret ||
 				!action.tramp || (action.flags & ~SIGNAL_SUPPORTED_FLAGS)) return -45;
 			if (signal_depth >= SIGNAL_FRAMES_MAX) return -35;
 			uint32_t n; long e = signal_fp_read(c->uc, NULL, &n); if (e) return e;
-			signal_pending |= DARWIN_USR1_BIT;
+			signal_pending |= 1u << (s - 1);
 			return 0;
 		}
 	} else if (action.handler > 1 && (target == 0 || target == -1 || target == -getpgrp())) return -45;

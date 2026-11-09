@@ -1,0 +1,38 @@
+# Regresiones de shell sobre Recovery
+
+## Base verificada el 9 de noviembre de 2026
+
+- Recovery original de Apple: macOS 26.6.2, build 25G83.
+- Emulador: commit `92e03169fb8c11f9e59f31a5ad1535525b88d7eb`.
+- GitHub Actions: ejecución `42582988131`, aprobada.
+- Regresiones ejecutadas localmente con el binario compilado en Actions:
+  19/19 casos de la suite existente en ese commit y prueba de PTY aprobados.
+- Incluye auto-USR1, continuación después del trap y dos entregas consecutivas.
+- No se compila localmente ni se distribuyen los binarios de Apple.
+
+Esto NO demuestra shell completa, señales externas, entrega multihilo,
+SIGCHLD asíncrono, Ctrl-C, conservación SIMD bajo todas las variantes ni
+soporte completo de los servicios de Recovery. Nuevos casos de la suite
+pueden seguir fallando: la cuenta anterior corresponde al commit indicado.
+
+## Extracción
+
+7zip dejó archivos HFS vacíos; no usar esa extracción como referencia completa.
+Se compiló `hfsdump`/`hfstar` en GitHub desde `0x09/hfsfuse`, revisión
+`eed780cbe0445893de6f4aa8d74461da00756984`. El archivo tar producido se extrajo
+en un directorio nuevo con `tools/extraer-hfs-tar.py`. Los enlaces absolutos
+se confinan a la raíz y se rechazan escapes; no se extraen dispositivos.
+El volumen Data vacío se preparó desde `System/Library/Templates/Data`,
+copiando enlaces sin seguirlos. El `rm` original quedó recuperado y se probó
+la creación/borrado real de archivos. Los datos Apple permanecen fuera del repo.
+
+## Repetición
+
+```sh
+python3 -I tools/probar-shell.py --root "$TAHOE_ROOT" --run "$TAHOE_RUN" --salida "$RESULTADOS/shell"
+python3 -I tools/probar-shell-pty.py --root "$TAHOE_ROOT" --run "$TAHOE_RUN" --salida "$RESULTADOS/pty"
+```
+
+Las suites usan límites temporales y grupos propios para la limpieza. PTY
+comprueba prompt/órdenes y trabajo con espera; no equivale a validar todo el
+control de trabajos y señales de terminal.
