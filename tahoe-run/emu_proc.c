@@ -63,6 +63,7 @@ static long bsd_bsdthread_register(struct ctx* c) {
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <time.h>
 
 // gettimeofday(timeval*, timezone*, mach_absolute_time*): struct timeval de Darwin = {int64 seg, int32 microseg, pad}
@@ -232,8 +233,8 @@ static long bsd_setrlimit(struct ctx* c) {
 	return setrlimit(r, &rl) == 0 ? 0 : -darwin_errno(errno);
 }
 
-// ---------------------------------------------------------------- señales (virtuales por ahora)
-// Los manejadores se registran, pero no se entregan señales asíncronas: hace falta construir marcos de señal de macOS.
+// ---------------------------------------------------------------- señales Darwin
+// USR1 self-kill se entrega al epílogo de SIGSYS. No hay recepción asíncrona Linux.
 _Static_assert(SIGHUP == 1 && SIGINT == 2 && SIGQUIT == 3 && SIGILL == 4 &&
 	SIGTRAP == 5 && SIGABRT == 6 && SIGBUS == 7 && SIGFPE == 8 && SIGKILL == 9 &&
 	SIGUSR1 == 10 && SIGSEGV == 11 && SIGUSR2 == 12 && SIGPIPE == 13 &&
@@ -244,15 +245,141 @@ _Static_assert(SIGHUP == 1 && SIGINT == 2 && SIGQUIT == 3 && SIGILL == 4 &&
 	"ABI de señales Linux incompatible con nucleo/src/senales.rs");
 static int darwin_to_linux_sig(int s) { return nucleo_senal_linux(s); }
 int darwin_sig_to_linux(int s) { return darwin_to_linux_sig(s); }   // para tahoe_run.c (proc_info)
-static struct { uint64_t handler, tramp; uint32_t mask, flags; } sigtab[32];
-static long bsd_sigaction(struct ctx* c) {
+struct signal_action { uint64_t handler, tramp; uint32_t mask, flags; };
+static struct signal_action sigtab[32];
+static pthread_mutex_t sigtab_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct signal_action signal_action_snapshot(int s) {
+	pthread_mutex_lock(&sigtab_lock);
+	struct signal_action a = sigtab[s];
+	pthread_mutex_unlock(&sigtab_lock);
+	return a;
+}
+// Alcance inicial: USR1 enviado al PID propio; sin recepción Linux de señales
+// externas ni interrupción de bucles sin syscalls. El resto no se simula.
+#define SIGNAL_FRAMES_MAX 8
+#define SIGNAL_XSTATE_MAX (64 * 1024)
+#define DARWIN_USR1_BIT (1u << 29)
+// libplatform añade 0x400 incluso al handler tradicional; aquí el token se
+// valida siempre. 0x2=RESTART (sin syscall interrumpida), 0x40=SIGINFO.
+#define SIGNAL_SUPPORTED_FLAGS (0x2u | 0x40u | 0x400u)
+static uint64_t signal_secret;                // getrandom en emu_proc_init, nunca en SIGSYS
+static __thread uint64_t signal_generation;
+static __thread uint32_t signal_pending, pthread_mask;
+static __thread uint64_t alt_sp, alt_size;
+static __thread int alt_flags = 4;
+static __thread unsigned signal_depth;
+static __thread int signal_registered;
+static _Atomic unsigned signal_threads;
+struct signal_frame_private {
+	uint64_t uctx, mc, token;
+	sigset_t host_mask;
+	struct nucleo_senal_maquina maquina;
+	uint32_t fp_len;
+	_Alignas(64) uint8_t fp[SIGNAL_XSTATE_MAX];
+};
+static __thread struct signal_frame_private* signal_frames;
+
+void emu_signal_thread_enter(void) {
+	if (!signal_registered) { signal_registered = 1; atomic_fetch_add(&signal_threads, 1); }
+}
+void emu_signal_thread_done(void) {
+	if (signal_registered) { signal_registered = 0; atomic_fetch_sub(&signal_threads, 1); }
+	signal_pending = 0; signal_depth = 0; alt_sp = alt_size = 0; alt_flags = 4; pthread_mask = 0;
+}
+// indices duros sólo aquí, en la frontera CPU Linux; el resto usa el codec Darwin.
+static const int signal_regs[18] = { REG_RAX, REG_RBX, REG_RCX, REG_RDX,
+	REG_RDI, REG_RSI, REG_RBP, REG_RSP, REG_R8, REG_R9, REG_R10, REG_R11,
+	REG_R12, REG_R13, REG_R14, REG_R15, REG_RIP, REG_EFL };
+static long signal_fp_read(ucontext_t* uc, uint8_t* out, uint32_t* len) {
+	struct nucleo_senal_fp prefix;
+	uint64_t addr = (uint64_t)uc->uc_mcontext.fpregs;
+	if (!addr || safe_read(addr, prefix.bytes, sizeof prefix) != sizeof prefix) return -D_EFAULT;
+	uint32_t n = nucleo_senal_xstate_largo(prefix);
+	if (!n || n > SIGNAL_XSTATE_MAX) return -45; // Darwin ENOTSUP; nunca truncar
+	if (out && safe_read(addr, out, n) != n) return -D_EFAULT;
+	if (n > 512) {
+		uint32_t magic;
+		if (safe_read(addr + n - 4, &magic, 4) != 4) return -D_EFAULT;
+		if (magic != 0x46505845) return -D_EINVAL;
+	}
+	*len = n;
+	return 0;
+}
+
+// A diferencia de /proc/self/mem, process_vm_writev respeta PROT_WRITE.
+// Una pila invitada de sólo lectura no debe convertirse en código parcheado.
+static ssize_t signal_stack_write(uint64_t addr, const void* src, size_t len) {
+	struct iovec local = { .iov_base = (void*)src, .iov_len = len };
+	struct iovec remote = { .iov_base = (void*)addr, .iov_len = len };
+	return syscall(SYS_process_vm_writev, getpid(), &local, 1UL, &remote, 1UL, 0UL);
+}
+
+// Se llama SÓLO después de materializar RAX/CF/RDX de la syscall.
+long emu_signal_epilogue(struct ctx* c) {
+	if (!(signal_pending & DARWIN_USR1_BIT) || (pthread_mask & DARWIN_USR1_BIT)) return 0;
+	// Una entrega fallida no debe reaparecer después de devolver error a kill.
+	signal_pending &= ~DARWIN_USR1_BIT;
+	struct signal_action action = signal_action_snapshot(30);
+	if (action.handler == 1) return 0;
+	if (action.handler <= 1 || !action.tramp ||
+		(action.flags & ~SIGNAL_SUPPORTED_FLAGS) || !signal_secret) return -45;
+	if (signal_depth >= SIGNAL_FRAMES_MAX) return -35; // EAGAIN
+	if (!signal_frames) tls_lazy((void**)&signal_frames, sizeof(*signal_frames) * SIGNAL_FRAMES_MAX);
+	struct signal_frame_private* f = &signal_frames[signal_depth];
+	long err = signal_fp_read(c->uc, f->fp, &f->fp_len);
+	if (err) return err;
+	greg_t* g = c->uc->uc_mcontext.gregs;
+	f->host_mask = c->uc->uc_sigmask;
+	for (int i = 0; i < 18; i++) f->maquina.regs[i] = g[signal_regs[i]];
+	f->maquina.regs[18] = 0x2b; // XNU USER64_CS, no el selector Linux
+	f->maquina.regs[19] = f->maquina.regs[20] = 0;
+	struct nucleo_senal_fp prefix;
+	memcpy(prefix.bytes, f->fp, 512);
+	uint64_t bv = 3;
+	if (f->fp_len > 512) memcpy(&bv, f->fp + 512, 8);
+	prefix = nucleo_senal_fp_inicial(prefix, bv);
+	memcpy(f->maquina.fp, prefix.bytes, 512);
+	// XNU: redzone, ucontext56, siginfo104, mcontext712, alineación, retorno.
+	uint64_t rsp = g[REG_RSP], sp = nucleo_senal_pila(rsp, 56 + 104 + 712);
+	if (!sp || rsp >= 0x0000800000000000ULL) return -D_EFAULT;
+	f->uctx = rsp - 128 - 56;
+	uint64_t sip = f->uctx - 104;
+	f->mc = sip - 712;
+	// Nonce por entrega evita replay incluso si la pila reutiliza la dirección.
+	if (signal_generation == UINT64_MAX) return -45;
+	signal_generation++;
+	f->token = f->uctx ^ signal_secret ^ signal_generation;
+	struct nucleo_senal_uc uc = { .onstack = !!(alt_flags & 1), .sigmask = pthread_mask,
+		.stack_sp = sp, .stack_size = 0, .stack_flags = (alt_flags & 1),
+		.mcsize = 712, .mcontext = f->mc };
+	struct nucleo_senal_bytes bytes = nucleo_senal_codificar(uc, f->maquina);
+	uint8_t info[104] = { 0 };
+	int32_t signo = 30, code = 0x10001, pid = getpid(); uint32_t uid = emu_signal_ruid(c);
+	memcpy(info, &signo, 4); memcpy(info + 8, &code, 4);
+	memcpy(info + 12, &pid, 4); memcpy(info + 16, &uid, 4);
+	memcpy(info + 24, &g[REG_RIP], 8); memcpy(info + 48, &rsp, 8);
+	uint64_t ret = 0; // _sigtramp debe salir por sigreturn, nunca por ret
+	if (signal_stack_write(f->uctx, bytes.uc, 56) != 56 || signal_stack_write(f->mc, bytes.mc, 712) != 712 ||
+		signal_stack_write(sip, info, 104) != 104 || signal_stack_write(sp, &ret, 8) != 8) return -D_EFAULT;
+	signal_depth++;
+	signal_pending &= ~DARWIN_USR1_BIT;
+	pthread_mask |= action.mask | DARWIN_USR1_BIT;
+	pthread_mask &= ~((1u << 8) | (1u << 16));
+	g[REG_RIP] = action.tramp; g[REG_RSP] = sp;
+	g[REG_RDI] = action.handler; g[REG_RSI] = (action.flags & 0x40) ? 30 : 1;
+	g[REG_RDX] = 30; g[REG_RCX] = sip; g[REG_R8] = f->uctx; g[REG_R9] = f->token;
+	g[REG_EFL] &= ~(0x100UL | 0x400UL | 0x10000UL); // TF, DF, RF
+	return 0;
+}
+static long bsd_sigaction_locked(struct ctx* c) {
 	int s = (int)c->a[0];
 	if (s <= 0 || s >= 32 || s == 9 || s == 17) return -D_EINVAL;           // KILL y STOP no se pueden capturar
 	if (c->a[2]) {                                                           // struct sigaction anterior: {handler, mask(4), flags(4)}
 		uint8_t old[16] = { 0 };
 		memcpy(old, &sigtab[s].handler, 8);
 		memcpy(old + 8, &sigtab[s].mask, 4);
-		memcpy(old + 12, &sigtab[s].flags, 4);
+		uint32_t flags = sigtab[s].flags & 0x7f; // SA_USERSPACE_MASK de XNU
+		memcpy(old + 12, &flags, 4);
 		if (safe_write(c->a[2], old, 16) != 16) return -D_EFAULT;
 	}
 	if (c->a[1]) {                                                           // struct __sigaction: {handler, tramp, mask(4), flags(4)}
@@ -270,8 +397,12 @@ static long bsd_sigaction(struct ctx* c) {
 	}
 	return 0;
 }
-static uint64_t alt_sp, alt_size;
-static int alt_flags = 4;                                                    // SS_DISABLE
+static long bsd_sigaction(struct ctx* c) {
+	pthread_mutex_lock(&sigtab_lock);
+	long r = bsd_sigaction_locked(c);
+	pthread_mutex_unlock(&sigtab_lock);
+	return r;
+}
 static long bsd_sigaltstack(struct ctx* c) {
 	if (c->a[1]) {
 		uint8_t old[24] = { 0 };
@@ -287,38 +418,78 @@ static long bsd_sigaltstack(struct ctx* c) {
 }
 // sigreturn(uctx, infostyle, token). Con uctx NULL es la forma con que siglongjmp/longjmp de libplatform avisan al núcleo
 // de que salen (UC_RESET_ALT_STACK) o entran (UC_SET_ALT_STACK) en la pila alternativa: como XNU (unix_signal.c), solo
-// se cambia SS_ONSTACK en ss_flags. La vuelta de un manejador de verdad no puede darse aún (no se construyen marcos de
-// señal): se anota y EINVAL.
+// se cambia SS_ONSTACK en ss_flags. Estilo 30 restaura exclusivamente el último marco privado activo.
 #define UC_SET_ALT_STACK 0x40000000u
 #define UC_RESET_ALT_STACK 0x80000000u
 static long bsd_sigreturn(struct ctx* c) {
 	uint32_t style = (uint32_t)c->a[1];
 	if (style == UC_SET_ALT_STACK) { alt_flags |= 1; return 0; }        // SS_ONSTACK
 	if (style == UC_RESET_ALT_STACK) { alt_flags &= ~1; return 0; }
-	static int dicho;
-	if (!dicho++) logf_("    sigreturn <%d>: vuelta de un marco de señal (uctx=0x%lx estilo=0x%x) sin implementar\n", (int)getpid(), c->a[0], style);
-	return -D_EINVAL;
-}
-static uint32_t pthread_mask;
-static long bsd_pthread_sigmask(struct ctx* c) {                             // (how, set*, oset*) por valor en Darwin: how, set, oset
-	uint32_t old = pthread_mask;
-	if (c->a[1]) {
-		uint32_t set;
-		if (safe_read(c->a[1], &set, 4) != 4) return -D_EFAULT;
-		if (c->a[0] == 1) pthread_mask |= set; else if (c->a[0] == 2) pthread_mask &= ~set; else if (c->a[0] == 3) pthread_mask = set; else return -D_EINVAL;
+	if (style != 30 || !signal_depth || !signal_frames) return -D_EINVAL;
+	struct signal_frame_private* f = &signal_frames[signal_depth - 1];
+	if (c->a[0] != f->uctx || c->a[2] != f->token) return -D_EINVAL;
+	struct nucleo_senal_bytes bytes;
+	if (safe_read(f->uctx, bytes.uc, 56) != 56 || safe_read(f->mc, bytes.mc, 712) != 712) return -D_EFAULT;
+	struct nucleo_senal_vuelta restored = nucleo_senal_decodificar(bytes, f->maquina, f->mc);
+	if (restored.error) return -restored.error;
+	uint32_t current_len;
+	long err = signal_fp_read(c->uc, NULL, &current_len);
+	if (err) return err;
+	// Sólo el almacenamiento del SIGSYS actual pertenece al rt_sigreturn que
+	// vamos a ejecutar. Nunca volver a usar el puntero fpregs del SIGSYS antiguo.
+	if (current_len != f->fp_len) return -45;
+	memcpy(f->fp, restored.maquina.fp, 512);
+	if (f->fp_len > 512) {
+		uint64_t bv; memcpy(&bv, f->fp + 512, 8); bv |= 3; // x87 y SSE traducidos
+		memcpy(f->fp + 512, &bv, 8);
 	}
-	if (c->a[2] && safe_write(c->a[2], &old, 4) != 4) return -D_EFAULT;
+	if (safe_write((uint64_t)c->uc->uc_mcontext.fpregs, f->fp, f->fp_len) != f->fp_len) return -D_EFAULT;
+	greg_t* g = c->uc->uc_mcontext.gregs;
+	for (int i = 0; i < 18; i++) g[signal_regs[i]] = restored.maquina.regs[i];
+	// NO escribir REG_CSGSFS ni arch_prctl: FS/GS.base y TLS/SUD siguen vivos.
+	c->uc->uc_sigmask = f->host_mask;
+	pthread_mask = restored.mascara;
+	alt_flags = (alt_flags & ~1) | restored.onstack;
+	f->token = 0; signal_depth--;
+	c->context_restored = 1;
 	return 0;
 }
-static long bsd_sigpending(struct ctx* c) { uint32_t z = 0; return safe_write(c->a[0], &z, 4) == 4 ? 0 : -D_EFAULT; }
+long emu_signal_mask(struct ctx* c) {
+	uint32_t old = pthread_mask, set = 0;
+	if (c->a[1] && safe_read(c->a[1], &set, 4) != 4) return -D_EFAULT;
+	uint64_t result = nucleo_senal_mascara(old, set, c->a[0], !!c->a[1]);
+	if (result >> 32) return -(long)(result >> 32);
+	if (c->a[2] && safe_write(c->a[2], &old, 4) != 4) return -D_EFAULT;
+	pthread_mask = (uint32_t)result;
+	return 0;
+}
+static long bsd_pthread_sigmask(struct ctx* c) { return emu_signal_mask(c); }
+static long bsd_sigpending(struct ctx* c) { uint32_t z = signal_pending; return safe_write(c->a[0], &z, 4) == 4 ? 0 : -D_EFAULT; }
 
-// kill(pid, señal) y __pthread_kill(hilo, señal): señales dirigidas al propio proceso se envían de verdad.
+// kill propio capturado: pendiente Darwin, nunca kill Linux. Grupos, selección
+// multihilo y capturas distintas de USR1 devuelven ENOTSUP. SA_ONSTACK,
+// SA_NODEFER, SA_RESETHAND y SA_USERTRAMP no se implementan en esta entrega.
 static long bsd_kill(struct ctx* c) {
 	int s = (int)c->a[1];
 	if (s == 0) { long r = syscall(SYS_kill, (int)c->a[0], 0); return r < 0 ? -darwin_errno(errno) : 0; }
 	int ls = darwin_to_linux_sig(s);
 	if (ls <= 0) return -D_EINVAL;
-	long r = syscall(SYS_kill, (int)c->a[0], ls);
+	int target = (int)c->a[0];
+	struct signal_action action = signal_action_snapshot(s);
+	if (target == getpid()) {
+		if (action.handler == 1) return 0;
+		if (action.handler > 1) {
+			// Elección de hilo de señales de proceso aún no implementada. No
+			// convertir una captura Darwin en una señal Linux posiblemente letal.
+			if (s != 30 || atomic_load(&signal_threads) != 1 || !signal_secret ||
+				!action.tramp || (action.flags & ~SIGNAL_SUPPORTED_FLAGS)) return -45;
+			if (signal_depth >= SIGNAL_FRAMES_MAX) return -35;
+			uint32_t n; long e = signal_fp_read(c->uc, NULL, &n); if (e) return e;
+			signal_pending |= DARWIN_USR1_BIT;
+			return 0;
+		}
+	} else if (action.handler > 1 && (target == 0 || target == -1 || target == -getpgrp())) return -45;
+	long r = syscall(SYS_kill, target, ls);
 	// Señales que terminan a otro proceso: al registro (si no, el proceso desaparece sin dejar rastro: SIGKILL no se
 	// puede interceptar en el destino).
 	if ((int)c->a[0] != getpid() && (s == 9 || s == 15 || s == 6 || s == 3 || s == 2 || s == 1))
@@ -635,6 +806,10 @@ static void on_sigabrt(int sig, siginfo_t* si, void* v) {
 static long bsd_pthread_kill(struct ctx* c) {
 	int s = (int)c->a[1];
 	if (s == 0) return 0;
+	if (s <= 0 || s >= 32) return -D_EINVAL;
+	struct signal_action action = signal_action_snapshot(s);
+	if (action.handler == 1) return 0;
+	if (action.handler > 1) return -45; // no tgkill Linux para capturas Darwin
 	if (s == 6) {
 		guest_abort = 1;
 		diag_crash(c->uc);
@@ -659,9 +834,16 @@ static int darwin_wait_status(int st) { return nucleo_wait_estado(st); }
 // fork: se usa el de Linux. La interceptación y la memoria se heredan. Convenio de Darwin: padre rax=pid hijo, rdx=0;
 // hijo rax=pid del padre, rdx=1 (libsyscall devuelve 0 al hijo al ver rdx != 0).
 static long bsd_fork(struct ctx* c) {
+	pthread_mutex_lock(&sigtab_lock);
 	long p = syscall(SYS_fork);
-	if (p < 0) return -darwin_errno(errno);
-	if (p == 0) { memfd_reopen(); ports_forked_child(); fileport_forked_child(); reenable_dispatch(); }  // el hijo: su propia memoria, no es el creador
+	int fork_errno = errno;
+	if (p == 0) sigtab_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+	else pthread_mutex_unlock(&sigtab_lock);
+	if (p < 0) return -darwin_errno(fork_errno);
+	if (p == 0) {
+		atomic_store(&signal_threads, 1); signal_registered = 1; signal_pending = 0;
+		memfd_reopen(); ports_forked_child(); fileport_forked_child(); reenable_dispatch();
+	}  // el hijo conserva marcos activos, pero no señales pendientes del padre
 	// Convenio de Darwin: hijo rax=pid del padre, rdx=1; padre rax=pid del hijo, rdx=0. libsyscall devuelve 0 al hijo
 	// al ver rdx != 0, y libc ejecuta entonces los manejadores de hijo (reinicio de puertos Mach, hilo principal...).
 	c->has_ret2 = 1;
@@ -1043,11 +1225,12 @@ static long bsd_bsdthread_ctl(struct ctx* c) {
 static __thread sigjmp_buf thr_exit, wq_park;
 static __thread int thr_exit_ok, wq_park_ok, wq_terminated;
 extern void guest_thread_done(void);
-struct new_thread { uint64_t pthread, func, arg, stack, flags; uint32_t kport; };
+struct new_thread { uint64_t pthread, func, arg, stack, flags; uint32_t kport, signal_mask; };
 extern void enter_guest_thread(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((noreturn));
 static void* thread_main(void* p) {
 	struct new_thread t = *(struct new_thread*)p;
 	free(p);
+	pthread_mask = t.signal_mask;
 	// Como XNU: base de GS en el TSD del hilo, se avisa con TSD_BASE_SET y se retira SUSPENDED (libpthread lo exige).
 	{ FILE* f = fopen("/dev/shm/tahoe-watch-func", "r"); unsigned long fn = 0; if (f) { if (fscanf(f, "%lx", &fn) != 1) fn = 0; fclose(f); } g_watch = fn && fn == t.func; }
 	uint64_t flags = t.flags & ~0x20000000u;
@@ -1064,7 +1247,7 @@ static void* thread_main(void* p) {
 static long bsd_bsdthread_create(struct ctx* c) {
 	struct new_thread* t = malloc(sizeof *t);
 	if (!t) return -D_ENOMEM;
-	*t = (struct new_thread){ .pthread = c->a[3], .func = c->a[0], .arg = c->a[1], .stack = c->a[2], .flags = c->a[4] };
+	*t = (struct new_thread){ .pthread = c->a[3], .func = c->a[0], .arg = c->a[1], .stack = c->a[2], .flags = c->a[4], .signal_mask = pthread_mask };
 	// Cada hilo tiene su propio nombre de puerto (os_unfair_lock lo usa como dueño). Como XNU, queda en el TSD del
 	// pthread antes de volver: pthread_join lo mira, y si el hilo aún no había arrancado lo daba por terminado (volvía en
 	// el acto, liberaba la pila y el hilo nuevo caía al arrancar sobre ella).
@@ -1650,6 +1833,15 @@ static long bsd_ptrace(struct ctx* c) {
 }
 
 void emu_proc_init(void) {
+	// Antes de activar SUD: nunca pedir entropía desde on_sigsys.
+	size_t have = 0;
+	while (have < sizeof signal_secret) {
+		long n = syscall(SYS_getrandom, (uint8_t*)&signal_secret + have, sizeof signal_secret - have, 0);
+		if (n < 0 && errno == EINTR) continue;
+		if (n <= 0) { signal_secret = 0; break; }
+		have += (size_t)n;
+	}
+	emu_signal_thread_enter();
 	tahoe_sigaction(SIGABRT, on_sigabrt);
 	reg_bsd(26, bsd_ptrace);
 	reg_bsd(515, bsd_ulock_wait); reg_bsd(516, bsd_ulock_wake); reg_bsd(544, bsd_ulock_wait2);

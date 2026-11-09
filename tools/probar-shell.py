@@ -25,6 +25,8 @@ CASOS = {
     "directorio_temporal": ('d=/tmp/tahoe-dir-$$; /bin/mkdir "$d" && cd "$d" && printf dato > archivo && /bin/rm archivo && cd / && /bin/rmdir "$d" && printf OK', 'OK'),
     "directorio": ('cd /System && test "$PWD" = /System && printf OK', 'OK'),
     "trap": ('trap "printf TRAP_OK" USR1; kill -USR1 $$', 'TRAP_OK'),
+    "trap_continuacion": ('n=0; trap "n=$((n+1))" USR1; kill -USR1 $$; test "$n" = 1 && printf OK', 'OK'),
+    "trap_repetido": ("n=0; trap 'n=$((n+1))' USR1; kill -USR1 $$; kill -USR1 $$; test \"$n\" = 2 && printf OK", 'OK'),
 }
 
 

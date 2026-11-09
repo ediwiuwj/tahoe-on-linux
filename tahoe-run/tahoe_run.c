@@ -673,19 +673,7 @@ static long bsd_getentropy(struct ctx* c) {
 	return r < 0 ? -darwin_errno(errno) : 0;
 }
 // La máscara de señales es virtual por ahora: aplicarla de verdad podría bloquear SIGSYS (la interceptación).
-static uint32_t virtual_sigmask;
-static long bsd_sigprocmask(struct ctx* c) {
-	uint32_t set = 0, old = virtual_sigmask;
-	if (c->a[1] && safe_read(c->a[1], &set, 4) != 4) return -14;
-	if (c->a[1]) {
-		if (c->a[0] == 1) virtual_sigmask |= set;          // SIG_BLOCK
-		else if (c->a[0] == 2) virtual_sigmask &= ~set;     // SIG_UNBLOCK
-		else if (c->a[0] == 3) virtual_sigmask = set;       // SIG_SETMASK
-		else return -22;
-	}
-	if (c->a[2] && safe_write(c->a[2], &old, 4) != 4) return -14;
-	return 0;
-}
+static long bsd_sigprocmask(struct ctx* c) { return emu_signal_mask(c); }
 static void show_payload(const char* what, uint64_t ns, uint64_t code, uint64_t payload, uint64_t size, uint64_t reason) {
 	char msg[512] = "", pl[600] = "";
 	safe_string(reason, msg, sizeof msg);
@@ -1002,6 +990,11 @@ uint64_t ctx_arg(struct ctx* c, int i) {
 }
 
 void reg_bsd(unsigned num, emu_fn fn)  { if (num < BSD_NAMES_N) bsd_table[num] = fn; }
+uint32_t emu_signal_ruid(struct ctx* c) {
+	// Consultar el getuid virtual registrado por emu_cred, no el UID Linux.
+	struct ctx query = *c;
+	return bsd_table[24] ? (uint32_t)bsd_table[24](&query) : (uint32_t)getuid();
+}
 void reg_mach(unsigned num, emu_fn fn) { if (num < MACH_NAMES_N) mach_table[num] = fn; }
 
 // Un selector por hilo: cada hilo de macOS es un hilo de Linux y el despacho se activa por hilo.
@@ -1068,7 +1061,8 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 			if (pa >= 0) { char path[200] = ""; if (safe_read(c.a[pa], path, sizeof path - 1) > 0) { path[199] = 0; logf_("        ruta: \"%s\"\n", path); } }
 		}
 		watch_path_call(num, &c, r);
-		if (c.raw_ret) { g[REG_RAX] = (uint64_t)r; g[REG_EFL] &= ~1UL; }
+		if (c.context_restored) { /* sigreturn ya publicó la CPU; no tocar RAX/CF/RDX */ }
+		else if (c.raw_ret) { g[REG_RAX] = (uint64_t)r; g[REG_EFL] &= ~1UL; }
 		else if (r < 0 && r > -4096) { g[REG_RAX] = -r; g[REG_EFL] |= 1; }   // error: rax = errno, CF = 1
 		else { g[REG_RAX] = r; g[REG_EFL] &= ~1UL; if (c.has_ret2) g[REG_RDX] = c.ret2; }
 	} else if (cls == 1) {                                       // trampa Mach
@@ -1093,6 +1087,19 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 	} else {
 		log_call("clase", (uint32_t)c.nr, NULL, &c, "FALTA");
 		g[REG_RAX] = (uint64_t)-1;
+	}
+	// Entrega síncrona diferida: el contexto guardado incluye el retorno ya
+	// materializado. Una restauración puede habilitar otra pendiente anidada.
+	long signal_error = emu_signal_epilogue(&c);
+	if (signal_error) {
+		if (cls == 2 && num == 37 && !c.context_restored) {
+			g[REG_RAX] = -signal_error; g[REG_EFL] |= 1;
+		} else {
+			// Una pendiente aceptada antes no puede perderse ni declarar éxito
+			// si ahora su marco no se puede construir. Fallar cerrado.
+			logf_("    entrega USR1: no se pudo construir marco (%ld)\n", signal_error);
+			_exit(128 + SIGSEGV);
+		}
 	}
 	t_cur = NULL;
 	__atomic_add_fetch(&sc_count[cls & 3], 1, __ATOMIC_RELAXED);
@@ -1145,6 +1152,7 @@ void* tls_lazy(void** slot, size_t size) {
 	return p;
 }
 void guest_thread_done(void) {
+	emu_signal_thread_done();
 	for (int i = 0; i < n_tls_lazies; i++) { munmap(*tls_lazies[i].slot, tls_lazies[i].size); *tls_lazies[i].slot = NULL; }
 	n_tls_lazies = 0;
 	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
@@ -1152,6 +1160,7 @@ void guest_thread_done(void) {
 	if (alt_stack) { stack_t ss = { .ss_flags = SS_DISABLE }; sigaltstack(&ss, NULL); munmap(alt_stack, 1 << 18); alt_stack = NULL; }
 }
 void __attribute__((noreturn)) enter_guest_thread(uint64_t rip, uint64_t rsp, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+	emu_signal_thread_enter();
 	g_thread_port = (uint32_t)a1;
 	if (!alt_stack) {                                    // un hilo reutilizado vuelve a entrar: la pila alterna se crea una sola vez
 		alt_stack = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

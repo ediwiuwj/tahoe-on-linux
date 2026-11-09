@@ -8,6 +8,27 @@ uint32_t nucleo_red_msg_flags(uint32_t darwin);
 int32_t nucleo_senal_linux(int32_t darwin);
 int32_t nucleo_wait_estado(int32_t linux_estado);
 
+// Señales normales: frontera Rust segura por valor, sin punteros invitados.
+struct nucleo_senal_maquina { uint64_t regs[21]; uint8_t fp[512]; };
+struct nucleo_senal_bytes { uint8_t uc[56], mc[712]; };
+struct nucleo_senal_uc {
+	int32_t onstack; uint32_t sigmask;
+	uint64_t stack_sp, stack_size; int32_t stack_flags; uint32_t stack_relleno;
+	uint64_t link, mcsize, mcontext;
+};
+struct nucleo_senal_vuelta { struct nucleo_senal_maquina maquina; uint32_t mascara; int32_t onstack, error; };
+struct nucleo_senal_fp { uint8_t bytes[512]; };
+_Static_assert(sizeof(struct nucleo_senal_maquina) == 680, "senal_maquina");
+_Static_assert(sizeof(struct nucleo_senal_bytes) == 768, "senal_bytes");
+_Static_assert(sizeof(struct nucleo_senal_uc) == 56, "senal_uc");
+_Static_assert(sizeof(struct nucleo_senal_vuelta) == 696, "senal_vuelta");
+struct nucleo_senal_bytes nucleo_senal_codificar(struct nucleo_senal_uc, struct nucleo_senal_maquina);
+struct nucleo_senal_vuelta nucleo_senal_decodificar(struct nucleo_senal_bytes, struct nucleo_senal_maquina, uint64_t);
+uint32_t nucleo_senal_xstate_largo(struct nucleo_senal_fp);
+struct nucleo_senal_fp nucleo_senal_fp_inicial(struct nucleo_senal_fp, uint64_t bv);
+uint64_t nucleo_senal_pila(uint64_t rsp, uint64_t tam);
+uint64_t nucleo_senal_mascara(uint32_t old, uint32_t set, uint64_t how, uint32_t has_set);
+
 // Un descriptor de mensaje Mach ya leído (nucleo/src/mensaje.rs, struct Desc).
 struct nucleo_desc {
 	uint32_t off;      // desplazamiento en el mensaje

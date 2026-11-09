@@ -13,6 +13,7 @@ pub mod rwlock;
 pub mod red;
 pub mod senales;
 pub mod marco_senal;
+pub mod entrega_senal;
 
 /// Un pánico en el núcleo es un error de programación: se anota y se aborta el proceso, como haría un fallo en C, pero
 /// sin corromper memoria antes.

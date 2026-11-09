@@ -17,6 +17,14 @@ cabeceras reales. Dos pruebas Rust cubren las 256 combinaciones conocidas y
 cada bit restante. El workflow compila el emulador y ejecuta las pruebas de
 biblioteca exclusivamente en GitHub; no se compila en la máquina local.
 
+## Política de seguridad
+
+Rust seguro por defecto. `unsafe` se admite únicamente en componentes concretos
+que lo necesiten para FFI, memoria invitada o contexto de CPU, con precondiciones
+`SAFETY` documentadas y una interfaz segura hacia el resto. No extenderlo por
+comodidad ni presentar la frontera C restante como memoria segura.
+La prioridad actual es shell y servicios, sin desarrollo gráfico.
+
 ## Orden de trabajo
 
 1. Funciones puras de conversión y validación, con pruebas de equivalencia.
