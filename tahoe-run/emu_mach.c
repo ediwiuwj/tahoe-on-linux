@@ -1210,6 +1210,15 @@ static long mach_msg2(struct ctx* c) {
 		if (n >= 36) memcpy(&kr, rep + 32, 4);
 		logf_("    MIG_REPLY <%d> id=%d kr=%d bytes=%zu\n", (int)getpid(), h.id, kr, n);
 	}
+	if (trace_mig && h.id == 3405 && n >= 72) {
+		int32_t flavor, count; uint32_t tok[8];
+		memcpy(&flavor, req + 32, 4); memcpy(&count, rep + 36, 4);
+		if (flavor == 15 && count >= 8) {
+			memcpy(tok, rep + 40, sizeof tok);
+			logf_("    TASK_AUDIT_TOKEN pid=%d remote=0x%x [%u,%u,%u,%u,%u,%u,%u,%u]\n",
+				(int)getpid(), h.remote, tok[0],tok[1],tok[2],tok[3],tok[4],tok[5],tok[6],tok[7]);
+		}
+	}
 	reply_end(rep, n);
 	if (trace_mig) logf_("    mach_msg2: id=%d -> respuesta id=%d (%zu bytes)\n", h.id, h.id + 100, n);
 
