@@ -17,6 +17,12 @@ CASOS = {
     "wait": ('/usr/bin/true & p=$!; wait "$p"; test "$?" = 0 && printf OK', 'OK'),
     "redireccion": ('f=/tmp/tahoe-shell-test-$$; printf prueba > "$f" && /bin/cat < "$f"', 'prueba'),
     "rm_disponible": ('test -x /bin/rm && printf OK', 'OK'),
+    "crear_borrar": ('f=/tmp/tahoe-rm-$$; printf dato > "$f" && /bin/rm "$f" && test ! -e "$f" && printf OK', 'OK'),
+    "append": ('f=/tmp/tahoe-append-$$; printf uno > "$f"; printf dos >> "$f"; x=$(/bin/cat "$f"); /bin/rm "$f"; test "$x" = unodos && printf OK', 'OK'),
+    "descriptor": ('f=/tmp/tahoe-fd-$$; exec 7>"$f"; printf dato >&7; exec 7>&-; x=$(/bin/cat "$f"); /bin/rm "$f"; test "$x" = dato && printf OK', 'OK'),
+    "pipe_estado": ('set -o pipefail; /usr/bin/false | /usr/bin/true; test "$?" = 1 && printf OK', 'OK'),
+    "cadena_pipes": ('printf abc | /usr/bin/tr a-z A-Z | /bin/cat', 'ABC'),
+    "directorio_temporal": ('d=/tmp/tahoe-dir-$$; /bin/mkdir "$d" && cd "$d" && printf dato > archivo && /bin/rm archivo && cd / && /bin/rmdir "$d" && printf OK', 'OK'),
     "directorio": ('cd /System && test "$PWD" = /System && printf OK', 'OK'),
     "trap": ('trap "printf TRAP_OK" USR1; kill -USR1 $$', 'TRAP_OK'),
 }
