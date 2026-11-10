@@ -15,6 +15,8 @@ int semaphore_signal_all(port_t);
 struct tiempo { unsigned sec,nsec; };
 int semaphore_timedwait(port_t,struct tiempo);
 int printf(const char*,...);
+int mach_msg(void*,unsigned,unsigned,unsigned,port_t,unsigned,port_t);
+struct mensaje { unsigned bits,size,remote,local,voucher; int id; unsigned payload,pad; unsigned char trailer[64]; };
 #define EXIGIR(x) do { if (!(x)) { printf("MACH_FALLO linea=%d\n",__LINE__); return 1; } } while(0)
 int main(void) {
     port_t task=mach_task_self_, p=0, set=0, sem=0;
@@ -26,6 +28,12 @@ int main(void) {
     EXIGIR(mach_port_extract_member(task,p,set)==18);
     EXIGIR(mach_port_guard(task,p,0x12345678ULL,0)==0);
     EXIGIR(mach_port_unguard(task,p,0x12345678ULL)==0);
+    struct mensaje msg={20,32,p,0,0,42,0x12345678,0,{0}};
+    EXIGIR(mach_msg(&msg,1,32,0,0,0,0)==0);
+    struct mensaje rx={0};
+    EXIGIR(mach_msg(&rx,2|0x100,0,sizeof rx,p,10,0)==0);
+    EXIGIR(rx.size==32 && rx.id==42 && rx.payload==0x12345678);
+    EXIGIR(mach_msg(&rx,2|0x100,0,sizeof rx,p,0,0)==0x10004003);
     EXIGIR(semaphore_create(task,&sem,0,1)==0 && sem!=0);
     EXIGIR(semaphore_wait(sem)==0);
     struct tiempo cero={0,0};
