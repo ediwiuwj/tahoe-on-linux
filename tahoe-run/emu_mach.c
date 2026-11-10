@@ -507,13 +507,11 @@ static int stat_fields(const char* path, long long f[24], char* state) {
 }
 // tiempo en ticks de reloj -> time_value_t {segundos, microsegundos}
 static void ticks_tv(long long t, int32_t tv[2]) {
-	long hz = sysconf(_SC_CLK_TCK); if (hz <= 0) hz = 100;
-	tv[0] = (int32_t)(t / hz); tv[1] = (int32_t)((t % hz) * (1000000 / hz));
+	struct nucleo_mach_tiempo value = nucleo_mach_ticks(t, sysconf(_SC_CLK_TCK));
+	tv[0] = value.segundos; tv[1] = value.microsegundos;
 }
-// prioridad de Mach a partir del nice de Linux: BASEPRI_DEFAULT (31) menos el nice, como hace XNU con setpriority
-static int32_t mach_pri(long long nice) { long long p = 31 - nice; return (int32_t)(p < 0 ? 0 : p > 63 ? 63 : p); }
-// estado de un hilo de Linux -> TH_STATE_* de Mach (RUNNING 1, STOPPED 2, WAITING 3, UNINTERRUPTIBLE 4, HALTED 5)
-static int32_t mach_run_state(char st) { return st == 'R' ? 1 : st == 'T' || st == 't' ? 2 : st == 'D' ? 4 : st == 'Z' || st == 'X' ? 5 : 3; }
+static int32_t mach_pri(long long nice) { return nucleo_mach_prioridad(nice); }
+static int32_t mach_run_state(char st) { return nucleo_mach_estado((uint8_t)st); }
 
 static size_t mig_task_info(const struct hdr* req, const uint8_t* m, uint8_t* r) {
 	int32_t flavor, cap;

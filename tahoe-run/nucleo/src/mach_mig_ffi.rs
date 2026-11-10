@@ -17,3 +17,12 @@ pub extern "C" fn nucleo_mig_ool(id:i32,dir:u64,len:u32,cnt:u32,ports:u32,extra:
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn nucleo_mig_rx_disp(tx:u32)->u32 {mach_mig::disposicion_recibida(tx)}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn nucleo_mach_ticks(t:i64,hz:i64)->crate::mach_planificacion::Tiempo {crate::mach_planificacion::ticks(t,hz)}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn nucleo_mach_prioridad(nice:i64)->i32 {crate::mach_planificacion::prioridad(nice)}
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn nucleo_mach_estado(st:u8)->i32 {crate::mach_planificacion::estado(st)}

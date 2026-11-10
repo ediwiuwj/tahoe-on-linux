@@ -19,7 +19,10 @@ pub mod spawn;
 pub mod marcos_activos;
 mod spawn_ffi;
 pub mod mach_puerto;
+pub mod mach_derechos;
+mod mach_derechos_ffi;
 pub mod mach_mig;
+pub mod mach_planificacion;
 mod mach_mig_ffi;
 mod mach_puerto_ffi;
 pub mod mach_semaforo;
@@ -42,7 +45,3 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
-
-// Máquina de estados de semáforos Mach y frontera ABI por valor.
-pub mod mach_semaforo;
-mod mach_semaforo_ffi;

@@ -424,31 +424,36 @@ static void ns_check_locked(uint32_t port) {
 // existen; restar de una que no consta no hace nada (el derecho llegó por un camino que no se sigue). base: con qué se crea
 // la entrada antes de sumar delta (1 si ya tenía un derecho que no constaba).
 static int sr_trace(void) { static int v = -1; if (v < 0) v = trace_file_on("/dev/shm/tahoe-sr-trace"); return v; }
-static void sr_add_locked_(uint32_t port, int32_t holder, int delta, int base, const char* why) {
-	if (!port || !delta) return;
+// C pendiente: lookup/recorridos, notificaciones, mensajes y syscalls. Toda
+// transición contable se decide en Rust sobre una entrada, bajo el mismo lock.
+static void sr_transition_locked(uint32_t port, int32_t holder, int delta, int base, uint32_t kind, const char* why) {
 	int fr = -1, mine = -1;
 	for (int i = 0; i < (int)shm->sh_hw; i++) {
 		if (shm->sh[i].port == port && shm->sh[i].holder == holder) { mine = i; break; }
 		if (fr < 0 && !shm->sh[i].port) fr = i;
 	}
+	struct nucleo_derechos_entry e = {0};
+	if (mine >= 0) e = (struct nucleo_derechos_entry){shm->sh[mine].port, shm->sh[mine].holder, shm->sh[mine].refs};
+	struct nucleo_derechos_result r = nucleo_derechos_reference(e, port_snapshot(find_locked(port)), port, holder, delta, base, kind, 0);
+	if (!r.changed) return;
 	if (mine < 0) {
-		if (delta < 0 || !find_locked(port)) return;
 		if (fr < 0 && shm->sh_hw < MAXSH) fr = (int)shm->sh_hw++;
 		if (fr < 0) { logf_("    no-senders: tabla llena\n"); return; }
-		shm->sh[mine = fr] = (struct shold){ port, holder, base };
+		mine = fr;
 	}
-	shm->sh[mine].refs += delta;
-	if (sr_trace()) { struct sport* q = find_locked(port); logf_("    SR <%d> %s 0x%x quien=%d %+d -> %d (recibe %d, aviso=%s)\n", (int)getpid(), why, port, (int)holder, delta, shm->sh[mine].refs, q ? (int)q->rpid : -1, q && q->nsreq ? "sí" : "no"); }
-	if (shm->sh[mine].refs <= 0) { shm->sh[mine].port = 0; ns_check_locked(port); }
+	shm->sh[mine] = (struct shold){r.entry.port, r.entry.holder, r.entry.refs};
+	if (sr_trace()) { struct sport* q = find_locked(port); logf_("    SR <%d> %s 0x%x quien=%d %+d -> %d (recibe %d, aviso=%s)\n", (int)getpid(), why, port, (int)holder, delta, r.entry.refs, q ? (int)q->rpid : -1, q && q->nsreq ? "sí" : "no"); }
+	if (r.released) ns_check_locked(port);
+}
+static void sr_add_locked_(uint32_t port, int32_t holder, int delta, int base, const char* why) {
+	sr_transition_locked(port, holder, delta, base, NUCLEO_D_ENVIO, why);
 }
 #define sr_add_locked(port, holder, delta, base) sr_add_locked_(port, holder, delta, base, __func__)
-// Un derecho de envío que llega a este proceso (en un mensaje o en una respuesta del núcleo).
-static void sh_add_locked(uint32_t port, int32_t holder) { if (holder) sr_add_locked(port, holder, 1, 0); }
-// Al traspasar el derecho de recepción, quien lo tenía suele quedarse con derechos de envío hechos por él; si no constaban,
-// se anota uno.
+static void sh_add_locked(uint32_t port, int32_t holder) {
+	sr_transition_locked(port, holder, 1, 0, NUCLEO_D_LLEGADA, __func__);
+}
 static void sh_put_locked(uint32_t port, int32_t holder) {
-	for (int i = 0; i < (int)shm->sh_hw; i++) if (shm->sh[i].port == port && shm->sh[i].holder == holder) return;
-	sr_add_locked(port, holder, 1, 0);
+	sr_transition_locked(port, holder, 1, 0, NUCLEO_D_CONSERVAR, __func__);
 }
 void port_send_got(uint32_t port) { lock(); sh_add_locked(port, (int32_t)getpid()); unlock(); }
 void port_send_release(uint32_t port, int delta) {
@@ -461,23 +466,22 @@ void port_send_release(uint32_t port, int delta) {
 // de /dev/shm. Sin contar los derechos, los archivos no se borraban nunca: lsd crea una de 1,5 MB por cada cliente que pide
 // su base de datos y en un par de minutos llenaba /dev/shm (SIGBUS al tocar la región compartida: launchd moría).
 static void mer_add_locked(uint32_t port, int32_t pid, int delta) {
-	if (!port || !delta) return;
 	struct sport* p = find_locked(port);
-	if (!p || !p->me) return;
-	int fr = -1, mine = -1; long total = 0;
+	int fr = -1, mine = -1; int64_t total = 0;
 	for (int i = 0; i < MAXMER; i++) {
 		if (shm->mer[i].port == port) { total += shm->mer[i].refs; if (shm->mer[i].pid == pid) mine = i; }
 		else if (fr < 0 && !shm->mer[i].port) fr = i;
 	}
+	struct nucleo_derechos_entry e = {0};
+	if (mine >= 0) e = (struct nucleo_derechos_entry){shm->mer[mine].port, shm->mer[mine].pid, shm->mer[mine].refs};
+	struct nucleo_derechos_result r = nucleo_derechos_reference(e, port_snapshot(p), port, pid, delta, 0, NUCLEO_D_MEMORIA, total);
+	if (!r.changed) return;
 	if (mine < 0) {
-		if (delta < 0) return;                                // no constaba: no se puede soltar lo que no se tiene
 		if (fr < 0) { logf_("    entradas de memoria: tabla llena\n"); return; }
-		shm->mer[mine = fr] = (struct meref){ port, pid, 0 };
+		mine = fr;
 	}
-	int32_t old = shm->mer[mine].refs, nw = old + delta < 0 ? 0 : old + delta;
-	shm->mer[mine].refs = nw; total += nw - old;
-	if (!nw) shm->mer[mine].port = 0;
-	if (total <= 0) destroy_locked(p);
+	shm->mer[mine] = (struct meref){r.entry.port, r.entry.holder, r.entry.refs};
+	if (r.destroy) destroy_locked(p);
 }
 void port_me_created(uint32_t port) {
 	lock();
@@ -492,17 +496,29 @@ static void port_me_release(uint32_t port, int delta) { lock(); mer_add_locked(p
 // duplicada, que en XNU no puede ocurrir (el derecho se consume al enviar).
 static struct sonce so_used[256];
 static unsigned so_used_next;
+static struct nucleo_derechos_result so_entry(struct sonce e, uint32_t port, int32_t holder, uint32_t op) {
+	return nucleo_derechos_once((struct nucleo_derechos_entry){e.port, e.holder, 0}, port, holder, op);
+}
 static int so_was_used_locked(uint32_t port, int32_t holder) {
-	for (int i = 0; i < 256; i++) if (so_used[i].port == port && so_used[i].holder == holder) return 1;
+	for (int i = 0; i < 256; i++) if (so_entry(so_used[i], port, holder, 0).changed) return 1;
 	return 0;
 }
 static void so_add_locked(uint32_t port, int32_t holder) {
-	for (int i = 0; i < 256; i++) if (so_used[i].port == port && so_used[i].holder == holder) so_used[i].port = 0;
-	for (int i = 0; i < MAXSO; i++) if (!shm->so[i].port) { shm->so[i] = (struct sonce){ port, holder }; return; }
+	for (int i = 0; i < 256; i++) {
+		struct nucleo_derechos_result r = so_entry(so_used[i], port, holder, 2);
+		if (r.changed) so_used[i] = (struct sonce){r.entry.port, r.entry.holder};
+	}
+	for (int i = 0; i < MAXSO; i++) {
+		struct nucleo_derechos_result r = so_entry(shm->so[i], port, holder, 1);
+		if (r.changed) { shm->so[i] = (struct sonce){r.entry.port, r.entry.holder}; return; }
+	}
 	logf_("    send-once: tabla llena\n");
 }
 static int so_take_locked(uint32_t port, int32_t holder) {
-	for (int i = 0; i < MAXSO; i++) if (shm->so[i].port == port && shm->so[i].holder == holder) { shm->so[i].port = 0; return 1; }
+	for (int i = 0; i < MAXSO; i++) {
+		struct nucleo_derechos_result r = so_entry(shm->so[i], port, holder, 2);
+		if (r.changed) { shm->so[i] = (struct sonce){r.entry.port, r.entry.holder}; return 1; }
+	}
 	return 0;
 }
 

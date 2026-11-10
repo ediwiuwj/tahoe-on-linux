@@ -9,6 +9,10 @@ struct nucleo_mig_respuesta nucleo_mig_error(int32_t id, int32_t codigo);
 struct nucleo_mig_respuesta nucleo_mig_puerto(int32_t id, uint32_t nombre, uint8_t disposicion);
 struct nucleo_mig_respuesta nucleo_mig_ool(int32_t id, uint64_t dir, uint32_t len, uint32_t cnt, uint32_t ports, uint32_t extra, uint32_t has_extra);
 uint32_t nucleo_mig_rx_disp(uint32_t tx);
+struct nucleo_mach_tiempo { int32_t segundos, microsegundos; };
+struct nucleo_mach_tiempo nucleo_mach_ticks(int64_t t, int64_t hz);
+int32_t nucleo_mach_prioridad(int64_t nice);
+int32_t nucleo_mach_estado(uint8_t st);
 
 // Traducción pura de MSG_* Darwin a Linux x86_64; conserva la supresión de SIGPIPE.
 uint32_t nucleo_red_msg_flags(uint32_t darwin);
@@ -133,6 +137,15 @@ uint32_t nucleo_puerto_in_set(struct nucleo_sport, uint32_t);
 struct nucleo_sport nucleo_puerto_remove(struct nucleo_sport, uint32_t);
 struct nucleo_puerto_batch nucleo_puerto_membership(struct nucleo_puerto_batch, uint32_t);
 struct nucleo_puerto_guard nucleo_puerto_guard(struct nucleo_sport, uint32_t, uint64_t, uint64_t, int32_t);
+
+// Derechos: una entrada por valor, nunca tablas compartidas; commit bajo shm->lk.
+struct nucleo_derechos_entry { uint32_t port; int32_t holder, refs; };
+struct nucleo_derechos_result { struct nucleo_derechos_entry entry; uint32_t changed, released, destroy; };
+_Static_assert(sizeof(struct nucleo_derechos_entry) == 12 && offsetof(struct nucleo_derechos_entry, refs) == 8, "derechos entry ABI");
+_Static_assert(sizeof(struct nucleo_derechos_result) == 24 && offsetof(struct nucleo_derechos_result, changed) == 12, "derechos result ABI");
+enum { NUCLEO_D_ENVIO, NUCLEO_D_MEMORIA, NUCLEO_D_LLEGADA, NUCLEO_D_CONSERVAR };
+struct nucleo_derechos_result nucleo_derechos_reference(struct nucleo_derechos_entry, struct nucleo_sport, uint32_t, int32_t, int32_t, int32_t, uint32_t, int64_t);
+struct nucleo_derechos_result nucleo_derechos_once(struct nucleo_derechos_entry, uint32_t, int32_t, uint32_t);
 
 // Semáforos Mach: transiciones puras, serializadas por el mutex del objeto en C.
 struct nucleo_sem_estado { int64_t count; uint64_t generation; uint32_t destroyed, reserved; };
