@@ -48,11 +48,39 @@
 // La lista va compactada (sin huecos: los nombres primero, luego ceros) para que mirar un puerto sin conjuntos cueste poco.
 #define NSETS 32
 struct sport { uint32_t name, sets[NSETS], head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; uint32_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; uint32_t spn; uint8_t me; };   // me: entrada de memoria (mach_make_memory_entry), ver mer_add_locked   // spn: peticiones MACH_NOTIFY_SEND_POSSIBLE pendientes en shm->sp (para no recorrer la tabla si no hay)   // hnext: siguiente (índice+1) en la cadena de su cubeta del índice por nombre   // nsreq: puerto que pidió MACH_NOTIFY_NO_SENDERS   // qlimit: 0 = MACH_PORT_QLIMIT_DEFAULT (5)   // svc/svc_ctx: puerto de servicio de launchd y su guarda (vuelve con PORT_DESTROYED)   // pdreq: puerto que pidió MACH_NOTIFY_PORT_DESTROYED   // guarded/strict_guard: el contexto es una guarda (mach_port_guard / MPO_CONTEXT_AS_GUARD)   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
-static int in_set(const struct sport* p, uint32_t set) { for (int j = 0; j < NSETS && p->sets[j]; j++) if (p->sets[j] == set) return 1; return 0; }
+_Static_assert(sizeof(struct sport) == sizeof(struct nucleo_sport) && _Alignof(struct sport) == _Alignof(struct nucleo_sport), "shared sport ABI");
+_Static_assert(offsetof(struct sport, name) == offsetof(struct nucleo_sport, name), "shared sport.name");
+_Static_assert(offsetof(struct sport, sets) == offsetof(struct nucleo_sport, sets), "shared sport.sets");
+_Static_assert(offsetof(struct sport, head) == offsetof(struct nucleo_sport, head), "shared sport.head");
+_Static_assert(offsetof(struct sport, tail) == offsetof(struct nucleo_sport, tail), "shared sport.tail");
+_Static_assert(offsetof(struct sport, count) == offsetof(struct nucleo_sport, count), "shared sport.count");
+_Static_assert(offsetof(struct sport, owner) == offsetof(struct nucleo_sport, owner), "shared sport.owner");
+_Static_assert(offsetof(struct sport, rpid) == offsetof(struct nucleo_sport, rpid), "shared sport.rpid");
+_Static_assert(offsetof(struct sport, used) == offsetof(struct nucleo_sport, used), "shared sport.used");
+_Static_assert(offsetof(struct sport, is_set) == offsetof(struct nucleo_sport, is_set), "shared sport.is_set");
+_Static_assert(offsetof(struct sport, guarded) == offsetof(struct nucleo_sport, guarded), "shared sport.guarded");
+_Static_assert(offsetof(struct sport, strict_guard) == offsetof(struct nucleo_sport, strict_guard), "shared sport.strict_guard");
+_Static_assert(offsetof(struct sport, cv) == offsetof(struct nucleo_sport, cv), "shared sport.cv");
+_Static_assert(offsetof(struct sport, ctx) == offsetof(struct nucleo_sport, ctx), "shared sport.ctx");
+_Static_assert(offsetof(struct sport, pdreq) == offsetof(struct nucleo_sport, pdreq), "shared sport.pdreq");
+_Static_assert(offsetof(struct sport, svc) == offsetof(struct nucleo_sport, svc), "shared sport.svc");
+_Static_assert(offsetof(struct sport, svc_ctx) == offsetof(struct nucleo_sport, svc_ctx), "shared sport.svc_ctx");
+_Static_assert(offsetof(struct sport, qlimit) == offsetof(struct nucleo_sport, qlimit), "shared sport.qlimit");
+_Static_assert(offsetof(struct sport, nsreq) == offsetof(struct nucleo_sport, nsreq), "shared sport.nsreq");
+_Static_assert(offsetof(struct sport, nsmscount) == offsetof(struct nucleo_sport, nsmscount), "shared sport.nsmscount");
+_Static_assert(offsetof(struct sport, hnext) == offsetof(struct nucleo_sport, hnext), "shared sport.hnext");
+_Static_assert(offsetof(struct sport, spn) == offsetof(struct nucleo_sport, spn), "shared sport.spn");
+_Static_assert(offsetof(struct sport, me) == offsetof(struct nucleo_sport, me), "shared sport.me");
+// Solo copias por valor: no se forman referencias Rust sobre memoria compartida.
+static struct nucleo_sport port_snapshot(const struct sport* p) {
+    struct nucleo_sport v = {0};
+    if (p) memcpy(&v, p, sizeof v);
+    return v;
+}
+static int in_set(const struct sport* p, uint32_t set) { return nucleo_puerto_in_set(port_snapshot(p), set); }
 static void set_remove(struct sport* p, uint32_t set) {
-	int n = 0;
-	for (int j = 0; j < NSETS && p->sets[j]; j++) if (p->sets[j] != set) p->sets[n++] = p->sets[j];
-	for (int j = n; j < NSETS && p->sets[j]; j++) p->sets[j] = 0;
+    struct nucleo_sport v = nucleo_puerto_remove(port_snapshot(p), set);
+    memcpy(p->sets, v.sets, sizeof p->sets);
 }
 struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint64_t spill; uint8_t data[MSGSZ - 40]; };   // sauid/sasid: sesión de auditoría del remitente   // spill: datos fuera de línea en un archivo aparte (nucleo_desborde_*), 0 = en la ranura
 // Derechos que el núcleo tiene que vigilar para avisar cuando muere su dueño (ver "notificaciones" más abajo):
@@ -1042,20 +1070,27 @@ int port_drain_idle(uint32_t name) {
 	return gone;
 }
 uint64_t port_get_context(uint32_t name) { lock(); struct sport* p = find_locked(name); uint64_t r = p ? p->ctx : 0; unlock(); return r; }
+// Snapshot y commit enteros dentro del candado ya existente. Sin alias Rust a shm.
+static int guard_transition(uint32_t name, uint32_t op, uint64_t old, uint64_t nw, int strict,
+                            uint64_t* context, int* guarded) {
+    lock();
+    struct sport* p = find_locked(name);
+    if (context) *context = p ? p->ctx : 0;
+    if (guarded) *guarded = p ? p->guarded : 0;
+    struct nucleo_puerto_guard r = nucleo_puerto_guard(port_snapshot(p), op, old, nw, strict);
+    if (p && !r.error) { p->ctx = r.port.ctx; p->guarded = r.port.guarded; p->strict_guard = r.port.strict_guard; }
+    unlock();
+    return r.error;
+}
 // mach_port_set_context: un puerto con guarda estricta no deja cambiar su contexto. Devuelve un kern_return_t.
 int port_set_context(uint32_t name, uint64_t v) {
-	lock(); struct sport* p = find_locked(name);
-	int r = !p ? 15 /* KERN_INVALID_NAME */ : p->strict_guard ? 4 /* KERN_INVALID_ARGUMENT */ : 0;
-	if (!r) p->ctx = v;
-	unlock();
-	if (r == 4) logf_("    guarda: <%d> mach_port_set_context(0x%x) sobre guarda estricta\n", (int)getpid(), name);
-	return r;
+    int r = guard_transition(name, 4, 0, v, 0, NULL, NULL);
+    if (r == 4) logf_("    guarda: <%d> mach_port_set_context(0x%x) sobre guarda estricta\n", (int)getpid(), name);
+    return r;
 }
 // mach_port_assert_attributes(MACH_PORT_GUARD_INFO): el puerto tiene guarda estricta con ese valor
 int port_assert_guard(uint32_t name, uint64_t guard) {
-	lock(); struct sport* p = find_locked(name);
-	int r = !p ? 15 : (p->guarded && p->strict_guard && p->ctx == guard) ? 0 : 4;
-	unlock(); return r;
+    return guard_transition(name, 0, guard, 0, 0, NULL, NULL);
 }
 // mach_port_get_refs(name, right): como los nombres son globales, se responde según lo que este proceso tiene de ese puerto.
 // right: 0 SEND, 1 RECEIVE, 2 SEND_ONCE, 3 PORT_SET, 4 DEAD_NAME. Un nombre que fue puerto y ya no existe es un nombre
@@ -1084,30 +1119,21 @@ int port_get_refs(uint32_t name, uint32_t right, uint32_t* refs) {
 }
 // mach_port_swap_guard: cambia la guarda de un puerto guardado (no estricto) si la vieja coincide
 int port_swap_guard(uint32_t name, uint64_t old, uint64_t nw) {
-	lock(); struct sport* p = find_locked(name);
-	int r = !p ? 15 : (!p->guarded || p->strict_guard || p->ctx != old) ? 4 : 0;
-	if (!r) p->ctx = nw;
-	unlock(); return r;
+    return guard_transition(name, 1, old, nw, 0, NULL, NULL);
 }
 // Guardas de puerto como en XNU (mach_port_guard_locked / unguard_locked): la guarda se guarda en el contexto, que el
 // receptor ve en el trailer (msgh_context). libxpc guarda así sus puertos de respuesta con el objeto de la petición.
 int port_guard(uint32_t name, uint64_t guard, int strict) {
-	lock(); struct sport* p = find_locked(name);
-	int r = !p ? 15 : p->ctx ? 4 : 0;                    // ya tiene contexto o guarda: KERN_INVALID_ARGUMENT
-	if (!r) { p->ctx = guard; p->guarded = 1; p->strict_guard = strict != 0; }
-	uint64_t old = p ? p->ctx : 0;
-	unlock();
-	if (r) logf_("    guarda: <%d> mach_port_guard(0x%x, 0x%lx) falla %d (contexto 0x%lx)\n", (int)getpid(), name, guard, r, old);
-	return r;
+    uint64_t old;
+    int r = guard_transition(name, 2, guard, 0, strict, &old, NULL);
+    if (r) logf_("    guarda: <%d> mach_port_guard(0x%x, 0x%lx) falla %d (contexto 0x%lx)\n", (int)getpid(), name, guard, r, old);
+    return r;
 }
 int port_unguard(uint32_t name, uint64_t guard) {
-	lock(); struct sport* p = find_locked(name);
-	int r = !p ? 15 : (!p->guarded || p->ctx != guard) ? 4 : 0;
-	uint64_t old = p ? p->ctx : 0; int gd = p ? p->guarded : 0;
-	if (!r) { p->ctx = 0; p->guarded = p->strict_guard = 0; }
-	unlock();
-	if (r) logf_("    guarda: <%d> mach_port_unguard(0x%x, 0x%lx) falla %d (contexto 0x%lx, guardado %d)\n", (int)getpid(), name, guard, r, old, gd);
-	return r;
+    uint64_t old; int gd;
+    int r = guard_transition(name, 3, guard, 0, 0, &old, &gd);
+    if (r) logf_("    guarda: <%d> mach_port_unguard(0x%x, 0x%lx) falla %d (contexto 0x%lx, guardado %d)\n", (int)getpid(), name, guard, r, old, gd);
+    return r;
 }
 // Diagnóstico (volcado de hilos): los puertos de este proceso con mensajes en cola y los conjuntos en que están; y sus
 // conjuntos con la cuenta que llevan. Un mensaje encolado en un puerto de un conjunto en el que espera un hilo que no se
@@ -1192,44 +1218,37 @@ static long t_insert_right(struct ctx* c) {
 }
 // mach_port_insert_member_trap(task, name, pset): además de los conjuntos en que ya esté (hasta NSETS).
 // Los mensajes ya encolados en el puerto cuentan también para el conjunto nuevo.
-static long t_insert_member(struct ctx* c) {
-	lock();
-	struct sport *p = find_locked((uint32_t)c->a[1]), *st = find_locked((uint32_t)c->a[2]);
-	long r = KERN_INVALID_NAME_;
-	if (p && st && st->is_set) {
-		if (in_set(p, st->name)) r = 17;                                 // KERN_ALREADY_IN_SET
-		else { r = 3; for (int j = 0; j < NSETS; j++) if (!p->sets[j]) { p->sets[j] = st->name; st->count += p->count; r = KERN_OK; break; } }   // 3: KERN_NO_SPACE
-	}
-	if (r) logf_("    insert_member <%d>: 0x%x en 0x%x -> %ld (puerto %s, conjunto %s)\n", (int)getpid(), (uint32_t)c->a[1], (uint32_t)c->a[2], r,
-		p ? "existe" : "no existe", st ? (st->is_set ? "existe" : "no es conjunto") : "no existe");
-	unlock();
-	return r;
+// Adaptador de lookup/copia/commit. La decisión y las cuentas son de Rust.
+static long member_transition(uint32_t member, uint32_t target, uint32_t op, int has_target) {
+    lock();
+    struct sport* refs[34] = { find_locked(member) };
+    struct nucleo_puerto_batch b = {0};
+    b.len = 1;
+    b.ports[0] = port_snapshot(refs[0]);
+    // Deduplicar por dirección conserva incluso miembro == conjunto.
+    for (int j = 0; j < NSETS + 1; j++) {
+        uint32_t name = j == NSETS ? target : b.ports[0].sets[j];
+        if (!name && j != NSETS) continue;
+        if (j == NSETS && !has_target) { b.target = b.len; continue; }
+        struct sport* p = find_locked(name);
+        uint32_t i;
+        for (i = 0; i < b.len && refs[i] != p; i++) {}
+        if (i == b.len) { refs[i] = p; b.ports[i] = port_snapshot(p); b.len++; }
+        if (j == NSETS) b.target = i;
+    }
+    b = nucleo_puerto_membership(b, op);
+    if (!b.error) for (uint32_t i = 0; i < b.len; i++) if (refs[i]) {
+        memcpy(refs[i]->sets, b.ports[i].sets, sizeof refs[i]->sets);
+        refs[i]->count = b.ports[i].count;
+    }
+    if (b.error && op == 0) logf_("    insert_member <%d>: 0x%x en 0x%x -> %d\n", (int)getpid(), member, target, b.error);
+    unlock();
+    return b.error;
 }
-// mach_port_move_member_trap(task, member, after): sale de todos sus conjuntos y entra en «after» (MACH_PORT_NULL: en ninguno)
-static long t_move_member(struct ctx* c) {
-	lock();
-	struct sport *p = find_locked((uint32_t)c->a[1]), *st = c->a[2] ? find_locked((uint32_t)c->a[2]) : NULL;
-	long r = KERN_INVALID_NAME_;
-	if (p && (!c->a[2] || (st && st->is_set))) {
-		for (int j = 0; j < NSETS; j++) if (p->sets[j]) { struct sport* o = find_locked(p->sets[j]); if (o && o->count >= p->count) o->count -= p->count; p->sets[j] = 0; }
-		if (st) { p->sets[0] = st->name; st->count += p->count; }
-		r = KERN_OK;
-	}
-	unlock();
-	return r;
-}
-// mach_port_extract_member_trap(task, name, pset): sale de ese conjunto
-static long t_extract_member(struct ctx* c) {
-	lock();
-	struct sport *p = find_locked((uint32_t)c->a[1]), *st = find_locked((uint32_t)c->a[2]);
-	long r = KERN_INVALID_NAME_;
-	if (p && st && st->is_set) {
-		if (!in_set(p, st->name)) r = 18;                                // KERN_NOT_IN_SET
-		else { set_remove(p, st->name); if (st->count >= p->count) st->count -= p->count; r = KERN_OK; }
-	}
-	unlock();
-	return r;
-}
+static long t_insert_member(struct ctx* c) { return member_transition((uint32_t)c->a[1], (uint32_t)c->a[2], 0, 1); }
+// La nulidad se comprueba antes de truncar, igual que el C original.
+static long t_move_member(struct ctx* c) { return member_transition((uint32_t)c->a[1], (uint32_t)c->a[2], 1, c->a[2] != 0); }
+static long t_extract_member(struct ctx* c) { return member_transition((uint32_t)c->a[1], (uint32_t)c->a[2], 2, 1); }
 // mach_port_type_trap(task, name, *tipo): bits de MACH_PORT_TYPE_* del nombre
 static long t_type(struct ctx* c) {
 	uint32_t name = (uint32_t)c->a[1], t;

@@ -3,6 +3,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct nucleo_mig_respuesta { uint8_t bytes[60]; uint32_t len; };
+_Static_assert(sizeof(struct nucleo_mig_respuesta) == 64, "mig_respuesta");
+struct nucleo_mig_respuesta nucleo_mig_error(int32_t id, int32_t codigo);
+struct nucleo_mig_respuesta nucleo_mig_puerto(int32_t id, uint32_t nombre, uint8_t disposicion);
+struct nucleo_mig_respuesta nucleo_mig_ool(int32_t id, uint64_t dir, uint32_t len, uint32_t cnt, uint32_t ports, uint32_t extra, uint32_t has_extra);
+uint32_t nucleo_mig_rx_disp(uint32_t tx);
+
 // Traducción pura de MSG_* Darwin a Linux x86_64; conserva la supresión de SIGPIPE.
 uint32_t nucleo_red_msg_flags(uint32_t darwin);
 int32_t nucleo_senal_linux(int32_t darwin);
@@ -92,3 +99,48 @@ int nucleo_candado_tomar(uint32_t* c);
 void nucleo_candado_soltar(uint32_t* c);
 int nucleo_esperar(uint32_t* e, uint32_t* c, const struct timespec* hasta);
 void nucleo_avisar(uint32_t* e);
+
+// Snapshots propios: C copia/commit bajo shm->lk; Rust nunca recibe punteros shm.
+struct nucleo_sport { uint32_t name, sets[32], head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; uint32_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; uint32_t spn; uint8_t me; };
+struct nucleo_puerto_batch { struct nucleo_sport ports[34]; uint32_t len, target; int32_t error; };
+struct nucleo_puerto_guard { struct nucleo_sport port; int32_t error; };
+_Static_assert(sizeof(struct nucleo_sport) == 208 && _Alignof(struct nucleo_sport) == 8, "sport ABI");
+_Static_assert(offsetof(struct nucleo_sport, name) == 0, "sport.name");
+_Static_assert(offsetof(struct nucleo_sport, sets) == 4, "sport.sets");
+_Static_assert(offsetof(struct nucleo_sport, head) == 132, "sport.head");
+_Static_assert(offsetof(struct nucleo_sport, tail) == 136, "sport.tail");
+_Static_assert(offsetof(struct nucleo_sport, count) == 140, "sport.count");
+_Static_assert(offsetof(struct nucleo_sport, owner) == 144, "sport.owner");
+_Static_assert(offsetof(struct nucleo_sport, rpid) == 148, "sport.rpid");
+_Static_assert(offsetof(struct nucleo_sport, used) == 152, "sport.used");
+_Static_assert(offsetof(struct nucleo_sport, is_set) == 153, "sport.is_set");
+_Static_assert(offsetof(struct nucleo_sport, guarded) == 154, "sport.guarded");
+_Static_assert(offsetof(struct nucleo_sport, strict_guard) == 155, "sport.strict_guard");
+_Static_assert(offsetof(struct nucleo_sport, cv) == 156, "sport.cv");
+_Static_assert(offsetof(struct nucleo_sport, ctx) == 160, "sport.ctx");
+_Static_assert(offsetof(struct nucleo_sport, pdreq) == 168, "sport.pdreq");
+_Static_assert(offsetof(struct nucleo_sport, svc) == 172, "sport.svc");
+_Static_assert(offsetof(struct nucleo_sport, svc_ctx) == 176, "sport.svc_ctx");
+_Static_assert(offsetof(struct nucleo_sport, qlimit) == 184, "sport.qlimit");
+_Static_assert(offsetof(struct nucleo_sport, nsreq) == 188, "sport.nsreq");
+_Static_assert(offsetof(struct nucleo_sport, nsmscount) == 192, "sport.nsmscount");
+_Static_assert(offsetof(struct nucleo_sport, hnext) == 196, "sport.hnext");
+_Static_assert(offsetof(struct nucleo_sport, spn) == 200, "sport.spn");
+_Static_assert(offsetof(struct nucleo_sport, me) == 204, "sport.me");
+_Static_assert(sizeof(struct nucleo_puerto_batch) == 7088 && offsetof(struct nucleo_puerto_batch, len) == 7072 && offsetof(struct nucleo_puerto_batch, target) == 7076 && offsetof(struct nucleo_puerto_batch, error) == 7080, "puerto batch ABI");
+_Static_assert(sizeof(struct nucleo_puerto_guard) == 216 && offsetof(struct nucleo_puerto_guard, error) == 208, "puerto guard ABI");
+uint32_t nucleo_puerto_in_set(struct nucleo_sport, uint32_t);
+struct nucleo_sport nucleo_puerto_remove(struct nucleo_sport, uint32_t);
+struct nucleo_puerto_batch nucleo_puerto_membership(struct nucleo_puerto_batch, uint32_t);
+struct nucleo_puerto_guard nucleo_puerto_guard(struct nucleo_sport, uint32_t, uint64_t, uint64_t, int32_t);
+
+// Semáforos Mach: transiciones puras, serializadas por el mutex del objeto en C.
+struct nucleo_sem_estado { int64_t count; uint64_t generation; uint32_t destroyed, reserved; };
+struct nucleo_sem_transicion { struct nucleo_sem_estado state; int32_t result; };
+_Static_assert(sizeof(struct nucleo_sem_estado) == 24, "sem_estado");
+_Static_assert(sizeof(struct nucleo_sem_transicion) == 32, "sem_transicion");
+struct nucleo_sem_estado nucleo_sem_new(int32_t);
+struct nucleo_sem_transicion nucleo_sem_signal(struct nucleo_sem_estado, uint32_t);
+struct nucleo_sem_transicion nucleo_sem_destroy(struct nucleo_sem_estado);
+struct nucleo_sem_transicion nucleo_sem_poll(struct nucleo_sem_estado, uint64_t, int32_t);
+int64_t nucleo_sem_relative_ns(uint32_t, uint32_t);

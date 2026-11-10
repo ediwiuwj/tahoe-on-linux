@@ -18,6 +18,12 @@ mod senal_ffi;
 pub mod spawn;
 pub mod marcos_activos;
 mod spawn_ffi;
+pub mod mach_puerto;
+pub mod mach_mig;
+mod mach_mig_ffi;
+mod mach_puerto_ffi;
+pub mod mach_semaforo;
+mod mach_semaforo_ffi;
 
 /// Un pánico en el núcleo es un error de programación: se anota y se aborta el proceso, como haría un fallo en C, pero
 /// sin corromper memoria antes.
@@ -36,3 +42,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
+
+// Máquina de estados de semáforos Mach y frontera ABI por valor.
+pub mod mach_semaforo;
+mod mach_semaforo_ffi;

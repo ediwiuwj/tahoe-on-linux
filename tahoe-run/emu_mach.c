@@ -81,11 +81,9 @@ static int tpol_get(uint32_t port, uint32_t flavor, uint32_t* v, uint32_t cnt) {
 	return ok;
 }
 static size_t reply_begin(uint8_t* r, const struct hdr* req, int32_t retcode) {
-	struct hdr h = { .bits = 0, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = req->id + 100 };
-	memcpy(r, &h, sizeof h);
-	memcpy(r + 24, NDR_LE, 8);
-	memcpy(r + 32, &retcode, 4);
-	return 36;
+	struct nucleo_mig_respuesta reply = nucleo_mig_error(req->id, retcode);
+	memcpy(r, reply.bytes, reply.len);
+	return reply.len;
 }
 static void reply_end(uint8_t* r, size_t len) { memcpy(r + 4, &(uint32_t){ (uint32_t)len }, 4); }
 
@@ -400,36 +398,22 @@ static size_t mig_host_get_clock_service(const struct hdr* req, const uint8_t* m
 
 // Respuesta compleja con un único descriptor de puerto: cabecera (24) + cuerpo (4) + descriptor (12) = 40 bytes.
 static size_t reply_port(uint8_t* r, const struct hdr* req, uint32_t name, uint8_t disposition) {
-	struct hdr h = { .bits = 0x80000000u, .size = 40, .remote = 0, .local = 0, .voucher = 0, .id = req->id + 100 };
-	memcpy(r, &h, sizeof h);
-	uint32_t ndesc = 1;
-	memcpy(r + 24, &ndesc, 4);
-	uint8_t desc[12] = { 0 };
-	memcpy(desc, &name, 4);
-	desc[10] = disposition;                                     // p. ej. 17 = MACH_MSG_TYPE_PORT_SEND
-	memcpy(r + 28, desc, 12);
-	return 40;
+	struct nucleo_mig_respuesta reply = nucleo_mig_puerto(req->id, name, disposition);
+	memcpy(r, reply.bytes, reply.len);
+	return reply.len;
 }
 
 // Respuesta compleja con un descriptor OOL: de puertos (names != NULL, derechos de envío) o de memoria (data), seguido de
 // NDR y la cuenta; extra (si no es NULL) va entre el NDR y la cuenta (host_processor_info: out_processor_count).
 static size_t reply_ool(uint8_t* r, const struct hdr* req, const uint32_t* names, const void* data, size_t len, uint32_t cnt, const uint32_t* extra) {
+	if (len > UINT32_MAX) return reply_begin(r, req, KERN_INVALID_ARG);
 	void* mm = mmap(NULL, len ? (len + 4095) & ~4095ul : 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (mm == MAP_FAILED) return reply_begin(r, req, 6 /* KERN_RESOURCE_SHORTAGE */);
-	memcpy(mm, names ? (const void*)names : data, len);
-	struct hdr nh = { .bits = 0x80000000u, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = req->id + 100 };
-	memcpy(r, &nh, sizeof nh);
-	uint32_t one = 1; memcpy(r + 24, &one, 4);
-	uint64_t addr = (uint64_t)mm;
-	uint8_t dsc[16] = { 0 }; memcpy(dsc, &addr, 8); dsc[8] = 1;            // deallocate
-	if (names) { dsc[10] = 17; dsc[11] = 2; memcpy(dsc + 12, &cnt, 4); }    // PORT_SEND, OOL_PORTS, cuántos
-	else { uint32_t l32 = (uint32_t)len; dsc[9] = 1; dsc[11] = 1; memcpy(dsc + 12, &l32, 4); }   // VIRTUAL_COPY, OOL, bytes
-	memcpy(r + 28, dsc, 16);
-	memcpy(r + 44, NDR_LE, 8);
-	size_t n = 52;
-	if (extra) { memcpy(r + n, extra, 4); n += 4; }
-	memcpy(r + n, &cnt, 4);
-	return n + 4;
+	if (mm == MAP_FAILED) return reply_begin(r, req, KERN_RES_SHORTAGE_);
+	if (len) memcpy(mm, names ? (const void*)names : data, len);
+	struct nucleo_mig_respuesta reply = nucleo_mig_ool(req->id, (uint64_t)mm,
+		(uint32_t)len, cnt, names != NULL, extra ? *extra : 0, extra != NULL);
+	memcpy(r, reply.bytes, reply.len);
+	return reply.len;
 }
 
 // Conjuntos de procesadores (top, ps): uno solo, como en un Mac. host_processor_sets (419) da su nombre, y
@@ -643,13 +627,7 @@ static size_t mig_mach_ports_lookup(const struct hdr* req, uint8_t* r) {
 // ---------------------------------------------------------------- mach_msg2
 // Recepción desde un puerto de usuario: saca el mensaje, ajusta la cabecera como lo hace el kernel (el puerto de
 // destino pasa a ser "local" y el de respuesta "remoto", con las disposiciones convertidas) y añade el trailer pedido.
-static uint32_t rx_disp(uint32_t tx) {
-	switch (tx) {
-	case 17: case 19: case 20: return 17;        // MOVE_SEND / COPY_SEND / MAKE_SEND -> PORT_SEND
-	case 18: case 21: return 18;                 // MOVE_SEND_ONCE / MAKE_SEND_ONCE -> PORT_SEND_ONCE
-	default: return tx;
-	}
-}
+static uint32_t rx_disp(uint32_t tx) { return nucleo_mig_rx_disp(tx); }
 // Recibe un mensaje de `rcv_name` en `buf` (capacidad `cap`) con el trailer que piden las opciones (bits 24-27).
 // Devuelve 0 o un código mach_msg; *total = bytes escritos (mensaje + trailer).
 // Cadenas legibles de un mensaje (de 6 caracteres o más, separadas por «|»), para las trazas: en XPC llevan las claves

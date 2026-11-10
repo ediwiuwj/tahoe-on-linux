@@ -6,21 +6,30 @@
 #include <time.h>
 
 #include "tahoe.h"
+#include "nucleo.h"
 
 #define KERN_OK 0
 #define KERN_BAD_ARG 4
 #define KERN_TIMED_OUT 49
 #define KERN_ABORTED_ 14
 
-struct sem { uint32_t name; int count; pthread_mutex_t m; pthread_cond_t cv; struct sem* next; };
+struct sem { uint32_t name; struct nucleo_sem_estado state; pthread_mutex_t m; pthread_cond_t cv; struct sem* next; };
 static struct sem* sems;
 static pthread_mutex_t table_lock = PTHREAD_MUTEX_INITIALIZER;
 
 uint32_t sem_create(int value) {
+	if (value < 0) return 0;
 	struct sem* s = calloc(1, sizeof *s);
-	pthread_condattr_t ca; pthread_condattr_init(&ca); pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
-	pthread_mutex_init(&s->m, NULL); pthread_cond_init(&s->cv, &ca);
-	s->count = value;
+	if (!s) return 0;
+	pthread_condattr_t ca;
+	if (pthread_condattr_init(&ca)) { free(s); return 0; }
+	int r = pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+	if (!r) r = pthread_mutex_init(&s->m, NULL);
+	if (r) { pthread_condattr_destroy(&ca); free(s); return 0; }
+	r = pthread_cond_init(&s->cv, &ca);
+	pthread_condattr_destroy(&ca);
+	if (r) { pthread_mutex_destroy(&s->m); free(s); return 0; }
+	s->state = nucleo_sem_new(value);
 	s->name = alloc_port();
 	pthread_mutex_lock(&table_lock);
 	s->next = sems; sems = s;
@@ -46,41 +55,61 @@ int machsem_destroy(uint32_t name) {
 	if (s) *pp = s->next;
 	pthread_mutex_unlock(&table_lock);
 	if (!s) return KERN_BAD_ARG;
-	pthread_mutex_lock(&s->m); s->count += 1 << 20; pthread_cond_broadcast(&s->cv); pthread_mutex_unlock(&s->m);
+	pthread_mutex_lock(&s->m); s->state = nucleo_sem_destroy(s->state).state; pthread_cond_broadcast(&s->cv); pthread_mutex_unlock(&s->m);
 	return KERN_OK;
 }
 
-static void signal_one(struct sem* s) { pthread_mutex_lock(&s->m); s->count++; pthread_cond_signal(&s->cv); pthread_mutex_unlock(&s->m); }
+// El registro y la vida de pthread quedan en C: ninguna referencia se libera mientras
+// un trap pueda conservarla. Rust decide permisos, broadcast, destroy y resultados.
+static int signal_sem(struct sem* s, int all) {
+	pthread_mutex_lock(&s->m);
+	struct nucleo_sem_transicion t = nucleo_sem_signal(s->state, all);
+	s->state = t.state;
+	if (!t.result) { if (all) pthread_cond_broadcast(&s->cv); else pthread_cond_signal(&s->cv); }
+	pthread_mutex_unlock(&s->m);
+	return t.result;
+}
+static void signal_one(struct sem* s) { (void)signal_sem(s, 0); }
 
-// Espera con plazo opcional (ns relativos; <0 = sin plazo). 0 = obtenido, 1 = plazo vencido.
+// Resultado Mach, no booleano: timeout y errores pthread no se confunden con éxito.
 static int wait_sem(struct sem* s, long long rel_ns) {
 	struct timespec dl;
-	if (rel_ns >= 0) { clock_gettime(CLOCK_MONOTONIC, &dl); dl.tv_sec += rel_ns / 1000000000LL; dl.tv_nsec += rel_ns % 1000000000LL; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; } }
-	int r = 0;
+	if (rel_ns >= 0) {
+		if (clock_gettime(CLOCK_MONOTONIC, &dl)) return KERN_ABORTED_;
+		dl.tv_sec += rel_ns / 1000000000LL;
+		dl.tv_nsec += rel_ns % 1000000000LL;
+		if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+	}
 	pthread_mutex_lock(&s->m);
-	while (s->count <= 0 && !r) r = rel_ns >= 0 ? pthread_cond_timedwait(&s->cv, &s->m, &dl) : pthread_cond_wait(&s->cv, &s->m);
-	if (s->count > 0) { s->count--; r = 0; }
-	pthread_mutex_unlock(&s->m);
-	return r ? 1 : 0;
+	uint64_t generation = s->state.generation;
+	int error = 0;
+	for (;;) {
+		struct nucleo_sem_transicion t = nucleo_sem_poll(s->state, generation, error);
+		s->state = t.state;
+		if (t.result != -1) { pthread_mutex_unlock(&s->m); return t.result; }
+		int r = rel_ns >= 0 ? pthread_cond_timedwait(&s->cv, &s->m, &dl) : pthread_cond_wait(&s->cv, &s->m);
+		error = r == 0 ? 0 : r == ETIMEDOUT ? KERN_TIMED_OUT : KERN_ABORTED_;
+	}
 }
 
-static long t_signal(struct ctx* c)     { struct sem* s = find((uint32_t)c->a[0]); if (!s) return KERN_BAD_ARG; signal_one(s); return KERN_OK; }
-static long t_signal_all(struct ctx* c) { struct sem* s = find((uint32_t)c->a[0]); if (!s) return KERN_BAD_ARG; pthread_mutex_lock(&s->m); s->count += 1000; pthread_cond_broadcast(&s->cv); pthread_mutex_unlock(&s->m); return KERN_OK; }
-static long t_wait(struct ctx* c)       { struct sem* s = find((uint32_t)c->a[0]); if (!s) return KERN_BAD_ARG; wait_sem(s, -1); return KERN_OK; }
+static long t_signal(struct ctx* c) { struct sem* s = find((uint32_t)c->a[0]); return s ? signal_sem(s, 0) : KERN_BAD_ARG; }
+static long t_signal_all(struct ctx* c) { struct sem* s = find((uint32_t)c->a[0]); return s ? signal_sem(s, 1) : KERN_BAD_ARG; }
+static long t_wait(struct ctx* c) { struct sem* s = find((uint32_t)c->a[0]); return s ? wait_sem(s, -1) : KERN_BAD_ARG; }
 static long t_wait_signal(struct ctx* c) {
 	struct sem *w = find((uint32_t)c->a[0]), *g = find((uint32_t)c->a[1]);
 	if (!w || !g) return KERN_BAD_ARG;
-	signal_one(g); wait_sem(w, -1); return KERN_OK;
+	int r = signal_sem(g, 0); return r ? r : wait_sem(w, -1);
 }
 static long t_timedwait(struct ctx* c) {
-	struct sem* s = find((uint32_t)c->a[0]); if (!s) return KERN_BAD_ARG;
-	return wait_sem(s, (long long)(uint32_t)c->a[1] * 1000000000LL + (int32_t)c->a[2]) ? KERN_TIMED_OUT : KERN_OK;
+	struct sem* s = find((uint32_t)c->a[0]);
+	long long ns = nucleo_sem_relative_ns((uint32_t)c->a[1], (uint32_t)c->a[2]);
+	return !s || ns < 0 ? KERN_BAD_ARG : wait_sem(s, ns);
 }
 static long t_timedwait_signal(struct ctx* c) {
 	struct sem *w = find((uint32_t)c->a[0]), *g = find((uint32_t)c->a[1]);
-	if (!w || !g) return KERN_BAD_ARG;
-	signal_one(g);
-	return wait_sem(w, (long long)(uint32_t)c->a[2] * 1000000000LL + (int32_t)c->a[3]) ? KERN_TIMED_OUT : KERN_OK;
+	long long ns = nucleo_sem_relative_ns((uint32_t)c->a[2], (uint32_t)c->a[3]);
+	if (!w || !g || ns < 0) return KERN_BAD_ARG;
+	int r = signal_sem(g, 0); return r ? r : wait_sem(w, ns);
 }
 
 // __semwait_signal(cond_sem, mutex_sem, timeout, relative, tv_sec, tv_nsec): usado por pthread_cond/join.
@@ -94,7 +123,8 @@ static long bsd_semwait_signal(struct ctx* c) {
 		if (c->a[3]) ns = sec * 1000000000LL + nsec;      // relativo
 		else { struct timespec now; clock_gettime(CLOCK_REALTIME, &now); ns = (sec - now.tv_sec) * 1000000000LL + (nsec - now.tv_nsec); if (ns < 0) ns = 0; }
 	}
-	return wait_sem(w, ns) ? -60 /* ETIMEDOUT */ : 0;
+	int r = wait_sem(w, ns);
+	return r == KERN_OK ? 0 : r == KERN_TIMED_OUT ? -60 /* ETIMEDOUT */ : -4 /* EINTR */;
 }
 
 
