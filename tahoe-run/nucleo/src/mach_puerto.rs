@@ -99,6 +99,11 @@ pub fn guard(mut p: Sport, op: u32, old: u64, new: u64, strict: i32) -> GuardRes
     GuardResult { port: p, error }
 }
 
+pub fn destroy_allowed(p: Sport, caller: i32) -> i32 {
+    if p.used == 0 {15} else if p.owner != caller {17}
+    else if p.guarded != 0 {4} else {0}
+}
+
 const _: () = {
     use core::mem::{size_of, align_of, offset_of};
     assert!(size_of::<Sport>() == 208 && align_of::<Sport>() == 8);
@@ -144,6 +149,14 @@ mod tests {
         b.ports[1] = port(20, 1, 5);
         b.ports[2] = port(30, 1, 7);
         b
+    }
+    #[test]
+    fn destruction_requires_live_owned_unguarded_port() {
+        let mut p=port(10,0,0); p.owner=42;
+        assert_eq!(destroy_allowed(p,42),0);
+        assert_eq!(destroy_allowed(p,43),17);
+        p.guarded=1; assert_eq!(destroy_allowed(p,42),4);
+        p.used=0; assert_eq!(destroy_allowed(p,42),15);
     }
     fn unchanged_error(b: Batch, op: u32, error: i32) {
         let r = membership(b, op);

@@ -19,6 +19,8 @@ pub mod spawn;
 pub mod marcos_activos;
 mod spawn_ffi;
 pub mod mach_puerto;
+pub mod mach_cola;
+mod mach_cola_ffi;
 pub mod mach_derechos;
 mod mach_derechos_ffi;
 pub mod mach_mig;

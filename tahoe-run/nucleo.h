@@ -106,6 +106,14 @@ void nucleo_avisar(uint32_t* e);
 
 // Snapshots propios: C copia/commit bajo shm->lk; Rust nunca recibe punteros shm.
 struct nucleo_sport { uint32_t name, sets[32], head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; uint32_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; uint32_t spn; uint8_t me; };
+// Cola: planes pequeños, únicamente campos afectados; índices desde 1.
+struct nucleo_cola_plan { uint32_t head, tail, count, free, slot, next, link, link_next, possible; int32_t action; };
+_Static_assert(sizeof(struct nucleo_cola_plan) == 40, "cola plan ABI");
+int32_t nucleo_cola_send(struct nucleo_sport, uint32_t, uint32_t, int32_t, uint32_t, uint32_t);
+struct nucleo_cola_plan nucleo_cola_transition(struct nucleo_sport, uint32_t, uint32_t, uint32_t, uint32_t);
+uint32_t nucleo_cola_qlimit(uint32_t);
+uint32_t nucleo_cola_count(uint32_t, uint32_t);
+int32_t nucleo_cola_receive(struct nucleo_sport, uint32_t, uint32_t, uint32_t);
 struct nucleo_puerto_batch { struct nucleo_sport ports[34]; uint32_t len, target; int32_t error; };
 struct nucleo_puerto_guard { struct nucleo_sport port; int32_t error; };
 _Static_assert(sizeof(struct nucleo_sport) == 208 && _Alignof(struct nucleo_sport) == 8, "sport ABI");
@@ -134,6 +142,7 @@ _Static_assert(offsetof(struct nucleo_sport, me) == 204, "sport.me");
 _Static_assert(sizeof(struct nucleo_puerto_batch) == 7088 && offsetof(struct nucleo_puerto_batch, len) == 7072 && offsetof(struct nucleo_puerto_batch, target) == 7076 && offsetof(struct nucleo_puerto_batch, error) == 7080, "puerto batch ABI");
 _Static_assert(sizeof(struct nucleo_puerto_guard) == 216 && offsetof(struct nucleo_puerto_guard, error) == 208, "puerto guard ABI");
 uint32_t nucleo_puerto_in_set(struct nucleo_sport, uint32_t);
+int32_t nucleo_puerto_destroy_allowed(struct nucleo_sport, int32_t);
 struct nucleo_sport nucleo_puerto_remove(struct nucleo_sport, uint32_t);
 struct nucleo_puerto_batch nucleo_puerto_membership(struct nucleo_puerto_batch, uint32_t);
 struct nucleo_puerto_guard nucleo_puerto_guard(struct nucleo_sport, uint32_t, uint64_t, uint64_t, int32_t);

@@ -634,6 +634,16 @@ static void destroy(uint32_t name) {
 	flush_notes();
 }
 
+int port_destroy_receive(uint32_t name) {
+	lock();
+	struct sport* p = find_locked(name);
+	int kr = nucleo_puerto_destroy_allowed(port_snapshot(p), (int32_t)getpid());
+	if (!kr) destroy_locked(p);
+	unlock();
+	flush_notes();
+	return kr;
+}
+
 // ---------------------------------------------------------------- recolector de procesos muertos
 // Al terminar una tarea, XNU destruye todos sus derechos. Aquí un hilo del primer proceso mira cada poco qué procesos
 // murieron (o son zombis) y hace lo mismo: destruye sus derechos de recepción y sus send-once pendientes.
@@ -797,6 +807,7 @@ int port_send_timeout(uint32_t dest, const uint8_t* msg, uint32_t size, int time
 // send-once (respuestas): XNU siempre los encola. Sin esto, un puerto que nadie vacía agota la reserva común de ranuras y
 // todos los envíos fallan (libxpc aborta: "MACH_SEND_NO_BUFFER returned for reliable message size").
 static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel, int timeout_ms, int notify) {
+	if (size < 24) return -1;
 	uint32_t ooff[32], olen[32];
 	uint8_t desc_fix[32 * 16];
 	int nool = ool_scan(msg, size, ooff, olen, 32);
@@ -825,31 +836,28 @@ static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 	lock();
 	struct sport* p = find_locked(dest);
 	uint32_t rbits = 0; memcpy(&rbits, msg, 4); rbits &= 0x1f;      // disposición del destino
-	if (p && !p->is_set && !kernel && rbits != 18 && rbits != 21) {   // MOVE_SEND_ONCE / MAKE_SEND_ONCE: sin límite
-		struct timespec dl;
-		// MACH_SEND_NOTIFY con la cola llena: se arma la petición SEND_POSSIBLE de este proceso sobre el destino, si la hay
-		// (ipc_kmsg_copyin_header -> ipc_port_request_sparm). Solo las armadas avisan cuando se saca un mensaje.
-		if (notify && p->spn && p->count >= (p->qlimit ? p->qlimit : 5)) {
+	struct timespec dl;
+	if (timeout_ms > 0) { clock_gettime(CLOCK_MONOTONIC, &dl); dl.tv_sec += timeout_ms / 1000; dl.tv_nsec += (timeout_ms % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; } }
+	int expired = 0, send_waited = 0;
+	for (;;) {
+		int action = nucleo_cola_send(port_snapshot(p), rbits, kernel, timeout_ms, expired, send_waited);
+		if (action == 0) break;
+		if (notify && !send_waited && p && p->spn && (action == 1 || action == 0x10000004)) {
 			int32_t me = (int32_t)getpid();
 			for (int k = 0; k < MAXSP; k++) if (shm->sp[k].port == dest && shm->sp[k].pid == me) shm->sp[k].armado = 1;
 		}
-		if (timeout_ms > 0) { clock_gettime(CLOCK_MONOTONIC, &dl); dl.tv_sec += timeout_ms / 1000; dl.tv_nsec += (timeout_ms % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; } }
-		while (p && p->count >= (p->qlimit ? p->qlimit : 5)) {
-			if (timeout_ms == 0) { unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return 0x10000004; }   // MACH_SEND_TIMED_OUT
-			int r = nucleo_esperar(&p->cv, &shm->lk, timeout_ms > 0 ? &dl : NULL);
-			p = find_locked(dest);                                    // el puerto pudo morir mientras se esperaba
-			if (r == ETIMEDOUT && p && p->count >= (p->qlimit ? p->qlimit : 5)) { unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return 0x10000004; }
-		}
-		if (!p) { unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return 0x10000003; }   // MACH_SEND_INVALID_DEST
-	}
-	if (!p || p->is_set || !shm->free_head) {
-		if (p && !shm->free_head) logf_("    puertos: reserva de mensajes agotada (envío a 0x%x)\n", dest);
-		unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return -1;
+		if (action != 1) { unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return action; }
+		int r = nucleo_esperar(&p->cv, &shm->lk, timeout_ms > 0 ? &dl : NULL);
+		send_waited = 1; expired = r == ETIMEDOUT;
+		p = find_locked(dest);
 	}
 	uint32_t idx = shm->free_head;
+	uint32_t next = idx && idx <= MAXMSG ? shm->msgs[idx - 1].next : 0;
+	struct nucleo_cola_plan enq = nucleo_cola_transition(port_snapshot(p), shm->free_head, idx, next, 0);
+	if (enq.action) { unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return -1; }
 	struct mslot* q = &shm->msgs[idx - 1];
-	shm->free_head = q->next;
-	q->next = 0; q->size = size; q->total = (uint32_t)total; q->spill = spill;
+	shm->free_head = enq.free;
+	q->next = enq.next; q->size = size; q->total = (uint32_t)total; q->spill = spill;
 	q->spid = kernel ? 0 : (uint32_t)getpid(); q->suid = kernel ? 0 : cred_euid(); q->sgid = kernel ? 0 : cred_egid();
 	q->sauid = kernel ? (uint32_t)-1 : cred_auid(); q->sasid = kernel ? 0 : cred_asid();   // para el trailer de auditoría del receptor
 	if (!kernel) msg_rights_locked(msg, size, RIGHTS_SEND, dest);
@@ -860,12 +868,12 @@ static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 		if (olen[i] && safe_read(addr, q->data + pos, olen[i]) != (ssize_t)olen[i]) memset(q->data + pos, 0, olen[i]);
 		pos += olen[i];
 	}
-	if (p->tail) shm->msgs[p->tail - 1].next = idx; else p->head = idx;
-	p->tail = idx; p->count++;
+	if (enq.link) shm->msgs[enq.link - 1].next = enq.link_next;
+	p->head = enq.head; p->tail = enq.tail; p->count = enq.count;
 	uint32_t setnames[NSETS]; int32_t rp_sets[NSETS] = { 0 };
 	int32_t rp_dest = p->rpid;
 	memcpy(setnames, p->sets, sizeof setnames);
-	for (int j = 0; j < NSETS; j++) if (setnames[j]) { struct sport* st = find_locked(setnames[j]); if (st) { st->count++; rp_sets[j] = st->rpid; } }
+	for (int j = 0; j < NSETS; j++) if (setnames[j]) { struct sport* st = find_locked(setnames[j]); if (st) { st->count = nucleo_cola_count(st->count, 1); rp_sets[j] = st->rpid; } }
 	nucleo_avisar(&p->cv);
 	for (int j = 0; j < NSETS; j++) if (setnames[j]) { struct sport* st2 = find_locked(setnames[j]); if (st2) nucleo_avisar(&st2->cv); }
 	unlock();
@@ -885,33 +893,37 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 		struct sport* p = find_locked(name);
 		if (!p) { unlock(); return waited ? MACH_RCV_PORT_DIED_ : MACH_RCV_INVALID_NAME_; }
 		struct sport* src = NULL;
-		if (!p->is_set) src = p->count ? p : NULL;
-		else for (int i = 0; i < (int)shm->hiwater; i++) if (shm->ports[i].used && shm->ports[i].count && in_set(&shm->ports[i], name)) { src = &shm->ports[i]; break; }
+		if (!p->is_set) src = nucleo_cola_receive(port_snapshot(p), 0, 0, 0) == 0 ? p : NULL;
+		else for (int i = 0; i < (int)shm->hiwater; i++) if (shm->ports[i].used && nucleo_cola_receive(port_snapshot(&shm->ports[i]), 0, 0, 0) == 0 && in_set(&shm->ports[i], name)) { src = &shm->ports[i]; break; }
 		if (src) {
 			uint32_t idx = src->head;
 			struct mslot* q = &shm->msgs[idx - 1];
-			if (large && limit && q->total > limit) {                       // MACH_RCV_LARGE: no se consume; se informa del tamaño necesario
+			if (nucleo_cola_receive(port_snapshot(src), q->total, limit, large) == MACH_RCV_TOO_LARGE_) {                       // MACH_RCV_LARGE: no se consume; se informa del tamaño necesario
 				uint8_t* h = malloc(q->size ? q->size : 1);
+				if (!h) { unlock(); return 0x10004008; }
 				memcpy(h, q->data, q->size);
 				*size = q->size; *out = h;
 				unlock();
 				return 0x10004004;
 			}
-			src->head = q->next; if (!src->head) src->tail = 0;
-			src->count--;
+			uint8_t* m = malloc(q->total ? q->total : 1);
+			if (!m) { unlock(); return 0x10004008; }
+			struct nucleo_cola_plan deq = nucleo_cola_transition(port_snapshot(src), shm->free_head, idx, q->next, 1);
+			if (deq.action) { free(m); unlock(); return MACH_RCV_INVALID_NAME_; }
+			src->head = deq.head; src->tail = deq.tail; src->count = deq.count;
 			nucleo_avisar(&src->cv);                     // hay sitio: remitentes esperando por el límite de cola
-			if (src->spn && src->count < (src->qlimit ? src->qlimit : 5)) {   // y las peticiones SEND_POSSIBLE armadas (ipc_port_spnotify);
+			if (deq.possible) {   // y las peticiones SEND_POSSIBLE armadas (ipc_port_spnotify);
 				for (int k = 0; k < MAXSP; k++)                                   // las no armadas siguen esperando
 					if (shm->sp[k].port == src->name && shm->sp[k].armado) { note_locked(shm->sp[k].notify, 66, src->name); shm->sp[k].port = 0; src->spn--; }
 			}
 			msg_rights_locked(q->data, q->size, RIGHTS_RECV, src->name);
-			for (int j = 0; j < NSETS; j++) if (src->sets[j]) { struct sport* s = find_locked(src->sets[j]); if (s && s->count) s->count--; }
+			for (int j = 0; j < NSETS; j++) if (src->sets[j]) { struct sport* s = find_locked(src->sets[j]); if (s) s->count = nucleo_cola_count(s->count, 0); }
 			uint32_t sz = q->size, tot = q->total; uint64_t spill = q->spill;
 			if (sender) { sender[0] = q->spid; sender[1] = q->suid; sender[2] = q->sgid; sender[3] = q->sauid; sender[4] = q->sasid; }
-			uint8_t* m = malloc(tot ? tot : 1);
 			memcpy(m, q->data, spill ? sz : tot);
 			q->spill = 0;
-			q->next = shm->free_head; shm->free_head = idx;
+			struct nucleo_cola_plan recycle = nucleo_cola_transition(port_snapshot(src), shm->free_head, idx, 0, 2);
+			q->next = recycle.next; shm->free_head = recycle.free;
 			int si = port_index(src);
 			int fd1 = local_sock[si], fd2[NSETS];
 			uint32_t rname1 = src->name, rname2[NSETS] = { 0 };
@@ -1067,7 +1079,7 @@ static long t_construct(struct ctx* c) {
 		if (flags & 0x10) { lock(); sr_add_locked(n, (int32_t)getpid(), 1, 0); unlock(); }   // MPO_INSERT_SEND_RIGHT
 		if (flags & 0x2) {                                   // MPO_QLIMIT: mach_port_options_t.mpl.mpl_qlimit (+4)
 			uint32_t ql = 0; safe_read(c->a[1] + 4, &ql, 4);
-			lock(); struct sport* p = find_locked(n); if (p) p->qlimit = ql > 2048 ? 2048 : ql; unlock();
+			lock(); struct sport* p = find_locked(n); if (p) p->qlimit = nucleo_cola_qlimit(ql); unlock();
 		}
 	}
 	if (mach_trace()) { uint32_t o[6] = { 0 }; if (c->a[1]) safe_read(c->a[1], o, 24); logf_("    MT pid=%d.%ld construct 0x%x contexto=0x%lx flags=0x%x opt=%x %x %x %x\n", (int)getpid(), (long)syscall(SYS_gettid), n, c->a[2], o[0], o[2], o[3], o[4], o[5]); }
@@ -1407,7 +1419,7 @@ int port_get_attributes(uint32_t name, int flavor, uint32_t* out, uint32_t* cnt)
 int port_set_attributes(uint32_t name, int flavor, const uint32_t* in, uint32_t cnt) {
 	lock();
 	struct sport* p = find_locked(name);
-	if (p && flavor == 1 && cnt >= 1) p->qlimit = in[0] > 2048 ? 2048 : in[0];
+	if (p && flavor == 1 && cnt >= 1) p->qlimit = nucleo_cola_qlimit(in[0]);
 	unlock();
 	return p ? KERN_OK : KERN_INVALID_RIGHT_;
 }

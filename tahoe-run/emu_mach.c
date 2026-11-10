@@ -902,6 +902,13 @@ static long mach_msg2(struct ctx* c) {
 		break;
 	}
 	case 5403: n = reply_begin(rep, &h, 46 /* KERN_NOT_SUPPORTED */); break;   // mach_voucher_attr_command: sin vales de atributos
+	case 3205: { // mach_port_destroy: la comprobación de estado/derecho es Rust.
+		extern int port_destroy_receive(uint32_t);
+		if (ssize < 36) { n = reply_begin(rep, &h, KERN_INVALID_ARG); break; }
+		uint32_t name; memcpy(&name, req + 32, 4);
+		n = reply_begin(rep, &h, port_destroy_receive(name));
+		break;
+	}
 	case 3206: {                                                  // mach_port_deallocate (MIG): soltar un send-once avisa; un derecho de envío no destruye nada
 		uint32_t nm; memcpy(&nm, req + 32, 4);
 		port_release_send_once(nm);

@@ -6,6 +6,12 @@ use crate::mach_puerto::{self as puerto, Batch, GuardResult, Sport};
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub extern "C" fn nucleo_puerto_destroy_allowed(p: Sport, caller: i32) -> i32 {
+    puerto::destroy_allowed(p, caller)
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub extern "C" fn nucleo_puerto_in_set(p: Sport, set: u32) -> u32 {
     u32::from(puerto::in_set(p, set))
 }
