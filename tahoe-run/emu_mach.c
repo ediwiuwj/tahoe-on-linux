@@ -642,16 +642,19 @@ static int msg_texts(const uint8_t* req, uint32_t size, char* s, size_t cap) {
 	return (int)k;
 }
 long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total) {
-	uint32_t elems = (uint32_t)(options >> 24) & 0xf, tsize = elems == 0 ? 8 : elems == 1 ? 12 : elems == 2 ? 20 : elems == 3 ? 52 : 68;
+	uint32_t tsize = nucleo_recepcion_tam_trailer(options);
 	uint8_t* m; uint32_t size, snd[5] = { 0, 0, 0, (uint32_t)-1, 0 };
 	int large = (options & 0x4) != 0;                         // MACH_RCV_LARGE
 	int r = port_receive(rcv_name, timeout_ms, &m, &size, snd, cap > tsize ? cap - tsize : 1, large);
 	if (r == 0x10004004 && large) {                           // el mensaje sigue en la cola; el receptor lee el tamaño de la cabecera
-		struct hdr hh; memcpy(&hh, m, sizeof hh);
+		struct nucleo_recepcion_cabecera hh; memcpy(&hh, m, sizeof hh);
 		// MACH_RCV_LARGE_IDENTITY: como XNU, msgh_local_port lleva el puerto donde espera el mensaje (el miembro del
 		// conjunto), para recibirlo de ahí con el búfer mayor. CoreAnimation lo hace así en WindowServer: con 0 recibía
 		// en el puerto 0 y abortaba al llegar la primera ventana grande.
-		if (options & 0x8) { hh.local = hh.remote; memcpy(m, &hh, sizeof hh); }
+		if (options & 0x8) {
+			hh = nucleo_recepcion_grande(hh, options);
+			memcpy(m, &hh, sizeof hh);
+		}
 		safe_write(buf, m, sizeof hh < size ? sizeof hh : size);
 		if (trace_all) logf_("    mach_msg: 0x%x demasiado grande (%u bytes, cabía %u): RCV_LARGE\n", rcv_name, size, cap);
 		if (total) *total = size + tsize;                      // tamaño necesario (con trailer), para kevent ext[1]
@@ -659,12 +662,10 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 		return r;
 	}
 	if (r) { if (r != 0x10004003) logf_("    mach_msg: <%d> recepción en 0x%x falló: 0x%x\n", (int)getpid(), rcv_name, r); return r; }
-	struct hdr h;
+	struct nucleo_recepcion_cabecera h;
 	memcpy(&h, m, sizeof h);
-	uint32_t txr = h.bits & 0xff, txl = (h.bits >> 8) & 0xff;
-	uint32_t nb = (h.bits & ~0x1f1fu & ~0xffu) | (txl ? rx_disp(txl) : 0) | ((txr ? 16u : 0) << 8);
-	uint32_t remote = h.local, local = h.remote;
-	h.bits = nb; h.remote = remote; h.local = local;
+	h = nucleo_recepcion_cabecera(h);
+	uint32_t remote = h.remote, local = h.local;
 	memcpy(m, &h, sizeof h);
 	char rxports[96] = "";                                    // para la traza MSG: puertos que trae el mensaje
 	{                                                          // complejo: el receptor ve los derechos de los descriptores ya convertidos
@@ -688,13 +689,12 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 			if (cl == NUCLEO_PUERTO || cl == NUCLEO_PUERTOS) m[d[i].off + 10] = (uint8_t)rx_disp(d[i].disp);   // disposición vista por el receptor
 		}
 	}
-	uint8_t tr[68] = { 0 };
-	uint32_t seq = 0, uid = snd[1], gid = snd[2], at[8] = { snd[3], snd[1], snd[2], snd[1], snd[2], snd[0], snd[4], 1 };   // audit_token_t: auid, euid, egid, ruid, rgid, pid, asid, versión
-	memcpy(tr + 4, &tsize, 4);
-	if (tsize >= 12) memcpy(tr + 8, &seq, 4);
-	if (tsize >= 20) { memcpy(tr + 12, &uid, 4); memcpy(tr + 16, &gid, 4); }
-	if (tsize >= 52) memcpy(tr + 20, at, 32);
-	if (tsize >= 60) { uint64_t ctx = port_get_context(local); memcpy(tr + 52, &ctx, 8); }   // msgh_context: contexto del puerto receptor
+	struct nucleo_recepcion_emisor emisor;
+	memcpy(emisor.datos, snd, sizeof snd);
+	// El lookup del contexto sigue en C; no se consulta para trailers cortos.
+	struct nucleo_recepcion_trailer trailer = nucleo_recepcion_trailer(options, emisor,
+		tsize >= 60 ? port_get_context(local) : 0);
+	const uint8_t* tr = trailer.bytes;
 	long res = 0;
 	if (size + tsize > cap) {                                 // sin RCV_LARGE: se entrega truncado y se descarta el resto
 		uint32_t fit = cap > 24 ? cap - 24 : 0;

@@ -93,6 +93,16 @@ struct mslot { uint32_t next, size, total, spid, suid, sgid, sauid, sasid; uint6
 #define MAXPROC 1024
 struct sonce { uint32_t port; int32_t holder; };
 struct dnreq { uint32_t port, notify; int32_t pid; uint32_t armado; };   // armado: solo SEND_POSSIBLE (ver port_request_notification)
+_Static_assert(sizeof(struct dnreq) == sizeof(struct nucleo_notificacion_entry) &&
+    offsetof(struct dnreq, port) == offsetof(struct nucleo_notificacion_entry, port) &&
+    offsetof(struct dnreq, notify) == offsetof(struct nucleo_notificacion_entry, notify) &&
+    offsetof(struct dnreq, pid) == offsetof(struct nucleo_notificacion_entry, pid) &&
+    offsetof(struct dnreq, armado) == offsetof(struct nucleo_notificacion_entry, armado), "dnreq ABI");
+static struct nucleo_notificacion_entry notification_snapshot(const struct dnreq* e) {
+    struct nucleo_notificacion_entry v = {0};
+    if (e) memcpy(&v, e, sizeof v);
+    return v;
+}
 struct sproc { int32_t pid; uint64_t start; };
 // shold: un proceso que no es el dueño tiene un derecho de envío a un puerto (para MACH_NOTIFY_NO_SENDERS, ver más abajo).
 #define MAXSH 32768                    // con 8192 se llenaba igual que la de puertos; recorridos hasta shm->sh_hw
@@ -377,8 +387,9 @@ struct note { uint32_t dest, arg; int id; };
 static __thread struct note notes[512];
 static __thread int nnotes;
 static void note_locked(uint32_t dest, int id, uint32_t arg) {
-	if (!dest) return;
-	if (nnotes < (int)(sizeof notes / sizeof notes[0])) notes[nnotes++] = (struct note){ dest, arg, id };
+	uint32_t action = nucleo_notificacion_enqueue(dest, (uint32_t)nnotes, sizeof notes / sizeof notes[0]);
+	if (!action) return;
+	if (action == 1) notes[nnotes++] = (struct note){ dest, arg, id };
 	else logf_("    notificaciones: cola llena, se pierde %d para 0x%x\n", id, dest);
 }
 static int port_send_k(uint32_t dest, const uint8_t* msg, uint32_t size, int kernel);
@@ -386,15 +397,9 @@ static void destroy_locked(struct sport* p);
 static void flush_notes(void) {
 	while (nnotes > 0) {
 		struct note n = notes[--nnotes];
-		uint8_t m[40] = { 0 };
-		uint32_t bits = 18, size = 24;                       // remoto: MOVE_SEND_ONCE (el aviso usa el send-once de la petición)
-		if (n.id == 72 || n.id == 70 || n.id == 66) { size = 36; m[24 + 4] = 1; memcpy(m + 32, &n.arg, 4); }      // NDR (little endian) + nombre muerto
-		else if (n.id == 69) {                               // complejo: un descriptor de puerto con el derecho de recepción
-			bits |= 0x80000000u; size = 40;
-			uint32_t one = 1; memcpy(m + 24, &one, 4); memcpy(m + 28, &n.arg, 4); m[38] = 16; m[39] = 0;
-		}
-		memcpy(m, &bits, 4); memcpy(m + 4, &size, 4); memcpy(m + 8, &n.dest, 4); memcpy(m + 20, &n.id, 4);
-		int r = port_send_k(n.dest, m, size, 1);
+		struct nucleo_notificacion_message m = nucleo_notificacion_message(
+			(struct nucleo_notificacion_note){ n.dest, n.arg, n.id });
+		int r = port_send_k(n.dest, m.bytes, m.len, 1);
 		if (mach_trace() || n.id != 71) logf_("    aviso %d (0x%x) -> 0x%x%s\n", n.id, n.arg, n.dest, r ? " (sin destino)" : "");
 		if (r && n.id == 69) {
 			// PORT_DESTROYED sin destino (quien pidió el aviso ya no existe): como en XNU, el mensaje no entregado se destruye y
@@ -410,13 +415,16 @@ static void flush_notes(void) {
 
 // Sin derechos de envío en ningún sitio: MACH_NOTIFY_NO_SENDERS al que lo pidió (el aviso consume la petición).
 static void ns_check_locked(uint32_t port) {
-	for (int i = 0; i < (int)shm->sh_hw; i++) if (shm->sh[i].port == port) return;
-	struct sport* q = find_locked(port);
-	if (q && q->nsreq) {
-		if (getenv("TAHOE_NSLOG") || access("/dev/shm/tahoe-ns-trace", F_OK) == 0)
-			logf_("    no-senders: 0x%x (recibe %d) avisado a 0x%x; el último lo soltó %d\n", port, (int)q->rpid, q->nsreq, (int)getpid());
-		note_locked(q->nsreq, 70, q->nsmscount); q->nsreq = 0;
-	}
+    uint32_t held = 0;
+    for (int i = 0; i < (int)shm->sh_hw; i++) if (shm->sh[i].port == port) { held = 1; break; }
+    struct sport* q = find_locked(port);
+    struct nucleo_notificacion_plan r = nucleo_notificacion_event(port_snapshot(q), notification_snapshot(NULL), port, 0, 0, held);
+    if (r.note.dest) {
+        if (getenv("TAHOE_NSLOG") || access("/dev/shm/tahoe-ns-trace", F_OK) == 0)
+            logf_("    no-senders: 0x%x (recibe %d) avisado a 0x%x; el último lo soltó %d\n", port, (int)q->rpid, r.note.dest, (int)getpid());
+        note_locked(r.note.dest, r.note.id, r.note.arg);
+        q->nsreq = r.port.nsreq;
+    }
 }
 // urefs de envío de holder a port += delta. Como en XNU cuentan también los del propio receptor (los que hace con
 // insert_right o construct): si no, al traspasar el derecho de recepción no se sabía cuántos se quedaba el que lo tenía y
@@ -592,15 +600,14 @@ static void msg_rights_locked(const uint8_t* m, uint32_t size, int mode, uint32_
 static void destroy_locked(struct sport* p) {
 	uint32_t name = p->name;
 	for (int i = 0; i < (int)shm->sh_hw; i++) if (shm->sh[i].port == name) shm->sh[i].port = 0;   // ya no hay a quién avisar
-	if (p->pdreq && !p->is_set) {
-		uint32_t to = p->pdreq; p->pdreq = 0;
-		p->owner = 0;                                         // en tránsito hacia quien pidió el aviso
-		if (p->svc && p->svc_ctx) { p->ctx = p->svc_ctx; p->guarded = p->strict_guard = 1; }   // ipc_right_copyout_recv: launchd recupera su guarda
-		else { p->guarded = p->strict_guard = 0; p->ctx = 0; }
-		note_locked(to, 69, name);
-		logf_("    puerto 0x%x: derecho de recepción devuelto a 0x%x (PORT_DESTROYED, cola=%u)\n", name, to, p->count);
-		return;
-	}
+    struct nucleo_notificacion_plan returned = nucleo_notificacion_event(port_snapshot(p), notification_snapshot(NULL), name, 0, 1, 0);
+    if (returned.note.dest) {
+        p->pdreq = returned.port.pdreq; p->owner = returned.port.owner;
+        p->ctx = returned.port.ctx; p->guarded = returned.port.guarded; p->strict_guard = returned.port.strict_guard;
+        note_locked(returned.note.dest, returned.note.id, returned.note.arg);
+        logf_("    puerto 0x%x: derecho de recepción devuelto a 0x%x (PORT_DESTROYED, cola=%u)\n", name, returned.note.dest, p->count);
+        return;
+    }
 	logf_("    puerto 0x%x destruido por pid %d (cola=%u)\n", name, (int)getpid(), p->count);
 	if (p->me) {
 		char path[128]; snprintf(path, sizeof path, "/dev/shm/tahoe-me-%s-%u", tag, name); unlink(path);
@@ -619,8 +626,14 @@ static void destroy_locked(struct sport* p) {
 		q->next = shm->free_head; shm->free_head = p->head; p->head = nx;
 	}
 	p->tail = 0; p->count = 0;
-	for (int k = 0; k < MAXDN; k++) if (shm->dn[k].port == name) { note_locked(shm->dn[k].notify, 72, name); shm->dn[k].port = 0; }
-	if (p->spn) for (int k = 0; k < MAXSP; k++) if (shm->sp[k].port == name) { note_locked(shm->sp[k].notify, 72, name); shm->sp[k].port = 0; }   // SEND_POSSIBLE pendientes: el puerto murió
+	for (int k = 0; k < MAXDN; k++) {
+        struct nucleo_notificacion_plan r = nucleo_notificacion_event(port_snapshot(p), notification_snapshot(&shm->dn[k]), name, 0, 2, 0);
+        note_locked(r.note.dest, r.note.id, r.note.arg); memcpy(&shm->dn[k], &r.entry, sizeof r.entry);
+    }
+	if (p->spn) for (int k = 0; k < MAXSP; k++) {
+        struct nucleo_notificacion_plan r = nucleo_notificacion_event(port_snapshot(p), notification_snapshot(&shm->sp[k]), name, 0, 2, 0);
+        note_locked(r.note.dest, r.note.id, r.note.arg); memcpy(&shm->sp[k], &r.entry, sizeof r.entry);
+    }   // SEND_POSSIBLE pendientes: el puerto murió
 	p->spn = 0;
 	for (int k = 0; k < MAXSO; k++) if (shm->so[k].port == name) shm->so[k].port = 0;     // ya no hay a quién responder
 	if (local_sock[i] >= 0) { close(local_sock[i]); local_sock[i] = -1; }
@@ -844,7 +857,10 @@ static int port_send_t(uint32_t dest, const uint8_t* msg, uint32_t size, int ker
 		if (action == 0) break;
 		if (notify && !send_waited && p && p->spn && (action == 1 || action == 0x10000004)) {
 			int32_t me = (int32_t)getpid();
-			for (int k = 0; k < MAXSP; k++) if (shm->sp[k].port == dest && shm->sp[k].pid == me) shm->sp[k].armado = 1;
+			for (int k = 0; k < MAXSP; k++) {
+                struct nucleo_notificacion_plan r = nucleo_notificacion_event(port_snapshot(p), notification_snapshot(&shm->sp[k]), dest, me, 4, 0);
+                memcpy(&shm->sp[k], &r.entry, sizeof r.entry);
+            }
 		}
 		if (action != 1) { unlock(); if (spill) nucleo_desborde_borrar(tag, spill); return action; }
 		int r = nucleo_esperar(&p->cv, &shm->lk, timeout_ms > 0 ? &dl : NULL);
@@ -914,7 +930,11 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			nucleo_avisar(&src->cv);                     // hay sitio: remitentes esperando por el límite de cola
 			if (deq.possible) {   // y las peticiones SEND_POSSIBLE armadas (ipc_port_spnotify);
 				for (int k = 0; k < MAXSP; k++)                                   // las no armadas siguen esperando
-					if (shm->sp[k].port == src->name && shm->sp[k].armado) { note_locked(shm->sp[k].notify, 66, src->name); shm->sp[k].port = 0; src->spn--; }
+					{
+                        struct nucleo_notificacion_plan r = nucleo_notificacion_event(port_snapshot(src), notification_snapshot(&shm->sp[k]), src->name, 0, 3, 0);
+                        note_locked(r.note.dest, r.note.id, r.note.arg);
+                        memcpy(&shm->sp[k], &r.entry, sizeof r.entry); src->spn = r.port.spn;
+                    }
 			}
 			msg_rights_locked(q->data, q->size, RIGHTS_RECV, src->name);
 			for (int j = 0; j < NSETS; j++) if (src->sets[j]) { struct sport* s = find_locked(src->sets[j]); if (s) s->count = nucleo_cola_count(s->count, 0); }
@@ -1665,55 +1685,42 @@ static long t_pid_for_task(struct ctx* c) {
 // MACH_SEND_NOTIFY que la encuentra llena. Una petición sin sync y sin armar no avisa nunca (antes avisaba en cada
 // mensaje que se sacaba: WindowServer y powerd entraban en un bucle de miles de mensajes por segundo).
 int port_request_notification(uint32_t name, int variant, uint32_t sync, uint32_t notify, uint32_t* previous) {
-	*previous = 0;
-	int r = KERN_OK;
-	lock();
-	struct sport* p = find_locked(name);
-	if (variant == 69) {
-		if (!p) r = KERN_INVALID_RIGHT_;
-		else { *previous = p->pdreq; p->pdreq = notify; }
-	} else if (variant == 70) {                                // NO_SENDERS: sobre un derecho de recepción; sync = make-send count
-		if (!p) r = KERN_INVALID_RIGHT_;
-		else {
-			*previous = p->nsreq; p->nsreq = notify; p->nsmscount = sync;
-			if (msg_trace()) {
-				int h = 0; for (int j = 0; j < (int)shm->sh_hw; j++) h += shm->sh[j].port == name;
-				logf_("    no-senders <%d>: pedido para 0x%x sync=%u aviso=0x%x usuarios anotados=%d dueño=%d\n", (int)getpid(), name, sync, notify, h, (int)p->owner);
-			}
-		}
-	} else if (variant == 66) {
-		int ko = name == 0x103;                                   // objetos del núcleo (tarea, hilo, IOKit...): fuera de la
-		for (int i = 0; i < MAXKOBJ && !ko; i++) ko = shm->kobjs[i].name == name;   // tabla de puertos pero vivos, y su cola nunca se llena
-		if (!p && ko) { if (notify && sync) note_locked(notify, 66, name); }
-		else if (!p) {
-			logf_("    send-possible <%d>: 0x%x no existe -> DEAD_NAME\n", (int)getpid(), name);
-			if (notify && name && name < shm->next_name) note_locked(notify, 72, name); else r = KERN_INVALID_NAME_;
-		}
-		else {                                                     // una petición por proceso: la nueva sustituye a la anterior
-			int32_t me = (int32_t)getpid();
-			for (int k = 0; k < MAXSP; k++) if (shm->sp[k].port == name && shm->sp[k].pid == me) { *previous = shm->sp[k].notify; shm->sp[k].port = 0; if (p->spn) p->spn--; break; }
-			if (notify && sync && p->count < (p->qlimit ? p->qlimit : 5)) note_locked(notify, 66, name);
-			else if (notify) {
-				int ok = 0;
-				for (int k = 0; k < MAXSP; k++) if (!shm->sp[k].port) { shm->sp[k] = (struct dnreq){ name, notify, me, sync != 0 }; p->spn++; ok = 1; break; }
-				if (!ok) logf_("    send-possible: tabla llena\n");
-			}
-		}
-	} else if (variant == 72) {
-		int32_t me = (int32_t)getpid();
-		for (int i = 0; i < MAXDN; i++) if (shm->dn[i].port == name && shm->dn[i].pid == me) { *previous = shm->dn[i].notify; shm->dn[i].port = 0; break; }
-		if (notify) {
-			if (!p) { if (name && name < shm->next_name) note_locked(notify, 72, name); else r = KERN_INVALID_NAME_; }
-			else {
-				int ok = 0;
-				for (int i = 0; i < MAXDN; i++) if (!shm->dn[i].port) { shm->dn[i] = (struct dnreq){ name, notify, me, 0 }; ok = 1; break; }
-				if (!ok) logf_("    dead-name: tabla llena\n");
-			}
-		}
-	}
-	unlock();
-	flush_notes();
-	return r;
+    lock();
+    struct sport* p = find_locked(name);
+    int32_t me = (int32_t)getpid();
+    int ko = name == 0x103;
+    if (variant == 66) for (int i = 0; i < MAXKOBJ && !ko; i++) ko = shm->kobjs[i].name == name;
+    struct dnreq* table = variant == 66 ? shm->sp : shm->dn;
+    int cap = variant == 66 ? MAXSP : MAXDN, mine = -1, free_slot = -1;
+    if (variant == 66 || variant == 72) {
+        for (int i = 0; i < cap; i++) {
+            if (mine < 0 && table[i].port == name && table[i].pid == me) mine = i;
+            if (free_slot < 0 && !table[i].port) free_slot = i;
+        }
+    }
+    struct nucleo_notificacion_plan r = nucleo_notificacion_request(port_snapshot(p),
+        notification_snapshot(mine >= 0 ? &table[mine] : NULL), name, variant, sync,
+        notify, me, shm->next_name, ko, mine >= 0 || free_slot >= 0);
+    *previous = r.previous;
+    if (r.remove) table[mine].port = 0;
+    if (r.store) {
+        // Conserva el orden anterior: reemplazo libera antes de buscar el primer hueco.
+        for (int i = 0; i < cap; i++) if (!table[i].port) { memcpy(&table[i], &r.entry, sizeof r.entry); break; }
+    }
+    if (p) {
+        p->pdreq = r.port.pdreq; p->nsreq = r.port.nsreq;
+        p->nsmscount = r.port.nsmscount; p->spn = r.port.spn;
+    }
+    note_locked(r.note.dest, r.note.id, r.note.arg);
+    if (r.full) logf_("    %s: tabla llena\n", variant == 66 ? "send-possible" : "dead-name");
+    if (variant == 70 && p && msg_trace()) {
+        int h = 0; for (int j = 0; j < (int)shm->sh_hw; j++) h += shm->sh[j].port == name;
+        logf_("    no-senders <%d>: pedido para 0x%x sync=%u aviso=0x%x usuarios anotados=%d dueño=%d\n", (int)getpid(), name, sync, notify, h, (int)p->owner);
+    }
+    if (variant == 66 && !p && !ko) logf_("    send-possible <%d>: 0x%x no existe -> DEAD_NAME\n", (int)getpid(), name);
+    unlock();
+    flush_notes();
+    return r.error;
 }
 static long t_request_notification(struct ctx* c) {
 	uint32_t prev = 0;

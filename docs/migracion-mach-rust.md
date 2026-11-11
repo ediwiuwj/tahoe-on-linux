@@ -51,6 +51,53 @@ Los atributos de exportación de símbolos se aíslan y justifican por ABI.
 - No sustituir funciones por stubs de éxito ni presentar un refactor parcial
   como implementación completa.
 
-Estado actual: **en curso, no completo**. El primer corte aborda estados de
-puertos/conjuntos/guardas y construcción de respuestas MIG; colas, derechos,
-memoria y demás componentes siguen pendientes hasta ser migrados y probados.
+Estado actual: **en curso, no completo**. Hay cortes de estados de
+puertos/conjuntos/guardas, planes de colas/derechos y respuestas MIG. Su cierre
+requiere validación externa; memoria y demás componentes no se consideran cerrados.
+
+### Corte de notificaciones (sin compilación ni ejecución local)
+
+`mach_notificacion.rs` prohíbe unsafe y decide registro, reemplazo, cancelación,
+armado/rearmado de SEND_POSSIBLE, sync/qlimit, DEAD_NAME inmediato, consumo de
+NO_SENDERS y devolución PORT_DESTROYED (incluida la guarda de servicio).
+`mach_notificacion_ffi.rs` exporta exclusivamente valores; no recibe punteros.
+Usa `deny(unsafe_code)` con excepciones sólo para `unsafe(no_mangle)`, justificadas
+por símbolos únicos y ABI espejo; no hay bloques unsafe nuevos.
+Se reutiliza `Sport` y se copian entradas dnreq/spreq sin cambiar el ABI shm.
+Assertions C/Rust fijan los layouts del plan y de las entradas.
+
+Se conserva explícitamente la conducta previa: NO_SENDERS no se dispara al
+registrarlo (sync se conserva como argumento); tabla de peticiones llena y
+variante desconocida siguen devolviendo éxito; los avisos se consumen aunque
+la pila TLS esté llena; flush sigue siendo LIFO. No se pretende corregir estas
+diferencias con XNU en este corte. El contador spn usa saturación defensiva en
+Rust (no afecta estados válidos: su máximo es MAXSP=1024).
+
+Tests añadidos: armado, consumo único, rearmado/reemplazo/cancelación, sync con
+cola llena/disponible, no-senders con/sin holders, devolución con guarda,
+nombres muertos, errores y límites de las colas. Se añade un codec seguro de
+mensajes de notificación (SEND_ONCE, DEAD_NAME, NO_SENDERS, SEND_POSSIBLE y
+PORT_DESTROYED), con pruebas de bytes y layout. Estas pruebas nuevas no se han
+ejecutado localmente: quedan compilación y regresiones en Actions.
+
+C pendiente en `emu_port.c`: lock, lookup y recorridos de tablas, snapshots y
+commit de campos, pila TLS/flush y serialización de mensajes, copyin/copyout,
+poke/syscalls, destrucción de mensajes/derechos, recolector, kobjects, puertos
+especiales y temporizadores. La selección de cuándo hay bloqueo de envío o
+hueco de recepción sigue en la integración con los planes de cola. No es el
+cierre de todas las funciones C ni de la migración Mach.
+
+### Recepción y validación externa
+
+`mach_recepcion.rs` migra la transformación de cabecera, RCV_LARGE_IDENTITY y
+los trailers LP64 (credenciales, audit token y contexto). El core prohíbe unsafe;
+la FFI trabaja por valor. Copyout, descriptores y efectos de derechos siguen en C.
+Este corte nuevo aún requiere Actions y prueba del artefacto resultante.
+
+El artefacto del commit `f21c75d`, compilado en Actions `42862094692`, se ejecutó
+con Recovery Tahoe: `MACH_PUERTOS_SEMAFOROS_OK` (incluye envío/recepción, timeout y
+destrucción), `SENALES_MASCARAS_SIGINFO_OK`, `SIGLONGJMP_REPETIDO_OK` (24 saltos)
+y ambas pruebas de spawn aprobadas. Shell: 23/24; `trap_cruzado` sigue fallando
+con retorno 139. No se atribuye ese fallo a Bash ni se declara resuelto sin prueba
+independiente. Estos resultados no validan todavía notificaciones ni recepción
+recién migradas.

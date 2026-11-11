@@ -9,6 +9,17 @@ struct nucleo_mig_respuesta nucleo_mig_error(int32_t id, int32_t codigo);
 struct nucleo_mig_respuesta nucleo_mig_puerto(int32_t id, uint32_t nombre, uint8_t disposicion);
 struct nucleo_mig_respuesta nucleo_mig_ool(int32_t id, uint64_t dir, uint32_t len, uint32_t cnt, uint32_t ports, uint32_t extra, uint32_t has_extra);
 uint32_t nucleo_mig_rx_disp(uint32_t tx);
+// Recepción: snapshots propios y bytes little-endian; sin punteros invitados.
+struct nucleo_recepcion_cabecera { uint32_t bits, size, remote, local, voucher; int32_t id; };
+struct nucleo_recepcion_emisor { uint32_t datos[5]; };
+struct nucleo_recepcion_trailer { uint8_t bytes[68]; uint32_t len; };
+_Static_assert(sizeof(struct nucleo_recepcion_cabecera) == 24 && _Alignof(struct nucleo_recepcion_cabecera) == 4 && offsetof(struct nucleo_recepcion_cabecera, id) == 20, "recepcion cabecera ABI");
+_Static_assert(sizeof(struct nucleo_recepcion_emisor) == 20, "recepcion emisor ABI");
+_Static_assert(sizeof(struct nucleo_recepcion_trailer) == 72 && _Alignof(struct nucleo_recepcion_trailer) == 4 && offsetof(struct nucleo_recepcion_trailer, len) == 68, "recepcion trailer ABI");
+uint32_t nucleo_recepcion_tam_trailer(uint64_t options);
+struct nucleo_recepcion_cabecera nucleo_recepcion_cabecera(struct nucleo_recepcion_cabecera);
+struct nucleo_recepcion_cabecera nucleo_recepcion_grande(struct nucleo_recepcion_cabecera, uint64_t options);
+struct nucleo_recepcion_trailer nucleo_recepcion_trailer(uint64_t options, struct nucleo_recepcion_emisor, uint64_t contexto);
 struct nucleo_mach_tiempo { int32_t segundos, microsegundos; };
 struct nucleo_mach_tiempo nucleo_mach_ticks(int64_t t, int64_t hz);
 int32_t nucleo_mach_prioridad(int64_t nice);
@@ -106,6 +117,24 @@ void nucleo_avisar(uint32_t* e);
 
 // Snapshots propios: C copia/commit bajo shm->lk; Rust nunca recibe punteros shm.
 struct nucleo_sport { uint32_t name, sets[32], head, tail, count; int32_t owner, rpid; uint8_t used, is_set, guarded, strict_guard; uint32_t cv; uint64_t ctx; uint32_t pdreq; uint8_t svc; uint64_t svc_ctx; uint32_t qlimit; uint32_t nsreq, nsmscount; int32_t hnext; uint32_t spn; uint8_t me; };
+// Notificaciones: snapshots por valor; C realiza lookup y commit bajo el lock.
+struct nucleo_notificacion_entry { uint32_t port, notify; int32_t pid; uint32_t armado; };
+struct nucleo_notificacion_note { uint32_t dest, arg; int32_t id; };
+struct nucleo_notificacion_message { uint8_t bytes[40]; uint32_t len; };
+_Static_assert(sizeof(struct nucleo_notificacion_message) == 44 && offsetof(struct nucleo_notificacion_message, len) == 40, "notification message ABI");
+struct nucleo_notificacion_message nucleo_notificacion_message(struct nucleo_notificacion_note);
+struct nucleo_notificacion_plan {
+    struct nucleo_sport port; struct nucleo_notificacion_entry entry;
+    struct nucleo_notificacion_note note;
+    uint32_t previous, remove, store, full; int32_t error;
+};
+_Static_assert(sizeof(struct nucleo_notificacion_entry) == 16 && offsetof(struct nucleo_notificacion_entry, armado) == 12, "notification entry ABI");
+_Static_assert(sizeof(struct nucleo_notificacion_note) == 12 && offsetof(struct nucleo_notificacion_note, id) == 8, "notification note ABI");
+_Static_assert(sizeof(struct nucleo_notificacion_plan) == 256 && offsetof(struct nucleo_notificacion_plan, entry) == 208 && offsetof(struct nucleo_notificacion_plan, note) == 224 && offsetof(struct nucleo_notificacion_plan, error) == 252, "notification plan ABI");
+uint32_t nucleo_notificacion_enqueue(uint32_t, uint32_t, uint32_t);
+struct nucleo_notificacion_plan nucleo_notificacion_request(struct nucleo_sport, struct nucleo_notificacion_entry, uint32_t, int32_t, uint32_t, uint32_t, int32_t, uint32_t, uint32_t, uint32_t);
+// Eventos: 0 no-senders, 1 port-destroyed, 2 dead-name, 3 send-possible, 4 arm.
+struct nucleo_notificacion_plan nucleo_notificacion_event(struct nucleo_sport, struct nucleo_notificacion_entry, uint32_t, int32_t, uint32_t, uint32_t);
 // Cola: planes pequeños, únicamente campos afectados; índices desde 1.
 struct nucleo_cola_plan { uint32_t head, tail, count, free, slot, next, link, link_next, possible; int32_t action; };
 _Static_assert(sizeof(struct nucleo_cola_plan) == 40, "cola plan ABI");
