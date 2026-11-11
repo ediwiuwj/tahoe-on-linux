@@ -170,6 +170,7 @@ _Static_assert(offsetof(struct nucleo_sport, spn) == 200, "sport.spn");
 _Static_assert(offsetof(struct nucleo_sport, me) == 204, "sport.me");
 _Static_assert(sizeof(struct nucleo_puerto_batch) == 7088 && offsetof(struct nucleo_puerto_batch, len) == 7072 && offsetof(struct nucleo_puerto_batch, target) == 7076 && offsetof(struct nucleo_puerto_batch, error) == 7080, "puerto batch ABI");
 _Static_assert(sizeof(struct nucleo_puerto_guard) == 216 && offsetof(struct nucleo_puerto_guard, error) == 208, "puerto guard ABI");
+struct nucleo_sport nucleo_puerto_create(struct nucleo_sport, uint32_t, int32_t, int32_t);
 uint32_t nucleo_puerto_in_set(struct nucleo_sport, uint32_t);
 int32_t nucleo_puerto_destroy_allowed(struct nucleo_sport, int32_t);
 struct nucleo_sport nucleo_puerto_remove(struct nucleo_sport, uint32_t);

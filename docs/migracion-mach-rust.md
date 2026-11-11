@@ -100,4 +100,10 @@ destrucción), `SENALES_MASCARAS_SIGINFO_OK`, `SIGLONGJMP_REPETIDO_OK` (24 salto
 y ambas pruebas de spawn aprobadas. Shell: 23/24; `trap_cruzado` sigue fallando
 con retorno 139. No se atribuye ese fallo a Bash ni se declara resuelto sin prueba
 independiente. Estos resultados no validan todavía notificaciones ni recepción
-recién migradas.
+recién migradas. PTY con el mismo artefacto: diez Ctrl-C y
+Ctrl-Z/jobs/bg/fg aprobados.
+
+La inicialización/reutilización de `Sport` también se decide en Rust: elimina
+el estado anterior y conserva exclusivamente la secuencia `cv`, para que un
+waiter antiguo vuelva a comprobar el puerto. Lookup, reserva de ranura, índice
+y creación del socket aún siguen en C; no se declara migrada toda la creación.

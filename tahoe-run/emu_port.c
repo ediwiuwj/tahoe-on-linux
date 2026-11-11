@@ -333,8 +333,8 @@ uint32_t port_create(int is_set) {
 		logf_("    puertos: tabla llena\n");
 		return 0;
 	}
-	{ uint32_t keep = p->cv; memset(p, 0, sizeof *p); p->cv = keep; }   // la secuencia de espera sigue (quien esperase vuelve a mirar)
-	p->used = 1; p->is_set = (uint8_t)is_set; p->name = name; p->owner = (int32_t)getpid(); p->rpid = (int32_t)getpid();
+	struct nucleo_sport created = nucleo_puerto_create(port_snapshot(p), name, (int32_t)getpid(), is_set);
+	memcpy(p, &created, sizeof created);
 	bucket_add_locked(p);
 	local_sock[port_index(p)] = make_wake_socket(name, p->rpid);
 	unlock();

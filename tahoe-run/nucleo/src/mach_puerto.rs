@@ -21,6 +21,13 @@ pub struct Batch { pub ports: [Sport; 34], pub len: u32, pub target: u32, pub er
 #[derive(Clone, Copy)]
 pub struct GuardResult { pub port: Sport, pub error: i32 }
 
+/// Reinicia una ranura sin reiniciar su secuencia de espera: los waiters
+/// anteriores deben despertar y comprobar el nombre/estado de nuevo.
+pub fn create(previous: Sport, name: u32, owner: i32, is_set: i32) -> Sport {
+    Sport { name, owner, rpid: owner, used: 1, is_set: is_set as u8,
+        cv: previous.cv, ..Sport::default() }
+}
+
 pub fn in_set(p: Sport, set: u32) -> bool {
     p.sets.iter().take_while(|&&n| n != 0).any(|&n| n == set)
 }
@@ -149,6 +156,20 @@ mod tests {
         b.ports[1] = port(20, 1, 5);
         b.ports[2] = port(30, 1, 7);
         b
+    }
+    #[test]
+    fn create_clears_previous_rights_and_keeps_wait_sequence() {
+        let mut old = port(9, 1, 99);
+        old.sets = [123; NSETS]; old.owner = 7; old.rpid = 8;
+        old.ctx = u64::MAX; old.guarded = 1; old.strict_guard = 1;
+        old.pdreq = 12; old.nsreq = 13; old.spn = 14; old.hnext = 15;
+        old.svc = 1; old.svc_ctx = 42; old.me = 1;
+        for is_set in [0, 1, -1, 256] {
+            let r = create(old, 100, 55, is_set);
+            assert_eq!(r, Sport { name: 100, owner: 55, rpid: 55, used: 1,
+                is_set: is_set as u8, cv: old.cv, ..Sport::default() });
+            assert_eq!(crate::mach_puerto_ffi::nucleo_puerto_create(old,100,55,is_set), r);
+        }
     }
     #[test]
     fn destruction_requires_live_owned_unguarded_port() {
